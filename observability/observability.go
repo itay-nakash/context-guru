@@ -17,16 +17,17 @@ import (
 // Event is one reduction's telemetry. Field comments give the OTel attribute key the
 // default emitter uses.
 type Event struct {
-	System       string  // gen_ai.system (e.g. "anthropic", "openai")
-	RequestModel string  // gen_ai.request.model
-	Surface      string  // context_engineering.surface
-	TokensBefore int     // context_engineering.tokens.before
-	TokensAfter  int     // context_engineering.tokens.after
-	TokensSaved  int     // context_engineering.tokens.saved
-	Ratio        float64 // context_engineering.tokens.ratio
-	CacheInject  bool    // context_engineering.cache_injected
-	Extracted    bool    // context_engineering.extracted
-	StageErrors  int     // context_engineering.stage_errors
+	System        string  // gen_ai.system (e.g. "anthropic", "openai")
+	RequestModel  string  // gen_ai.request.model
+	Surface       string  // context_engineering.surface
+	TokensBefore  int     // context_engineering.tokens.before
+	TokensAfter   int     // context_engineering.tokens.after
+	TokensSaved   int     // context_engineering.tokens.saved
+	Ratio         float64 // context_engineering.tokens.ratio
+	CacheInject   bool    // context_engineering.cache_injected
+	Extracted     bool    // context_engineering.extracted
+	StageErrors   int     // context_engineering.stage_errors
+	LatencyMillis int     // context_engineering.added_latency_ms (time the reduce path added)
 }
 
 // Emitter records reduction events. Implementations must be safe for concurrent use.
@@ -38,6 +39,18 @@ type Emitter interface {
 type Nop struct{}
 
 func (Nop) Emit(context.Context, Event) {}
+
+// Tee fans an event out to several Emitters in order (e.g. stream via slog AND
+// accumulate in an Aggregator). nil entries are skipped.
+type Tee []Emitter
+
+func (t Tee) Emit(ctx context.Context, e Event) {
+	for _, em := range t {
+		if em != nil {
+			em.Emit(ctx, e)
+		}
+	}
+}
 
 // SlogEmitter logs events as structured records in gen_ai.* vocabulary.
 type SlogEmitter struct{ Logger *slog.Logger }
@@ -58,5 +71,6 @@ func (s SlogEmitter) Emit(ctx context.Context, e Event) {
 		slog.Bool("context_engineering.cache_injected", e.CacheInject),
 		slog.Bool("context_engineering.extracted", e.Extracted),
 		slog.Int("context_engineering.stage_errors", e.StageErrors),
+		slog.Int("context_engineering.added_latency_ms", e.LatencyMillis),
 	)
 }

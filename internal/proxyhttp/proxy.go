@@ -31,6 +31,10 @@ type Config struct {
 	OpenAIDefault    string // default "https://api.openai.com"
 	Client           *http.Client
 	Emitter          observability.Emitter // default observability.Nop
+	// Aggregator, if set, is served at GET /stats (Snapshot as JSON). It is
+	// independent of Emitter: a host may stream via Emitter and also expose
+	// process-wide stats here, or pass the same *observability.Aggregator as both.
+	Aggregator *observability.Aggregator
 	// MaxBodyBytes caps the request body read from clients; 0 means no cap. A body
 	// exceeding the cap yields HTTP 413.
 	MaxBodyBytes int64
@@ -74,6 +78,8 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.ok(w, r)
 	case path == "/winnow/expand":
 		p.expand(w, r)
+	case path == "/stats":
+		p.stats(w, r)
 	case strings.HasSuffix(path, "/v1/messages"):
 		p.model(surfaces.Anthropic{}, p.cfg.AnthropicDefault)(w, r)
 	case strings.HasSuffix(path, "/chat/completions"):
@@ -84,6 +90,17 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *proxy) ok(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }
+
+// stats serves the process-wide reduction Snapshot as JSON. Returns 404 when no
+// Aggregator is configured.
+func (p *proxy) stats(w http.ResponseWriter, _ *http.Request) {
+	if p.cfg.Aggregator == nil {
+		http.Error(w, "stats not enabled", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = p.cfg.Aggregator.WriteJSON(w)
+}
 
 func (p *proxy) expand(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
@@ -115,7 +132,10 @@ func (p *proxy) model(surface surfaces.Surface, providerDefault string) http.Han
 		// Reduce unless bypassed or the surface can't map this format.
 		outBody := body
 		if !bypassed(r) {
-			if reduced, rep, ok := p.reduce(r.Context(), surface, body); ok {
+			start := time.Now()
+			reduced, rep, ok := p.reduce(r.Context(), surface, body)
+			latencyMs := int(time.Since(start).Milliseconds())
+			if ok {
 				outBody = reduced
 				p.cfg.Emitter.Emit(r.Context(), observability.Event{
 					System: surface.Name(), Surface: surface.Name(),
@@ -123,7 +143,8 @@ func (p *proxy) model(surface surfaces.Surface, providerDefault string) http.Han
 					TokensBefore: rep.Reduce.TokensBefore, TokensAfter: rep.Reduce.TokensAfter,
 					TokensSaved: rep.Reduce.TokensSaved, Ratio: rep.Reduce.Ratio,
 					CacheInject: rep.CacheInjected, Extracted: len(rep.Candidates) > 0,
-					StageErrors: rep.StageErrors,
+					StageErrors:   rep.StageErrors,
+					LatencyMillis: latencyMs,
 				})
 			}
 		}

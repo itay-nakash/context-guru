@@ -6,8 +6,10 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"time"
@@ -25,6 +27,7 @@ func usage() {
 
 Usage:
   lab-cx proxy [--addr :8080] [--preset balanced] [--upstream URL]   start the proxy
+  lab-cx stats [--addr http://localhost:8080]                        print live /stats
   lab-cx version                                                     print version
 
 Point your agent at the proxy, e.g.:
@@ -56,6 +59,8 @@ func main() {
 		fmt.Printf("lab-cx %s (%s)\n", buildinfo.Version, buildinfo.Commit)
 	case "proxy":
 		runProxy(os.Args[2:])
+	case "stats":
+		runStats(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -154,9 +159,12 @@ func runProxy(args []string) {
 		eng.EnableExtract(model, engine.DefaultExtractConfig())
 		fmt.Fprintf(os.Stderr, "lab-cx: extraction enabled (provider=%s model=%s)\n", *extractProvider, *extractModel)
 	}
+	agg := observability.NewAggregator(defaultCostRates())
 	handler := proxyhttp.New(proxyhttp.Config{
 		Engine: eng, Upstream: *upstream,
-		Emitter:         observability.SlogEmitter{},
+		// Stream each event via slog AND fold it into the Aggregator served at /stats.
+		Emitter:         observability.Tee{observability.SlogEmitter{}, agg},
+		Aggregator:      agg,
 		MaxBodyBytes:    *maxBodyBytes,
 		UpstreamTimeout: upstreamTimeoutDur,
 	})
@@ -166,6 +174,45 @@ func runProxy(args []string) {
 		fmt.Fprintln(os.Stderr, "lab-cx:", err)
 		os.Exit(1)
 	}
+}
+
+// defaultCostRates is a small input/output price table ($/MTok) used to estimate the
+// dollar value of saved tokens. Savings are priced on input rates (reduction removes
+// input tokens). DefaultCostKey prices any model not listed here. Edit to match your
+// provider's published pricing; values here are illustrative defaults.
+func defaultCostRates() map[string]observability.CostRate {
+	return map[string]observability.CostRate{
+		"claude-haiku-4-5":           {InputPerMTok: 1.00, OutputPerMTok: 5.00},
+		observability.DefaultCostKey: {InputPerMTok: 3.00, OutputPerMTok: 15.00},
+	}
+}
+
+// runStats GETs /stats from a running proxy and prints the JSON plus a one-line summary.
+func runStats(args []string) {
+	fs := flag.NewFlagSet("stats", flag.ExitOnError)
+	addr := fs.String("addr", "http://localhost:8080", "base URL of a running lab-cx proxy")
+	_ = fs.Parse(args)
+
+	url := *addr + "/stats"
+	resp, err := http.Get(url)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "lab-cx: GET %s: %v\n", url, err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintf(os.Stderr, "lab-cx: %s returned %d: %s\n", url, resp.StatusCode, string(body))
+		os.Exit(1)
+	}
+
+	var snap observability.Snapshot
+	if err := json.Unmarshal(body, &snap); err != nil {
+		fmt.Fprintf(os.Stderr, "lab-cx: bad /stats response: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println(string(body))
+	fmt.Println(observability.SummaryOf(snap))
 }
 
 // flagOrConfig resolves an extract-* knob: an explicitly-set flag wins; otherwise the

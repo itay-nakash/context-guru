@@ -2,6 +2,7 @@ package proxyhttp
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -168,6 +169,55 @@ func TestRequestBodyCap(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status=%d want 413", rec.Code)
+	}
+}
+
+func TestStatsExposesSavings(t *testing.T) {
+	var upstreamGot string
+	up := captureUpstream(t, &upstreamGot)
+	defer up.Close()
+
+	s := config.Default()
+	s.ProtectRecent = 1
+	agg := observability.NewAggregator(map[string]observability.CostRate{
+		observability.DefaultCostKey: {InputPerMTok: 1.0},
+	})
+	h := New(Config{Engine: engine.New(s, nil, nil), Upstream: up.URL, Emitter: agg, Aggregator: agg})
+
+	big := strings.Repeat("a.go long file content line for the read result here\\n", 12)
+	body := `{"model":"claude-x","messages":[
+		{"role":"assistant","content":[{"type":"tool_use","id":"u1","name":"read","input":{"file_path":"a.go"}}]},
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"u1","content":"` + big + `"}]},
+		{"role":"assistant","content":[{"type":"tool_use","id":"u2","name":"edit","input":{"file_path":"a.go"}}]},
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"u2","content":"success: edited"}]},
+		{"role":"user","content":[{"type":"text","text":"thanks"}]}
+	]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	srec := httptest.NewRecorder()
+	h.ServeHTTP(srec, httptest.NewRequest(http.MethodGet, "/stats", nil))
+	if srec.Code != http.StatusOK {
+		t.Fatalf("/stats status = %d", srec.Code)
+	}
+	var snap observability.Snapshot
+	if err := json.Unmarshal(srec.Body.Bytes(), &snap); err != nil {
+		t.Fatalf("unmarshal /stats: %v", err)
+	}
+	if snap.Requests != 1 {
+		t.Fatalf("Requests = %d, want 1", snap.Requests)
+	}
+	if snap.TokensSaved <= 0 {
+		t.Fatalf("TokensSaved = %d, want > 0", snap.TokensSaved)
+	}
+}
+
+func TestStatsDisabledWhenNoAggregator(t *testing.T) {
+	h := newProxy(t, "http://unused")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/stats", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("/stats without aggregator = %d, want 404", rec.Code)
 	}
 }
 
