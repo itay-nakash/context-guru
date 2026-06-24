@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/kagenti/lab-context-engineering/config"
 	"github.com/kagenti/lab-context-engineering/engine"
@@ -34,6 +35,11 @@ Flags:
   --preset    safe|balanced|aggressive|cache|coding|mcp (default balanced)
   --upstream  forward ALL requests here (e.g. an eval gateway); default routes by
               provider (api.anthropic.com / api.openai.com)
+  --max-body-bytes  cap request body size in bytes (default 33554432 = 32 MiB);
+                    0 means no cap
+  --upstream-timeout  max total time per upstream request (e.g. 30s; default 0s = no
+                      timeout). WARNING: a non-zero value caps the WHOLE request
+                      including streamed responses and can truncate long LLM SSE streams
 `)
 }
 
@@ -64,7 +70,15 @@ func runProxy(args []string) {
 	extractModel := fs.String("extract-model", "", "enable cheap-model extraction with this model (e.g. claude-haiku-4-5)")
 	extractProvider := fs.String("extract-provider", "anthropic", "extraction model provider: anthropic|openai")
 	extractBase := fs.String("extract-base", "", "base URL for the extraction model (default per provider)")
+	maxBodyBytes := fs.Int64("max-body-bytes", 33554432, "cap request body size in bytes (32 MiB default); 0 means no cap")
+	upstreamTimeout := fs.String("upstream-timeout", "0s", "max total time per upstream request (e.g. 30s); 0 means no timeout. WARNING: a non-zero value caps the WHOLE request including streamed responses and can truncate long LLM SSE streams")
 	_ = fs.Parse(args)
+
+	upstreamTimeoutDur, err := time.ParseDuration(*upstreamTimeout)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "lab-cx: invalid --upstream-timeout %q: %v\n", *upstreamTimeout, err)
+		os.Exit(2)
+	}
 
 	if os.Getenv("WINNOW_DISABLE") == "1" {
 		fmt.Fprintln(os.Stderr, "lab-cx: WINNOW_DISABLE=1 — running as a transparent passthrough")
@@ -101,7 +115,9 @@ func runProxy(args []string) {
 	}
 	handler := proxyhttp.New(proxyhttp.Config{
 		Engine: eng, Upstream: *upstream,
-		Emitter: observability.SlogEmitter{},
+		Emitter:         observability.SlogEmitter{},
+		MaxBodyBytes:    *maxBodyBytes,
+		UpstreamTimeout: upstreamTimeoutDur,
 	})
 
 	fmt.Fprintf(os.Stderr, "lab-cx proxy listening on %s (preset=%s)\n", *addr, *preset)
