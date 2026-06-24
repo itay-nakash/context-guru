@@ -21,6 +21,12 @@ type Anthropic struct {
 	Model     string // e.g. claude-haiku-4-5
 	MaxTokens int    // default 2048
 	Client    *http.Client
+	// AuthScheme selects how the API key is sent. "" or "x-api-key" sends the
+	// x-api-key header (Anthropic default). "bearer" sends
+	// Authorization: Bearer <APIKey> instead, for gateways (e.g. an IBM LiteLLM
+	// Anthropic-compatible endpoint) that authenticate with a bearer token. The
+	// anthropic-version header is sent in both cases.
+	AuthScheme string
 }
 
 func (a Anthropic) Complete(ctx context.Context, prompt string) (string, error) {
@@ -47,7 +53,11 @@ func (a Anthropic) Complete(ctx context.Context, prompt string) (string, error) 
 		return "", err
 	}
 	req.Header.Set("content-type", "application/json")
-	req.Header.Set("x-api-key", a.APIKey)
+	if a.AuthScheme == "bearer" {
+		req.Header.Set("Authorization", "Bearer "+a.APIKey)
+	} else {
+		req.Header.Set("x-api-key", a.APIKey)
+	}
 	req.Header.Set("anthropic-version", "2023-06-01")
 
 	resp, err := client.Do(req)

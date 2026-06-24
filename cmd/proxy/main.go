@@ -70,6 +70,7 @@ func runProxy(args []string) {
 	extractModel := fs.String("extract-model", "", "enable cheap-model extraction with this model (e.g. claude-haiku-4-5)")
 	extractProvider := fs.String("extract-provider", "anthropic", "extraction model provider: anthropic|openai")
 	extractBase := fs.String("extract-base", "", "base URL for the extraction model (default per provider)")
+	extractAuth := fs.String("extract-auth", "x-api-key", "anthropic auth scheme: x-api-key|bearer (bearer for gateway endpoints)")
 	maxBodyBytes := fs.Int64("max-body-bytes", 33554432, "cap request body size in bytes (32 MiB default); 0 means no cap")
 	upstreamTimeout := fs.String("upstream-timeout", "0s", "max total time per upstream request (e.g. 30s); 0 means no timeout. WARNING: a non-zero value caps the WHOLE request including streamed responses and can truncate long LLM SSE streams")
 	_ = fs.Parse(args)
@@ -103,8 +104,12 @@ func runProxy(args []string) {
 			if key == "" {
 				key = os.Getenv("ANTHROPIC_API_KEY")
 			}
+			if key == "" {
+				key = os.Getenv("ANTHROPIC_AUTH_TOKEN")
+			}
 			model = cheapmodel.Anthropic{
 				BaseURL: *extractBase, APIKey: key, Model: *extractModel,
+				AuthScheme: *extractAuth,
 			}
 		default:
 			fmt.Fprintf(os.Stderr, "lab-cx: unknown --extract-provider %q (want anthropic|openai)\n", *extractProvider)
