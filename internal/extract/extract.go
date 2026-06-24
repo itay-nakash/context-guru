@@ -113,7 +113,11 @@ func parseNDJSON(text string) []any {
 func resultToText(v any) string {
 	switch v.(type) {
 	case map[string]any, []any:
-		b, err := json.MarshalIndent(v, "", "  ")
+		// Compact, not indented: this is the reduced tool-output value, and
+		// indentation whitespace inflates the BPE token count (it can exceed the
+		// original), which trips the never-inflate gate and silently drops the
+		// extraction. Compact JSON keeps the projection a real reduction.
+		b, err := json.Marshal(v)
 		if err == nil {
 			return string(b)
 		}
