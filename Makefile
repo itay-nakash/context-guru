@@ -6,6 +6,10 @@ LDFLAGS := -s -w \
 	-X $(PKG)/internal/buildinfo.Version=$(VERSION) \
 	-X $(PKG)/internal/buildinfo.Commit=$(COMMIT)
 
+# CGO is required to compile the tree-sitter binding; a C toolchain (gcc/clang)
+# must be present for make test/build/lint.
+export CGO_ENABLED=1
+
 .DEFAULT_GOAL := help
 
 .PHONY: help
