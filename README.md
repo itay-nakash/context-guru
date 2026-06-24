@@ -4,53 +4,153 @@ Context engineering for LLM agents — reduce token cost without changing the ag
 hurting the result.
 
 `lab-context-engineering` is a [Kagenti](https://github.com/kagenti/kagenti) platform
-component. It is a single Go core that intercepts the traffic between an LLM agent and
-the model API, reduces the context it carries (caching, lossless reduction, and
-verified-lossless extraction), and forwards a cheaper request upstream. It fails open:
-on any error the original request is forwarded untouched.
+component: a single Go core that sits between an LLM coding agent and the model API,
+reduces the context the request carries (caching, lossless reduction, and
+verified-lossless extraction), and forwards a cheaper request upstream. It runs from one
+codebase as a **standalone proxy** (`lab-cx proxy`), an **importable Go library**
+(`engine`, `surfaces`, `config`), or **inside eval-containers**.
 
-It is designed to run in three places from **one codebase**:
+It is **fail-open** (any error in any stage forwards the original request untouched) and
+every reduction is **reversible** (a namespaced marker plus a content-addressed rewind
+store, so a downstream consumer or the agent can always recover the original bytes).
 
-- **As a standalone proxy** (`lab-cx proxy`) — point any agent's `ANTHROPIC_BASE_URL` /
-  `OPENAI_BASE_URL` at it. Works with Claude Code, Bob/OpenClaw, Codex, Cursor, Aider.
-- **As an importable Go library** (`engine`, `surfaces`) — so a Kagenti
-  [AuthBridge](https://github.com/kagenti/kagenti-extensions) plugin can wrap the engine
-  in-process, with no extra network hop. The plugin lives in `kagenti-extensions` and
-  depends on this repo; this repo contains no AuthBridge-specific code.
-- **Inside eval-containers** — as a proxy placed before or after the eval gateway, so the
-  component can be benchmarked across many agents and benchmarks.
+## Install
 
-## What it does
+Prerequisites:
 
-Three independent, toggleable levers (the lineage is the `winnow` research prototype):
-
-| Lever      | What it does                                                                 | Loss profile          |
-|------------|------------------------------------------------------------------------------|-----------------------|
-| **Cache**  | Injects Anthropic `cache_control` breakpoints on the stable prefix.          | Lossless              |
-| **Reduce** | Collapses stale/duplicate/empty content; re-encodes bulky output to cheaper, lossless forms; skeletonizes code. | Lossless, reversible  |
-| **Extract**| A cheap model proposes a structured projection of huge tool/MCP output; accepted only if structurally contained in the original. | Verified-lossless, reversible |
-
-Every reduction is reversible via a namespaced marker and a content-addressed rewind
-store, so a downstream consumer (or the agent) can always recover the original bytes.
-
-## Quick start
+- **Go 1.25**
+- **A C toolchain** (`gcc`/`clang`) — the code skeletonizer uses tree-sitter via cgo, so
+  `CGO_ENABLED=1` is required to build, test, and lint. The Makefile exports it for you.
 
 ```sh
-make build
-./bin/lab-cx version
+make build           # builds ./bin/lab-cx (CGO_ENABLED=1)
+./bin/lab-cx version  # prints: lab-cx <version> (<commit>)
 ```
 
-(`lab-cx proxy` and the engine library are landing incrementally — see `docs/`.)
+## Run
+
+Point any agent's base URL at the proxy — no agent changes:
+
+```sh
+./bin/lab-cx proxy --preset balanced
+# then, for any agent:
+#   ANTHROPIC_BASE_URL=http://localhost:8080
+#   OPENAI_BASE_URL=http://localhost:8080/v1
+```
+
+Works with Claude Code, Bob/OpenClaw, Codex, Cursor, Aider. With a config file and the
+cheap-model extractor enabled, forwarding all traffic to an upstream gateway:
+
+```sh
+./bin/lab-cx proxy --config configs/lab-cx.yaml \
+  --upstream https://gateway.example/v1 \
+  --extract-model claude-haiku-4-5 --extract-provider anthropic --extract-auth bearer \
+  --extract-base https://gateway.example/v1
+```
+
+`proxy` flags: `--addr` (default `:8080`), `--preset`
+(`safe|balanced|aggressive|cache|coding|mcp`), `--config` (a YAML file that names which
+components run, overrides `--preset`), `--upstream` (forward ALL requests here; default
+routes by provider), `--extract-model/-provider/-auth/-base` (enable + configure the
+cheap-model extractor; these override the config's transport block), `--max-body-bytes`
+(default 32 MiB; `0` = no cap), `--upstream-timeout` (default `0s` = none; a non-zero
+value caps the whole request and can truncate long SSE streams).
+
+Read the live aggregate metrics:
+
+```sh
+./bin/lab-cx stats                       # GETs /stats from a running proxy + prints a summary
+./bin/lab-cx stats --addr http://localhost:8080
+```
+
+Endpoints the proxy serves:
+
+- `GET /stats` — process-wide reduction snapshot as JSON (tokens before/after/saved,
+  cache injected, extracted, stage errors, added-latency p50/p95).
+- `GET /winnow/expand?id=<marker-id>` — returns the original bytes behind a reversibility
+  marker.
+- `GET /health`, `GET /ready` — liveness/readiness.
+
+Bypass / disable:
+
+- `WINNOW_DISABLE=1` env var — run the proxy as a transparent passthrough.
+- `x-winnow-bypass: true` request header — skip reduction for that single request.
+
+## Components
+
+- **Cache** — injects Anthropic `cache_control` breakpoints on the stable prefix
+  (lossless). Stands down when the client already self-caches (e.g. Claude Code).
+- **Reduce** (deterministic, no model) — `relevance` scoring + `collapse` of
+  stale/duplicate/empty content, `dedup`, `cmdfilter` (trims noisy shell-command output),
+  `skeleton` (drops function bodies, keeps signatures, via tree-sitter), and `format`
+  re-encoders that re-express bulky structured output in cheaper lossless forms
+  (`json_compact`, `toon`, `jsonl`, `markdown_kv`, `tsv`, `csv`).
+- **Extract** (cheap model) — a cheap model proposes a structured projection of a huge
+  tool/MCP output; accepted only if **structurally contained** in the original. Strategies
+  `code` (model writes a filter run in a **Starlark sandbox** over the full body), `single`
+  (one-shot JSON-return filter), `rlm` (chunked), and a `deterministic` fallback.
+- **Tokenizer** — real BPE token counts via tiktoken `o200k_base` (`internal/tokens`); the
+  same counter gates every reduction (a component never inflates an output).
+- **Reversibility** — namespaced markers + a content-addressed rewind store; recover via
+  `engine.FindMarkers` + `engine.Expand`, or the `/winnow/expand` endpoint.
+- **Observability** — OpenTelemetry GenAI semantic conventions (`gen_ai.*`) plus the live
+  `/stats` aggregate.
+
+## Config
+
+The example config is [`configs/lab-cx.yaml`](configs/lab-cx.yaml). It folds onto a base
+`preset`, then selects which stages/reducers/encoders/extract-strategies run, **purely by
+name**. Extension path — no core edit beyond one registration:
+
+1. **Add** a new encoder/reducer/extract-strategy/stage, and **register by name** in its
+   registry (encoders in `internal/reduce/actions.go`, reducers via
+   `reduce.RegisterReducer`, strategies in `internal/extract` `RunExtraction`, stages in
+   `engine` `builtinStages`).
+2. **List it by name** in the matching list in `configs/lab-cx.yaml` (an empty/omitted list
+   means "all built-in defaults"; list order sets priority/run order).
+
+Full detail in [docs/RUNNING.md](docs/RUNNING.md).
+
+## Integrations
+
+- [docs/integration/claude-code.md](docs/integration/claude-code.md) — base-URL swap;
+  real run measured (do-no-harm on a self-caching client).
+- [docs/integration/swe-bench.md](docs/integration/swe-bench.md) — proxy before the
+  eval-containers gateway; wiring validated, full run is a documented runbook.
+- [docs/integration/authbridge.md](docs/integration/authbridge.md) — import the engine
+  in-process from a Kagenti AuthBridge plugin (the plugin lives in `kagenti-extensions`).
+
+## Results
+
+Real measured numbers (2026-06-24). See [docs/RESULTS.md](docs/RESULTS.md) for the index.
+
+| Measurement | Result | Source |
+|---|---|---|
+| `cmdfilter` on verbose command output | **−94%** tokens (reversible) | [RESULTS-offline.md](docs/RESULTS-offline.md) |
+| `format` re-encode on structured output | **−35%** best / **−29%** TOON | [RESULTS-offline.md](docs/RESULTS-offline.md) |
+| `skeleton` on a code read | **−78%** tokens | [RESULTS-offline.md](docs/RESULTS-offline.md) |
+| Full deterministic pipeline, 10 real fixtures | **−93%** aggregate (all reversible) | [RESULTS-offline.md](docs/RESULTS-offline.md) |
+| Cheap-model extractor (`claude-haiku-4-5`) | **−56%…−80%** on 4/6 structured fixtures; 2 honest declines; all contained | [RESULTS-extract.md](docs/RESULTS-extract.md) |
+
+These are deterministic-component and cheap-model-extractor numbers on real tool-output
+fixtures, with a real BPE tokenizer. On Claude Code (which self-caches) the proxy is
+**do-no-harm** by design — a real run measured cost-neutral
+([claude-code.md](docs/integration/claude-code.md)). The end-to-end SWE-bench run is a
+**documented runbook, not yet executed** ([swe-bench.md](docs/integration/swe-bench.md)).
 
 ## Repository layout
 
 ```
-cmd/proxy/        the lab-cx binary
-engine/           Engine: Transform / Expand, stage orchestration
+cmd/proxy/        the lab-cx binary (proxy | stats | version)
+cmd/labcx-bench/  offline + --extract measurement harness
+engine/           Engine: Transform / Expand, stage orchestration (builtinStages)
 surfaces/         anthropic | openai | gemini  wire <-> canonical request
-config/           Settings + presets (safe | balanced | aggressive | coding | mcp)
-observability/    OpenTelemetry GenAI emitter
-docs/             design proposals, developer + integration guides
+config/           Settings + presets, YAML config loader
+canon/            canonical request type
+observability/    OpenTelemetry GenAI emitter + /stats aggregator
+internal/         tokens, reduce, extract, cheapmodel, cache, markers, store, proxyhttp, treesitter
+configs/          example config (lab-cx.yaml)
+docs/             RUNNING, RESULTS, integration guides
 deploy/           eval-containers wiring
 ```
 
