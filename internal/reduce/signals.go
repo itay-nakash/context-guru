@@ -4,6 +4,7 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/kagenti/lab-context-engineering/internal/treesitter"
 	sitter "github.com/tree-sitter/go-tree-sitter"
@@ -125,13 +126,27 @@ func pathReferenced(filePath, text string) bool {
 	if filePath == "" || text == "" {
 		return false
 	}
+	// Compile the boundary patterns once per call (the caller scans this in an
+	// O(items²) loop, so building the regex per token inside the loop was hot).
 	for _, tok := range []string{filePath, path.Base(filePath)} {
-		re := regexp.MustCompile(`(?:^|[^\w./-])` + regexp.QuoteMeta(tok) + `(?:[^\w]|$)`)
+		re := pathTokenRe(tok)
 		if re.MatchString(text) {
 			return true
 		}
 	}
 	return false
+}
+
+// pathTokenCache memoizes the boundary-aware regex for each path token across calls.
+var pathTokenCache sync.Map // string -> *regexp.Regexp
+
+func pathTokenRe(tok string) *regexp.Regexp {
+	if v, ok := pathTokenCache.Load(tok); ok {
+		return v.(*regexp.Regexp)
+	}
+	re := regexp.MustCompile(`(?:^|[^\w./-])` + regexp.QuoteMeta(tok) + `(?:[^\w]|$)`)
+	pathTokenCache.Store(tok, re)
+	return re
 }
 
 // symbolsUsed reports whether any defined symbol appears as a standalone identifier.

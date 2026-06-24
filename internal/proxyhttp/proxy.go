@@ -9,9 +9,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/kagenti/lab-context-engineering/engine"
 	"github.com/kagenti/lab-context-engineering/observability"
@@ -29,6 +31,12 @@ type Config struct {
 	OpenAIDefault    string // default "https://api.openai.com"
 	Client           *http.Client
 	Emitter          observability.Emitter // default observability.Nop
+	// MaxBodyBytes caps the request body read from clients; 0 means no cap. A body
+	// exceeding the cap yields HTTP 413.
+	MaxBodyBytes int64
+	// UpstreamTimeout bounds each upstream request when Client is not set; 0 means
+	// no timeout (http.DefaultClient).
+	UpstreamTimeout time.Duration
 }
 
 type proxy struct {
@@ -41,7 +49,11 @@ type proxy struct {
 // path is preserved when forwarding upstream.
 func New(cfg Config) http.Handler {
 	if cfg.Client == nil {
-		cfg.Client = http.DefaultClient
+		if cfg.UpstreamTimeout > 0 {
+			cfg.Client = &http.Client{Timeout: cfg.UpstreamTimeout}
+		} else {
+			cfg.Client = http.DefaultClient
+		}
 	}
 	if cfg.AnthropicDefault == "" {
 		cfg.AnthropicDefault = "https://api.anthropic.com"
@@ -96,10 +108,9 @@ func (p *proxy) upstreamBase(providerDefault string) string {
 func (p *proxy) model(surface surfaces.Surface, providerDefault string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		base := p.upstreamBase(providerDefault)
-		body, err := io.ReadAll(r.Body)
+		body, err := p.readBody(w, r)
 		if err != nil {
-			http.Error(w, "read body", http.StatusBadRequest)
-			return
+			return // readBody already wrote the response
 		}
 		// Reduce unless bypassed or the surface can't map this format.
 		outBody := body
@@ -151,9 +162,32 @@ func modelOf(body []byte) string {
 
 func (p *proxy) passthrough(providerDefault string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
+		body, err := p.readBody(w, r)
+		if err != nil {
+			return // readBody already wrote the response
+		}
 		p.forward(w, r, p.upstreamBase(providerDefault), body)
 	}
+}
+
+// readBody reads the full request body, enforcing cfg.MaxBodyBytes when set. On a
+// cap overflow it writes HTTP 413; on any other read error it writes HTTP 400. In
+// both error cases the response is already written and the caller must just return.
+func (p *proxy) readBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
+	if p.cfg.MaxBodyBytes > 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, p.cfg.MaxBodyBytes)
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+		} else {
+			http.Error(w, "read body", http.StatusBadRequest)
+		}
+		return nil, err
+	}
+	return body, nil
 }
 
 // hop-by-hop headers that must not be forwarded.

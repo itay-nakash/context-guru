@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func parse(s string) any { return parseBody(s) }
@@ -138,6 +139,14 @@ func TestRunExtractionRLMBatchedMergesChunks(t *testing.T) {
 	}
 	if len(merged) != 3 { // one per chunk
 		t.Fatalf("expected 3 merged records, got %d", len(merged))
+	}
+}
+
+func TestTruncateValueDoesNotSplitRunes(t *testing.T) {
+	s := strings.Repeat("é", 10) // 2 bytes each
+	out := truncateValue(s, 5).(string)
+	if !utf8.ValidString(out) {
+		t.Fatalf("truncation split a rune: %q", out)
 	}
 }
 

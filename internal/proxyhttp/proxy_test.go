@@ -161,6 +161,16 @@ func TestProxyEmitsSavingsEvent(t *testing.T) {
 	}
 }
 
+func TestRequestBodyCap(t *testing.T) {
+	h := New(Config{Engine: engine.New(config.Default(), nil, nil), Upstream: "http://unused", MaxBodyBytes: 10})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(strings.Repeat("x", 100)))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status=%d want 413", rec.Code)
+	}
+}
+
 func TestHealth(t *testing.T) {
 	h := newProxy(t, "http://unused")
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)

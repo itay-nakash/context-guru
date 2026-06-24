@@ -34,8 +34,8 @@ func truncateValue(value any, maxChars int) any {
 	}
 	switch v := value.(type) {
 	case string:
-		if len(v) > maxChars {
-			return v[:maxChars]
+		if r := []rune(v); len(r) > maxChars {
+			return string(r[:maxChars])
 		}
 		return v
 	case []any:
@@ -55,27 +55,49 @@ func truncateValue(value any, maxChars int) any {
 }
 
 func extractTextWindow(text string, terms []string, maxChars int) string {
-	if maxChars <= 0 || len(text) <= maxChars {
+	runes := []rune(text)
+	if maxChars <= 0 || len(runes) <= maxChars {
 		return text
 	}
-	lowered := strings.ToLower(text)
+	loweredRunes := []rune(strings.ToLower(text))
 	for _, term := range terms {
 		t := strings.TrimSpace(strings.ToLower(term))
 		if t == "" {
 			continue
 		}
-		if idx := strings.Index(lowered, t); idx >= 0 {
+		// Index into the rune slice (not bytes) so the window math stays rune-aligned.
+		if idx := runeIndex(loweredRunes, []rune(t)); idx >= 0 {
 			start := idx - maxChars/4
 			if start < 0 {
 				start = 0
 			}
-			if start > len(text)-maxChars {
-				start = len(text) - maxChars
+			if start > len(runes)-maxChars {
+				start = len(runes) - maxChars
 			}
-			return text[start : start+maxChars]
+			return string(runes[start : start+maxChars])
 		}
 	}
-	return text[:maxChars]
+	return string(runes[:maxChars])
+}
+
+// runeIndex returns the index (in runes) of the first occurrence of sub in s, or -1.
+func runeIndex(s, sub []rune) int {
+	if len(sub) == 0 {
+		return 0
+	}
+	for i := 0; i+len(sub) <= len(s); i++ {
+		match := true
+		for j := range sub {
+			if s[i+j] != sub[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
+	}
+	return -1
 }
 
 func projectMapping(m map[string]any, terms map[string]struct{}, maxChars int) map[string]any {
