@@ -33,6 +33,9 @@ Point your agent at the proxy, e.g.:
 Flags:
   --addr      listen address (default :8080)
   --preset    safe|balanced|aggressive|cache|coding|mcp (default balanced)
+  --config    path to a YAML config file (overrides --preset; names which reducers/
+              encoders/extract-strategies/stages run, by name; see configs/lab-cx.yaml).
+              --extract-model/-provider/-auth/-base still override the file's transport.
   --upstream  forward ALL requests here (e.g. an eval gateway); default routes by
               provider (api.anthropic.com / api.openai.com)
   --max-body-bytes  cap request body size in bytes (default 33554432 = 32 MiB);
@@ -66,6 +69,7 @@ func runProxy(args []string) {
 	fs := flag.NewFlagSet("proxy", flag.ExitOnError)
 	addr := fs.String("addr", ":8080", "listen address")
 	preset := fs.String("preset", "balanced", "settings preset")
+	configPath := fs.String("config", "", "path to a YAML config file (overrides --preset; see configs/lab-cx.yaml)")
 	upstream := fs.String("upstream", "", "forward all requests to this base URL")
 	extractModel := fs.String("extract-model", "", "enable cheap-model extraction with this model (e.g. claude-haiku-4-5)")
 	extractProvider := fs.String("extract-provider", "anthropic", "extraction model provider: anthropic|openai")
@@ -84,7 +88,39 @@ func runProxy(args []string) {
 	if os.Getenv("WINNOW_DISABLE") == "1" {
 		fmt.Fprintln(os.Stderr, "lab-cx: WINNOW_DISABLE=1 — running as a transparent passthrough")
 	}
-	settings := config.Preset(*preset)
+
+	// Resolve settings: a --config file (with named component selection) takes
+	// precedence over --preset. The file may also name the extraction transport
+	// (provider/model/auth/base); the matching --extract-* flags still override it.
+	var settings config.Settings
+	var tr config.Transport
+	settingsSrc := "preset=" + *preset
+	if *configPath != "" {
+		var loadErr error
+		settings, tr, loadErr = config.LoadWithTransport(*configPath)
+		if loadErr != nil {
+			fmt.Fprintf(os.Stderr, "lab-cx: %v\n", loadErr)
+			os.Exit(2)
+		}
+		settingsSrc = "config=" + *configPath
+	} else {
+		settings = config.Preset(*preset)
+	}
+	// --extract-* flags override the config's transport block (flag set explicitly wins;
+	// otherwise fall back to the config value, then the flag default).
+	if v := flagOrConfig(fs, "extract-model", *extractModel, tr.Model); v != "" {
+		*extractModel = v
+	}
+	if v := flagOrConfig(fs, "extract-provider", *extractProvider, tr.Provider); v != "" {
+		*extractProvider = v
+	}
+	if v := flagOrConfig(fs, "extract-auth", *extractAuth, tr.Auth); v != "" {
+		*extractAuth = v
+	}
+	if v := flagOrConfig(fs, "extract-base", *extractBase, tr.Base); v != "" {
+		*extractBase = v
+	}
+
 	if os.Getenv("WINNOW_DISABLE") == "1" {
 		settings.Disabled = true
 	}
@@ -125,9 +161,28 @@ func runProxy(args []string) {
 		UpstreamTimeout: upstreamTimeoutDur,
 	})
 
-	fmt.Fprintf(os.Stderr, "lab-cx proxy listening on %s (preset=%s)\n", *addr, *preset)
+	fmt.Fprintf(os.Stderr, "lab-cx proxy listening on %s (%s)\n", *addr, settingsSrc)
 	if err := http.ListenAndServe(*addr, handler); err != nil {
 		fmt.Fprintln(os.Stderr, "lab-cx:", err)
 		os.Exit(1)
 	}
+}
+
+// flagOrConfig resolves an extract-* knob: an explicitly-set flag wins; otherwise the
+// config value (if non-empty); otherwise the flag's current value (its default). This
+// lets a --config file name the extraction transport while --extract-* flags override.
+func flagOrConfig(fs *flag.FlagSet, name, flagVal, cfgVal string) string {
+	set := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	if set {
+		return flagVal
+	}
+	if cfgVal != "" {
+		return cfgVal
+	}
+	return flagVal
 }

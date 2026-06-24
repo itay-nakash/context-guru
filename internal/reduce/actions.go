@@ -128,12 +128,57 @@ func nearDuplicateEarlier(texts []string, threshold float64) []int {
 
 // ---------- format re-encoding ----------
 
+// encoder is one named, ranked format re-encoder. The rank is the tie-break priority
+// when two encoders produce the same token count (lower wins).
+type encoder struct {
+	name string
+	rank int
+	fn   func(any) (string, bool)
+}
+
+// allEncoders is the built-in re-encoder table, keyed by name so config can enable,
+// disable, and reorder them purely by NAME. To ADD an encoder: append an entry here
+// (give it a unique name and rank), then list that name under reduce.encoders in the
+// config file — no other code change is needed.
+var allEncoders = []encoder{
+	{"json_compact", 0, encCompact},
+	{"toon", 1, encTOON},
+	{"jsonl", 2, encJSONL},
+	{"markdown_kv", 3, encMarkdownKV},
+	{"tsv", 4, func(d any) (string, bool) { return encDelimited(d, '\t') }},
+	{"csv", 5, func(d any) (string, bool) { return encDelimited(d, ',') }},
+}
+
+// selectEncoders returns the encoders allowed by the named set, in the order the names
+// were given (a config-controlled priority). An empty/nil set means "all built-ins" in
+// their default order, preserving prior behavior. Unknown names are ignored.
+func selectEncoders(enabled []string) []encoder {
+	if len(enabled) == 0 {
+		return allEncoders
+	}
+	byName := make(map[string]encoder, len(allEncoders))
+	for _, e := range allEncoders {
+		byName[e.name] = e
+	}
+	out := make([]encoder, 0, len(enabled))
+	for i, name := range enabled {
+		if e, ok := byName[name]; ok {
+			// Honor the config-given order as the tie-break rank: the first listed
+			// encoder wins ties, regardless of its built-in rank.
+			e.rank = i
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
 // bestEncoding returns the smallest faithful re-encoding strictly smaller than text,
-// plus its format name, or ("","") if none helps / text isn't structured.
+// plus its format name, or ("","") if none helps / text isn't structured. enabled is an
+// allowed-encoder set referenced by name; empty/nil means all built-in encoders.
 //
 // ponytail: object keys re-encode in alphabetical order (Go maps don't preserve
 // source order). Lossless to the DATA — the original is stored for exact recovery.
-func bestEncoding(text string) (string, string) {
+func bestEncoding(text string, enabled []string) (string, string) {
 	var data any
 	dec := json.NewDecoder(strings.NewReader(text))
 	dec.UseNumber()
@@ -150,19 +195,7 @@ func bestEncoding(text string) (string, string) {
 		rank, tok int
 	}
 	var best *cand
-	encoders := []struct {
-		name string
-		rank int
-		fn   func(any) (string, bool)
-	}{
-		{"json_compact", 0, encCompact},
-		{"toon", 1, encTOON},
-		{"jsonl", 2, encJSONL},
-		{"markdown_kv", 3, encMarkdownKV},
-		{"tsv", 4, func(d any) (string, bool) { return encDelimited(d, '\t') }},
-		{"csv", 5, func(d any) (string, bool) { return encDelimited(d, ',') }},
-	}
-	for _, e := range encoders {
+	for _, e := range selectEncoders(enabled) {
 		enc, ok := e.fn(data)
 		if !ok {
 			continue
@@ -452,21 +485,29 @@ func skeletonReduce(item ContextItem, v Verdict, st store.Rewind) *Reduced {
 	return reversible(item, sk, "skeleton", "code body skeletonized", st)
 }
 
-func formatReduce(item ContextItem, v Verdict, st store.Rewind) *Reduced {
-	fr, fmtName := bestEncoding(item.Text)
+func formatReduce(item ContextItem, v Verdict, st store.Rewind, enabledEncoders []string) *Reduced {
+	fr, fmtName := bestEncoding(item.Text, enabledEncoders)
 	if fr == "" {
 		return keepItem(item)
 	}
 	return reversible(item, fr, "format", "reformatted as "+fmtName, st)
 }
 
+// formatReducerName is the built-in name of the lossless format re-encoder. route
+// applies it specially (it threads the config-selected encoder set into bestEncoding),
+// so the table entry below is a marker whose Reduce is never invoked directly.
+const formatReducerName = "format"
+
 var reducers = []Reducer{
 	{"collapse", func(i ContextItem, v Verdict) bool { _, ok := collapseReasons[v.Reason]; return ok }, collapseReduce},
 	{"skeleton", func(i ContextItem, v Verdict) bool { return isCodePath(i.FilePath) }, skeletonReduce},
-	{"format", func(i ContextItem, v Verdict) bool { return true }, formatReduce},
+	{formatReducerName, func(i ContextItem, v Verdict) bool { return true },
+		func(i ContextItem, v Verdict, st store.Rewind) *Reduced { return formatReduce(i, v, st, nil) }},
 }
 
-// RegisterReducer inserts a custom strategy just before the format fallback.
+// RegisterReducer inserts a custom strategy just before the format fallback. A custom
+// reducer is selectable by config purely by its Reducer.Name — list it under
+// reduce.reducers and it is honored; omit it and it is filtered out.
 func RegisterReducer(r Reducer) {
 	idx := len(reducers) - 1
 	if idx < 0 {
@@ -475,18 +516,44 @@ func RegisterReducer(r Reducer) {
 	reducers = append(reducers[:idx], append([]Reducer{r}, reducers[idx:]...)...)
 }
 
-// route picks the cheapest faithful action for an item.
-func route(item ContextItem, v Verdict, st store.Rewind) *Reduced {
+// reducerAllowed reports whether a reducer name is enabled by the named set. An
+// empty/nil set means "all built-ins", preserving prior behavior.
+func reducerAllowed(name string, enabled []string) bool {
+	if len(enabled) == 0 {
+		return true
+	}
+	for _, n := range enabled {
+		if n == name {
+			return true
+		}
+	}
+	return false
+}
+
+// route picks the cheapest faithful action for an item. enabledReducers/enabledEncoders
+// are config-selected allow-lists referenced by name; empty means "all built-ins".
+func route(item ContextItem, v Verdict, st store.Rewind, enabledReducers, enabledEncoders []string) *Reduced {
 	if v.Protected {
 		// Recent content keeps full fidelity for lossy ops, but a lossless format
-		// re-encode is safe even here.
-		return formatReduce(item, v, st)
+		// re-encode is safe even here — when the format reducer is enabled.
+		if reducerAllowed(formatReducerName, enabledReducers) {
+			return formatReduce(item, v, st, enabledEncoders)
+		}
+		return keepItem(item)
 	}
 	for _, r := range reducers {
-		if r.Applies(item, v) {
-			if res := r.Reduce(item, v, st); res != nil {
+		if !reducerAllowed(r.Name, enabledReducers) || !r.Applies(item, v) {
+			continue
+		}
+		if r.Name == formatReducerName {
+			// Thread the config-selected encoder set into the format re-encoder.
+			if res := formatReduce(item, v, st, enabledEncoders); res != nil {
 				return res
 			}
+			continue
+		}
+		if res := r.Reduce(item, v, st); res != nil {
+			return res
 		}
 	}
 	return keepItem(item)

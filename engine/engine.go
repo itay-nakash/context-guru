@@ -63,7 +63,36 @@ type Engine struct {
 	extract  ExtractFunc
 }
 
-// New builds an engine with the default stage pipeline (Reduce → Extract → Cache).
+// builtinStages maps a stage NAME to its built-in implementation. Stage selection in a
+// config file ("stages: [reduce, extract, cache]") is resolved through this table, so a
+// stage added tomorrow is wired on/off purely by name — register it here, then list it.
+var builtinStages = map[string]func() Stage{
+	"reduce":  func() Stage { return ReduceStage{} },
+	"extract": func() Stage { return ExtractStage{} },
+	"cache":   func() Stage { return CacheStage{} },
+}
+
+// defaultStageOrder is the pipeline used when Settings.Stages is empty.
+var defaultStageOrder = []string{"reduce", "extract", "cache"}
+
+// stagesFor resolves the stage list from names, falling back to the default order when
+// the list is empty. Unknown names are skipped (fail-open: a typo can't crash startup).
+func stagesFor(names []string) []Stage {
+	order := names
+	if len(order) == 0 {
+		order = defaultStageOrder
+	}
+	out := make([]Stage, 0, len(order))
+	for _, n := range order {
+		if mk, ok := builtinStages[n]; ok {
+			out = append(out, mk())
+		}
+	}
+	return out
+}
+
+// New builds an engine with the configured stage pipeline (default: Reduce → Extract →
+// Cache, or Settings.Stages by name when provided).
 func New(settings config.Settings, st store.Rewind, ev *store.Eviction) *Engine {
 	if st == nil {
 		st = store.NewMemory(0)
@@ -73,7 +102,7 @@ func New(settings config.Settings, st store.Rewind, ev *store.Eviction) *Engine 
 	}
 	return &Engine{
 		settings: settings, store: st, evict: ev,
-		stages: []Stage{ReduceStage{}, ExtractStage{}, CacheStage{}},
+		stages: stagesFor(settings.Stages),
 	}
 }
 

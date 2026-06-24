@@ -17,7 +17,7 @@ func TestBestEncodingConsidersTOON(t *testing.T) {
 		recs = append(recs, `{"id":`+itoaTest(i)+`,"name":"item","status":"active"}`)
 	}
 	body := "[" + strings.Join(recs, ",") + "]"
-	enc, name := bestEncoding(body)
+	enc, name := bestEncoding(body, nil)
 	if enc == "" {
 		t.Fatal("expected a smaller encoding")
 	}

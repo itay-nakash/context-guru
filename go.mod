@@ -22,6 +22,7 @@ require (
 	github.com/toon-format/toon-go v0.0.0-20251202084852-7ca0e27c4e8c
 	github.com/tree-sitter/go-tree-sitter v0.25.0
 	go.starlark.net v0.0.0-20260613233743-8ba36ccb83fb
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (

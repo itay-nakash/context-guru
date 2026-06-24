@@ -29,6 +29,10 @@ type Cfg struct {
 	MinKeepRatio       float64 // 0 disables the blunt ratio backstop (keep-set check governs)
 	AllowDeterministic bool
 	MaxChars           int // deterministic projection window
+	// AllowedStrategies, when non-empty, restricts strategyOrder to these strategy names
+	// (code | single | rlm | deterministic) preserving the computed order. Empty means
+	// "all" — prior behavior. Lets config enable/disable strategies purely by name.
+	AllowedStrategies []string
 }
 
 // DefaultCfg mirrors winnow's ExtractCfg defaults.
@@ -176,7 +180,30 @@ func validateExtraction(resultText, bodyText string, keepIDs []string, cfg Cfg) 
 	return IsContained(parseBody(resultText), parseBody(bodyText))
 }
 
+// intersectAllowed filters order to the allowed set (non-empty), preserving order.
+// Empty allowed means no filtering.
+func intersectAllowed(order, allowed []string) []string {
+	if len(allowed) == 0 {
+		return order
+	}
+	allow := make(map[string]struct{}, len(allowed))
+	for _, a := range allowed {
+		allow[a] = struct{}{}
+	}
+	out := make([]string, 0, len(order))
+	for _, s := range order {
+		if _, ok := allow[s]; ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 func strategyOrder(tokenEst int, cfg Cfg) []string {
+	return intersectAllowed(rawStrategyOrder(tokenEst, cfg), cfg.AllowedStrategies)
+}
+
+func rawStrategyOrder(tokenEst int, cfg Cfg) []string {
 	switch cfg.Mode {
 	case "deterministic":
 		return []string{"deterministic"}

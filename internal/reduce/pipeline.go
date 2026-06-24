@@ -58,6 +58,13 @@ type Opts struct {
 	ProvableOnly             bool
 	ReduceCachedPrefix       bool
 	CmdFilter                bool
+
+	// EnabledReducers / EnabledEncoders are config-selected allow-lists referenced by
+	// NAME (Reducer.Name / encoder name). Empty means "all built-ins" — prior behavior.
+	// They let config enable, disable, and (for encoders) reorder components without a
+	// core edit; see config.Settings.Reducers / .Encoders.
+	EnabledReducers []string
+	EnabledEncoders []string
 }
 
 // DefaultOpts mirrors winnow's reduce_request defaults.
@@ -334,7 +341,7 @@ func ReduceRequest(req canon.Request, st store.Rewind, ev *store.Eviction, opts 
 			continue
 		}
 
-		reduced := route(byID[item.ID], v, st)
+		reduced := route(byID[item.ID], v, st, opts.EnabledReducers, opts.EnabledEncoders)
 		if reduced.NewText != nil {
 			setBlockText(block, *reduced.NewText)
 			reducedIDs[item.ID] = struct{}{}

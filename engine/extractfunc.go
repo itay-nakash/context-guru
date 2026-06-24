@@ -28,6 +28,9 @@ type ExtractConfig struct {
 	MinKeepRatio       float64 // 0 disables the blunt ratio backstop
 	AllowDeterministic bool
 	MaxChars           int
+	// Strategies, when non-empty, restricts the strategy order to these names by-name
+	// (code | single | rlm | deterministic). Empty means "all".
+	Strategies []string
 }
 
 // DefaultExtractConfig returns sensible extraction defaults.
@@ -38,13 +41,22 @@ func DefaultExtractConfig() ExtractConfig {
 
 func (c ExtractConfig) internal() extract.Cfg {
 	return extract.Cfg{Mode: c.Mode, Floor: c.Floor, MinKeepRatio: c.MinKeepRatio,
-		AllowDeterministic: c.AllowDeterministic, MaxChars: c.MaxChars}
+		AllowDeterministic: c.AllowDeterministic, MaxChars: c.MaxChars,
+		AllowedStrategies: c.Strategies}
 }
 
 // EnableExtract turns on cheap-model extraction with the given model and config. It
 // builds the candidate→extraction→reversible-splice adapter and registers it; the
-// Extract stage then runs after Reduce. Fail-open per candidate.
+// Extract stage then runs after Reduce. Fail-open per candidate. Settings that name
+// component selection (ExtractMode, ExtractStrategies) override cfg when set, so a
+// config file fully drives the run.
 func (e *Engine) EnableExtract(model Model, cfg ExtractConfig) {
+	if e.settings.ExtractMode != "" {
+		cfg.Mode = e.settings.ExtractMode
+	}
+	if len(e.settings.ExtractStrategies) > 0 {
+		cfg.Strategies = e.settings.ExtractStrategies
+	}
 	icfg := cfg.internal()
 	cache := extract.NewCache()
 	e.settings.ExtractEnabled = true

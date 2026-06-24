@@ -26,8 +26,24 @@ type Settings struct {
 
 	// Extract stage (cheap-model projection of large structured outputs).
 	ExtractEnabled           bool
+	ExtractMode              string // "" | auto | single | rlm | deterministic
 	LLMCompactFloor          int
 	LLMCompactStructuredOnly bool
+
+	// Named component selection. Each list is referenced BY NAME so that a component
+	// added tomorrow (a new reducer/encoder/extract strategy/stage) is controlled purely
+	// from config — register it by name in its package, then list it here. An empty list
+	// means "use all built-in defaults" (no filtering), preserving prior behavior.
+	//
+	// Reducers filters internal/reduce reducers by Reducer.Name (e.g. collapse, skeleton,
+	// format). Encoders filters AND orders the format re-encoders by name (e.g.
+	// json_compact, toon, jsonl, markdown_kv, tsv, csv). ExtractStrategies restricts the
+	// internal/extract strategy order (e.g. code, single, rlm, deterministic). Stages
+	// selects which engine stages run and in what order (reduce, extract, cache).
+	Reducers          []string
+	Encoders          []string
+	ExtractStrategies []string
+	Stages            []string
 }
 
 // Default is the "balanced" preset: lossless caching + accuracy-safe reduction on,

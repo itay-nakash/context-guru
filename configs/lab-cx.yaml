@@ -1,0 +1,49 @@
+# lab-cx example config — pass with: lab-cx proxy --config configs/lab-cx.yaml
+#
+# This file controls which components run and in what order, purely by NAME. It folds
+# onto a base `preset`, then applies the overrides below. Unknown top-level keys are a
+# hard error (strict). Any key you omit falls back to the preset/defaults.
+#
+# ── HOW TO ADD A NEW COMPONENT (one-line config, no core edit needed) ───────────────
+#   • new ENCODER  : register it in internal/reduce/actions.go `allEncoders`
+#                    (unique name + rank), then list its name under `reduce.encoders`.
+#   • new REDUCER  : register it via reduce.RegisterReducer (its Reducer.Name), then
+#                    list that name under `reduce.reducers`.
+#   • new EXTRACT STRATEGY : add it to internal/extract `RunExtraction`'s switch +
+#                    `rawStrategyOrder`, then list its name under `extract.strategies`.
+#   • new STAGE    : register it in engine `builtinStages`, then list it under `stages`.
+# Each list is referenced by NAME; enabling/disabling/ordering is pure config.
+# An empty or omitted list means "use all built-in defaults".
+# ─────────────────────────────────────────────────────────────────────────────────────
+
+preset: balanced                  # base defaults: safe|balanced|aggressive|cache|coding|mcp
+
+stages: [reduce, extract, cache]  # which engine stages run, in order
+
+reduce:
+  protect_recent: 2               # keep the N most recent turns at full fidelity
+  provable_only: true             # never drop merely-predicted-unused content
+  # Enabled reducers, by Reducer.Name. Built-ins: collapse, skeleton, format.
+  # (cmdfilter and dedup are separate pipeline passes toggled by their own keys below.)
+  reducers: [collapse, skeleton, format]
+  cmd_filter: true                # dedup/trim noisy shell command output
+  # Format re-encoders, by name — this list also sets PRIORITY (first listed wins ties).
+  # Built-ins: json_compact, toon, jsonl, markdown_kv, tsv, csv.
+  encoders: [json_compact, toon, jsonl, markdown_kv, tsv, csv]
+
+extract:
+  enabled: true                   # cheap-model projection of large structured outputs
+  mode: auto                      # auto | single | rlm | deterministic
+  # Allowed strategies, by name; intersected with the computed order. Built-ins:
+  # code, single, rlm, deterministic.
+  strategies: [code, single, rlm, deterministic]
+  floor: 3000                     # token floor before extraction is considered
+  # Extraction model transport (read by the proxy; --extract-* flags override these):
+  provider: anthropic             # anthropic | openai
+  model: claude-haiku-4-5
+  auth: x-api-key                 # x-api-key | bearer (bearer for gateway endpoints)
+  # base: https://gateway.example/v1   # optional: override the model base URL
+
+cache:
+  enabled: true
+  breakpoints: 4                  # ephemeral cache_control breakpoints on the stable prefix

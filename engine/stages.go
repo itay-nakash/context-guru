@@ -27,6 +27,8 @@ func (ReduceStage) Run(req canon.Request, agg *Report, c *Context) error {
 	opts.ReduceCachedPrefix = s.ReduceCachedPrefix
 	opts.CmdFilter = s.CmdFilter
 	opts.RehydrateOnCompaction = s.RehydrateOnCompaction
+	opts.EnabledReducers = s.Reducers
+	opts.EnabledEncoders = s.Encoders
 	opts.CacheFloor = c.ClientCacheFloor
 	opts.StickyIDs = c.StickyIDs
 	// Only mark candidates when an extractor is wired; otherwise leave large outputs
