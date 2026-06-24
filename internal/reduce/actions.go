@@ -12,6 +12,8 @@ import (
 	"github.com/kagenti/lab-context-engineering/internal/markers"
 	"github.com/kagenti/lab-context-engineering/internal/store"
 	"github.com/kagenti/lab-context-engineering/internal/tokens"
+	"github.com/kagenti/lab-context-engineering/internal/treesitter"
+	sitter "github.com/tree-sitter/go-tree-sitter"
 )
 
 // ---------- collapse ----------
@@ -323,12 +325,55 @@ func encCompact(data any) (string, bool) {
 
 // ---------- skeleton ----------
 
-// skeletonize would drop code-function bodies while keeping signatures. A faithful
-// implementation needs a real parser; a regex version mangles code, so v1 declines.
-//
-// ponytail: stubbed — the router falls through to format re-encoding. Implement with
-// tree-sitter (go-tree-sitter) when code-skeletonization is needed.
-func skeletonize(source, lang string) (string, bool) { return "", false }
+var bodyDefKinds = map[string]bool{
+	"function_declaration": true, "function_definition": true, "function_item": true,
+	"method_declaration": true, "method_definition": true, "method": true,
+	"constructor_declaration": true,
+}
+
+// skeletonize keeps signatures and drops function/method BODIES (the "body" field),
+// language-agnostic via tree-sitter. Returns ok=false for non-code, parse failure,
+// no bodies, or no token savings.
+func skeletonize(source, filePath string) (string, bool) {
+	lang := treesitter.LangForExt(filePath)
+	if lang == "" {
+		return "", false
+	}
+	src := []byte(source)
+	tree, _, ok := treesitter.Parse(lang, src)
+	if !ok {
+		return "", false
+	}
+	defer tree.Close()
+	type span struct{ start, end uint }
+	var bodies []span
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		if bodyDefKinds[n.Kind()] {
+			if b := n.ChildByFieldName("body"); b != nil {
+				bodies = append(bodies, span{b.StartByte(), b.EndByte()})
+				return // don't recurse into a body we're dropping (nested fns)
+			}
+		}
+		for i := uint(0); i < n.NamedChildCount(); i++ {
+			walk(n.NamedChild(i))
+		}
+	}
+	walk(tree.RootNode())
+	if len(bodies) == 0 {
+		return "", false
+	}
+	sort.Slice(bodies, func(i, j int) bool { return bodies[i].start > bodies[j].start })
+	out := append([]byte(nil), src...)
+	for _, b := range bodies {
+		out = append(out[:b.start], append([]byte("{ ... }"), out[b.end:]...)...)
+	}
+	result := string(out)
+	if tokens.Count(result) >= tokens.Count(source) {
+		return "", false
+	}
+	return result, true
+}
 
 // ---------- is_structured ----------
 
@@ -387,7 +432,7 @@ func skeletonReduce(item ContextItem, v Verdict, st store.Rewind) *Reduced {
 	if !isCodePath(item.FilePath) {
 		return nil
 	}
-	sk, ok := skeletonize(item.Text, "")
+	sk, ok := skeletonize(item.Text, item.FilePath)
 	if !ok {
 		return nil
 	}
