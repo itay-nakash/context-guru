@@ -4,6 +4,9 @@ import (
 	"path"
 	"regexp"
 	"strings"
+
+	"github.com/kagenti/lab-context-engineering/internal/treesitter"
+	sitter "github.com/tree-sitter/go-tree-sitter"
 )
 
 // Code-reference signals. The question is not "was the basename restated" but: was
@@ -11,15 +14,12 @@ import (
 // distinctive LITERAL it contains reused later? Every signal biases toward KEEP (the
 // safe direction; reductions are reversible). Ported from winnow's signals/refs.py.
 //
-// ponytail: definedSymbols uses regex per language instead of tree-sitter. It biases
-// identically (toward keep) with zero CGO/grammar deps. Upgrade to tree-sitter
-// (go-tree-sitter) if precise symbol/skeleton extraction is ever needed.
+// definedSymbols uses tree-sitter (go-tree-sitter + per-grammar forest), which catches
+// methods the old regex missed and ignores commented-out definitions. It still biases
+// toward KEEP and fails open (empty on non-code paths or parse failure).
 
 var (
-	identRe = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*`)
-	// def/func/function/fn/class/struct/enum/trait/interface NAME — common langs.
-	defRe = regexp.MustCompile(
-		`(?m)\b(?:func|function|def|fn|class|struct|enum|trait|interface|type)\s+([A-Za-z_][A-Za-z0-9_]*)`)
+	identRe  = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*`)
 	constRe  = regexp.MustCompile(`\b[A-Z][A-Z0-9_]{2,}\b`)
 	numRe    = regexp.MustCompile(`(?:^|[^\w.])(\d{3,})(?:[^\w.]|$)`)
 	quotedRe = regexp.MustCompile(`['"]([^'"\n]{3,40})['"]`)
@@ -31,27 +31,47 @@ var stopLiterals = set(
 	"error", "warning", "info", "debug", "string", "number", "object", "array",
 )
 
-func isCodePath(fp string) bool {
-	switch strings.ToLower(path.Ext(fp)) {
-	case ".go", ".py", ".js", ".jsx", ".ts", ".tsx", ".rs", ".java", ".c", ".h",
-		".cc", ".cpp", ".hpp", ".rb", ".php", ".cs", ".kt", ".swift", ".scala":
-		return true
-	}
-	return false
+func isCodePath(fp string) bool { return treesitter.LangForExt(fp) != "" }
+
+// defNodeKinds: definition node kinds whose "name" field (or identifier child)
+// names a symbol, across grammars.
+var defNodeKinds = map[string]bool{
+	"function_declaration": true, "function_definition": true, "function_item": true,
+	"method_declaration": true, "method_definition": true, "method": true,
+	"class_declaration": true, "class_definition": true, "class": true,
+	"struct_item": true, "enum_item": true, "trait_item": true,
+	"type_spec": true, "interface_declaration": true, "module": true,
 }
 
-// definedSymbols returns names of functions/classes/etc. defined in code text.
-// Empty for non-code paths. Drops names shorter than 3 chars (noisy).
+// definedSymbols returns names of functions/classes/methods/types defined in code
+// text. Empty for non-code paths or on any parse failure (fail-open). Drops names
+// shorter than 3 chars.
 func definedSymbols(text, filePath string) map[string]struct{} {
-	if filePath == "" || !isCodePath(filePath) {
+	lang := treesitter.LangForExt(filePath)
+	if lang == "" {
 		return nil
 	}
+	src := []byte(text)
+	tree, _, ok := treesitter.Parse(lang, src)
+	if !ok {
+		return nil
+	}
+	defer tree.Close()
 	out := map[string]struct{}{}
-	for _, m := range defRe.FindAllStringSubmatch(text, -1) {
-		if len(m[1]) >= 3 {
-			out[m[1]] = struct{}{}
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		if defNodeKinds[n.Kind()] {
+			if name := n.ChildByFieldName("name"); name != nil {
+				if s := name.Utf8Text(src); len(s) >= 3 {
+					out[s] = struct{}{}
+				}
+			}
+		}
+		for i := uint(0); i < n.NamedChildCount(); i++ {
+			walk(n.NamedChild(i))
 		}
 	}
+	walk(tree.RootNode())
 	return out
 }
 
