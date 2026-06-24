@@ -11,10 +11,19 @@
 //
 //	CGO_ENABLED=1 go run ./cmd/labcx-bench            # human table
 //	CGO_ENABLED=1 go run ./cmd/labcx-bench --json     # machine-readable rows
+//
+// With --extract the harness flips into ONLINE mode: it enables cheap-model extraction,
+// wires a REAL Anthropic-compatible gateway (claude-haiku-4-5) via cheapmodel.Anthropic,
+// and measures the LLM extractor on the large structured fixtures. See docs/RESULTS-extract.md
+// for the recorded run. The env vars ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN must be set:
+//
+//	source /tmp/lcx_env.sh && CGO_ENABLED=1 go run ./cmd/labcx-bench --extract
 package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -26,6 +35,10 @@ import (
 	"github.com/kagenti/lab-context-engineering/canon"
 	"github.com/kagenti/lab-context-engineering/config"
 	"github.com/kagenti/lab-context-engineering/engine"
+	"github.com/kagenti/lab-context-engineering/internal/cheapmodel"
+	"github.com/kagenti/lab-context-engineering/internal/extract"
+	"github.com/kagenti/lab-context-engineering/internal/markers"
+	"github.com/kagenti/lab-context-engineering/internal/reduce"
 	"github.com/kagenti/lab-context-engineering/internal/tokens"
 )
 
@@ -134,7 +147,13 @@ type row struct {
 
 func main() {
 	jsonOut := flag.Bool("json", false, "emit machine-readable JSON rows instead of a table")
+	extractMode := flag.Bool("extract", false, "ONLINE: measure the real cheap-model extractor against the live gateway (claude-haiku-4-5)")
 	flag.Parse()
+
+	if *extractMode {
+		runExtract(*jsonOut)
+		return
+	}
 
 	rows := measureAll()
 
@@ -335,6 +354,365 @@ func markdownTable(rows []row) string {
 		fmt.Fprintf(&b, "| %s | %s%s | %d | %d | %.2f | %d | %d | %s | %.3f |\n",
 			r.Fixture, r.Component, note, r.TokensBefore, r.TokensAfter, r.PctSaved,
 			r.BytesBefore, r.BytesAfter, rev, r.AddedLatency)
+	}
+	return b.String()
+}
+
+// ---------------------------------------------------------------------------
+// --extract: ONLINE measurement of the REAL cheap-model extractor.
+// ---------------------------------------------------------------------------
+
+// extractFloor is the LLMCompactFloor used for the --extract measurement. The committed
+// structured fixtures are only a few hundred tokens, well below the production default of
+// 3000, so we lower the floor to 200 here purely so that extraction actually FIRES on the
+// corpus. This is a measurement-only setting; it does not change any default.
+const extractFloor = 200
+
+// extractFixture is a large/structured fixture surfaced as a tool_result, paired with a
+// realistic recent goal that references specific records — so HarvestIdentifiers builds a
+// non-trivial keep-set and the extractor has something concrete to filter toward.
+type extractFixture struct {
+	name     string
+	relPath  string
+	toolName string
+	command  string
+	goal     string
+}
+
+// extractFixtureSet is the structured_json + search_results corpus (the large, record-shaped
+// fixtures extraction targets). Each goal names records that exist in the fixture.
+var extractFixtureSet = []extractFixture{
+	{"flights_search", "structured_json/flights_search.json", "search_flights", "",
+		"Book the cheapest nonstop SFO->JFK flight. I only care about flights FL003 and FL004 and their prices; ignore the rest."},
+	{"users_directory", "structured_json/users_directory.json", "list_users", "",
+		"I need the admin account only — find user_0037 (alice.target@corp.com) and confirm the role is admin."},
+	{"products_inventory", "structured_json/products_inventory.json", "list_products", "",
+		"Reorder the out-of-stock items. I care about SKU0001 and SKU0004 (in_stock=false) and their prices."},
+	{"oc_pods_slice", "structured_json/oc_pods_slice.json", "Bash", "oc get pods -o json",
+		"Find pods that are NOT Running or that have restarts. I care about alertmanager-main-0 and any pod with restartCount > 0."},
+	{"glab_issue_list", "search_results/glab_issue_list.json", "Bash", "glab issue list -F json",
+		"Triage open issues. I only care about issue iid 156 (Support glab CI pipeline filtering) — its title, state, and labels."},
+	{"glab_mr_list", "search_results/glab_mr_list.json", "Bash", "glab mr list -F json",
+		"Review the glab MR. I only care about merge request iid 314 (feat(glab): add GitLab CLI support) — its state, merge_status, and source_branch."},
+}
+
+// extractRow is one measured (fixture) extraction result.
+type extractRow struct {
+	Fixture      string  `json:"fixture"`
+	TokensBefore int     `json:"tokens_before"`
+	TokensAfter  int     `json:"tokens_after"`
+	PctSaved     float64 `json:"pct_saved"`
+	Strategy     string  `json:"strategy"`
+	Contained    bool    `json:"contained"`
+	LatencyMs    float64 `json:"latency_ms"`
+	Model        string  `json:"model"`
+}
+
+// runExtract enables real cheap-model extraction and measures it against the structured
+// corpus, printing a Markdown table (or JSON with --json). It requires the gateway env.
+func runExtract(jsonOut bool) {
+	base := os.Getenv("ANTHROPIC_BASE_URL")
+	token := os.Getenv("ANTHROPIC_AUTH_TOKEN")
+	if base == "" || token == "" {
+		fmt.Fprintln(os.Stderr, "labcx-bench --extract: ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN must be set (source /tmp/lcx_env.sh)")
+		os.Exit(1)
+	}
+	dir, err := fixturesDir()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "labcx-bench:", err)
+		os.Exit(1)
+	}
+
+	model := cheapmodel.Anthropic{
+		BaseURL:    base,
+		APIKey:     token,
+		Model:      "claude-haiku-4-5",
+		AuthScheme: "bearer",
+	}
+
+	var rows []extractRow
+	for _, fx := range extractFixtureSet {
+		body, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(fx.relPath)))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "labcx-bench: read %s: %v\n", fx.relPath, err)
+			os.Exit(1)
+		}
+		rows = append(rows, measureExtract(fx, string(body), model))
+	}
+
+	if jsonOut {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(rows); err != nil {
+			fmt.Fprintln(os.Stderr, "labcx-bench:", err)
+			os.Exit(1)
+		}
+		return
+	}
+	fmt.Print(extractTable(rows))
+}
+
+// measureExtract runs the engine with extraction ENABLED against one fixture and records
+// the real result. The engine is configured so the fixture qualifies as an LLM candidate
+// (ExtractEnabled, low LLMCompactFloor, small ProtectRecent). To record the strategy the
+// model actually chose — which engine.EnableExtract does not surface — we register a
+// strategy-capturing extract func that mirrors EnableExtract's logic exactly (same
+// goal/keep-set, RunExtraction, then reversible splice via the engine store + recovery
+// marker) using cheapmodel.Anthropic as the model. There is exactly ONE model call path.
+func measureExtract(fx extractFixture, fixtureText string, model engine.Model) extractRow {
+	settings := config.Settings{
+		CacheEnabled:    false,
+		ReduceEnabled:   true,
+		ProtectRecent:   1,
+		ProvableOnly:    false,
+		CollapseOutputs: true,
+		Reducers:        []string{"__none__"}, // no deterministic reducer touches the body first
+		Stages:          []string{"reduce", "extract"},
+		ExtractEnabled:  true,
+		LLMCompactFloor: extractFloor,
+	}
+	eng := engine.New(settings, nil, nil)
+
+	cfg := engine.DefaultExtractConfig()
+	cfg.Floor = extractFloor
+	// EnableExtract performs the real wiring/splice; we then override its func with a
+	// behaviorally identical one that also records the chosen strategy.
+	eng.EnableExtract(model, cfg)
+
+	var chosen string
+	eng.SetExtract(capturingExtractFunc(eng, model, cfg.Floor, &chosen))
+
+	req := buildExtractRequest(fx, fixtureText)
+	before := req.Clone()
+	beforeText := toolResultTextAny(before)
+
+	start := time.Now()
+	out, _ := eng.Transform(context.Background(), req)
+	elapsed := time.Since(start)
+
+	afterText := toolResultTextAny(out)
+
+	r := extractRow{
+		Fixture:      fx.name,
+		TokensBefore: tokens.Count(beforeText),
+		TokensAfter:  tokens.Count(afterText),
+		Strategy:     chosen,
+		LatencyMs:    float64(elapsed.Milliseconds()),
+		Model:        "claude-haiku-4-5",
+	}
+	if r.TokensBefore > 0 {
+		r.PctSaved = round2(float64(r.TokensBefore-r.TokensAfter) / float64(r.TokensBefore) * 100)
+	}
+	if chosen == "" {
+		r.Strategy = "none"
+	}
+	// Contained: the engine only splices a result that left a reversible recovery marker
+	// whose stored original is a substring of the pre-extraction body. Verify via the
+	// public FindMarkers + Expand round-trip — a spliced block is lossless and reversible.
+	r.Contained = verifyContained(eng, beforeText, afterText)
+	return r
+}
+
+// capturingExtractFunc returns an extract func equivalent to engine.EnableExtract's, but
+// it records the strategy RunExtraction selected for the (single) candidate into *chosen
+// and performs the reversible splice through the engine's public store + recovery marker.
+func capturingExtractFunc(eng *engine.Engine, model engine.Model, floor int, chosen *string) engine.ExtractFunc {
+	icfg := extract.Cfg{Mode: "auto", Floor: floor, AllowDeterministic: true, MaxChars: 4000}
+	cache := extract.NewCache()
+	return func(ctx context.Context, req canon.Request, cands []reduce.Candidate) error {
+		goal := recentGoalText(req, 6)
+		keep := extract.HarvestIdentifiers(goal, 60)
+		for _, c := range cands {
+			func() {
+				defer func() { _ = recover() }() // fail-open per candidate
+				key := goalKey(extract.ContentKey(c.Text), goal, keep)
+				result, ok := cache.Get(key)
+				var strat string
+				if ok {
+					strat = "cache"
+				} else {
+					result, strat = extract.RunExtraction(ctx, c.Text, goal, keep, c.TokenEst, icfg, model)
+					if strat == "none" || result == "" {
+						*chosen = "none"
+						return
+					}
+					cache.Put(key, result)
+				}
+				*chosen = strat
+				spliceResult(eng, req, c, result)
+			}()
+		}
+		return nil
+	}
+}
+
+// spliceResult mirrors engine.(*Engine).splice using the public API: store the original
+// for reversal, write the extracted text plus a recovery marker, never inflate.
+func spliceResult(eng *engine.Engine, req canon.Request, c reduce.Candidate, result string) {
+	block := blockAtExtract(req, c.MsgIndex, c.BlockIndex)
+	if block == nil {
+		return
+	}
+	rid := eng.Store().Put(c.Text)
+	label := c.FilePath
+	if label == "" {
+		label = c.ToolName
+	}
+	if label == "" {
+		label = "tool output"
+	}
+	newText := strings.TrimRight(result, "\n") + "\n" + markers.RecoveryNote(label, "extracted", rid)
+	if tokens.Count(newText) >= tokens.Count(c.Text) {
+		return // never inflate
+	}
+	switch block["type"] {
+	case "tool_result":
+		block["content"] = newText
+	case "text":
+		block["text"] = newText
+	}
+}
+
+func blockAtExtract(req canon.Request, mi, bi int) map[string]any {
+	msgs := req.Messages()
+	if mi < 0 || mi >= len(msgs) {
+		return nil
+	}
+	list, ok := msgs[mi]["content"].([]any)
+	if !ok || bi < 0 || bi >= len(list) {
+		return nil
+	}
+	blk, _ := list[bi].(map[string]any)
+	return blk
+}
+
+// goalKey mirrors engine.goalKey: a goal-aware composite of the body content key, goal,
+// and keep-set, so a different goal is a cache miss.
+func goalKey(contentKey, goal string, keep []string) string {
+	h := sha256.New()
+	h.Write([]byte(contentKey))
+	h.Write([]byte{0})
+	h.Write([]byte(goal))
+	for _, k := range keep {
+		h.Write([]byte{0})
+		h.Write([]byte(k))
+	}
+	return hex.EncodeToString(h.Sum(nil))[:24]
+}
+
+// recentGoalText concatenates the text of the last k turns (excluding tool_result content),
+// mirroring the engine's goal-extraction window.
+func recentGoalText(req canon.Request, k int) string {
+	msgs := req.Messages()
+	start := len(msgs) - k
+	if start < 0 {
+		start = 0
+	}
+	var out []string
+	for _, m := range msgs[start:] {
+		switch c := m["content"].(type) {
+		case string:
+			out = append(out, c)
+		case []any:
+			for _, b := range c {
+				if bb, ok := b.(map[string]any); ok && bb["type"] == "text" {
+					if t, ok := bb["text"].(string); ok {
+						out = append(out, t)
+					}
+				}
+			}
+		}
+	}
+	s := strings.Join(out, "\n")
+	if len(s) > 6000 {
+		s = s[:6000]
+	}
+	return s
+}
+
+// buildExtractRequest surfaces the fixture as a tool_result, with the fixture's realistic
+// goal as the recent trailing user turn (so it sits OUTSIDE protect-recent=1 and the goal
+// conditions the keep-set).
+func buildExtractRequest(fx extractFixture, fixtureText string) canon.Request {
+	input := map[string]any{}
+	if fx.command != "" {
+		input["command"] = fx.command
+	}
+	root := map[string]any{
+		"model": "claude-sonnet-4-6",
+		"messages": []any{
+			map[string]any{"role": "user", "content": "Run the tool and report back."},
+			map[string]any{"role": "assistant", "content": []any{
+				map[string]any{"type": "tool_use", "id": "tu_1", "name": fx.toolName, "input": input},
+			}},
+			map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "tool_result", "tool_use_id": "tu_1", "content": fixtureText},
+			}},
+			map[string]any{"role": "assistant", "content": "Acknowledged; continuing."},
+			map[string]any{"role": "user", "content": fx.goal},
+		},
+	}
+	return canon.Request{Root: root}
+}
+
+// toolResultTextAny pulls the (possibly extracted) tool_result text out of a request.
+func toolResultTextAny(req canon.Request) string {
+	for _, m := range req.Messages() {
+		for _, b := range canon.Blocks(m) {
+			if canon.BlockType(b) != "tool_result" {
+				continue
+			}
+			switch c := b["content"].(type) {
+			case string:
+				return c
+			case []any:
+				var parts []string
+				for _, x := range c {
+					if bb, ok := x.(map[string]any); ok && bb["type"] == "text" {
+						if t, ok := bb["text"].(string); ok {
+							parts = append(parts, t)
+						}
+					}
+				}
+				return strings.Join(parts, "\n")
+			}
+		}
+	}
+	return ""
+}
+
+// verifyContained confirms a spliced extraction is lossless + reversible: the marker's
+// stored original must be a substring of the original body. A decline (no marker, text
+// unchanged) is reported as not-contained=false honestly (nothing was spliced).
+func verifyContained(eng *engine.Engine, before, after string) bool {
+	if after == before {
+		return false // no splice happened (decline)
+	}
+	ids := engine.FindMarkers(after)
+	if len(ids) == 0 {
+		return false
+	}
+	for _, id := range ids {
+		orig, ok := eng.Expand(id)
+		if !ok || !strings.Contains(before, orig) {
+			return false
+		}
+	}
+	return true
+}
+
+// extractTable renders the measured extraction rows as the table pasted into RESULTS-extract.md.
+func extractTable(rows []extractRow) string {
+	var b strings.Builder
+	b.WriteString("| fixture | tokens_before | tokens_after | %saved | strategy | contained | latency_ms | model |\n")
+	b.WriteString("| --- | ---: | ---: | ---: | :---: | :---: | ---: | :--- |\n")
+	for _, r := range rows {
+		contained := "yes"
+		if !r.Contained {
+			contained = "no"
+		}
+		fmt.Fprintf(&b, "| %s | %d | %d | %.2f | %s | %s | %.0f | %s |\n",
+			r.Fixture, r.TokensBefore, r.TokensAfter, r.PctSaved, r.Strategy, contained, r.LatencyMs, r.Model)
 	}
 	return b.String()
 }
