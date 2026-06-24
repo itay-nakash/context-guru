@@ -100,7 +100,7 @@ type Snapshot struct {
 	TokensBefore          int64   `json:"tokens_before"`
 	TokensAfter           int64   `json:"tokens_after"`
 	TokensSaved           int64   `json:"tokens_saved"`
-	Ratio                 float64 `json:"ratio"` // tokens_after / tokens_before (lower is more reduction)
+	Ratio                 float64 `json:"reduction_ratio"` // tokens_saved / tokens_before (higher is more reduction; 0 = no savings)
 	CacheInjected         int64   `json:"cache_injected"`
 	Extracted             int64   `json:"extracted"`
 	StageErrors           int64   `json:"stage_errors"`
@@ -125,7 +125,8 @@ func (a *Aggregator) Snapshot() Snapshot {
 		CostSavedUSD:  a.costSavedUSD,
 	}
 	if a.tokensBefore > 0 {
-		s.Ratio = float64(a.tokensAfter) / float64(a.tokensBefore)
+		// Fraction of input tokens removed: 0 = no savings, 0.9 = 90% reduced.
+		s.Ratio = float64(a.tokensSaved) / float64(a.tokensBefore)
 	}
 	s.AddedLatencyP50Millis = a.percentileLocked(0.50)
 	s.AddedLatencyP95Millis = a.percentileLocked(0.95)
@@ -168,8 +169,8 @@ func (a *Aggregator) Summary() string {
 // client (e.g. `lab-cx stats`) that holds only a decoded Snapshot.
 func SummaryOf(s Snapshot) string {
 	return fmt.Sprintf(
-		"requests=%d tokens %d→%d saved=%d (ratio=%.3f) cost_saved=$%.4f cache=%d extract=%d errors=%d latency p50=%dms p95=%dms",
-		s.Requests, s.TokensBefore, s.TokensAfter, s.TokensSaved, s.Ratio,
+		"requests=%d tokens %d→%d saved=%d (reduction=%.1f%%) cost_saved=$%.4f cache=%d extract=%d errors=%d latency p50=%dms p95=%dms",
+		s.Requests, s.TokensBefore, s.TokensAfter, s.TokensSaved, s.Ratio*100,
 		s.CostSavedUSD, s.CacheInjected, s.Extracted, s.StageErrors,
 		s.AddedLatencyP50Millis, s.AddedLatencyP95Millis,
 	)

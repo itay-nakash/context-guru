@@ -44,9 +44,9 @@ func TestAggregatorSnapshot(t *testing.T) {
 	if s.TokensSaved != 1500 {
 		t.Fatalf("TokensSaved = %d, want 1500", s.TokensSaved)
 	}
-	// Overall ratio = after/before = 2500/4000 = 0.625
-	if s.Ratio < 0.624 || s.Ratio > 0.626 {
-		t.Fatalf("Ratio = %v, want ~0.625", s.Ratio)
+	// Reduction ratio = saved/before = 1500/4000 = 0.375 (fraction of input removed).
+	if s.Ratio < 0.374 || s.Ratio > 0.376 {
+		t.Fatalf("Ratio = %v, want ~0.375 (saved/before)", s.Ratio)
 	}
 	if s.CacheInjected != 2 {
 		t.Fatalf("CacheInjected = %d, want 2", s.CacheInjected)

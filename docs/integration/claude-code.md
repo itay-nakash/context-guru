@@ -65,8 +65,9 @@ real large outputs see [../RESULTS-offline.md](../RESULTS-offline.md) (determini
 −56%…−80% on structured outputs). A non-self-caching tool-calling agent additionally
 gets the cache-injection lever that Claude Code declines.
 
-## Known metric quirk
+## Metric note
 
-In this run `/stats` reported `"ratio": 1` while `tokens_saved: 0` — the aggregate ratio
-field is `after/before`, not `saved/before`; read `tokens_saved` for savings. (Tracked
-as a follow-up to align the field name with `saved/before`.)
+`/stats` reports `reduction_ratio` = `tokens_saved / tokens_before` (fraction of input
+removed; 0 = no savings, higher = more reduction). On this self-caching do-no-harm run
+that value is 0, matching `tokens_saved: 0`. (Earlier builds exposed `ratio` as
+`after/before`, which read as 1.0 at zero savings — fixed.)
