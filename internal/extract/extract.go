@@ -186,16 +186,26 @@ func strategyOrder(tokenEst int, cfg Cfg) []string {
 			order = append(order, "deterministic")
 		}
 		return order
+	case "code":
+		order := []string{"code"}
+		if cfg.AllowDeterministic {
+			order = append(order, "deterministic")
+		}
+		return order
 	default: // auto
-		primary := "single"
+		// "code" (model-written Starlark filter over the full body) is primary for
+		// mid-size bodies; "rlm" (chunked) above the floor. "single" (JSON-return) and
+		// "deterministic" are ordered fallbacks behind the primary.
 		floor4 := cfg.Floor * 4
 		if floor4 < 8000 {
 			floor4 = 8000
 		}
+		var order []string
 		if tokenEst >= floor4 {
-			primary = "rlm"
+			order = []string{"rlm", "code", "single"}
+		} else {
+			order = []string{"code", "single"}
 		}
-		order := []string{primary}
 		if cfg.AllowDeterministic {
 			order = append(order, "deterministic")
 		}
@@ -211,6 +221,8 @@ func RunExtraction(ctx context.Context, body, goal string, keepIDs []string, tok
 	for _, name := range strategyOrder(tokenEst, cfg) {
 		var cand string
 		switch name {
+		case "code":
+			cand = runStarlark(ctx, body, goal, keepIDs, model)
 		case "single":
 			cand = runSingle(ctx, body, goal, keepIDs, model)
 		case "rlm":

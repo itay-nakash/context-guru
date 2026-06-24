@@ -21,9 +21,11 @@ require (
 	github.com/tiktoken-go/tokenizer v0.7.0
 	github.com/toon-format/toon-go v0.0.0-20251202084852-7ca0e27c4e8c
 	github.com/tree-sitter/go-tree-sitter v0.25.0
+	go.starlark.net v0.0.0-20260613233743-8ba36ccb83fb
 )
 
 require (
 	github.com/dlclark/regexp2 v1.11.5 // indirect
 	github.com/mattn/go-pointer v0.0.1 // indirect
+	golang.org/x/sys v0.42.0 // indirect
 )

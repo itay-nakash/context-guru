@@ -65,6 +65,75 @@ func buildPrompt(bodyText, goal string, keepIDs []string) string {
 		keepBlock + sampleMarker + sample + "\n\n" + rules + "\n\n" + example
 }
 
+// codeRules is the Starlark code-writing contract: the model writes a program that
+// runs over the real INPUT (it is NOT shown the full body), so the prompt stays cheap.
+// Same "select, never summarize, recall-first" discipline as buildPrompt, retargeted
+// from "return the value" to "write the filter".
+const codeRules = `Write a Starlark program (a safe Python subset) that filters this ONE tool output
+down to only what the agent needs next. Contract:
+- The global string INPUT holds the FULL tool output. The module ` + "`json`" + ` is available.
+- Start: data = json.decode(INPUT)
+- Select a SMALLER value of the SAME shape (e.g. drop irrelevant list records / fields).
+- End: OUTPUT = json.encode(result)   # OUTPUT must be a string
+Rules, in priority order:
+1. RECALL FIRST. When unsure whether a record/field is relevant, KEEP IT.
+2. SELECT, NEVER SUMMARIZE. Keep whole records/values byte-for-byte. Never paraphrase,
+   truncate, round, reformat, or invent values — only DROP clearly-irrelevant ones.
+3. PRESERVE EXACTLY: ids, numbers, names, paths, timestamps, errors, stack traces —
+   and anything matching the KEEP list.
+4. NO imports (no load()), NO I/O, NO network. Use only json.decode/json.encode and
+   plain Starlark (list comprehensions, dict/list ops, string ops).
+5. If you cannot identify clearly-irrelevant content, set OUTPUT = INPUT.
+Output ONLY the Starlark program — no prose, no markdown fences.`
+
+const codeExample = `EXAMPLE
+Goal: "Fix failing test test_auth_expiry; find the relevant hit."
+KEEP: ["test_auth_expiry","auth/session.py"]
+INPUT schema: list of {"path": str, "snippet": str}
+PROGRAM:
+data = json.decode(INPUT)
+result = [r for r in data if "auth" in r["path"] or "test_auth_expiry" in r["snippet"]]
+OUTPUT = json.encode(result)`
+
+// buildCodePrompt builds the prompt for the Starlark code-writing strategy. Unlike
+// buildPrompt it does NOT inline the full body — the program runs over the real INPUT.
+// It shows the parsed shape and a small sample so the model knows the schema cheaply.
+func buildCodePrompt(bodyText, goal string, keepIDs []string) string {
+	g := strings.TrimSpace(goal)
+	if g == "" {
+		g = "(no explicit goal stated)"
+	}
+	if len(g) > 2000 {
+		g = g[:2000]
+	}
+	keep := keepIDs
+	if len(keep) > 60 {
+		keep = keep[:60]
+	}
+	keepBlock := ""
+	if len(keep) > 0 {
+		kb, _ := json.Marshal(keep)
+		keepBlock = "IDENTIFIERS THE AGENT REFERENCED RECENTLY — keep every record or field\n" +
+			"whose value matches any of these, verbatim:\n" + string(kb) + "\n\n"
+	}
+
+	// A small sample of the parsed shape — enough to infer the schema, not the full body.
+	sample := bodyText
+	if v := parseBody(bodyText); !isRawString(v) {
+		if b, err := json.MarshalIndent(v, "", "  "); err == nil {
+			sample = string(b)
+		}
+	}
+	sample = truncate(sample, codeSampleChars)
+
+	return "You write a Starlark filter for ONE tool output, keeping only what the agent needs next.\n\n" +
+		"WHAT THE AGENT IS DOING NOW (filter toward this):\n" + g + "\n\n" +
+		keepBlock + "INPUT SAMPLE (the real INPUT at runtime is the FULL output of this same shape):\n" +
+		sample + "\n\n" + codeRules + "\n\n" + codeExample
+}
+
+const codeSampleChars = 1500
+
 func isRawString(v any) bool {
 	_, ok := v.(string)
 	return ok
