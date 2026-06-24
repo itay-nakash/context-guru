@@ -13,6 +13,7 @@ import (
 	"github.com/kagenti/lab-context-engineering/internal/store"
 	"github.com/kagenti/lab-context-engineering/internal/tokens"
 	"github.com/kagenti/lab-context-engineering/internal/treesitter"
+	toon "github.com/toon-format/toon-go"
 	sitter "github.com/tree-sitter/go-tree-sitter"
 )
 
@@ -155,10 +156,11 @@ func bestEncoding(text string) (string, string) {
 		fn   func(any) (string, bool)
 	}{
 		{"json_compact", 0, encCompact},
-		{"jsonl", 1, encJSONL},
-		{"markdown_kv", 2, encMarkdownKV},
-		{"tsv", 3, func(d any) (string, bool) { return encDelimited(d, '\t') }},
-		{"csv", 4, func(d any) (string, bool) { return encDelimited(d, ',') }},
+		{"toon", 1, encTOON},
+		{"jsonl", 2, encJSONL},
+		{"markdown_kv", 3, encMarkdownKV},
+		{"tsv", 4, func(d any) (string, bool) { return encDelimited(d, '\t') }},
+		{"csv", 5, func(d any) (string, bool) { return encDelimited(d, ',') }},
 	}
 	for _, e := range encoders {
 		enc, ok := e.fn(data)
@@ -313,6 +315,17 @@ func encMarkdownKV(data any) (string, bool) {
 		lines = append(lines, fmt.Sprintf("%s: %s", k, scalarStr(m[k])))
 	}
 	return strings.Join(lines, "\n"), true
+}
+
+// encTOON re-encodes data as Token-Oriented Object Notation. The decoded-JSON
+// value may carry json.Number; toon-go renders those natively. Returns false on
+// error or empty output so the candidate is simply skipped.
+func encTOON(data any) (string, bool) {
+	out, err := toon.MarshalString(data, toon.WithLengthMarkers(true))
+	if err != nil || out == "" {
+		return "", false
+	}
+	return out, true
 }
 
 func encCompact(data any) (string, bool) {

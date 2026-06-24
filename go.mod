@@ -19,6 +19,7 @@ require (
 	github.com/alexaandru/go-sitter-forest/tsx v1.9.2
 	github.com/alexaandru/go-sitter-forest/typescript v1.9.4
 	github.com/tiktoken-go/tokenizer v0.7.0
+	github.com/toon-format/toon-go v0.0.0-20251202084852-7ca0e27c4e8c
 	github.com/tree-sitter/go-tree-sitter v0.25.0
 )
 
