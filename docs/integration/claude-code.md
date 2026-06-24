@@ -65,6 +65,57 @@ real large outputs see [../RESULTS-offline.md](../RESULTS-offline.md) (determini
 −56%…−80% on structured outputs). A non-self-caching tool-calling agent additionally
 gets the cache-injection lever that Claude Code declines.
 
+## Real savings on Claude Code (and a harm check)
+
+The do-no-harm run above changed nothing because the task was tiny and Claude Code
+self-caches. To get **real reduction on a self-caching client**, enable
+`reduce_cached_prefix` (lab-cx then reduces even the client's cached prefix — a one-time
+re-cache of a smaller prefix) and give it a workload with a large file read. Config:
+
+```yaml
+# /tmp/cc-save-cfg.yaml
+preset: balanced
+reduce:
+  protect_recent: 1
+  provable_only: true
+  reduce_cached_prefix: true
+  reducers: [collapse, skeleton, format]
+extract: { enabled: true, mode: auto, floor: 400 }
+```
+
+Run (a 1,179-line / 32 KB real Go file, 42 top-level funcs), routed through the proxy
+with haiku, then read `/stats`:
+
+```sh
+./bin/lab-cx proxy --addr 127.0.0.1:8094 --config /tmp/cc-save-cfg.yaml \
+  --upstream "$ANTHROPIC_BASE_URL" --extract-model claude-haiku-4-5 \
+  --extract-provider anthropic --extract-auth bearer --extract-base "$ANTHROPIC_BASE_URL"
+claude -p "Read bigfile.go, then tell me in two lines: (1) roughly how many top-level
+  'func' declarations it has, and (2) what the code does overall." \
+  --settings /tmp/cc-save-settings.json --dangerously-skip-permissions
+```
+
+**Result (real, 2026-06-24, claude-haiku-4-5):**
+
+```json
+{ "requests": 4, "tokens_before": 69683, "tokens_after": 34729,
+  "tokens_saved": 34954, "reduction_ratio": 0.502, "cost_saved_usd": 0.0350,
+  "cache_injected": 0, "added_latency_p50_ms": 86, "added_latency_p95_ms": 191 }
+```
+
+- **−50.2% tokens** (34,954 saved across 4 requests; up to −70% on the turn carrying the
+  full file read), ~$0.035 saved on this short interaction.
+- **No harm — the task was answered correctly:** Claude Code reported **42 top-level
+  `func` declarations** (exactly matches `grep -c '^func '`) and an accurate summary of
+  the file. The `skeleton` reducer dropped function *bodies* while keeping every
+  signature, so the agent could still count and describe the functions — reduction that
+  preserves the task.
+- `cache_injected: 0` because Claude Code self-caches; with `reduce_cached_prefix` lab-cx
+  reduces content instead of fighting the client's cache.
+
+So: on a real workload (large file read) lab-cx cuts Claude Code's tokens ~50% with the
+answer unchanged; on a trivial task it safely does nothing (above).
+
 ## Metric note
 
 `/stats` reports `reduction_ratio` = `tokens_saved / tokens_before` (fraction of input

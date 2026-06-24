@@ -114,7 +114,10 @@ Full detail in [docs/RUNNING.md](docs/RUNNING.md).
 ## Integrations
 
 - [docs/integration/claude-code.md](docs/integration/claude-code.md) — base-URL swap;
-  real run measured (do-no-harm on a self-caching client).
+  real runs measured (**−50% tokens** on a large-file task with correctness preserved;
+  do-no-harm on a trivial task).
+- [docs/integration/bob.md](docs/integration/bob.md) — IBM Bob Shell (OpenAI-compatible
+  CLI); real run, **5/5 tasks correct**, cache-injection lever fires on every request.
 - [docs/integration/swe-bench.md](docs/integration/swe-bench.md) — proxy before the
   eval-containers gateway; wiring validated, full run is a documented runbook.
 - [docs/integration/authbridge.md](docs/integration/authbridge.md) — import the engine
@@ -131,12 +134,15 @@ Real measured numbers (2026-06-24). See [docs/RESULTS.md](docs/RESULTS.md) for t
 | `skeleton` on a code read | **−78%** tokens | [RESULTS-offline.md](docs/RESULTS-offline.md) |
 | Full deterministic pipeline, 10 real fixtures | **−93%** aggregate (all reversible) | [RESULTS-offline.md](docs/RESULTS-offline.md) |
 | Cheap-model extractor (`claude-haiku-4-5`) | **−56%…−80%** on 4/6 structured fixtures; 2 honest declines; all contained | [RESULTS-extract.md](docs/RESULTS-extract.md) |
+| **Claude Code, large-file task (haiku)** | **−50.2%** tokens (34,954 saved), answer correct (42 funcs) | [claude-code.md](docs/integration/claude-code.md) |
+| **Bob (haiku), 5-task suite** | **5/5 correct** incl. a file edit; cache injected 6/6; 0 errors | [bob.md](docs/integration/bob.md) |
 
-These are deterministic-component and cheap-model-extractor numbers on real tool-output
-fixtures, with a real BPE tokenizer. On Claude Code (which self-caches) the proxy is
-**do-no-harm** by design — a real run measured cost-neutral
-([claude-code.md](docs/integration/claude-code.md)). The end-to-end SWE-bench run is a
-**documented runbook, not yet executed** ([swe-bench.md](docs/integration/swe-bench.md)).
+These are real measured numbers on real tool-output fixtures and live agent runs, with a
+real BPE tokenizer. **Claude Code** (self-caching): −50% on a large-file task with
+`reduce_cached_prefix`, answer unchanged — and do-no-harm on a trivial task. **Bob**
+(non-self-caching): 5/5 tasks correct, the cache-injection lever fires every request. The
+end-to-end **SWE-bench** run is a **documented runbook, not yet executed**
+([swe-bench.md](docs/integration/swe-bench.md)).
 
 ## Repository layout
 
