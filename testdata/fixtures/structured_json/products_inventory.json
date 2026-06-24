@@ -1,0 +1,44 @@
+[
+  {
+    "sku": "SKU0000",
+    "name": "item 0",
+    "price": 0,
+    "in_stock": true
+  },
+  {
+    "sku": "SKU0001",
+    "name": "item 1",
+    "price": 13,
+    "in_stock": false
+  },
+  {
+    "sku": "SKU0002",
+    "name": "item 2",
+    "price": 26,
+    "in_stock": false
+  },
+  {
+    "sku": "SKU0003",
+    "name": "item 3",
+    "price": 39,
+    "in_stock": true
+  },
+  {
+    "sku": "SKU0004",
+    "name": "item 4",
+    "price": 52,
+    "in_stock": false
+  },
+  {
+    "sku": "SKU0006",
+    "name": "item 6",
+    "price": 78,
+    "in_stock": true
+  },
+  {
+    "sku": "SKU0009",
+    "name": "item 9",
+    "price": 117,
+    "in_stock": true
+  }
+]

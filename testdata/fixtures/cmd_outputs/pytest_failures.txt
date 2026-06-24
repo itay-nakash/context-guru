@@ -1,0 +1,14 @@
+=== test session starts ===
+platform linux -- Python 3.12.11, pytest-8.1.0
+collected 1705 items
+
+.......F.......
+
+=== FAILURES ===
+___ test_something ___
+
+E   AssertionError: expected True
+
+=== short test summary info ===
+FAILED tests/test_foo.py::test_something - AssertionError
+5 failed, 1698 passed, 2 skipped in 108.89s
