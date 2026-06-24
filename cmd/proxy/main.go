@@ -1,0 +1,96 @@
+// Command lab-cx is the standalone context-engineering proxy: it sits between any
+// LLM coding agent and the model API, reduces token cost on the request, and
+// forwards it upstream. The same engine that powers this binary is importable as
+// a library (see ../../engine) so other hosts — e.g. a Kagenti AuthBridge plugin
+// — can wrap it without running this process.
+package main
+
+import (
+	"flag"
+	"fmt"
+	"net/http"
+	"os"
+
+	"github.com/kagenti/lab-context-engineering/config"
+	"github.com/kagenti/lab-context-engineering/engine"
+	"github.com/kagenti/lab-context-engineering/internal/buildinfo"
+	"github.com/kagenti/lab-context-engineering/internal/cheapmodel"
+	"github.com/kagenti/lab-context-engineering/internal/proxyhttp"
+	"github.com/kagenti/lab-context-engineering/observability"
+)
+
+func usage() {
+	fmt.Fprintf(os.Stderr, `lab-cx — context-engineering proxy for LLM agents
+
+Usage:
+  lab-cx proxy [--addr :8080] [--preset balanced] [--upstream URL]   start the proxy
+  lab-cx version                                                     print version
+
+Point your agent at the proxy, e.g.:
+  ANTHROPIC_BASE_URL=http://localhost:8080  OPENAI_BASE_URL=http://localhost:8080/v1
+
+Flags:
+  --addr      listen address (default :8080)
+  --preset    safe|balanced|aggressive|cache|coding|mcp (default balanced)
+  --upstream  forward ALL requests here (e.g. an eval gateway); default routes by
+              provider (api.anthropic.com / api.openai.com)
+`)
+}
+
+func main() {
+	if len(os.Args) < 2 {
+		usage()
+		os.Exit(2)
+	}
+	switch os.Args[1] {
+	case "version", "-v", "--version":
+		fmt.Printf("lab-cx %s (%s)\n", buildinfo.Version, buildinfo.Commit)
+	case "proxy":
+		runProxy(os.Args[2:])
+	case "help", "-h", "--help":
+		usage()
+	default:
+		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", os.Args[1])
+		usage()
+		os.Exit(2)
+	}
+}
+
+func runProxy(args []string) {
+	fs := flag.NewFlagSet("proxy", flag.ExitOnError)
+	addr := fs.String("addr", ":8080", "listen address")
+	preset := fs.String("preset", "balanced", "settings preset")
+	upstream := fs.String("upstream", "", "forward all requests to this base URL")
+	extractModel := fs.String("extract-model", "", "enable cheap-model extraction with this Anthropic model (e.g. claude-haiku-4-5)")
+	extractBase := fs.String("extract-base", "https://api.anthropic.com", "base URL for the extraction model")
+	_ = fs.Parse(args)
+
+	if os.Getenv("WINNOW_DISABLE") == "1" {
+		fmt.Fprintln(os.Stderr, "lab-cx: WINNOW_DISABLE=1 — running as a transparent passthrough")
+	}
+	settings := config.Preset(*preset)
+	if os.Getenv("WINNOW_DISABLE") == "1" {
+		settings.Disabled = true
+	}
+	eng := engine.New(settings, nil, nil)
+	if *extractModel != "" {
+		key := os.Getenv("WINNOW_EXTRACT_KEY")
+		if key == "" {
+			key = os.Getenv("ANTHROPIC_API_KEY")
+		}
+		eng.EnableExtract(cheapmodel.Anthropic{
+			BaseURL: *extractBase, APIKey: key, Model: *extractModel,
+		}, engine.DefaultExtractConfig())
+		fmt.Fprintf(os.Stderr, "lab-cx: extraction enabled (model=%s)\n", *extractModel)
+	}
+	handler := proxyhttp.New(proxyhttp.Config{
+		Engine: eng, Upstream: *upstream,
+		Emitter: observability.SlogEmitter{},
+	})
+
+	fmt.Fprintf(os.Stderr, "lab-cx proxy listening on %s (preset=%s)\n", *addr, *preset)
+	if err := http.ListenAndServe(*addr, handler); err != nil {
+		fmt.Fprintln(os.Stderr, "lab-cx:", err)
+		os.Exit(1)
+	}
+}
