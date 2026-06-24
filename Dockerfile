@@ -1,7 +1,16 @@
-FROM python:3.13-slim
-COPY --from=ghcr.io/astral-sh/uv:0.9.5 /uv /bin/uv
-WORKDIR /app
+# Build the lab-cx proxy. CGO is required (tree-sitter), so the final image is
+# glibc-based (distroless/base), not static.
+FROM golang:1.25 AS build
+WORKDIR /src
 COPY . .
-RUN UV_COMPILE_BYTECODE=1 HOME=/tmp uv sync --no-cache --link-mode copy
-ENV PRODUCTION_MODE=True
-CMD ["/app/.venv/bin/server"]
+ARG VERSION=dev
+ARG COMMIT=none
+RUN CGO_ENABLED=1 go build \
+	-ldflags "-s -w -X github.com/kagenti/lab-context-engineering/internal/buildinfo.Version=${VERSION} -X github.com/kagenti/lab-context-engineering/internal/buildinfo.Commit=${COMMIT}" \
+	-o /out/lab-cx ./cmd/proxy
+
+FROM gcr.io/distroless/base-debian12:nonroot
+COPY --from=build /out/lab-cx /usr/local/bin/lab-cx
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/lab-cx"]
+CMD ["proxy"]

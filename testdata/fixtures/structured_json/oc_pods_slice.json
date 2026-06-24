@@ -1,0 +1,147 @@
+{
+  "apiVersion": "v1",
+  "kind": "List",
+  "metadata": {
+    "resourceVersion": ""
+  },
+  "items": [
+    {
+      "metadata": {
+        "name": "alertmanager-main-0",
+        "namespace": "openshift-monitoring"
+      },
+      "status": {
+        "phase": "Running",
+        "containerStatuses": [
+          {
+            "name": "alertmanager",
+            "restartCount": 0
+          },
+          {
+            "name": "config-reloader",
+            "restartCount": 0
+          },
+          {
+            "name": "kube-rbac-proxy",
+            "restartCount": 0
+          },
+          {
+            "name": "kube-rbac-proxy-metric",
+            "restartCount": 0
+          },
+          {
+            "name": "kube-rbac-proxy-web",
+            "restartCount": 0
+          },
+          {
+            "name": "prom-label-proxy",
+            "restartCount": 0
+          }
+        ]
+      }
+    },
+    {
+      "metadata": {
+        "name": "alertmanager-main-1",
+        "namespace": "openshift-monitoring"
+      },
+      "status": {
+        "phase": "Running",
+        "containerStatuses": [
+          {
+            "name": "alertmanager",
+            "restartCount": 0
+          },
+          {
+            "name": "config-reloader",
+            "restartCount": 0
+          },
+          {
+            "name": "kube-rbac-proxy",
+            "restartCount": 0
+          },
+          {
+            "name": "kube-rbac-proxy-metric",
+            "restartCount": 0
+          },
+          {
+            "name": "kube-rbac-proxy-web",
+            "restartCount": 0
+          },
+          {
+            "name": "prom-label-proxy",
+            "restartCount": 0
+          }
+        ]
+      }
+    },
+    {
+      "metadata": {
+        "name": "cluster-monitoring-operator-7fb9fd4c5d-wm2k6",
+        "namespace": "openshift-monitoring"
+      },
+      "status": {
+        "phase": "Running",
+        "containerStatuses": [
+          {
+            "name": "cluster-monitoring-operator",
+            "restartCount": 0
+          }
+        ]
+      }
+    },
+    {
+      "metadata": {
+        "name": "kube-state-metrics-75586fdddb-5zw6b",
+        "namespace": "openshift-monitoring"
+      },
+      "status": {
+        "phase": "Running",
+        "containerStatuses": [
+          {
+            "name": "kube-rbac-proxy-main",
+            "restartCount": 0
+          },
+          {
+            "name": "kube-rbac-proxy-self",
+            "restartCount": 0
+          },
+          {
+            "name": "kube-state-metrics",
+            "restartCount": 0
+          }
+        ]
+      }
+    },
+    {
+      "metadata": {
+        "name": "metrics-server-fdfb77995-jmqnm",
+        "namespace": "openshift-monitoring"
+      },
+      "status": {
+        "phase": "Running",
+        "containerStatuses": [
+          {
+            "name": "metrics-server",
+            "restartCount": 0
+          }
+        ]
+      }
+    },
+    {
+      "metadata": {
+        "name": "metrics-server-fdfb77995-w4r8p",
+        "namespace": "openshift-monitoring"
+      },
+      "status": {
+        "phase": "Running",
+        "containerStatuses": [
+          {
+            "name": "metrics-server",
+            "restartCount": 0
+          }
+        ]
+      }
+    }
+  ]
+}

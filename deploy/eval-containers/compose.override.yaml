@@ -1,0 +1,29 @@
+# Drop-in override that inserts lab-cx BEFORE the eval-containers gateway, so it sees
+# exactly what the agent sends (native protocol, pre model-name rewrite) and controls
+# the context before it reaches the gateway:
+#
+#   runner (agent) ──▶ lab-cx ──▶ gateway ──▶ provider
+#
+# Usage (from an eval-containers benchmark dir):
+#   docker compose -f compose.yaml -f /path/to/this/compose.override.yaml up ...
+#
+# It repoints the runner's *_BASE_URL at lab-cx and points lab-cx at the gateway.
+# Nothing about the agent images or the gateway changes. For the AFTER-gateway
+# placement instead, see README.md in this directory.
+
+services:
+  winnow:
+    image: ghcr.io/kagenti/lab-context-engineering:latest
+    command: ["proxy", "--addr", ":8080", "--preset", "balanced", "--upstream", "http://gateway:4000"]
+    networks:
+      - internal
+
+  runner:
+    environment:
+      # Route the agent through lab-cx; it forwards the (full, prefixed) path to the
+      # gateway. Suffix routing means /anthropic/v1/messages etc. are still reduced.
+      ANTHROPIC_BASE_URL: http://winnow:8080/anthropic
+      OPENAI_BASE_URL: http://winnow:8080/openai/v1
+      GOOGLE_GEMINI_BASE_URL: http://winnow:8080/genai
+    depends_on:
+      - winnow
