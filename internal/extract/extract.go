@@ -240,7 +240,12 @@ func RunExtraction(ctx context.Context, body, goal string, keepIDs []string, tok
 	return "", "none"
 }
 
-// runSingle asks the model for the filtered subset in one call.
+// runSingle asks the model for the filtered subset in one call. It is a FALLBACK
+// behind the primary full-body strategies: "code" (a model-written Starlark filter)
+// and "rlm" (chunked) both run over the FULL body, so they never truncate. runSingle
+// inlines the body into the prompt via buildPrompt, which truncates to sampleChars to
+// bound prompt cost — acceptable for a fallback, since whatever the model returns is
+// still containment-checked against the full body before it can be spliced in.
 func runSingle(ctx context.Context, body, goal string, keepIDs []string, model Model) string {
 	if model == nil {
 		return ""

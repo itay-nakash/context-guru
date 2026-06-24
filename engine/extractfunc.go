@@ -2,6 +2,8 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 
 	"github.com/kagenti/lab-context-engineering/canon"
@@ -52,7 +54,7 @@ func (e *Engine) EnableExtract(model Model, cfg ExtractConfig) {
 		for _, c := range cands {
 			func() {
 				defer func() { _ = recover() }() // fail-open per candidate
-				key := extract.ContentKey(c.Text)
+				key := goalKey(extract.ContentKey(c.Text), goal, keep)
 				result, ok := cache.Get(key)
 				if !ok {
 					var strat string
@@ -67,6 +69,23 @@ func (e *Engine) EnableExtract(model Model, cfg ExtractConfig) {
 		}
 		return nil
 	}
+}
+
+// goalKey makes the extraction cache goal-aware: the cache value is the FILTERED
+// result, which depends on the goal and keep-set, not just the body. Keying on body
+// alone would let the same tool output re-read under a different goal reuse the first
+// goal's filtered result. The key composites the body's content key with the goal and
+// the keep-set so a different goal is a cache miss.
+func goalKey(contentKey, goal string, keep []string) string {
+	h := sha256.New()
+	h.Write([]byte(contentKey))
+	h.Write([]byte{0})
+	h.Write([]byte(goal))
+	for _, k := range keep {
+		h.Write([]byte{0})
+		h.Write([]byte(k))
+	}
+	return hex.EncodeToString(h.Sum(nil))[:24]
 }
 
 // splice replaces the candidate block with the extracted result plus a reversible
