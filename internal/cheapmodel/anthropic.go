@@ -66,8 +66,12 @@ func (a Anthropic) Complete(ctx context.Context, prompt string) (string, error) 
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return "", err
 	}
-	if len(out.Content) == 0 {
-		return "", nil
+	// Return the first content block that carries text. A leading non-text block
+	// (e.g. "thinking") has an empty Text, so we skip it rather than returning "".
+	for _, c := range out.Content {
+		if c.Text != "" {
+			return c.Text, nil
+		}
 	}
-	return out.Content[0].Text, nil
+	return "", nil
 }
