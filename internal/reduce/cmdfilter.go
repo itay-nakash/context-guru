@@ -9,7 +9,7 @@ import (
 // Deterministic, LLM-free compaction of KNOWN command outputs (rtk-style): keep the
 // signal (failures, errors, summary) and drop routine noise. Lossy but reversible —
 // the caller stores the original and applies only when strictly smaller. Ported from
-// winnow's cmdfilter.py.
+// the reference prototype's cmdfilter.py.
 
 type commandRule struct {
 	name    string
@@ -125,6 +125,6 @@ func compactCommandOutput(command, output string) (string, bool) {
 	if len(cmd) > 60 {
 		cmd = cmd[:60]
 	}
-	result += fmt.Sprintf("\n[winnow: %d routine line(s) filtered from `%s`]", dropped, cmd)
+	result += fmt.Sprintf("\n[labcx: %d routine line(s) filtered from `%s`]", dropped, cmd)
 	return result, true
 }

@@ -1,22 +1,28 @@
 package engine
 
 import (
+	"encoding/json"
 	"fmt"
 
 	"github.com/kagenti/lab-context-engineering/canon"
 	"github.com/kagenti/lab-context-engineering/internal/cache"
+	"github.com/kagenti/lab-context-engineering/internal/markers"
 	"github.com/kagenti/lab-context-engineering/internal/reduce"
+	"github.com/kagenti/lab-context-engineering/internal/tokens"
 )
 
-func errFromPanic(r any) error { return fmt.Errorf("stage panic: %v", r) }
+func errFromPanic(r any) error { return fmt.Errorf("compactor panic: %v", r) }
 
-// ReduceStage runs the deterministic, lossless-first reduction pass.
-type ReduceStage struct{}
+// Reducer runs the deterministic, lossless-first reduction pass (collapse / skeleton /
+// format, cmdfilter, dedup). No model. Large structured tool outputs are left for the
+// extract compactor (which runs first in the default pipeline); whatever it does not
+// claim, Reducer reduces losslessly here.
+type Reducer struct{}
 
-func (ReduceStage) Name() string            { return "reduce" }
-func (ReduceStage) Enabled(c *Context) bool { return c.Settings.ReduceEnabled }
+func (Reducer) Name() string            { return reduceName }
+func (Reducer) Enabled(c *Context) bool { return c.Settings.ReduceEnabled }
 
-func (ReduceStage) Run(req canon.Request, agg *Report, c *Context) error {
+func (Reducer) Compact(req canon.Request, agg *Report, c *Context) (canon.Request, error) {
 	s := c.Settings
 	opts := reduce.DefaultOpts()
 	opts.ProtectRecent = s.ProtectRecent
@@ -31,45 +37,23 @@ func (ReduceStage) Run(req canon.Request, agg *Report, c *Context) error {
 	opts.EnabledEncoders = s.Encoders
 	opts.CacheFloor = c.ClientCacheFloor
 	opts.StickyIDs = c.StickyIDs
-	// Only mark candidates when an extractor is wired; otherwise leave large outputs
-	// for the deterministic actions to handle.
-	opts.LLMCompact = c.Extract != nil && s.ExtractEnabled
-	opts.LLMCompactFloor = s.LLMCompactFloor
-	opts.LLMCompactStructuredOnly = s.LLMCompactStructuredOnly
 
 	rep := reduce.ReduceRequest(req, c.Store, c.Evictions, opts)
 	agg.Reduce = rep
-	agg.Candidates = rep.LLMCandidates
-	return nil
+	return req, nil
 }
 
-// ExtractStage hands the large candidate outputs to the injected cheap-model
-// extractor. No-op when no extractor is wired or there are no candidates.
-type ExtractStage struct{}
+// Cacher injects ephemeral cache_control breakpoints on the stable prefix. Only active
+// when the client did not already self-cache (ClientCacheFloor < 0): a self-caching
+// client (e.g. Claude Code) keeps its own breakpoints.
+type Cacher struct{}
 
-func (ExtractStage) Name() string { return "extract" }
-func (ExtractStage) Enabled(c *Context) bool {
-	return c.Settings.ExtractEnabled && c.Extract != nil
-}
-
-func (ExtractStage) Run(req canon.Request, agg *Report, c *Context) error {
-	if len(agg.Candidates) == 0 {
-		return nil
-	}
-	return c.Extract(c.GoCtx, req, agg.Candidates)
-}
-
-// CacheStage injects ephemeral cache_control breakpoints on the stable prefix. Only
-// active when the client did not already self-cache (ClientCacheFloor < 0), matching
-// winnow: a self-caching client (e.g. Claude Code) keeps its own breakpoints.
-type CacheStage struct{}
-
-func (CacheStage) Name() string { return "cache" }
-func (CacheStage) Enabled(c *Context) bool {
+func (Cacher) Name() string { return cacheName }
+func (Cacher) Enabled(c *Context) bool {
 	return c.Settings.CacheEnabled && c.ClientCacheFloor < 0
 }
 
-func (CacheStage) Run(req canon.Request, agg *Report, c *Context) error {
+func (Cacher) Compact(req canon.Request, agg *Report, c *Context) (canon.Request, error) {
 	s := c.Settings
 	anchor := -1
 	if msgs, ok := req.Root["messages"].([]any); ok {
@@ -77,5 +61,42 @@ func (CacheStage) Run(req canon.Request, agg *Report, c *Context) error {
 	}
 	cache.Inject(req.Root, s.CacheBreakpoints, s.CacheStableGap, anchor, s.CacheToolsBreakpoint)
 	agg.CacheInjected = true
-	return nil
+	return req, nil
+}
+
+// Truncator is the naive baseline: it keeps the last KeepLast messages and drops the
+// older ones, replacing them with one recoverable note. No relevance scoring, no model.
+//
+// ponytail: naive by design — it does not enforce user/assistant role alternation after
+// the drop. It is the no-LLM control to measure smarter compactors against.
+type Truncator struct{}
+
+func (Truncator) Name() string            { return truncateName }
+func (Truncator) Enabled(c *Context) bool { return c.Settings.TruncateEnabled }
+
+func (Truncator) Compact(req canon.Request, agg *Report, c *Context) (canon.Request, error) {
+	s := c.Settings
+	keep := s.TruncateKeepLast
+	if keep <= 0 {
+		keep = 3
+	}
+	msgs := req.Messages()
+	if len(msgs) <= keep {
+		return req, nil
+	}
+	if s.TruncateTriggerTokens > 0 {
+		if b, err := json.Marshal(msgs); err == nil && tokens.Count(string(b)) < s.TruncateTriggerTokens {
+			return req, nil
+		}
+	}
+	dropped := msgs[:len(msgs)-keep]
+	b, _ := json.Marshal(dropped)
+	rid := c.Store.Put(string(b))
+	note := map[string]any{
+		"role": "user",
+		"content": "=== Truncated history ===\n" +
+			markers.RecoveryNote(fmt.Sprintf("%d earlier message(s)", len(dropped)), "truncated", rid),
+	}
+	req.SetMessages(append([]map[string]any{note}, msgs[len(msgs)-keep:]...))
+	return req, nil
 }

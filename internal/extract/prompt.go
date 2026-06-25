@@ -8,7 +8,7 @@ import (
 // Prompt building. Because the model returns the filtered VALUE (which containment
 // then verifies), it must SEE the values — so the prompt shows the actual JSON/text
 // (truncated). For very large lists the RLM strategy chunks the body so each chunk is
-// shown in full. The rule set is winnow's "select, never summarize, recall-first"
+// shown in full. The rule set is the reference prototype's "select, never summarize, recall-first"
 // contract, retargeted from "write a function" to "return the JSON".
 
 // sampleMarker precedes the body in the prompt; tests and the (future) model both

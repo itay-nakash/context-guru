@@ -1,5 +1,5 @@
 // Package reduce is the deterministic, lossless-first reduction core ported from
-// winnow: parse a canonical request into items, score each item's relevance from
+// the reference prototype: parse a canonical request into items, score each item's relevance from
 // transcript signals, and apply the cheapest faithful, reversible action. No I/O,
 // clock, or randomness beyond the injected rewind store.
 package reduce

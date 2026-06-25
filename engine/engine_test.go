@@ -45,7 +45,7 @@ func TestTransformReducesAndCaches(t *testing.T) {
 	out2, _ := out.Encode()
 	ids := markers.FindIDs(string(out2))
 	if len(ids) == 0 {
-		t.Fatalf("expected a winnow marker in the reduced request")
+		t.Fatalf("expected a lab-cx marker in the reduced request")
 	}
 	if _, ok := e.Expand(ids[0]); !ok {
 		t.Fatalf("Expand could not recover marker %s", ids[0])

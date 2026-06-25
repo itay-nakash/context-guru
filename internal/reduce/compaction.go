@@ -10,7 +10,7 @@ import (
 
 // Phrases characterizing a known agent compaction prompt (Claude Code / Codex /
 // Gemini CLI). A false positive only forgoes one turn's savings. Ported from
-// winnow's compaction.py.
+// the reference prototype's compaction.py.
 var compactionPhrases = []string{
 	"this session is being continued from a previous conversation",
 	"create a detailed summary of the conversation",
@@ -61,7 +61,7 @@ func IsCompactionRequest(req canon.Request) bool {
 	return false
 }
 
-// RehydrateMarkers replaces any winnow-collapsed block with its stored original, in
+// RehydrateMarkers replaces any lab-cx-collapsed block with its stored original, in
 // place. Returns the number of blocks restored.
 func RehydrateMarkers(req canon.Request, st store.Rewind) int {
 	restored := 0

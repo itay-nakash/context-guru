@@ -14,7 +14,7 @@ is the behavioral reference — port its *logic*, re-implement its transport in 
 - **No AuthBridge / kagenti-extensions code lives here.** That plugin is built in
   `kagenti-extensions` and depends on this repo. Keep the public API (`engine`,
   `surfaces`, `config`) clean and importable; never reach into another repo.
-- **Fail open, always.** Any error in any stage forwards the original request untouched.
+- **Fail open, always.** Any error in any compactor forwards the original request untouched.
   Reductions must be reversible (markers + rewind store). Never drop content that is only
   *predicted* unused — `provable_only` is on by default.
 
@@ -29,7 +29,7 @@ is the behavioral reference — port its *logic*, re-implement its transport in 
 
 ## Layout
 
-`cmd/proxy` (binary) · `engine` (Transform/Expand + stages) · `surfaces` (wire⇄canonical)
+`cmd/proxy` (binary) · `engine` (Transform/Expand + Compactor pipeline) · `surfaces` (wire⇄canonical)
 · `internal/*` (types, extract, relevance, signals, taxonomy, actions, cache, markers,
 rewind, zones, session, compaction, tokens) · `config` · `observability` · `deploy` ·
 `docs`.

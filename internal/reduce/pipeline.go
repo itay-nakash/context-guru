@@ -38,7 +38,6 @@ type Report struct {
 	ToolDefTokens         int
 	ToolsTotal            int
 	ReducedIDs            []string
-	LLMCandidates         []Candidate
 	CompactionPassthrough bool
 	Rehydrated            int
 }
@@ -50,7 +49,6 @@ type Opts struct {
 	StickyIDs                map[string]struct{}
 	CollapseOutputs          bool
 	CacheFloor               int
-	LLMCompact               bool
 	LLMCompactFloor          int
 	LLMCompactStructuredOnly bool
 	RehydrateOnCompaction    bool
@@ -67,7 +65,7 @@ type Opts struct {
 	EnabledEncoders []string
 }
 
-// DefaultOpts mirrors winnow's reduce_request defaults.
+// DefaultOpts mirrors the reference prototype's reduce_request defaults.
 func DefaultOpts() Opts {
 	return Opts{
 		CollapseOutputs: true, CacheFloor: -1, LLMCompactFloor: 3000,
@@ -133,7 +131,7 @@ func blockAt(msgs []map[string]any, mi, bi int) map[string]any {
 }
 
 // ReduceRequest reduces req in place and returns a Report. Fail-open: a per-item
-// reducer error is counted and leaves that item verbatim. Ported from winnow's
+// reducer error is counted and leaves that item verbatim. Ported from the reference prototype's
 // reduce_request.
 func ReduceRequest(req canon.Request, st store.Rewind, ev *store.Eviction, opts Opts) Report {
 	msgs := req.Messages()
@@ -292,13 +290,14 @@ func ReduceRequest(req canon.Request, st store.Rewind, ev *store.Eviction, opts 
 		}
 	}
 
-	var llmCandidates []Candidate
-
 	for _, item := range items {
 		if _, done := handled[item.ID]; done {
 			continue
 		}
-		if item.MsgIndex < frozen || markers.HasForeign(item.Text) {
+		// Skip frozen, foreign-marked, and already-lab-cx-marked blocks. The last guard
+		// keeps reduce off blocks the extract compactor already rewrote (extract runs
+		// first in the default pipeline), so they are not double-processed.
+		if item.MsgIndex < frozen || markers.HasForeign(item.Text) || markers.Has(item.Text) {
 			continue
 		}
 		block := blockAt(msgs, item.MsgIndex, item.BlockIndex)
@@ -318,26 +317,6 @@ func ReduceRequest(req canon.Request, st store.Rewind, ev *store.Eviction, opts 
 
 		v, ok := verdicts[item.ID]
 		if !ok {
-			continue
-		}
-
-		// LLM-extraction candidate selection.
-		structured := IsStructured(item.Text)
-		reasonOK := false
-		switch {
-		case opts.LLMCompactStructuredOnly && !structured:
-			reasonOK = false
-		case structured:
-			reasonOK = v.Reason == "unused" || v.Reason == "lossy_candidate" || v.Reason == "kept_default"
-		default:
-			reasonOK = v.Reason == "unused" || v.Reason == "lossy_candidate"
-		}
-		if opts.LLMCompact && reasonOK && item.TokenEst >= opts.LLMCompactFloor && len(markers.FindIDs(item.Text)) == 0 {
-			llmCandidates = append(llmCandidates, Candidate{
-				ID: item.ID, MsgIndex: item.MsgIndex, BlockIndex: item.BlockIndex,
-				Text: item.Text, FilePath: item.FilePath, ToolName: item.ToolName,
-				TokenEst: item.TokenEst,
-			})
 			continue
 		}
 
@@ -366,6 +345,6 @@ func ReduceRequest(req canon.Request, st store.Rewind, ev *store.Eviction, opts 
 		SessionID: sid, AtCompaction: zones.AtCompaction, FrozenCount: frozen,
 		TokensBefore: b, TokensAfter: a, TokensSaved: saved, Ratio: ratio,
 		ReducerErrors: reducerErrors, ToolDefTokens: toolDefTokens, ToolsTotal: len(toolsList),
-		ReducedIDs: ids, LLMCandidates: llmCandidates,
+		ReducedIDs: ids,
 	}
 }

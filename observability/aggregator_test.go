@@ -106,3 +106,43 @@ func TestAggregatorDefaultCostRate(t *testing.T) {
 		t.Fatalf("CostSavedUSD = %v, want ~2.0", s.CostSavedUSD)
 	}
 }
+
+// TestAggregatorPerSessionAndRecentCalls verifies the per-session breakdown, the
+// recent-call ring, and the richer latency distribution.
+func TestAggregatorPerSessionAndRecentCalls(t *testing.T) {
+	a := NewAggregator(nil)
+	ctx := context.Background()
+	// Two sessions, one with two calls.
+	a.Emit(ctx, Event{SessionID: "s1", RequestModel: "m", Surface: "anthropic",
+		TokensBefore: 1000, TokensAfter: 600, TokensSaved: 400, ReducedCount: 2,
+		CandidatesCount: 1, ToolsTotal: 3, ToolDefTokens: 50, LatencyMillis: 10})
+	a.Emit(ctx, Event{SessionID: "s1", RequestModel: "m", Surface: "anthropic",
+		TokensBefore: 500, TokensAfter: 400, TokensSaved: 100, ReducedCount: 1, LatencyMillis: 30})
+	a.Emit(ctx, Event{SessionID: "s2", RequestModel: "m", Surface: "openai",
+		TokensBefore: 200, TokensAfter: 200, TokensSaved: 0, LatencyMillis: 50})
+
+	s := a.Snapshot()
+	if s.Requests != 3 || s.Sessions != 2 {
+		t.Fatalf("requests=%d sessions=%d, want 3/2", s.Requests, s.Sessions)
+	}
+	if len(s.RecentCalls) != 3 {
+		t.Fatalf("recent_calls=%d, want 3", len(s.RecentCalls))
+	}
+	if len(s.SessionStats) != 2 {
+		t.Fatalf("session_stats=%d, want 2", len(s.SessionStats))
+	}
+	// Find s1 and check its aggregate (2 calls, 500 saved, reduced 3).
+	var s1 *SessionSnapshot
+	for i := range s.SessionStats {
+		if s.SessionStats[i].SessionID == "s1" {
+			s1 = &s.SessionStats[i]
+		}
+	}
+	if s1 == nil || s1.Requests != 2 || s1.TokensSaved != 500 || s1.ReducedBlocks != 3 {
+		t.Fatalf("s1 aggregate wrong: %+v", s1)
+	}
+	// Latency distribution populated.
+	if s.Latency.MaxMillis != 50 || s.Latency.P50Millis == 0 {
+		t.Fatalf("global latency wrong: %+v", s.Latency)
+	}
+}

@@ -48,7 +48,7 @@ func reduceFixture(t *testing.T, body string, opts Opts) (canon.Request, Report,
 	return req, rep, st
 }
 
-// markerOriginal returns the stored original for the first winnow marker found in text.
+// markerOriginal returns the stored original for the first lab-cx marker found in text.
 func markerOriginal(t *testing.T, st store.Rewind, text string) (string, bool) {
 	ids := markers.FindIDs(text)
 	if len(ids) == 0 {

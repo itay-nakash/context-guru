@@ -1,6 +1,6 @@
 // Package cache injects Anthropic ephemeral cache_control breakpoints on the stable
 // prefix of a request. Lossless: nothing is dropped or rewritten, only annotated
-// where the provider may cache. Ported from winnow's cache.py.
+// where the provider may cache. Ported from the reference prototype's cache.py.
 //
 // All functions operate on the canonical Root map (Anthropic shape) in place.
 package cache

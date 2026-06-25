@@ -12,9 +12,28 @@
 # placement instead, see README.md in this directory.
 
 services:
-  winnow:
+  lab-cx:
     image: ghcr.io/kagenti/lab-context-engineering:latest
-    command: ["proxy", "--addr", ":8080", "--preset", "balanced", "--upstream", "http://gateway:4000"]
+    # Run our components: reduce + cache (preset balanced) AND the cheap-model extractor.
+    # The extractor calls claude-haiku-4-5 back THROUGH the gateway's /anthropic route
+    # using the same sk-proxy credential the agent holds (x-api-key) — no real key here,
+    # no new egress. Summarize/truncate are intentionally NOT enabled for these runs.
+    command:
+      - "proxy"
+      - "--addr"
+      - ":8080"
+      - "--preset"
+      - "balanced"
+      - "--upstream"
+      - "http://gateway:4000"
+      - "--extract-model"
+      - "claude-haiku-4-5"
+      - "--extract-base"
+      - "http://gateway:4000/anthropic"
+      - "--extract-auth"
+      - "x-api-key"
+    environment:
+      LABCX_EXTRACT_KEY: sk-proxy
     networks:
       - internal
 
@@ -22,8 +41,8 @@ services:
     environment:
       # Route the agent through lab-cx; it forwards the (full, prefixed) path to the
       # gateway. Suffix routing means /anthropic/v1/messages etc. are still reduced.
-      ANTHROPIC_BASE_URL: http://winnow:8080/anthropic
-      OPENAI_BASE_URL: http://winnow:8080/openai/v1
-      GOOGLE_GEMINI_BASE_URL: http://winnow:8080/genai
+      ANTHROPIC_BASE_URL: http://lab-cx:8080/anthropic
+      OPENAI_BASE_URL: http://lab-cx:8080/openai/v1
+      GOOGLE_GEMINI_BASE_URL: http://lab-cx:8080/genai
     depends_on:
-      - winnow
+      - lab-cx

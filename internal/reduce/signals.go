@@ -13,7 +13,7 @@ import (
 // Code-reference signals. The question is not "was the basename restated" but: was
 // the read file's PATH referenced later, or a SYMBOL it DEFINES used later, or a
 // distinctive LITERAL it contains reused later? Every signal biases toward KEEP (the
-// safe direction; reductions are reversible). Ported from winnow's signals/refs.py.
+// safe direction; reductions are reversible). Ported from the reference prototype's signals/refs.py.
 //
 // definedSymbols uses tree-sitter (go-tree-sitter + per-grammar forest), which catches
 // methods the old regex missed and ignores commented-out definitions. It still biases

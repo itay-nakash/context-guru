@@ -8,7 +8,7 @@ import (
 // Deterministic, model-free projection: filter a parsed value to the parts that match
 // the keep-set (plus the important-key "spine"). Every leaf it emits is an unchanged
 // value, a string prefix, or a contiguous window, so its output always passes
-// IsContained by construction and is never empty. Ported from winnow's
+// IsContained by construction and is never empty. Ported from the reference prototype's
 // deterministic_project.
 
 var importantKeyTokens = []string{"id", "status", "state", "name", "error", "reason", "date", "time"}

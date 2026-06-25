@@ -32,17 +32,28 @@ OPENAI_BASE_URL=http://localhost:8080/v1         # OpenAI-wire agents
 ```
 
 Flags: `--addr`, `--preset` (`safe|balanced|aggressive|cache|coding|mcp`), `--config`,
-`--upstream`, `--extract-model/-provider/-auth/-base`, `--max-body-bytes` (default
-33554432 = 32 MiB; `0` = no cap), `--upstream-timeout` (default `0s`; non-zero caps the
-whole request incl. streamed responses).
+`--upstream`, `--extract-model/-provider/-auth/-base`,
+`--summarize-model/-provider/-auth/-base`, `--reduce-cached-prefix` (run the reducers +
+extractor on a self-caching client's cached prefix instead of deferring to its cache —
+see below), `--max-body-bytes` (default 33554432 = 32 MiB; `0` = no cap),
+`--upstream-timeout` (default `0s`; non-zero caps the whole request incl. streamed
+responses).
 
-Extractor API key comes from the env: `WINNOW_EXTRACT_KEY`, else `ANTHROPIC_API_KEY` /
-`ANTHROPIC_AUTH_TOKEN` (anthropic provider) or `OPENAI_API_KEY` (openai provider).
+Self-caching agents (Claude Code): by default lab-cx defers to the client's own
+`cache_control` (the cache stage stands down) and reduces little. Pass
+`--reduce-cached-prefix` (or `reduce.reduce_cached_prefix: true`) to run the deterministic
+reducers and the LLM extractor on the cached prefix too — real token reduction at the cost
+of invalidating the client's cached prefix.
+
+Model credentials: an inline `api_key` (or `key_env`) in the config wins; else the
+compactor's env var (`LABCX_EXTRACT_KEY` / `LABCX_SUMMARIZE_KEY`); else the provider
+default (`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`, or `OPENAI_API_KEY`). Set
+`source: incoming` to reuse the proxied request's own model + credentials instead.
 
 Disable / bypass:
 
-- `WINNOW_DISABLE=1` — transparent passthrough for the whole process.
-- `x-winnow-bypass: true` header — skip reduction for one request.
+- `LABCX_DISABLE=1` — transparent passthrough for the whole process.
+- `x-labcx-bypass: true` header — skip reduction for one request.
 
 ## Read /stats
 
@@ -52,9 +63,22 @@ curl -s http://localhost:8080/stats          # raw JSON
 ./bin/lab-cx stats --addr http://localhost:8080
 ```
 
-`/stats` fields: `requests`, `tokens_before`, `tokens_after`, `tokens_saved`,
-`cache_injected`, `extracted`, `stage_errors`, `added_latency_p50_ms`,
-`added_latency_p95_ms`. Recover an omitted block: `GET /winnow/expand?id=<marker-id>`.
+`/stats` is comprehensive — global totals, a per-session breakdown, and a recent-per-call
+ring:
+
+- **Global:** `requests`, `tokens_before/after/saved`, `reduction_ratio`, `cache_injected`,
+  `extracted`, `reduced_blocks`, `extract_candidates`, `stage_errors`, `cost_saved_usd`,
+  `sessions`, and a `latency` object (`p50_ms`, `p95_ms`, `p99_ms`, `max_ms`, `mean_ms`;
+  the flat `added_latency_p50_ms`/`p95_ms` are kept for compatibility).
+- **`session_stats[]`** — per conversation: the same token/cache/extract/reduced metrics,
+  `cost_saved_usd`, `tools_total`, `tool_def_tokens`, `model`, `surface`, and its own
+  `latency` distribution.
+- **`recent_calls[]`** (last 256) — every metric for each call: tokens + ratio,
+  `cache_injected`, `extracted`, `reduced_blocks`, `extract_candidates`, `frozen_messages`,
+  `rehydrated`, `at_compaction`, `session_id`, `request_model`, and `added_latency_ms`.
+
+The same per-call fields are emitted as a structured slog event per request
+(`gen_ai.*` + `context_engineering.*`). Recover an omitted block: `GET /labcx/expand?id=<marker-id>`.
 
 ## Measure: offline deterministic harness
 
@@ -106,18 +130,25 @@ name in the config — no other core edit needed.
 
 | Component | Register it in | Then list it under |
 |---|---|---|
-| **Stage** | `engine` `builtinStages` map (`engine/engine.go`) | `stages:` |
+| **Compactor** | `engine.(*Engine).Register` / `builtinCompactors` map (`engine/engine.go`) | `compactors:` |
 | **Reducer** | `reduce.RegisterReducer(...)` (its `Reducer.Name`) | `reduce.reducers:` |
 | **Encoder** (format re-encoder) | `allEncoders` table in `internal/reduce/actions.go` (unique name + rank) | `reduce.encoders:` (order = tie-break priority) |
 | **Extract strategy** | `RunExtraction`'s switch + `rawStrategyOrder` in `internal/extract/extract.go` | `extract.strategies:` |
 
-Built-ins: stages `reduce, extract, cache`; reducers `collapse, skeleton, format`
-(`cmdfilter` and `dedup` are separate passes toggled by their own keys); encoders
-`json_compact, toon, jsonl, markdown_kv, tsv, csv`; strategies
+Every compaction approach (`reduce`, `extract`, `summarize`, `truncate`, `cache`)
+implements one `engine.Compactor` interface — given the conversation, return the
+transformed conversation. Built-ins: compactors `reduce, extract, summarize, truncate,
+cache` (default order `extract, reduce, cache`; summarize/truncate are opt-in); reducers
+`collapse, skeleton, format` (`cmdfilter` and `dedup` are separate passes toggled by their
+own keys); encoders `json_compact, toon, jsonl, markdown_kv, tsv, csv`; strategies
 `code, single, rlm, deterministic`.
 
 Other `reduce` keys: `protect_recent` (keep N most recent turns at full fidelity),
 `provable_only` (never drop merely-predicted-unused content), `cmd_filter` (bool).
-`extract` keys: `enabled`, `mode` (`auto|single|rlm|deterministic`), `floor` (token floor
-before extraction is considered), and the transport block (`provider`, `model`, `auth`,
-`base`) which the `--extract-*` flags override. `cache` keys: `enabled`, `breakpoints`.
+`extract` and `summarize` share one LLM transport block: `provider`, `model`, `auth`,
+`base`, plus credentials (`api_key` inline or `key_env` naming an env var) and `source`
+(`config` = use the configured model; `incoming` = reuse the proxied request's own model +
+credentials). `--extract-*` / `--summarize-*` flags override it. `extract` keys: `enabled`,
+`mode` (`auto|single|rlm|deterministic`), `floor`. `summarize` keys: `enabled`, `level`
+(`concise|regular|highly_detailed`), `keep_last`, `trigger_tokens`. `truncate` keys (no
+model): `enabled`, `keep_last`, `trigger_tokens`. `cache` keys: `enabled`, `breakpoints`.

@@ -11,7 +11,7 @@ import (
 // Tool-result reads are the main reduction target, so ToInternal normalizes the
 // whole request but Render writes back only the reduced tool_result content into the
 // original OpenAI message list — assistant tool_calls and plain text are left
-// structurally intact. Ported from winnow's openai_adapter.
+// structurally intact. Ported from the reference prototype's openai_adapter.
 type OpenAI struct{}
 
 func (OpenAI) Name() string { return "openai" }

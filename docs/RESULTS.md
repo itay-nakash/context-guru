@@ -50,12 +50,24 @@ verbatim harness output. No numbers are invented; this page only indexes them.
   Bob backend; `/stats` after a 3-task suite.
 - **Detail:** [integration/bob.md](integration/bob.md).
 
-## SWE-bench / eval-containers integration
+## SWE-bench / eval-containers integration (real runs)
 
-- **Headline:** wiring **validated** — the merged compose renders `winnow` before the
-  gateway and the lab-cx image builds (CGO, distroless/base). The **full SWE-bench run was
-  NOT executed** this session (multi-GB pulls + real model spend); the doc is the runbook
-  to execute, with no fabricated benchmark numbers.
-- **Date:** 2026-06-24. **How produced:** structural `docker compose ... config` merge
-  validation (no image pull).
-- **Detail + runbook:** [integration/swe-bench.md](integration/swe-bench.md).
+- **Headline:** **10 real SWE-bench Verified tasks** (Claude Code agent → `lab-cx` →
+  gateway, `claude-sonnet-4-6` agent / `claude-haiku-4-5` extractor) reduced the agent's
+  input traffic by **−35.5% aggregate** (4,405,821 → 2,840,296 tokens; **1,565,525 saved**
+  over 263 requests), ranging **−10.4%…−51.8%** per task — entirely from the deterministic
+  reducers (collapse/skeleton/format/cmdfilter, **1,598 blocks reduced**) running on Claude
+  Code's self-cached prefix via `--reduce-cached-prefix`. 0 stage errors; p95 added latency
+  ~130–250 ms.
+- **Caveats (honest):** the LLM extractor did not fire on these astropy tasks
+  (`extract_candidates=0` — no large *structured* tool outputs; its value is shown by the
+  extractor results above). Resolve status is reported per task, but Epoch AI marks the
+  **arm64** SWE-bench bases (used here for native Apple-Silicon runs) best-effort/untested
+  for grading, so `not resolved` rows may understate accuracy; **token reduction is
+  architecture-independent and valid**. `--reduce-cached-prefix` trades the client's
+  prompt-cache hits for these reductions (the deliberate choice for self-caching agents).
+- **Date:** 2026-06-25. **How produced:** per-task eval images built locally
+  (`combination.Dockerfile` over the public Epoch base + the claude-code agent), run via
+  the eval-containers compose with [`deploy/eval-containers/compose.override.yaml`](../deploy/eval-containers/compose.override.yaml);
+  per-task reduction read from `lab-cx`'s `/stats`, resolve status from `result.json`.
+- **Detail + per-task table + runbook:** [integration/swe-bench.md](integration/swe-bench.md).

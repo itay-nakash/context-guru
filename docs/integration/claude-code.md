@@ -49,7 +49,7 @@ The task completed correctly through the proxy. `/stats` after the run:
   integration works.
 - **`cache_injected: 0`** — Claude Code is a *self-caching* client (it sends its own
   `cache_control` breakpoints), so lab-cx's cache stage correctly **stands down** rather
-  than fight the client's cache. This matches the winnow finding that on Claude Code the
+  than fight the client's cache. This matches the reference prototype's finding that on Claude Code the
   proxy is cost-neutral by design.
 - **`tokens_saved: 0`** — a tiny 2-file, 2-turn task has no large/stale/duplicate tool
   outputs to reduce and nothing over the extraction floor. lab-cx safely did nothing.
