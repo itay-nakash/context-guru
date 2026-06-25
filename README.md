@@ -1,7 +1,7 @@
 # lab-context-engineering
 
-Context engineering for LLM agents — reduce token cost without changing the agent or
-hurting the result.
+## Executive Summary
+Context engineering attempts to reduce cost and latency by lowering token count and optimizing llm context without changing agent behavior or degregading its accurcy
 
 `lab-context-engineering` is a [Kagenti](https://github.com/kagenti/kagenti) platform
 component: a single Go core that sits between an LLM coding agent and the model API,
