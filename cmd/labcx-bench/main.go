@@ -92,7 +92,7 @@ func isolate(reducers, encoders []string, cmdFilter bool) config.Settings {
 		CmdFilter:       cmdFilter,
 		Reducers:        reducers,
 		Encoders:        encoders,
-		Stages:          []string{"reduce"},
+		Compactors:      []string{"reduce"},
 		ExtractEnabled:  false,
 	}
 }
@@ -245,7 +245,7 @@ func measure(fx fixture, fixtureText string, c component) row {
 	return r
 }
 
-// verifyReversible confirms the reduction is recoverable: if the component left a winnow
+// verifyReversible confirms the reduction is recoverable: if the component left a lab-cx
 // marker, the rewind store must return the exact original; if it left the text untouched
 // (a no-op for this fixture/component), that is trivially reversible. A reduction that
 // changed the text but exposes no recoverable original would be a (disallowed) lossy drop.
@@ -467,27 +467,29 @@ func measureExtract(fx extractFixture, fixtureText string, model engine.Model) e
 		ProvableOnly:    false,
 		CollapseOutputs: true,
 		Reducers:        []string{"__none__"}, // no deterministic reducer touches the body first
-		Stages:          []string{"reduce", "extract"},
-		ExtractEnabled:  true,
+		Compactors:      []string{"reduce"},
 		LLMCompactFloor: extractFloor,
 	}
 	eng := engine.New(settings, nil, nil)
 
 	cfg := engine.DefaultExtractConfig()
 	cfg.Floor = extractFloor
-	// EnableExtract performs the real wiring/splice; we then override its func with a
-	// behaviorally identical one that also records the chosen strategy.
-	eng.EnableExtract(model, cfg)
-
-	var chosen string
-	eng.SetExtract(capturingExtractFunc(eng, model, cfg.Floor, &chosen))
 
 	req := buildExtractRequest(fx, fixtureText)
 	before := req.Clone()
 	beforeText := toolResultTextAny(before)
 
 	start := time.Now()
+	// reduce runs first (no deterministic reducer touches the body); then we run the
+	// extraction ourselves over the same candidate set the engine's Extractor would, so
+	// we can record which strategy RunExtraction selected for the row.
 	out, _ := eng.Transform(context.Background(), req)
+	opts := reduce.DefaultOpts()
+	opts.ProtectRecent = 1
+	opts.ProvableOnly = false
+	opts.LLMCompactFloor = extractFloor
+	cands := reduce.SelectLLMCandidates(out, opts)
+	chosen := runCapturingExtract(eng, out, cands, model, cfg.Floor)
 	elapsed := time.Since(start)
 
 	afterText := toolResultTextAny(out)
@@ -513,37 +515,37 @@ func measureExtract(fx extractFixture, fixtureText string, model engine.Model) e
 	return r
 }
 
-// capturingExtractFunc returns an extract func equivalent to engine.EnableExtract's, but
-// it records the strategy RunExtraction selected for the (single) candidate into *chosen
-// and performs the reversible splice through the engine's public store + recovery marker.
-func capturingExtractFunc(eng *engine.Engine, model engine.Model, floor int, chosen *string) engine.ExtractFunc {
+// runCapturingExtract runs the same extraction the engine's Extractor would over cands,
+// but records which strategy RunExtraction selected and performs the reversible splice
+// through the engine's public store + recovery marker. Returns the chosen strategy.
+func runCapturingExtract(eng *engine.Engine, req canon.Request, cands []reduce.Candidate, model engine.Model, floor int) string {
 	icfg := extract.Cfg{Mode: "auto", Floor: floor, AllowDeterministic: true, MaxChars: 4000}
 	cache := extract.NewCache()
-	return func(ctx context.Context, req canon.Request, cands []reduce.Candidate) error {
-		goal := recentGoalText(req, 6)
-		keep := extract.HarvestIdentifiers(goal, 60)
-		for _, c := range cands {
-			func() {
-				defer func() { _ = recover() }() // fail-open per candidate
-				key := goalKey(extract.ContentKey(c.Text), goal, keep)
-				result, ok := cache.Get(key)
-				var strat string
-				if ok {
-					strat = "cache"
-				} else {
-					result, strat = extract.RunExtraction(ctx, c.Text, goal, keep, c.TokenEst, icfg, model)
-					if strat == "none" || result == "" {
-						*chosen = "none"
-						return
-					}
-					cache.Put(key, result)
+	goal := recentGoalText(req, 6)
+	keep := extract.HarvestIdentifiers(goal, 60)
+	ctx := context.Background()
+	chosen := "none"
+	for _, c := range cands {
+		func() {
+			defer func() { _ = recover() }() // fail-open per candidate
+			key := goalKey(extract.ContentKey(c.Text), goal, keep)
+			result, ok := cache.Get(key)
+			var strat string
+			if ok {
+				strat = "cache"
+			} else {
+				result, strat = extract.RunExtraction(ctx, c.Text, goal, keep, c.TokenEst, icfg, model)
+				if strat == "none" || result == "" {
+					chosen = "none"
+					return
 				}
-				*chosen = strat
-				spliceResult(eng, req, c, result)
-			}()
-		}
-		return nil
+				cache.Put(key, result)
+			}
+			chosen = strat
+			spliceResult(eng, req, c, result)
+		}()
 	}
+	return chosen
 }
 
 // spliceResult mirrors engine.(*Engine).splice using the public API: store the original

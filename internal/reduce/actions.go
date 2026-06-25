@@ -28,9 +28,9 @@ func collapse(text, filePath, reason string, st store.Rewind, terse bool) (strin
 		label = "tool output"
 	}
 	if terse {
-		return fmt.Sprintf("[winnow %s: %s] %s", reason, label, marker), rid
+		return fmt.Sprintf("[labcx %s: %s] %s", reason, label, marker), rid
 	}
-	return fmt.Sprintf("[winnow: %s omitted (%s); call winnow_expand(%q) to restore] %s",
+	return fmt.Sprintf("[labcx: %s omitted (%s); call labcx_expand(%q) to restore] %s",
 		label, reason, rid, marker), rid
 }
 

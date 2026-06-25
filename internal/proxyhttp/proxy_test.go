@@ -59,7 +59,7 @@ func TestProxyReducesBeforeForwarding(t *testing.T) {
 		t.Fatalf("upstream body not reduced: got %d, original %d", len(upstreamGot), len(body))
 	}
 	if len(markers.FindIDs(upstreamGot)) == 0 {
-		t.Fatalf("expected a winnow marker in the forwarded body")
+		t.Fatalf("expected a lab-cx marker in the forwarded body")
 	}
 }
 
@@ -71,7 +71,7 @@ func TestBypassForwardsOriginal(t *testing.T) {
 
 	body := `{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
-	req.Header.Set("x-winnow-bypass", "true")
+	req.Header.Set("x-labcx-bypass", "true")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
@@ -228,5 +228,21 @@ func TestHealth(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("health = %d", rec.Code)
+	}
+}
+
+// TestModelBasePreservesPrefix: the per-request (source: incoming) model base must
+// reproduce the main request's upstream URL, including any route prefix.
+func TestModelBasePreservesPrefix(t *testing.T) {
+	cases := []struct{ upstream, path, surface, want string }{
+		{"http://gateway:4000", "/anthropic/v1/messages", "anthropic", "http://gateway:4000/anthropic"},
+		{"http://gateway:4000/", "/v1/messages", "anthropic", "http://gateway:4000"},
+		{"https://api.anthropic.com", "/v1/messages", "anthropic", "https://api.anthropic.com"},
+		{"http://gateway:4000", "/openai/v1/chat/completions", "openai", "http://gateway:4000/openai"},
+	}
+	for _, c := range cases {
+		if got := modelBase(c.upstream, c.path, c.surface); got != c.want {
+			t.Errorf("modelBase(%q,%q,%q) = %q, want %q", c.upstream, c.path, c.surface, got, c.want)
+		}
 	}
 }

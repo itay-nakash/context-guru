@@ -41,6 +41,12 @@ type Config struct {
 	// UpstreamTimeout bounds each upstream request when Client is not set; 0 means
 	// no timeout (http.DefaultClient).
 	UpstreamTimeout time.Duration
+	// BuildRequestModel, when set, builds an engine.Model from the incoming request's
+	// own model + credentials (surface name, model id, resolved upstream base, request
+	// headers) for LLM compactors configured with source "incoming". Returning nil means
+	// "no per-request model" (those compactors then no-op). The host (proxy binary)
+	// supplies this so cheapmodel construction stays out of this package.
+	BuildRequestModel func(surfaceName, model, base string, h http.Header) engine.Model
 }
 
 type proxy struct {
@@ -76,7 +82,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case path == "/health" || path == "/ready":
 		p.ok(w, r)
-	case path == "/winnow/expand":
+	case path == "/labcx/expand":
 		p.expand(w, r)
 	case path == "/stats":
 		p.stats(w, r)
@@ -133,18 +139,32 @@ func (p *proxy) model(surface surfaces.Surface, providerDefault string) http.Han
 		outBody := body
 		if !bypassed(r) {
 			start := time.Now()
-			reduced, rep, ok := p.reduce(r.Context(), surface, body)
+			ctx := r.Context()
+			if p.cfg.BuildRequestModel != nil {
+				mb := modelBase(base, r.URL.Path, surface.Name())
+				if m := p.cfg.BuildRequestModel(surface.Name(), modelOf(body), mb, r.Header); m != nil {
+					ctx = engine.WithRequestModel(ctx, m)
+				}
+			}
+			reduced, rep, ok := p.reduce(ctx, surface, body)
 			latencyMs := int(time.Since(start).Milliseconds())
 			if ok {
 				outBody = reduced
 				p.cfg.Emitter.Emit(r.Context(), observability.Event{
 					System: surface.Name(), Surface: surface.Name(),
-					RequestModel: modelOf(body),
+					RequestModel: modelOf(body), SessionID: rep.Reduce.SessionID,
 					TokensBefore: rep.Reduce.TokensBefore, TokensAfter: rep.Reduce.TokensAfter,
 					TokensSaved: rep.Reduce.TokensSaved, Ratio: rep.Reduce.Ratio,
 					CacheInject: rep.CacheInjected, Extracted: len(rep.Candidates) > 0,
-					StageErrors:   rep.StageErrors,
-					LatencyMillis: latencyMs,
+					StageErrors:     rep.StageErrors,
+					ToolsTotal:      rep.Reduce.ToolsTotal,
+					ToolDefTokens:   rep.Reduce.ToolDefTokens,
+					ReducedCount:    len(rep.Reduce.ReducedIDs),
+					CandidatesCount: len(rep.Candidates),
+					FrozenCount:     rep.Reduce.FrozenCount,
+					Rehydrated:      rep.Reduce.Rehydrated,
+					AtCompaction:    rep.Reduce.AtCompaction,
+					LatencyMillis:   latencyMs,
 				})
 			}
 		}
@@ -170,6 +190,22 @@ func (p *proxy) reduce(ctx context.Context, surface surfaces.Surface, body []byt
 		return nil, engine.Report{}, false
 	}
 	return rendered, report, true
+}
+
+// modelBase returns the base URL a per-request (source: incoming) model client should
+// use so that appending the surface's fixed path (/v1/messages or /v1/chat/completions)
+// reproduces the SAME upstream URL the main request forwards to — preserving any route
+// prefix (e.g. /anthropic when the agent points at http://gateway:4000/anthropic).
+func modelBase(upstream, reqPath, surfaceName string) string {
+	suffix := "/v1/messages"
+	if surfaceName == "openai" {
+		suffix = "/v1/chat/completions"
+	}
+	prefix := strings.TrimSuffix(reqPath, suffix)
+	if prefix == reqPath { // suffix not present; fall back to the bare upstream
+		prefix = ""
+	}
+	return strings.TrimRight(upstream, "/") + prefix
 }
 
 // modelOf best-effort reads the "model" field from a request body for telemetry.
@@ -274,5 +310,5 @@ func (p *proxy) forward(w http.ResponseWriter, r *http.Request, base string, bod
 }
 
 func bypassed(r *http.Request) bool {
-	return strings.EqualFold(r.Header.Get("x-winnow-bypass"), "true")
+	return strings.EqualFold(r.Header.Get("x-labcx-bypass"), "true")
 }

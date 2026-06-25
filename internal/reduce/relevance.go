@@ -8,7 +8,7 @@ import (
 
 // Relevance scoring — the core contribution. For each reducible read/tool_result
 // item, decide whether it is still relevant using deterministic transcript signals.
-// Ported from winnow's relevance.py.
+// Ported from the reference prototype's relevance.py.
 
 var (
 	salientRe = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_./-]{7,}`)
@@ -26,7 +26,7 @@ type ScoreOpts struct {
 	LiteralSignal         bool
 }
 
-// DefaultScoreOpts mirrors winnow's score_relevance defaults.
+// DefaultScoreOpts mirrors the reference prototype's score_relevance defaults.
 func DefaultScoreOpts(protectRecent int) ScoreOpts {
 	return ScoreOpts{
 		ProtectRecent: protectRecent, CollapseOutputs: true,

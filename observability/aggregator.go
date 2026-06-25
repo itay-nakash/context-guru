@@ -21,18 +21,72 @@ type CostRate struct {
 	OutputPerMTok float64 `json:"output_per_mtok"`
 }
 
-// maxLatencySamples bounds the retained latency samples so memory stays flat over a
-// long-running process. The most recent maxLatencySamples are kept (ring buffer).
-const maxLatencySamples = 1024
+const (
+	// maxLatencySamples bounds retained latency samples (per scope) so memory stays
+	// flat over a long-running process — most recent samples kept (ring buffer).
+	maxLatencySamples = 1024
+	// maxRecentCalls bounds the retained per-call records served at /stats.
+	maxRecentCalls = 256
+	// maxSessions bounds the per-session breakdown; the least-recently-seen session is
+	// evicted past this.
+	maxSessions = 512
+)
 
-// Aggregator is an Emitter that accumulates Events into process-wide reduction stats,
-// safe for concurrent use. A host installs it as the proxy Emitter and serves its
-// Snapshot/WriteJSON on a /stats endpoint. It does not replace a streaming Emitter —
-// a host can fan out to both.
-type Aggregator struct {
-	rates map[string]CostRate
+// LatencyStats summarizes a set of added-latency samples (milliseconds).
+type LatencyStats struct {
+	P50Millis  int `json:"p50_ms"`
+	P95Millis  int `json:"p95_ms"`
+	P99Millis  int `json:"p99_ms"`
+	MaxMillis  int `json:"max_ms"`
+	MeanMillis int `json:"mean_ms"`
+}
 
-	mu            sync.Mutex
+// latRing is a bounded ring of latency samples with quantile/aggregate helpers.
+type latRing struct {
+	buf    []int
+	next   int
+	filled int
+}
+
+func newLatRing(n int) latRing { return latRing{buf: make([]int, n)} }
+
+func (r *latRing) add(v int) {
+	r.buf[r.next] = v
+	r.next = (r.next + 1) % len(r.buf)
+	if r.filled < len(r.buf) {
+		r.filled++
+	}
+}
+
+func (r *latRing) stats() LatencyStats {
+	if r.filled == 0 {
+		return LatencyStats{}
+	}
+	xs := make([]int, r.filled)
+	copy(xs, r.buf[:r.filled])
+	sort.Ints(xs)
+	sum := 0
+	for _, x := range xs {
+		sum += x
+	}
+	q := func(p float64) int {
+		idx := int(p*float64(r.filled)+0.999999) - 1
+		if idx < 0 {
+			idx = 0
+		}
+		if idx >= r.filled {
+			idx = r.filled - 1
+		}
+		return xs[idx]
+	}
+	return LatencyStats{
+		P50Millis: q(0.50), P95Millis: q(0.95), P99Millis: q(0.99),
+		MaxMillis: xs[r.filled-1], MeanMillis: sum / r.filled,
+	}
+}
+
+// sessionAgg accumulates one conversation's metrics.
+type sessionAgg struct {
 	requests      int64
 	tokensBefore  int64
 	tokensAfter   int64
@@ -40,25 +94,85 @@ type Aggregator struct {
 	cacheInjected int64
 	extracted     int64
 	stageErrors   int64
+	reducedTotal  int64
+	candidates    int64
 	costSavedUSD  float64
+	toolsTotal    int
+	toolDefTokens int
+	lastModel     string
+	lastSurface   string
+	lastSeq       int64
+	lat           latRing
+}
 
-	// latency holds a bounded ring of recent added-latency samples (ms). next is the
-	// next write index; filled tracks how many slots are valid.
-	latency [maxLatencySamples]int
-	next    int
-	filled  int
+// Aggregator is an Emitter that accumulates Events into process-wide reduction stats, a
+// per-session breakdown, and a recent-per-call ring — safe for concurrent use. A host
+// installs it as the proxy Emitter and serves its Snapshot/WriteJSON on /stats.
+type Aggregator struct {
+	rates map[string]CostRate
+
+	mu            sync.Mutex
+	seq           int64
+	requests      int64
+	tokensBefore  int64
+	tokensAfter   int64
+	tokensSaved   int64
+	cacheInjected int64
+	extracted     int64
+	stageErrors   int64
+	reducedTotal  int64
+	candidates    int64
+	costSavedUSD  float64
+	lat           latRing
+
+	sessions map[string]*sessionAgg
+	recent   []CallRecord // ring of recent per-call records
+	rNext    int
+	rFilled  int
 }
 
 // NewAggregator returns an Aggregator pricing savings with rates (keyed by model, plus
 // an optional DefaultCostKey fallback). A nil rates map disables cost estimation.
 func NewAggregator(rates map[string]CostRate) *Aggregator {
-	return &Aggregator{rates: rates}
+	return &Aggregator{
+		rates:    rates,
+		lat:      newLatRing(maxLatencySamples),
+		sessions: make(map[string]*sessionAgg),
+		recent:   make([]CallRecord, maxRecentCalls),
+	}
 }
 
-// Emit folds one Event into the running totals.
+// CallRecord is the full per-call metric set retained for /stats (recent_calls).
+type CallRecord struct {
+	Seq             int64   `json:"seq"`
+	System          string  `json:"system"`
+	RequestModel    string  `json:"request_model"`
+	Surface         string  `json:"surface"`
+	SessionID       string  `json:"session_id"`
+	TokensBefore    int     `json:"tokens_before"`
+	TokensAfter     int     `json:"tokens_after"`
+	TokensSaved     int     `json:"tokens_saved"`
+	Ratio           float64 `json:"reduction_ratio"`
+	CacheInjected   bool    `json:"cache_injected"`
+	Extracted       bool    `json:"extracted"`
+	StageErrors     int     `json:"stage_errors"`
+	ToolsTotal      int     `json:"tools_total"`
+	ToolDefTokens   int     `json:"tool_def_tokens"`
+	ReducedCount    int     `json:"reduced_blocks"`
+	CandidatesCount int     `json:"extract_candidates"`
+	FrozenCount     int     `json:"frozen_messages"`
+	Rehydrated      int     `json:"rehydrated"`
+	AtCompaction    bool    `json:"at_compaction"`
+	AddedLatencyMs  int     `json:"added_latency_ms"`
+}
+
+// Emit folds one Event into the global totals, its session, and the recent-calls ring.
 func (a *Aggregator) Emit(_ context.Context, e Event) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	a.seq++
+	cost := float64(e.TokensSaved) / 1e6 * a.inputRate(e.RequestModel)
 
 	a.requests++
 	a.tokensBefore += int64(e.TokensBefore)
@@ -71,13 +185,70 @@ func (a *Aggregator) Emit(_ context.Context, e Event) {
 		a.extracted++
 	}
 	a.stageErrors += int64(e.StageErrors)
-	a.costSavedUSD += float64(e.TokensSaved) / 1e6 * a.inputRate(e.RequestModel)
+	a.reducedTotal += int64(e.ReducedCount)
+	a.candidates += int64(e.CandidatesCount)
+	a.costSavedUSD += cost
+	a.lat.add(e.LatencyMillis)
 
-	a.latency[a.next] = e.LatencyMillis
-	a.next = (a.next + 1) % maxLatencySamples
-	if a.filled < maxLatencySamples {
-		a.filled++
+	// Per-session.
+	if e.SessionID != "" {
+		s := a.sessions[e.SessionID]
+		if s == nil {
+			a.evictSessionsLocked()
+			s = &sessionAgg{lat: newLatRing(maxLatencySamples)}
+			a.sessions[e.SessionID] = s
+		}
+		s.requests++
+		s.tokensBefore += int64(e.TokensBefore)
+		s.tokensAfter += int64(e.TokensAfter)
+		s.tokensSaved += int64(e.TokensSaved)
+		if e.CacheInject {
+			s.cacheInjected++
+		}
+		if e.Extracted {
+			s.extracted++
+		}
+		s.stageErrors += int64(e.StageErrors)
+		s.reducedTotal += int64(e.ReducedCount)
+		s.candidates += int64(e.CandidatesCount)
+		s.costSavedUSD += cost
+		s.toolsTotal = e.ToolsTotal
+		s.toolDefTokens = e.ToolDefTokens
+		s.lastModel = e.RequestModel
+		s.lastSurface = e.Surface
+		s.lastSeq = a.seq
+		s.lat.add(e.LatencyMillis)
 	}
+
+	// Recent per-call ring.
+	a.recent[a.rNext] = CallRecord{
+		Seq: a.seq, System: e.System, RequestModel: e.RequestModel, Surface: e.Surface,
+		SessionID: e.SessionID, TokensBefore: e.TokensBefore, TokensAfter: e.TokensAfter,
+		TokensSaved: e.TokensSaved, Ratio: e.Ratio, CacheInjected: e.CacheInject,
+		Extracted: e.Extracted, StageErrors: e.StageErrors, ToolsTotal: e.ToolsTotal,
+		ToolDefTokens: e.ToolDefTokens, ReducedCount: e.ReducedCount,
+		CandidatesCount: e.CandidatesCount, FrozenCount: e.FrozenCount,
+		Rehydrated: e.Rehydrated, AtCompaction: e.AtCompaction, AddedLatencyMs: e.LatencyMillis,
+	}
+	a.rNext = (a.rNext + 1) % maxRecentCalls
+	if a.rFilled < maxRecentCalls {
+		a.rFilled++
+	}
+}
+
+// evictSessionsLocked drops the least-recently-seen session when at capacity.
+func (a *Aggregator) evictSessionsLocked() {
+	if len(a.sessions) < maxSessions {
+		return
+	}
+	var oldestID string
+	var oldestSeq int64 = 1<<63 - 1
+	for id, s := range a.sessions {
+		if s.lastSeq < oldestSeq {
+			oldestSeq, oldestID = s.lastSeq, id
+		}
+	}
+	delete(a.sessions, oldestID)
 }
 
 // inputRate resolves the input price for a model, falling back to DefaultCostKey, then 0.
@@ -94,63 +265,95 @@ func (a *Aggregator) inputRate(model string) float64 {
 	return 0
 }
 
-// Snapshot is a point-in-time, JSON-serializable view of the aggregated stats.
-type Snapshot struct {
-	Requests              int64   `json:"requests"`
-	TokensBefore          int64   `json:"tokens_before"`
-	TokensAfter           int64   `json:"tokens_after"`
-	TokensSaved           int64   `json:"tokens_saved"`
-	Ratio                 float64 `json:"reduction_ratio"` // tokens_saved / tokens_before (higher is more reduction; 0 = no savings)
-	CacheInjected         int64   `json:"cache_injected"`
-	Extracted             int64   `json:"extracted"`
-	StageErrors           int64   `json:"stage_errors"`
-	CostSavedUSD          float64 `json:"cost_saved_usd"`
-	AddedLatencyP50Millis int     `json:"added_latency_p50_ms"`
-	AddedLatencyP95Millis int     `json:"added_latency_p95_ms"`
+// SessionSnapshot is one conversation's aggregated metrics.
+type SessionSnapshot struct {
+	SessionID     string       `json:"session_id"`
+	Requests      int64        `json:"requests"`
+	TokensBefore  int64        `json:"tokens_before"`
+	TokensAfter   int64        `json:"tokens_after"`
+	TokensSaved   int64        `json:"tokens_saved"`
+	Ratio         float64      `json:"reduction_ratio"`
+	CacheInjected int64        `json:"cache_injected"`
+	Extracted     int64        `json:"extracted"`
+	StageErrors   int64        `json:"stage_errors"`
+	ReducedBlocks int64        `json:"reduced_blocks"`
+	Candidates    int64        `json:"extract_candidates"`
+	CostSavedUSD  float64      `json:"cost_saved_usd"`
+	ToolsTotal    int          `json:"tools_total"`
+	ToolDefTokens int          `json:"tool_def_tokens"`
+	Model         string       `json:"model"`
+	Surface       string       `json:"surface"`
+	Latency       LatencyStats `json:"latency"`
 }
 
-// Snapshot returns the current totals.
+// Snapshot is a point-in-time, JSON-serializable view of the aggregated stats: global
+// totals, a per-session breakdown, and the most recent per-call records.
+type Snapshot struct {
+	Requests      int64   `json:"requests"`
+	TokensBefore  int64   `json:"tokens_before"`
+	TokensAfter   int64   `json:"tokens_after"`
+	TokensSaved   int64   `json:"tokens_saved"`
+	Ratio         float64 `json:"reduction_ratio"` // tokens_saved / tokens_before (0 = no savings)
+	CacheInjected int64   `json:"cache_injected"`
+	Extracted     int64   `json:"extracted"`
+	StageErrors   int64   `json:"stage_errors"`
+	ReducedBlocks int64   `json:"reduced_blocks"`
+	Candidates    int64   `json:"extract_candidates"`
+	CostSavedUSD  float64 `json:"cost_saved_usd"`
+	Sessions      int     `json:"sessions"`
+
+	// Flat latency fields (kept for compatibility) + full distribution.
+	AddedLatencyP50Millis int          `json:"added_latency_p50_ms"`
+	AddedLatencyP95Millis int          `json:"added_latency_p95_ms"`
+	Latency               LatencyStats `json:"latency"`
+
+	SessionStats []SessionSnapshot `json:"session_stats,omitempty"`
+	RecentCalls  []CallRecord      `json:"recent_calls,omitempty"`
+}
+
+// Snapshot returns the current totals plus per-session and recent-call detail.
 func (a *Aggregator) Snapshot() Snapshot {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
+	lat := a.lat.stats()
 	s := Snapshot{
-		Requests:      a.requests,
-		TokensBefore:  a.tokensBefore,
-		TokensAfter:   a.tokensAfter,
-		TokensSaved:   a.tokensSaved,
-		CacheInjected: a.cacheInjected,
-		Extracted:     a.extracted,
-		StageErrors:   a.stageErrors,
-		CostSavedUSD:  a.costSavedUSD,
+		Requests: a.requests, TokensBefore: a.tokensBefore, TokensAfter: a.tokensAfter,
+		TokensSaved: a.tokensSaved, CacheInjected: a.cacheInjected, Extracted: a.extracted,
+		StageErrors: a.stageErrors, ReducedBlocks: a.reducedTotal, Candidates: a.candidates,
+		CostSavedUSD: a.costSavedUSD, Sessions: len(a.sessions),
+		AddedLatencyP50Millis: lat.P50Millis, AddedLatencyP95Millis: lat.P95Millis,
+		Latency: lat,
 	}
 	if a.tokensBefore > 0 {
-		// Fraction of input tokens removed: 0 = no savings, 0.9 = 90% reduced.
 		s.Ratio = float64(a.tokensSaved) / float64(a.tokensBefore)
 	}
-	s.AddedLatencyP50Millis = a.percentileLocked(0.50)
-	s.AddedLatencyP95Millis = a.percentileLocked(0.95)
-	return s
-}
 
-// percentileLocked computes the p-quantile of the retained latency samples. Caller
-// holds a.mu. Returns 0 when no samples have been recorded.
-func (a *Aggregator) percentileLocked(p float64) int {
-	if a.filled == 0 {
-		return 0
+	for id, sa := range a.sessions {
+		ss := SessionSnapshot{
+			SessionID: id, Requests: sa.requests, TokensBefore: sa.tokensBefore,
+			TokensAfter: sa.tokensAfter, TokensSaved: sa.tokensSaved,
+			CacheInjected: sa.cacheInjected, Extracted: sa.extracted, StageErrors: sa.stageErrors,
+			ReducedBlocks: sa.reducedTotal, Candidates: sa.candidates, CostSavedUSD: sa.costSavedUSD,
+			ToolsTotal: sa.toolsTotal, ToolDefTokens: sa.toolDefTokens,
+			Model: sa.lastModel, Surface: sa.lastSurface, Latency: sa.lat.stats(),
+		}
+		if sa.tokensBefore > 0 {
+			ss.Ratio = float64(sa.tokensSaved) / float64(sa.tokensBefore)
+		}
+		s.SessionStats = append(s.SessionStats, ss)
 	}
-	xs := make([]int, a.filled)
-	copy(xs, a.latency[:a.filled])
-	sort.Ints(xs)
-	// Nearest-rank: index = ceil(p*N)-1, clamped.
-	idx := int(p*float64(a.filled)+0.999999) - 1
-	if idx < 0 {
-		idx = 0
+	// Stable order: most recently active session first.
+	sort.Slice(s.SessionStats, func(i, j int) bool {
+		return a.sessions[s.SessionStats[i].SessionID].lastSeq > a.sessions[s.SessionStats[j].SessionID].lastSeq
+	})
+
+	// Recent calls in chronological order (oldest retained → newest).
+	for i := 0; i < a.rFilled; i++ {
+		idx := (a.rNext - a.rFilled + i + maxRecentCalls*2) % maxRecentCalls
+		s.RecentCalls = append(s.RecentCalls, a.recent[idx])
 	}
-	if idx >= a.filled {
-		idx = a.filled - 1
-	}
-	return xs[idx]
+	return s
 }
 
 // WriteJSON writes the current Snapshot as indented JSON.
@@ -169,9 +372,9 @@ func (a *Aggregator) Summary() string {
 // client (e.g. `lab-cx stats`) that holds only a decoded Snapshot.
 func SummaryOf(s Snapshot) string {
 	return fmt.Sprintf(
-		"requests=%d tokens %d→%d saved=%d (reduction=%.1f%%) cost_saved=$%.4f cache=%d extract=%d errors=%d latency p50=%dms p95=%dms",
-		s.Requests, s.TokensBefore, s.TokensAfter, s.TokensSaved, s.Ratio*100,
-		s.CostSavedUSD, s.CacheInjected, s.Extracted, s.StageErrors,
-		s.AddedLatencyP50Millis, s.AddedLatencyP95Millis,
+		"requests=%d sessions=%d tokens %d→%d saved=%d (reduction=%.1f%%) cost_saved=$%.4f cache=%d extract=%d reduced=%d errors=%d latency p50=%dms p95=%dms p99=%dms max=%dms",
+		s.Requests, s.Sessions, s.TokensBefore, s.TokensAfter, s.TokensSaved, s.Ratio*100,
+		s.CostSavedUSD, s.CacheInjected, s.Extracted, s.ReducedBlocks, s.StageErrors,
+		s.AddedLatencyP50Millis, s.AddedLatencyP95Millis, s.Latency.P99Millis, s.Latency.MaxMillis,
 	)
 }

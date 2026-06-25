@@ -26,7 +26,7 @@ docker compose -f compose.yaml -f .../deploy/eval-containers/compose.override.ya
   -y --abort-on-container-exit
 ```
 
-It adds a `winnow` service on the `internal` network, repoints the runner's
+It adds a `lab-cx` service on the `internal` network, repoints the runner's
 `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` / `GOOGLE_GEMINI_BASE_URL` at it, and sets
 `--upstream http://gateway:4000` so lab-cx forwards the full (prefixed) path on to the
 gateway. The agent still holds only `sk-proxy`; the real key stays in the gateway.
@@ -38,7 +38,7 @@ runner (agent) ──▶ gateway ──▶ lab-cx ──▶ provider
 ```
 
 lab-cx sees normalized (OpenAI-shaped) traffic. Point the gateway's `OPENAI_API_BASE`
-at lab-cx (`http://winnow:8080`) and put `winnow` on the `upstream` network, with
+at lab-cx (`http://lab-cx:8080`) and put `lab-cx` on the `upstream` network, with
 `--upstream` set to the real provider base.
 
 ## Notes

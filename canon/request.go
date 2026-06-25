@@ -8,7 +8,7 @@
 // (max_tokens, temperature, stream, metadata, ...) and per-block extensions
 // (cache_control). Keeping the whole object as decoded JSON preserves every field
 // across a decode→encode round-trip and lets stages add breakpoints freely — exactly
-// what the winnow prototype relied on. Typed helpers give ergonomic access to the
+// what the reference prototype relied on. Typed helpers give ergonomic access to the
 // parts stages actually touch (messages and content blocks).
 package canon
 
@@ -78,6 +78,17 @@ func (r Request) Messages() []map[string]any {
 		}
 	}
 	return out
+}
+
+// SetMessages replaces the message list. Compactors that rebuild the conversation
+// (summarize, truncate) write the new list back through this; block-level compactors
+// mutate the maps returned by Messages in place and need not call it.
+func (r Request) SetMessages(msgs []map[string]any) {
+	raw := make([]any, len(msgs))
+	for i, m := range msgs {
+		raw[i] = m
+	}
+	r.Root["messages"] = raw
 }
 
 // Blocks returns the content blocks of a message as a slice of maps. Anthropic

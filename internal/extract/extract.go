@@ -35,7 +35,7 @@ type Cfg struct {
 	AllowedStrategies []string
 }
 
-// DefaultCfg mirrors winnow's ExtractCfg defaults.
+// DefaultCfg mirrors the reference prototype's ExtractCfg defaults.
 func DefaultCfg() Cfg {
 	return Cfg{Mode: "auto", Floor: 3000, AllowDeterministic: true, MaxChars: sampleChars}
 }

@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"strings"
@@ -10,16 +9,11 @@ import (
 	"github.com/kagenti/lab-context-engineering/internal/extract"
 	"github.com/kagenti/lab-context-engineering/internal/markers"
 	"github.com/kagenti/lab-context-engineering/internal/reduce"
+	"github.com/kagenti/lab-context-engineering/internal/store"
 	"github.com/kagenti/lab-context-engineering/internal/tokens"
 )
 
 const goalTurns = 6 // recent turns whose text conditions extraction + keep-set
-
-// Model is the cheap-model client extraction calls. A host (the proxy, or a Kagenti
-// AuthBridge plugin) implements it; the engine has no model client of its own.
-type Model interface {
-	Complete(ctx context.Context, prompt string) (string, error)
-}
 
 // ExtractConfig configures cheap-model extraction (public mirror of the internal cfg).
 type ExtractConfig struct {
@@ -45,49 +39,85 @@ func (c ExtractConfig) internal() extract.Cfg {
 		AllowedStrategies: c.Strategies}
 }
 
-// EnableExtract turns on cheap-model extraction with the given model and config. It
-// builds the candidate→extraction→reversible-splice adapter and registers it; the
-// Extract stage then runs after Reduce. Fail-open per candidate. Settings that name
-// component selection (ExtractMode, ExtractStrategies) override cfg when set, so a
-// config file fully drives the run.
+// Extractor is the cheap-model extraction compactor. It does its OWN detection of large
+// structured tool outputs in the conversation (independent of the reduce pass), projects
+// each to a smaller faithful subset via the model, and splices it back with a reversible
+// recovery marker. Fail-open per candidate. Implements Compactor.
+type Extractor struct {
+	spec  ModelSpec
+	icfg  extract.Cfg
+	cache *extract.Cache
+}
+
+// NewExtractor builds the extract compactor with the given model spec + config.
+func NewExtractor(spec ModelSpec, cfg ExtractConfig) *Extractor {
+	return &Extractor{spec: spec, icfg: cfg.internal(), cache: extract.NewCache()}
+}
+
+func (*Extractor) Name() string            { return extractName }
+func (*Extractor) Enabled(c *Context) bool { return c.Settings.ExtractEnabled }
+
+func (x *Extractor) Compact(req canon.Request, agg *Report, c *Context) (canon.Request, error) {
+	model := x.spec.Resolve(c)
+	if model == nil {
+		return req, nil // no model available (e.g. incoming creds missing) — fail-open
+	}
+	opts := reduce.DefaultOpts()
+	opts.ProtectRecent = c.Settings.ProtectRecent
+	opts.ProtectRecentToolUses = c.Settings.ProtectRecentToolUses
+	opts.ProvableOnly = c.Settings.ProvableOnly
+	opts.ContextLimit = c.Settings.ContextLimit
+	opts.ReduceCachedPrefix = c.Settings.ReduceCachedPrefix
+	opts.CacheFloor = c.ClientCacheFloor
+	opts.LLMCompactFloor = c.Settings.LLMCompactFloor
+	opts.LLMCompactStructuredOnly = c.Settings.LLMCompactStructuredOnly
+
+	cands := reduce.SelectLLMCandidates(req, opts)
+	agg.Candidates = cands
+	goal := recentGoalText(req, goalTurns)
+	keep := extract.HarvestIdentifiers(goal, 60)
+	for _, cand := range cands {
+		func() {
+			defer func() { _ = recover() }() // fail-open per candidate
+			key := goalKey(extract.ContentKey(cand.Text), goal, keep)
+			result, ok := x.cache.Get(key)
+			if !ok {
+				var strat string
+				result, strat = extract.RunExtraction(c.GoCtx, cand.Text, goal, keep, cand.TokenEst, x.icfg, model)
+				if strat == "none" || result == "" {
+					return
+				}
+				x.cache.Put(key, result)
+			}
+			splice(req, cand, result, c.Store)
+		}()
+	}
+	return req, nil
+}
+
+// EnableExtract registers the extract compactor backed by a static model (config
+// source). Settings.ExtractMode / ExtractStrategies override cfg when set, so a config
+// file fully drives the run.
 func (e *Engine) EnableExtract(model Model, cfg ExtractConfig) {
+	e.EnableExtractSpec(ModelSpec{Static: model}, cfg)
+}
+
+// EnableExtractSpec registers the extract compactor with an explicit ModelSpec — use
+// ModelSpec{UseIncoming:true} to reuse the proxied request's own model + credentials.
+func (e *Engine) EnableExtractSpec(spec ModelSpec, cfg ExtractConfig) {
 	if e.settings.ExtractMode != "" {
 		cfg.Mode = e.settings.ExtractMode
 	}
 	if len(e.settings.ExtractStrategies) > 0 {
 		cfg.Strategies = e.settings.ExtractStrategies
 	}
-	icfg := cfg.internal()
-	cache := extract.NewCache()
 	e.settings.ExtractEnabled = true
-	e.extract = func(ctx context.Context, req canon.Request, cands []reduce.Candidate) error {
-		goal := recentGoalText(req, goalTurns)
-		keep := extract.HarvestIdentifiers(goal, 60)
-		for _, c := range cands {
-			func() {
-				defer func() { _ = recover() }() // fail-open per candidate
-				key := goalKey(extract.ContentKey(c.Text), goal, keep)
-				result, ok := cache.Get(key)
-				if !ok {
-					var strat string
-					result, strat = extract.RunExtraction(ctx, c.Text, goal, keep, c.TokenEst, icfg, model)
-					if strat == "none" || result == "" {
-						return
-					}
-					cache.Put(key, result)
-				}
-				e.splice(req, c, result)
-			}()
-		}
-		return nil
-	}
+	e.Register(extractName, NewExtractor(spec, cfg))
 }
 
 // goalKey makes the extraction cache goal-aware: the cache value is the FILTERED
-// result, which depends on the goal and keep-set, not just the body. Keying on body
-// alone would let the same tool output re-read under a different goal reuse the first
-// goal's filtered result. The key composites the body's content key with the goal and
-// the keep-set so a different goal is a cache miss.
+// result, which depends on the goal and keep-set, not just the body. The key composites
+// the body's content key with the goal and the keep-set so a different goal is a miss.
 func goalKey(contentKey, goal string, keep []string) string {
 	h := sha256.New()
 	h.Write([]byte(contentKey))
@@ -102,12 +132,12 @@ func goalKey(contentKey, goal string, keep []string) string {
 
 // splice replaces the candidate block with the extracted result plus a reversible
 // recovery marker (original stored), only if that is strictly smaller.
-func (e *Engine) splice(req canon.Request, c reduce.Candidate, result string) {
+func splice(req canon.Request, c reduce.Candidate, result string, st store.Rewind) {
 	block := blockAt(req, c.MsgIndex, c.BlockIndex)
 	if block == nil {
 		return
 	}
-	rid := e.store.Put(c.Text)
+	rid := st.Put(c.Text)
 	label := c.FilePath
 	if label == "" {
 		label = c.ToolName

@@ -3,10 +3,10 @@
 // containment validator here PROVES the result is a lossless projection of the
 // original, so a chatty model can never corrupt a value the agent relies on. On any
 // failure it falls back to a deterministic projection, then to the original
-// (fail-open). Ported from winnow's actions/llm_compact.py.
+// (fail-open). Ported from the reference prototype's actions/llm_compact.py.
 //
 // ponytail: the model returns the selected JSON directly and containment verifies it —
-// no model-generated code (winnow's Python sandbox) and no custom spec language. The
+// no model-generated code (the reference prototype's Python sandbox) and no custom spec language. The
 // containment proof is what makes the mechanism safe, whatever produced the subset.
 package extract
 

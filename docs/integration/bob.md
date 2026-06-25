@@ -8,7 +8,7 @@ unlike Claude Code lab-cx's cache-injection lever fires on every request.
 ## Setup
 
 ```sh
-# Bob's API key (here from winnow/.env: BOBSHELL_API_KEY=bob_...)
+# Bob's API key (here from ../winnow/.env: BOBSHELL_API_KEY=bob_...)
 export BOBSHELL_API_KEY=...
 
 # Start lab-cx: agent upstream = Bob's backend; cheap-model extractor = your gateway.

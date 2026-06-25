@@ -6,9 +6,9 @@ import (
 )
 
 // Tool-name taxonomy covering common coding agents (Claude Code, Cursor, Aider,
-// Cline, Continue, Codex). Ported from winnow's taxonomy.py.
+// Cline, Continue, Codex). Ported from the reference prototype's taxonomy.py.
 //
-// ponytail: defaults only; WINNOW_TOOLS-style env overrides land with the config
+// ponytail: defaults only; LABCX_TOOLS-style env overrides land with the config
 // package rather than being re-parsed here.
 var (
 	readTools = set(

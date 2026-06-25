@@ -51,8 +51,9 @@ cheap-model extractor enabled, forwarding all traffic to an upstream gateway:
 `proxy` flags: `--addr` (default `:8080`), `--preset`
 (`safe|balanced|aggressive|cache|coding|mcp`), `--config` (a YAML file that names which
 components run, overrides `--preset`), `--upstream` (forward ALL requests here; default
-routes by provider), `--extract-model/-provider/-auth/-base` (enable + configure the
-cheap-model extractor; these override the config's transport block), `--max-body-bytes`
+routes by provider), `--extract-model/-provider/-auth/-base` and
+`--summarize-model/-provider/-auth/-base` (enable + configure the cheap-model extractor /
+summarizer; these override the config's transport block), `--max-body-bytes`
 (default 32 MiB; `0` = no cap), `--upstream-timeout` (default `0s` = none; a non-zero
 value caps the whole request and can truncate long SSE streams).
 
@@ -67,14 +68,14 @@ Endpoints the proxy serves:
 
 - `GET /stats` — process-wide reduction snapshot as JSON (tokens before/after/saved,
   cache injected, extracted, stage errors, added-latency p50/p95).
-- `GET /winnow/expand?id=<marker-id>` — returns the original bytes behind a reversibility
+- `GET /labcx/expand?id=<marker-id>` — returns the original bytes behind a reversibility
   marker.
 - `GET /health`, `GET /ready` — liveness/readiness.
 
 Bypass / disable:
 
-- `WINNOW_DISABLE=1` env var — run the proxy as a transparent passthrough.
-- `x-winnow-bypass: true` request header — skip reduction for that single request.
+- `LABCX_DISABLE=1` env var — run the proxy as a transparent passthrough.
+- `x-labcx-bypass: true` request header — skip reduction for that single request.
 
 ## Components
 
@@ -89,23 +90,33 @@ Bypass / disable:
   tool/MCP output; accepted only if **structurally contained** in the original. Strategies
   `code` (model writes a filter run in a **Starlark sandbox** over the full body), `single`
   (one-shot JSON-return filter), `rlm` (chunked), and a `deterministic` fallback.
+- **Summarize** (cheap model, opt-in) — replaces older turns with one factual
+  `<summary>` (ReSum-style prompt), keeping the last `keep_last` messages verbatim; the
+  dropped span is stored and recoverable.
+- **Truncate** (no model, opt-in) — the naive baseline: keep the last `keep_last`
+  messages, drop the rest behind one recoverable note. The control to measure smarter
+  compactors against.
 - **Tokenizer** — real BPE token counts via tiktoken `o200k_base` (`internal/tokens`); the
   same counter gates every reduction (a component never inflates an output).
 - **Reversibility** — namespaced markers + a content-addressed rewind store; recover via
-  `engine.FindMarkers` + `engine.Expand`, or the `/winnow/expand` endpoint.
+  `engine.FindMarkers` + `engine.Expand`, or the `/labcx/expand` endpoint.
 - **Observability** — OpenTelemetry GenAI semantic conventions (`gen_ai.*`) plus the live
   `/stats` aggregate.
 
 ## Config
 
-The example config is [`configs/lab-cx.yaml`](configs/lab-cx.yaml). It folds onto a base
-`preset`, then selects which stages/reducers/encoders/extract-strategies run, **purely by
-name**. Extension path — no core edit beyond one registration:
+Every compaction approach — `reduce`, `extract`, `summarize`, `truncate`, `cache` —
+implements one interface, `engine.Compactor` (given the conversation, return the
+transformed conversation). The `compactors:` list selects which run and in what order.
 
-1. **Add** a new encoder/reducer/extract-strategy/stage, and **register by name** in its
-   registry (encoders in `internal/reduce/actions.go`, reducers via
-   `reduce.RegisterReducer`, strategies in `internal/extract` `RunExtraction`, stages in
-   `engine` `builtinStages`).
+The example config is [`configs/lab-cx.yaml`](configs/lab-cx.yaml). It folds onto a base
+`preset`, then selects which compactors/reducers/encoders/extract-strategies run, **purely
+by name**. Extension path — no core edit beyond one registration:
+
+1. **Add** a new encoder/reducer/extract-strategy/compactor, and **register by name** in
+   its registry (encoders in `internal/reduce/actions.go`, reducers via
+   `reduce.RegisterReducer`, strategies in `internal/extract` `RunExtraction`, compactors
+   via `engine.(*Engine).Register`).
 2. **List it by name** in the matching list in `configs/lab-cx.yaml` (an empty/omitted list
    means "all built-in defaults"; list order sets priority/run order).
 
@@ -149,7 +160,7 @@ end-to-end **SWE-bench** run is a **documented runbook, not yet executed**
 ```
 cmd/proxy/        the lab-cx binary (proxy | stats | version)
 cmd/labcx-bench/  offline + --extract measurement harness
-engine/           Engine: Transform / Expand, stage orchestration (builtinStages)
+engine/           Engine: Transform / Expand, Compactor pipeline (builtinCompactors)
 surfaces/         anthropic | openai | gemini  wire <-> canonical request
 config/           Settings + presets, YAML config loader
 canon/            canonical request type

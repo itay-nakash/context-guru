@@ -9,7 +9,7 @@
   same counter the engine uses to gate reductions. Counts are real BPE token counts, not
   a chars/4 estimate.
 - **Fixtures:** 10 real tool outputs committed under `testdata/fixtures/` (rtk command
-  outputs + winnow structured tool outputs). Provenance for every file is in
+  outputs + reference-prototype structured tool outputs). Provenance for every file is in
   `testdata/fixtures/README.md`.
 
 ## Reproduce

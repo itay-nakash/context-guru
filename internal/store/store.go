@@ -5,7 +5,7 @@
 // The default Rewind implementation is in-memory — correct for a single proxy or
 // sidecar process. A Redis/SQLite-backed implementation can satisfy the same
 // interface later for multi-replica recovery (the plan's deferred option).
-// Ported from winnow's rewind.py / session.py.
+// Ported from the reference prototype's rewind.py / session.py.
 package store
 
 import (
