@@ -13,12 +13,39 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/kagenti/lab-context-engineering/engine"
 	"github.com/kagenti/lab-context-engineering/observability"
 	"github.com/kagenti/lab-context-engineering/surfaces"
 )
+
+// Mode is the proxy's process-wide runtime reduction mode, settable without a
+// restart via POST /labcx/mode. It is the new-stack equivalent of the old
+// CE-Manager activation: a KV-pressure monitor flips it on/off live.
+type Mode string
+
+const (
+	ModeOn            Mode = "on"            // reduce with the startup-configured method
+	ModeOff           Mode = "off"           // bypass: forward the original request untouched
+	ModeDeterministic Mode = "deterministic" // reserved; currently behaves like ModeOn
+)
+
+// ParseMode validates a mode string (case/space-insensitive). ok=false for anything
+// outside the enum, so callers can reject it with HTTP 400.
+func ParseMode(s string) (Mode, bool) {
+	switch Mode(strings.ToLower(strings.TrimSpace(s))) {
+	case ModeOn:
+		return ModeOn, true
+	case ModeOff:
+		return ModeOff, true
+	case ModeDeterministic:
+		return ModeDeterministic, true
+	default:
+		return "", false
+	}
+}
 
 // Config configures the proxy handler.
 type Config struct {
@@ -47,10 +74,15 @@ type Config struct {
 	// "no per-request model" (those compactors then no-op). The host (proxy binary)
 	// supplies this so cheapmodel construction stays out of this package.
 	BuildRequestModel func(surfaceName, model, base string, h http.Header) engine.Model
+	// InitialMode is the reduction mode at startup (on|off|deterministic). Empty or
+	// invalid defaults to ModeOn, preserving the always-reduce default. Settable at
+	// runtime via POST /labcx/mode.
+	InitialMode Mode
 }
 
 type proxy struct {
-	cfg Config
+	cfg  Config
+	mode atomic.Value // holds Mode; runtime-settable via POST /labcx/mode
 }
 
 // New returns the proxy http.Handler. Routing is by path SUFFIX so it works both for
@@ -74,7 +106,13 @@ func New(cfg Config) http.Handler {
 	if cfg.Emitter == nil {
 		cfg.Emitter = observability.Nop{}
 	}
-	return &proxy{cfg: cfg}
+	p := &proxy{cfg: cfg}
+	initial := cfg.InitialMode
+	if _, ok := ParseMode(string(initial)); !ok {
+		initial = ModeOn
+	}
+	p.mode.Store(initial)
+	return p
 }
 
 func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -84,6 +122,8 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.ok(w, r)
 	case path == "/labcx/expand":
 		p.expand(w, r)
+	case path == "/labcx/mode":
+		p.modeControl(w, r)
 	case path == "/stats":
 		p.stats(w, r)
 	case strings.HasSuffix(path, "/v1/messages"):
@@ -119,6 +159,46 @@ func (p *proxy) expand(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.WriteString(w, original)
 }
 
+// currentMode returns the live reduction mode (defaults to ModeOn if unset).
+func (p *proxy) currentMode() Mode {
+	if m, ok := p.mode.Load().(Mode); ok {
+		return m
+	}
+	return ModeOn
+}
+
+// modeControl gets or sets the process-wide reduction mode at runtime — no restart.
+// GET → {"mode":"<current>"}. POST/PUT reads {"mode":"on|off|deterministic"} (or the
+// ?mode= query) and stores it; an unknown value is rejected with HTTP 400. This is the
+// switch a KV-pressure monitor flips to activate/deactivate context engineering live.
+func (p *proxy) modeControl(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		// fall through and report the current mode
+	case http.MethodPost, http.MethodPut:
+		want := r.URL.Query().Get("mode")
+		if want == "" {
+			var body struct {
+				Mode string `json:"mode"`
+			}
+			if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body); err == nil {
+				want = body.Mode
+			}
+		}
+		m, ok := ParseMode(want)
+		if !ok {
+			http.Error(w, "invalid mode (want on|off|deterministic)", http.StatusBadRequest)
+			return
+		}
+		p.mode.Store(m)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"mode": string(p.currentMode())})
+}
+
 // upstreamBase returns the base URL to forward to: the configured single upstream,
 // or the provider default.
 func (p *proxy) upstreamBase(providerDefault string) string {
@@ -135,9 +215,10 @@ func (p *proxy) model(surface surfaces.Surface, providerDefault string) http.Han
 		if err != nil {
 			return // readBody already wrote the response
 		}
-		// Reduce unless bypassed or the surface can't map this format.
+		// Reduce unless bypassed (per-request header or process-wide mode=off) or the
+		// surface can't map this format.
 		outBody := body
-		if !bypassed(r) {
+		if !bypassed(r) && p.currentMode() != ModeOff {
 			start := time.Now()
 			ctx := r.Context()
 			if p.cfg.BuildRequestModel != nil {

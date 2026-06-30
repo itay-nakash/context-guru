@@ -42,6 +42,9 @@ Flags:
               --extract-model/-provider/-auth/-base still override the file's transport.
   --upstream  forward ALL requests here (e.g. an eval gateway); default routes by
               provider (api.anthropic.com / api.openai.com)
+  --mode      initial reduction mode: on|off|deterministic (default on). Settable at
+              runtime without a restart: POST /labcx/mode {"mode":"off"} (GET reads it).
+              off = transparent passthrough; deterministic is reserved (behaves like on).
   --max-body-bytes  cap request body size in bytes (default 33554432 = 32 MiB);
                     0 means no cap
   --upstream-timeout  max total time per upstream request (e.g. 30s; default 0s = no
@@ -77,6 +80,7 @@ func runProxy(args []string) {
 	preset := fs.String("preset", "balanced", "settings preset")
 	configPath := fs.String("config", "", "path to a YAML config file (overrides --preset; see configs/lab-cx.yaml)")
 	upstream := fs.String("upstream", "", "forward all requests to this base URL")
+	mode := fs.String("mode", "on", "initial reduction mode: on|off|deterministic (runtime-settable via POST /labcx/mode)")
 	extractModel := fs.String("extract-model", "", "enable cheap-model extraction with this model (e.g. claude-haiku-4-5)")
 	extractProvider := fs.String("extract-provider", "anthropic", "extraction model provider: anthropic|openai")
 	extractBase := fs.String("extract-base", "", "base URL for the extraction model (default per provider)")
@@ -93,6 +97,12 @@ func runProxy(args []string) {
 	upstreamTimeoutDur, err := time.ParseDuration(*upstreamTimeout)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "lab-cx: invalid --upstream-timeout %q: %v\n", *upstreamTimeout, err)
+		os.Exit(2)
+	}
+
+	initialMode, ok := proxyhttp.ParseMode(*mode)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "lab-cx: invalid --mode %q (want on|off|deterministic)\n", *mode)
 		os.Exit(2)
 	}
 
@@ -195,6 +205,7 @@ func runProxy(args []string) {
 		Aggregator:      agg,
 		MaxBodyBytes:    *maxBodyBytes,
 		UpstreamTimeout: upstreamTimeoutDur,
+		InitialMode:     initialMode,
 	}
 	if useIncoming {
 		// A compactor reuses the proxied request's own model + credentials: build a
