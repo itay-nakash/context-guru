@@ -80,6 +80,93 @@ func TestBypassForwardsOriginal(t *testing.T) {
 	}
 }
 
+// TestRuntimeModeToggle: POST /labcx/mode flips reduction on/off without a restart.
+// mode=off → forward the original untouched; mode=on → reduce again. Bad value → 400.
+func TestRuntimeModeToggle(t *testing.T) {
+	var upstreamGot string
+	up := captureUpstream(t, &upstreamGot)
+	defer up.Close()
+	h := newProxy(t, up.URL)
+
+	big := strings.Repeat("a.go long file content line for the read result here\\n", 12)
+	body := `{"messages":[
+		{"role":"assistant","content":[{"type":"tool_use","id":"u1","name":"read","input":{"file_path":"a.go"}}]},
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"u1","content":"` + big + `"}]},
+		{"role":"assistant","content":[{"type":"tool_use","id":"u2","name":"edit","input":{"file_path":"a.go"}}]},
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"u2","content":"success: edited"}]},
+		{"role":"user","content":[{"type":"text","text":"thanks"}]}
+	]}`
+
+	post := func(payload string) string {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/labcx/mode", strings.NewReader(payload))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("POST /labcx/mode %s = %d", payload, rec.Code)
+		}
+		var got struct{ Mode string }
+		_ = json.Unmarshal(rec.Body.Bytes(), &got)
+		return got.Mode
+	}
+
+	// Default is "on": a reduce-eligible request gets reduced.
+	{
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if len(upstreamGot) >= len(body) {
+			t.Fatalf("default mode should reduce: got %d, original %d", len(upstreamGot), len(body))
+		}
+	}
+
+	// Flip to off → the next request is forwarded verbatim.
+	if m := post(`{"mode":"off"}`); m != "off" {
+		t.Fatalf("mode after off = %q", m)
+	}
+	upstreamGot = ""
+	{
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if upstreamGot != body {
+			t.Fatalf("mode=off should forward original verbatim:\n got: %s\nwant: %s", upstreamGot, body)
+		}
+	}
+
+	// Flip back to on → reduction resumes.
+	if m := post(`{"mode":"on"}`); m != "on" {
+		t.Fatalf("mode after on = %q", m)
+	}
+	upstreamGot = ""
+	{
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if len(upstreamGot) >= len(body) {
+			t.Fatalf("mode=on should reduce again: got %d, original %d", len(upstreamGot), len(body))
+		}
+	}
+
+	// Unknown value → 400, mode unchanged.
+	req := httptest.NewRequest(http.MethodPost, "/labcx/mode", strings.NewReader(`{"mode":"bogus"}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad mode should be 400, got %d", rec.Code)
+	}
+
+	// GET reports the current mode.
+	greq := httptest.NewRequest(http.MethodGet, "/labcx/mode", nil)
+	grec := httptest.NewRecorder()
+	h.ServeHTTP(grec, greq)
+	var got struct{ Mode string }
+	_ = json.Unmarshal(grec.Body.Bytes(), &got)
+	if got.Mode != "on" {
+		t.Fatalf("GET mode = %q, want on", got.Mode)
+	}
+}
+
 func TestPassthroughForwardsUnknownPaths(t *testing.T) {
 	var upstreamGot string
 	up := captureUpstream(t, &upstreamGot)
