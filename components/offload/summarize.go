@@ -79,7 +79,9 @@ func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 		return nil, nil
 	}
 
-	summary, err := s.summarize(c.Ctx, model, span)
+	ctx, cancel := context.WithTimeout(c.Ctx, llmCallTimeout)
+	defer cancel()
+	summary, err := s.summarize(ctx, model, span)
 	if err != nil {
 		return nil, err // fail-open: the pipeline reverts this component
 	}

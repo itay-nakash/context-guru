@@ -1,7 +1,9 @@
 package offload
 
 import (
+	"context"
 	"strings"
+	"time"
 
 	"github.com/kagenti/context-guru/components"
 	"github.com/kagenti/context-guru/expand"
@@ -10,6 +12,10 @@ import (
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"gopkg.in/yaml.v3"
 )
+
+// llmCallTimeout bounds a single in-request model call so a slow/hung model
+// fails open (the component falls back / reverts) instead of stalling the agent.
+const llmCallTimeout = 30 * time.Second
 
 func init() { components.Register("extract", newExtract) }
 
@@ -108,7 +114,10 @@ func (e *Extract) reduce(c *components.Ctx, content, goal string, keepIDs []stri
 		cfg := extract.DefaultCfg()
 		cfg.Mode = "code" // rlm is deferred → use the Starlark code strategy
 		cfg.Floor = e.minTokens
-		if res, _ := extract.RunExtraction(c.Ctx, content, goal, keepIDs, schema.TextTokens(content), cfg, model); res != "" && res != content {
+		ctx, cancel := context.WithTimeout(c.Ctx, llmCallTimeout)
+		res, _ := extract.RunExtraction(ctx, content, goal, keepIDs, schema.TextTokens(content), cfg, model)
+		cancel()
+		if res != "" && res != content {
 			return res, true
 		}
 	}
