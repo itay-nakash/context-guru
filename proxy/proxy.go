@@ -21,10 +21,12 @@ import (
 	"github.com/kagenti/context-guru/apply"
 	"github.com/kagenti/context-guru/components"
 	"github.com/kagenti/context-guru/expand"
+	"github.com/kagenti/context-guru/internal/cheapmodel"
 	"github.com/kagenti/context-guru/metrics"
 	"github.com/kagenti/context-guru/schema"
 	"github.com/kagenti/context-guru/store"
 	bschemas "github.com/maximhq/bifrost/core/schemas"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -43,6 +45,10 @@ type Options struct {
 	// uses this to pin every call to EVAL_MODEL regardless of what the agent asked for.
 	ForceModel string
 	Client     *http.Client
+	// CheapModel is the static "config"-source LLM client for NeedsModel
+	// components (nil = none). The "incoming"-source client is built per request
+	// from the route's upstream + the gateway's real key.
+	CheapModel components.Model
 }
 
 // upstream binds a provider to its base URL, the canonical provider path to POST
@@ -105,6 +111,45 @@ func headerKey(name, key string) func(http.Header) {
 	return func(h http.Header) { h.Set(name, key) }
 }
 
+// incomingModel builds an LLM client that reuses the proxied request's own model
+// and the route's upstream + credential, so a NeedsModel component can call the
+// same backend the request targets. Prefers the gateway's injected key (gateway
+// mode); falls back to the client's own auth header (pass-through). Returns nil
+// when no upstream/model/key is resolvable, and the component degrades.
+func (h *Handler) incomingModel(provider bschemas.ModelProvider, up upstream, body []byte, r *http.Request) components.Model {
+	if up.base == "" {
+		return nil
+	}
+	model := gjson.GetBytes(body, "model").String()
+	if model == "" {
+		return nil
+	}
+	switch provider {
+	case bschemas.Anthropic:
+		key := h.opts.AnthropicKey
+		if key == "" {
+			key = r.Header.Get("x-api-key")
+		}
+		if key == "" {
+			key = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		}
+		if key == "" {
+			return nil
+		}
+		return cheapmodel.Anthropic{BaseURL: up.base, Model: model, APIKey: key, Client: h.client}
+	case bschemas.OpenAI:
+		key := h.opts.OpenAIKey
+		if key == "" {
+			key = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		}
+		if key == "" {
+			return nil
+		}
+		return cheapmodel.OpenAI{BaseURL: up.base, Model: model, APIKey: key, Client: h.client}
+	}
+	return nil
+}
+
 func (h *Handler) chat(provider bschemas.ModelProvider, up upstream) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
@@ -118,11 +163,19 @@ func (h *Handler) chat(provider bschemas.ModelProvider, up upstream) http.Handle
 				body = out
 			}
 		}
-		// Rewrite the messages via the shared apply path; fail open.
-		body, _ = apply.Body(
+		// Rewrite the messages via the shared apply path; fail open. Supply the
+		// LLM clients NeedsModel components may call: the per-request "incoming"
+		// model (the route's upstream + the gateway's real key + the request's
+		// model) and the static "config" cheap model.
+		models := components.ModelSpec{
+			Incoming: h.incomingModel(provider, up, body, r),
+			Static:   h.opts.CheapModel,
+		}
+		body, _ = apply.BodyWithModel(
 			r.Context(), h.pipe, h.store, provider, body,
 			r.Header.Get("x-context-guru-session"),
 			strings.EqualFold(r.Header.Get("x-context-guru-bypass"), "true"),
+			models,
 		)
 		h.serve(w, r, provider, up, body)
 	}

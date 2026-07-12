@@ -26,6 +26,10 @@ const SessionContextKey bschemas.BifrostContextKey = "context-guru-session"
 type Plugin struct {
 	pipe  *components.Pipeline
 	store store.Store
+	// CheapModel is the static "config"-source LLM for NeedsModel components. The
+	// bifrost host has no usable "incoming" client (the agent's key is a
+	// placeholder), so only the static source is offered here. Optional.
+	CheapModel components.Model
 }
 
 // New builds the adapter from an already-constructed pipeline and store.
@@ -48,6 +52,7 @@ func (p *Plugin) PreRequestHook(ctx *bschemas.BifrostContext, req *bschemas.Bifr
 		Ctx:     ctx,
 		Session: p.resolveSession(ctx, chat),
 		Store:   p.store,
+		Model:   components.ModelSpec{Static: p.CheapModel},
 		Bypass:  bypassed(ctx),
 	}
 	p.pipe.Run(chat, c)

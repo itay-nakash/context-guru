@@ -26,6 +26,7 @@ require (
 	github.com/tidwall/sjson v1.2.5
 	github.com/tiktoken-go/tokenizer v0.7.0
 	github.com/tree-sitter/go-tree-sitter v0.25.0
+	go.starlark.net v0.0.0-20260708150628-5395d018f003
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -38,7 +39,6 @@ require (
 	github.com/bytedance/sonic/loader v0.5.1 // indirect
 	github.com/cloudwego/base64x v0.1.6 // indirect
 	github.com/dlclark/regexp2 v1.11.5 // indirect
-	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/invopop/jsonschema v0.13.0 // indirect
 	github.com/klauspost/compress v1.18.6 // indirect

@@ -205,3 +205,26 @@ store: { ttl_seconds: 1800, max_entries: 1000 }
 A component registers its constructor + config type via `init()`; adding one makes it
 YAML-configurable with no core edit. See [components.md](components.md) for presets and every
 component's config.
+
+## LLM components
+
+Most components are deterministic. Two call an LLM: `extract` (`strategy: code`/`rlm`, a Starlark
+filter run in a sandbox) and `summarize` (whole-transcript summary). They implement `NeedsModel` and
+call `Ctx.Model` — a `ModelSpec` the host resolves per request:
+
+```mermaid
+flowchart LR
+  cfg["component config<br/>model.source"] --> res{"ModelSpec.For(source)"}
+  res -->|incoming| inc["Incoming: request's own<br/>model + upstream + key<br/>(built in proxy.chat)"]
+  res -->|config| stat["Static: cheap model<br/>(CHEAP_MODEL* env)"]
+  res -->|nil| deg["degrade: extract→deterministic,<br/>summarize→no-op"]
+  inc --> call["Model.Complete(ctx, prompt)"]
+  stat --> call
+```
+
+- **`incoming`** (default) reuses the proxied request's model + the gateway's key — zero extra config,
+  works through the eval-containers gateway. **`config`** uses a dedicated cheap model (`internal/cheapmodel`
+  Anthropic/OpenAI). The AuthBridge host offers only `config` (its incoming key is a placeholder).
+- The call is synchronous in the request path, so it's bounded (short timeout, retry) and **fail-open**:
+  any error reverts the component (pipeline guarantee), and a missing model degrades gracefully.
+- Reversibility is unchanged — the LLM output is still stashed under a `<<cg:HASH>>` marker for `expand`.

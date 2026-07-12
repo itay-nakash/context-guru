@@ -16,14 +16,21 @@ messages (`role:"tool"`; for Anthropic, `tool_result` blocks normalized to that 
 | `collapse` | Offload | middle of an oversized output | via expand | any large tool output (fallback) | `max_tokens` (2000), `head_lines` (20), `tail_lines` (20) |
 | `failed_run` | Offload | earlier superseded test/build runs | via expand | ≥2 run-like outputs | `min_tokens` (100) |
 | `cmdfilter` | Offload | lines per declarative DSL filter | via expand | output matching a filter | `filters` ([]), `disable_builtins` (false) |
-| `extract` | Offload | query-irrelevant lines | via expand | large output + a recent query | `min_tokens` (300), `head_lines`/`tail_lines` (5), `strategy` (deterministic) |
+| `extract` | Offload | query-irrelevant lines (or an LLM-written filter) | via expand | large output + a recent query | `min_tokens` (300), `head_lines`/`tail_lines` (5), `strategy` (deterministic\|code\|rlm), `model.source` |
 | `smartcrush` | Offload | middle items of a JSON array | via expand | JSON-array tool output | `min_items` (5), `min_tokens` (200), `keep_first` (3), `keep_last` (2) |
 | `mask` | Offload | older tool outputs (age-based) | via expand | more than `keep_recent` outputs | `keep_recent` (3), `min_tokens` (100) |
 | `phi_evict` | Offload | lowest-scoring outputs over budget | via expand | transcript over `budget_tokens` | `budget_tokens` (120000), `weights` (balanced) |
+| `summarize` | Offload (LLM) | the middle of the transcript → one summary | via expand | long trajectories | `summary_level` (regular), `keep_last` (3), `start_from_message` (6), `min_tokens` (500), `model.source` |
 
 Presets (`config`): `off` `[]` · `safe` `[format, cacheinject]` · `balanced`
 `[format, dedup, failed_run, cmdfilter, cacheinject]` · `aggressive` adds `smartcrush, extract` ·
-`coding` `[format, skeleton, cmdfilter, cacheinject]` · `mcp` `[format, smartcrush, cacheinject]`.
+`coding` `[format, skeleton, cmdfilter, cacheinject]` · `mcp` `[format, smartcrush, cacheinject]` ·
+`summarize` `[summarize]` (run alone — it restructures the whole transcript).
+
+**LLM-based components** (`extract` with `strategy: code`/`rlm`, and `summarize`) call a model, chosen by
+`model.source`: `incoming` (default — reuse the proxied request's own model + key) or `config` (a dedicated
+cheap model set via `CHEAP_MODEL*` env / the gateway's `CheapModel`). When no model is available they
+degrade — `extract` to its deterministic projection, `summarize` to a no-op. See [design.md](design.md#llm-components).
 
 Common gates every Offload respects: skip non-text (`Rewritable`) messages, skip content already
 carrying a marker (no double-offload), and skip if the rewrite (marker + hint included) isn't
@@ -156,10 +163,13 @@ after:   <head> … lines mentioning auth/timeout + any error lines … <tail>
 ```
 
 - **Config:** `min_tokens` (300), `head_lines`/`tail_lines` (5), `strategy`
-  (`deterministic` | `code` | `rlm`). `NeedsModel()` is true for `code`/`rlm`, but the cheap-LLM
-  client isn't wired yet — those select-and-fall-back to deterministic. **Shines:** big
-  query-focused MCP/API outputs. **Inert:** no user query to score against, output < `min_tokens`,
-  projection not smaller.
+  (`deterministic` | `code` | `rlm`), `model.source`. With `code`, a cheap LLM writes a Starlark
+  `extract_relevant_data`-style filter (`data = json.decode(INPUT)` → `OUTPUT = json.encode(...)`)
+  run in a sandbox (no imports/IO, step + 2s limits); the result is accepted only if a **containment**
+  check proves it's a lossless subset (else fall back to deterministic). `rlm` currently maps to
+  `code`. **Shines:** big query-focused MCP/API outputs; `code` shines on structured JSON where a
+  filter can select records precisely. **Inert:** no user query, output < `min_tokens`, projection
+  not smaller, or (for `code`) no model available → deterministic.
 
 ### `smartcrush`
 Statistical JSON-**array** compressor: parse the array, keep `keep_first` + `keep_last` items plus
@@ -200,6 +210,24 @@ $$\Phi = w_R\cdot\text{relevance} + w_H\cdot\text{recency} - w_C\cdot\text{cost}
 - **Shines:** very long transcripts that must fit a context budget. **Inert:** total tool tokens ≤
   budget, or ≤1 tool output. The scalar-ranking essence of lean-ctx's Context Field (the full
   heat-diffusion/MMR/bandit machinery is a documented refinement).
+
+### `summarize` (LLM)
+Compresses the **middle of the trajectory** into one LLM-written summary (ported from CE-Manager's
+ReSum-style summarizer). Restructures the message list to `[msg0, <summary system message>, last-K]`;
+the replaced span is stashed under a marker carried in the summary message, so `expand` restores the
+full earlier trajectory. This is the one component that changes the message count — `apply.Body`
+rebuilds the body keeping the retained messages byte-identical.
+
+```
+before:  [system, u1, tool, a1, tool, u2, … 30 turns …, uN-1, uN]
+after:   [system, "=== History Summary === … <summary> … <<cg:…>>", uN-1, uN]
+```
+
+- **Config:** `summary_level` (`concise`|`regular`|`highly_detailed`), `keep_last` (3),
+  `start_from_message` (6 — no-op until the list is this long), `min_tokens` (500), `include_tool_calls`
+  (false → tool outputs masked in the trajectory), `model.source`. **Shines:** long agentic sessions
+  where the bulk is stale middle context. **Inert:** short transcripts, span below `min_tokens`, or no
+  model available (no-op). Run it **alone** (its own preset) — it restructures the whole transcript.
 
 ---
 

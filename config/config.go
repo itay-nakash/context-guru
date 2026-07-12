@@ -78,6 +78,9 @@ var presets = map[string][]string{
 	"aggressive": {"format", "dedup", "failed_run", "cmdfilter", "smartcrush", "extract", "cacheinject"},
 	"coding":     {"format", "skeleton", "cmdfilter", "cacheinject"},
 	"mcp":        {"format", "smartcrush", "cacheinject"},
+	// summarize restructures the whole transcript (changes the message count) — run
+	// it alone so no other component's in-place edits race apply's rebuild.
+	"summarize": {"summarize"},
 }
 
 // Build constructs the ordered pipeline from the config, wiring each named

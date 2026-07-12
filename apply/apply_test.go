@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/kagenti/context-guru/apply"
+	"github.com/kagenti/context-guru/components"
 	_ "github.com/kagenti/context-guru/components/all"
 	"github.com/kagenti/context-guru/config"
 	"github.com/kagenti/context-guru/store"
@@ -203,6 +204,56 @@ func TestAnthropicStructuredToolResultUntouched(t *testing.T) {
 	}
 	if gjson.GetBytes(out, "messages.1.content.0.content.1.source.data").String() != "AAAA" {
 		t.Fatalf("structured tool_result content was corrupted: %s", out)
+	}
+}
+
+type stubModel struct{ resp string }
+
+func (m stubModel) Complete(context.Context, string) (string, error) { return m.resp, nil }
+
+// TestSummarizeCountChangeLossless: summarize restructures [system,u1,tool,final]
+// into [system, <summary>, final]; apply must keep the retained messages and all
+// non-message fields byte-identical while the count drops.
+func TestSummarizeCountChangeLossless(t *testing.T) {
+	cfg := pipe(t, "pipeline: [summarize]\ncomponents:\n  summarize: {keep_last: 1, start_from_message: 0, min_tokens: 1}\n")
+	p, _ := cfg.Build(nil)
+	st := store.NewMemory(store.Options{})
+
+	body, _ := json.Marshal(map[string]any{
+		"model":       "gpt-x",
+		"temperature": 0.3,
+		"messages": []map[string]any{
+			{"role": "system", "content": "you are helpful"},
+			{"role": "user", "content": "do the task"},
+			{"role": "tool", "tool_call_id": "a", "content": strings.Repeat("verbose tool output\n", 50)},
+			{"role": "user", "content": "the final question"},
+		},
+	})
+
+	out, changed := apply.BodyWithModel(context.Background(), p, st, bschemas.OpenAI, body, "", false,
+		components.ModelSpec{Incoming: stubModel{resp: "essential facts"}})
+	if !changed {
+		t.Fatal("summarize should have restructured the transcript")
+	}
+	if n := gjson.GetBytes(out, "messages.#").Int(); n != 3 {
+		t.Fatalf("expected 3 messages after summarize, got %d: %s", n, out)
+	}
+	// Non-message fields byte-identical.
+	for _, path := range []string{"model", "temperature"} {
+		if gjson.GetBytes(out, path).Raw != gjson.GetBytes(body, path).Raw {
+			t.Fatalf("field %q not preserved", path)
+		}
+	}
+	// Retained messages (system msg0, final user msg) byte-identical to originals.
+	if gjson.GetBytes(out, "messages.0").Raw != gjson.GetBytes(body, "messages.0").Raw {
+		t.Fatal("msg0 must be byte-identical")
+	}
+	if gjson.GetBytes(out, "messages.2").Raw != gjson.GetBytes(body, "messages.3").Raw {
+		t.Fatalf("the final message must be preserved verbatim: %s", gjson.GetBytes(out, "messages.2").Raw)
+	}
+	// The inserted summary carries the marker for expand recovery.
+	if s := gjson.GetBytes(out, "messages.1.content").String(); !strings.Contains(s, "History Summary") || !strings.Contains(s, "<<cg:") {
+		t.Fatalf("summary message missing wrapper/marker: %q", s)
 	}
 }
 

@@ -16,8 +16,10 @@ import (
 	"net/http"
 	"os"
 
+	"github.com/kagenti/context-guru/components"
 	_ "github.com/kagenti/context-guru/components/all"
 	"github.com/kagenti/context-guru/config"
+	"github.com/kagenti/context-guru/internal/cheapmodel"
 	"github.com/kagenti/context-guru/metrics"
 	"github.com/kagenti/context-guru/proxy"
 )
@@ -52,6 +54,7 @@ func main() {
 		OpenAIKey:    os.Getenv("OPENAI_API_KEY"),
 		AnthropicKey: os.Getenv("ANTHROPIC_API_KEY"),
 		ForceModel:   os.Getenv("FORCE_MODEL"), // eval-containers pins EVAL_MODEL's model here
+		CheapModel:   cheapModelFromEnv(),      // static "config"-source LLM for NeedsModel components
 	})
 
 	slog.Info("context-guru-proxy listening", "addr", addr, "pipeline", cfg.Pipeline)
@@ -72,4 +75,33 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// cheapModelFromEnv builds the static "config"-source LLM client for NeedsModel
+// components (extract code/rlm, summarize with model.source=config). Returns nil
+// when CHEAP_MODEL is unset, so those components fall back / no-op.
+//
+//	CHEAP_MODEL           model id (e.g. claude-haiku-4-5); unset => no client
+//	CHEAP_MODEL_PROVIDER  anthropic (default) | openai
+//	CHEAP_MODEL_BASE      upstream base URL (default: the matching provider default)
+//	CHEAP_MODEL_KEY       API key (default: ANTHROPIC_API_KEY / OPENAI_API_KEY)
+//	CHEAP_MODEL_AUTH      anthropic auth scheme: x-api-key (default) | bearer
+func cheapModelFromEnv() components.Model {
+	model := os.Getenv("CHEAP_MODEL")
+	if model == "" {
+		return nil
+	}
+	switch envOr("CHEAP_MODEL_PROVIDER", "anthropic") {
+	case "openai":
+		return cheapmodel.OpenAI{
+			BaseURL: os.Getenv("CHEAP_MODEL_BASE"), Model: model,
+			APIKey: envOr("CHEAP_MODEL_KEY", os.Getenv("OPENAI_API_KEY")),
+		}
+	default:
+		return cheapmodel.Anthropic{
+			BaseURL: os.Getenv("CHEAP_MODEL_BASE"), Model: model,
+			APIKey:     envOr("CHEAP_MODEL_KEY", os.Getenv("ANTHROPIC_API_KEY")),
+			AuthScheme: os.Getenv("CHEAP_MODEL_AUTH"),
+		}
+	}
 }
