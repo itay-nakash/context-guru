@@ -99,6 +99,7 @@ Details in [docs/integrations.md](docs/integrations.md).
 - [docs/components.md](docs/components.md) — every registered component: how it works, before→after, lossiness, config, best use.
 - [docs/integrations.md](docs/integrations.md) — proxy gateway vs AuthBridge plugin, with request paths.
 - [docs/setup.md](docs/setup.md) — setup + a concrete SWE-bench run through the eval-containers gateway.
+- [docs/RESULTS.md](docs/RESULTS.md) — per-component SWE-bench benchmark (Claude Code, claude-sonnet-4-6): `mask` ≈27% token savings, no reward loss.
 
 ## License
 

@@ -23,7 +23,9 @@ messages (`role:"tool"`; for Anthropic, `tool_result` blocks normalized to that 
 
 Presets (`config`): `off` `[]` · `safe` `[format, cacheinject]` · `balanced`
 `[format, dedup, failed_run, cmdfilter, cacheinject]` · `aggressive` adds `smartcrush, extract` ·
-`coding` `[format, skeleton, cmdfilter, cacheinject]` · `mcp` `[format, smartcrush, cacheinject]`.
+`coding` `[format, skeleton, cmdfilter, cacheinject]` · `mcp` `[format, smartcrush, cacheinject]` ·
+**`agent`** `[format, dedup, failed_run, mask, extract, cacheinject]` — for long agentic sessions;
+`mask` is the biggest lever there (~27% content-token savings, no reward loss — see [RESULTS.md](RESULTS.md)).
 
 Common gates every Offload respects: skip non-text (`Rewritable`) messages, skip content already
 carrying a marker (no double-offload), and skip if the rewrite (marker + hint included) isn't
