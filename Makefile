@@ -1,5 +1,5 @@
-BINARY := lab-cx
-PKG := github.com/kagenti/lab-context-engineering
+BINARY := context-guru-proxy
+PKG := github.com/kagenti/context-guru
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
 LDFLAGS := -s -w \
@@ -18,9 +18,9 @@ help: ## Display this help
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
 
 .PHONY: build
-build: ## Build the lab-cx binary into ./bin
+build: ## Build the context-guru-proxy binary into ./bin
 	@mkdir -p bin
-	go build -ldflags "$(LDFLAGS)" -o bin/$(BINARY) ./cmd/proxy
+	go build -ldflags "$(LDFLAGS)" -o bin/$(BINARY) ./cmd/context-guru-proxy
 
 .PHONY: test
 test: ## Run all tests with the race detector

@@ -1,0 +1,3 @@
+#!/bin/sh
+# Readiness probe: 0 when the proxy answers /healthz.
+exec curl -sf -m 1 "http://127.0.0.1:${PORT:-4000}/healthz" >/dev/null

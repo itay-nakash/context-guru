@@ -1,26 +1,29 @@
 # CLAUDE.md
 
-Guidance for working in `lab-context-engineering`, a Kagenti platform component.
+Guidance for working in `context-guru` (repo dir `lab-context-engineering`), a Kagenti
+platform component.
 
 ## What this repo is
 
-A single **Go** core that reduces the token cost of LLM agent traffic. It ships as a
-standalone proxy binary (`cmd/proxy`), an importable library (`engine`, `surfaces`), and
-eval-containers wiring. Its lineage is the Python `winnow` prototype (`../winnow`), which
-is the behavioral reference — port its *logic*, re-implement its transport in Go.
+A single **Go** core (`components`) that reduces the token cost of LLM agent traffic,
+operating on bifrost's provider-agnostic chat schema. It ships as a proxy binary
+(`cmd/context-guru-proxy`), an importable library (`components`, `apply`, `schema`,
+`config`, `expand`, `store`), a bifrost `LLMPlugin` adapter (`adapters/bifrost`), and
+eval-containers wiring. Its lineage is the Python `winnow` prototype, the behavioral
+reference — port its *logic*, re-implement its transport in Go.
 
 ## Hard boundaries
 
 - **No AuthBridge / kagenti-extensions code lives here.** That plugin is built in
-  `kagenti-extensions` and depends on this repo. Keep the public API (`engine`,
-  `surfaces`, `config`) clean and importable; never reach into another repo.
-- **Fail open, always.** Any error in any compactor forwards the original request untouched.
-  Reductions must be reversible (markers + rewind store). Never drop content that is only
-  *predicted* unused — `provable_only` is on by default.
+  `kagenti-extensions` and depends on this repo. Keep the public API (`components`,
+  `apply`, `schema`, `config`) clean and importable; never reach into another repo.
+- **Fail open, always.** Any component error/panic reverts that component only; the
+  original request is always forwarded as a valid fallback. Every lossy Offload must be
+  reversible (a `<<cg:HASH>>` marker + the stashed original in the Store).
 
 ## Conventions
 
-- Go 1.25, module `github.com/kagenti/lab-context-engineering`. `make fmt lint test build`.
+- Go 1.26, module `github.com/kagenti/context-guru`. Build needs `CGO_ENABLED=1` (tree-sitter).
 - Match the surrounding code's style; keep packages small and single-purpose.
 - **Commits: DCO sign-off is mandatory** — `git commit -s`. Author as the repo owner.
   AI attribution uses `Assisted-By:` — never `Co-Authored-By`, never a "Generated with"
@@ -29,7 +32,8 @@ is the behavioral reference — port its *logic*, re-implement its transport in 
 
 ## Layout
 
-`cmd/proxy` (binary) · `engine` (Transform/Expand + Compactor pipeline) · `surfaces` (wire⇄canonical)
-· `internal/*` (types, extract, relevance, signals, taxonomy, actions, cache, markers,
-rewind, zones, session, compaction, tokens) · `config` · `observability` · `deploy` ·
-`docs`.
+`components` (Component/Reformat/Offload + Pipeline + registry) · `components/{reformat,offload,dsl,all}`
+· `apply` (wire body ⇄ pipeline, byte-lossless splice) · `schema` (bifrost-schema helpers) ·
+`expand` (marker + expand tool loop) · `store` · `session` · `metrics` · `config` ·
+`proxy` · `adapters/bifrost` · `cmd/context-guru-proxy` · `internal/{tokens,treesitter,buildinfo}`
+· `deploy` · `docs`. See [docs/design.md](docs/design.md).

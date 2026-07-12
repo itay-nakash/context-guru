@@ -1,16 +1,35 @@
-# Build the lab-cx proxy. CGO is required (tree-sitter), so the final image is
-# glibc-based (distroless/base), not static.
-FROM golang:1.25 AS build
+# context-guru-proxy: the LLM-proxy integration and eval-containers gateway.
+#
+# The module uses a local `replace github.com/maximhq/bifrost/core => ../bifrost/core`,
+# so the build context MUST be the PARENT directory that contains both repos:
+#
+#   docker build -f lab-context-engineering/Dockerfile -t context-guru-proxy .
+#
+# (run from .../context-engineering/). CI that builds standalone should either
+# `go mod vendor` first or switch the replace to a pinned published bifrost.
+#
+# CGO is required (tree-sitter for the skeleton component), so the final image is
+# glibc-based. It also carries a shell + curl for the eval-containers
+# start/health scripts under /opt/gateway.
+FROM golang:1.26 AS build
 WORKDIR /src
-COPY . .
+COPY bifrost/ ./bifrost/
+COPY lab-context-engineering/ ./lab-context-engineering/
+WORKDIR /src/lab-context-engineering
 ARG VERSION=dev
 ARG COMMIT=none
 RUN CGO_ENABLED=1 go build \
-	-ldflags "-s -w -X github.com/kagenti/lab-context-engineering/internal/buildinfo.Version=${VERSION} -X github.com/kagenti/lab-context-engineering/internal/buildinfo.Commit=${COMMIT}" \
-	-o /out/lab-cx ./cmd/proxy
+	-ldflags "-s -w -X github.com/kagenti/context-guru/internal/buildinfo.Version=${VERSION} -X github.com/kagenti/context-guru/internal/buildinfo.Commit=${COMMIT}" \
+	-o /out/context-guru-proxy ./cmd/context-guru-proxy
 
-FROM gcr.io/distroless/base-debian12:nonroot
-COPY --from=build /out/lab-cx /usr/local/bin/lab-cx
-EXPOSE 8080
-ENTRYPOINT ["/usr/local/bin/lab-cx"]
-CMD ["proxy"]
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+	&& rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/context-guru-proxy /opt/gateway/main
+COPY lab-context-engineering/deploy/eval-containers/start /opt/gateway/start
+COPY lab-context-engineering/deploy/eval-containers/health /opt/gateway/health
+RUN chmod +x /opt/gateway/start /opt/gateway/health
+EXPOSE 4000
+# Default entrypoint is the eval-containers gateway wrapper; override with
+# `/opt/gateway/main` to run the proxy directly with flags.
+ENTRYPOINT ["/opt/gateway/start"]

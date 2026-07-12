@@ -1,0 +1,36 @@
+# Compose override that swaps the eval-containers gateway for the locally-built
+# context-guru image and wires it for the IBM litellm upstream (Anthropic-native).
+#
+# Usage (from containers/benchmarks/swe-bench/):
+#   docker compose -f compose.yaml -f <this file> up --abort-on-container-exit
+#
+# Required env (export before `up`):
+#   EVAL_TASK_ID, EVAL_MODEL=anthropic/claude-sonnet-4-6, EVAL_AGENT=claude-code
+#   ANTHROPIC_API_BASE=<IBM litellm base>, ANTHROPIC_API_KEY=<token>
+#   OPENAI_API_KEY/OPENAI_API_BASE are unused for Anthropic but the base service
+#   marks them required (:?), so pass any placeholder.
+#   CONTEXT_GURU_PRESET selects the pipeline: `off` (baseline passthrough),
+#   `safe`, `balanced`, ...
+services:
+  # SWE-bench runner images are published amd64-only; pin the platform so an
+  # arm64 host pulls/runs the amd64 image under emulation instead of failing with
+  # "no matching manifest for linux/arm64".
+  runner:
+    platform: linux/amd64
+  gateway:
+    image: context-guru:local
+    pull_policy: never
+    # Mount the shared output volume so the gateway can write its change-capture
+    # (CONTEXT_GURU_DUMP) where we can read it after the run.
+    volumes:
+      - output:/output
+    environment:
+      # our start script reads these to target the upstream + inject the real key
+      ANTHROPIC_API_BASE: ${ANTHROPIC_API_BASE:?set to the IBM litellm base URL}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?set to the litellm token}
+      # pipeline selection: a non-empty list wins, else the preset is used
+      CONTEXT_GURU_PIPELINE: ${CONTEXT_GURU_PIPELINE:-}
+      CONTEXT_GURU_PRESET: ${CONTEXT_GURU_PRESET:-off}
+      CONTEXT_GURU_DEBUG: ${CONTEXT_GURU_DEBUG:-}
+      # when set, the gateway appends a before→after record per rewritten message
+      CONTEXT_GURU_DUMP: ${CONTEXT_GURU_DUMP:-}
