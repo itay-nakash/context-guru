@@ -78,6 +78,14 @@ var presets = map[string][]string{
 	"aggressive": {"format", "dedup", "failed_run", "cmdfilter", "smartcrush", "extract", "cacheinject"},
 	"coding":     {"format", "skeleton", "cmdfilter", "cacheinject"},
 	"mcp":        {"format", "smartcrush", "cacheinject"},
+	// agent: tuned for long agentic sessions (e.g. Claude Code on SWE-bench),
+	// where the dominant cost is the transcript of tool outputs (file reads)
+	// re-sent every turn. mask (drop old tool outputs) is the biggest lever
+	// there — ~27% content-token savings with no task-reward loss in the
+	// eval-containers SWE-bench sweep (see docs/RESULTS.md); extract + failed_run
+	// + dedup add relevance/supersession/dup wins; cacheinject keeps the prefix
+	// cacheable. Order: lossless first, then offload old-then-large, cache last.
+	"agent": {"format", "dedup", "failed_run", "mask", "extract", "cacheinject"},
 	// summarize restructures the whole transcript (changes the message count) — run
 	// it alone so no other component's in-place edits race apply's rebuild.
 	"summarize": {"summarize"},

@@ -25,6 +25,8 @@ messages (`role:"tool"`; for Anthropic, `tool_result` blocks normalized to that 
 Presets (`config`): `off` `[]` · `safe` `[format, cacheinject]` · `balanced`
 `[format, dedup, failed_run, cmdfilter, cacheinject]` · `aggressive` adds `smartcrush, extract` ·
 `coding` `[format, skeleton, cmdfilter, cacheinject]` · `mcp` `[format, smartcrush, cacheinject]` ·
+**`agent`** `[format, dedup, failed_run, mask, extract, cacheinject]` — for long agentic sessions;
+`mask` is the biggest lever there (~27% content-token savings, no reward loss — see [RESULTS.md](RESULTS.md)) ·
 `summarize` `[summarize]` (run alone — it restructures the whole transcript).
 
 **LLM-based components** (`extract` with `strategy: code`/`rlm`, and `summarize`) call a model, chosen by
