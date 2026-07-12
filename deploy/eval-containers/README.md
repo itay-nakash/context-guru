@@ -1,54 +1,45 @@
-# Running lab-cx inside eval-containers
+# context-guru as an eval-containers gateway
 
-[eval-containers](https://github.com/exgentic/eval-containers) runs `one benchmark +
-one agent + one model`, with the agent's LLM traffic always flowing through a
-**gateway** (bifrost/litellm) on port 4000. `lab-cx` slots into that request path as a
-plain HTTP proxy — no changes to the agent images, no changes to the gateway.
+`context-guru-proxy` is a drop-in eval-containers gateway flavor: it runs the
+context-engineering pipeline on every request, then forwards to the real
+provider. Swap it in with `EVAL_GATEWAY_IMAGE` — no agent or benchmark changes.
 
-The image is built from this repo's root `Dockerfile`:
+## Build
 
-```sh
-docker build -t ghcr.io/kagenti/lab-context-engineering:latest .
-```
-
-## Placement A — before the gateway (recommended)
-
-```
-runner (agent) ──▶ lab-cx ──▶ gateway ──▶ provider
-```
-
-lab-cx sees what the agent sends, in its native protocol, before any model-name
-rewrite — the right place to control the agent's context. Use
-[`compose.override.yaml`](compose.override.yaml):
+The module uses a local `replace` to `../bifrost/core`, so build from the parent
+directory that holds both repos:
 
 ```sh
-docker compose -f compose.yaml -f .../deploy/eval-containers/compose.override.yaml up \
-  -y --abort-on-container-exit
+cd .../context-engineering
+docker build -f lab-context-engineering/Dockerfile -t context-guru-proxy:latest .
 ```
 
-It adds a `lab-cx` service on the `internal` network, repoints the runner's
-`ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` / `GOOGLE_GEMINI_BASE_URL` at it, and sets
-`--upstream http://gateway:4000` so lab-cx forwards the full (prefixed) path on to the
-gateway. The agent still holds only `sk-proxy`; the real key stays in the gateway.
+## Run under eval-containers
 
-## Placement B — after the gateway
-
-```
-runner (agent) ──▶ gateway ──▶ lab-cx ──▶ provider
+```sh
+EVAL_GATEWAY_IMAGE=context-guru-proxy:latest \
+  eval-containers run <benchmark> --agent <agent> --model <provider>/<model>
 ```
 
-lab-cx sees normalized (OpenAI-shaped) traffic. Point the gateway's `OPENAI_API_BASE`
-at lab-cx (`http://lab-cx:8080`) and put `lab-cx` on the `upstream` network, with
-`--upstream` set to the real provider base.
+The gateway (`start`) reads:
+- `EVAL_MODEL=<provider>/<model>` — the model pins every call (`FORCE_MODEL`); the provider selects the upstream.
+- `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` — the real key, injected on forward (the agent holds only `sk-proxy`).
+- `OPENAI_API_BASE` / `ANTHROPIC_API_BASE` — optional upstream overrides.
+- `CONTEXT_GURU_PRESET` (default `balanced`) — which pipeline preset to run.
 
-## Notes
+Endpoints on `:4000`: `/openai/v1/chat/completions`, `/anthropic/v1/messages`,
+plus `/healthz`, `/stats` (savings rollups), `/expand?id=` (recover offloaded content).
 
-- **Suffix routing**: lab-cx reduces any path ending in `/v1/messages` or
-  `/chat/completions`, so the eval prefixes (`/anthropic`, `/openai/v1`) work
-  unchanged. The Gemini prefix (`/genai`) is forwarded untouched (fail-open) until the
-  Gemini surface lands.
-- **Isolation/cost invariants are preserved**: lab-cx adds no egress (before-gateway it
-  lives on `internal` only), doesn't touch `sk-proxy`/`TASK_ID`, and the gateway keeps
-  emitting OTel + enforcing `EVAL_MODEL_MAX_BUDGET`.
-- **Measuring the effect**: compare `trajectory.jsonl` / `result.json` token + cost
-  totals with and without the override on the same `EVAL_TASK_ID`.
+## Measuring the effect
+
+Run the same `EVAL_TASK_ID` twice — once normally, once with the agent sending
+`x-context-guru-bypass: true` — and compare. `/stats` reports token-weighted
+savings per component; per-task attribution improves once a session id is stamped
+(`x-context-guru-session`).
+
+## Known gaps (tracked, P5)
+
+- OTel `gen_ai` spans are not yet emitted (eval-containers' otelcol ingests them);
+  today savings come from `/stats`.
+- The image build needs the parent-dir context (or `go mod vendor`) until bifrost
+  is pinned to a published version.

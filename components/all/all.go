@@ -1,0 +1,12 @@
+// Package all blank-imports every built-in component so their init()
+// registrations run. Binaries (context-guru-proxy, the AuthBridge plugin)
+// import this package for its side effects, then build a pipeline by name from
+// config. Import it for effect:
+//
+//	import _ "github.com/kagenti/context-guru/components/all"
+package all
+
+import (
+	_ "github.com/kagenti/context-guru/components/offload"
+	_ "github.com/kagenti/context-guru/components/reformat"
+)

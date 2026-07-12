@@ -1,0 +1,48 @@
+#!/bin/sh
+# eval-containers gateway entrypoint for context-guru-proxy.
+#
+# Contract (see eval-containers .agents/gateways/RULES.md): parse
+# EVAL_MODEL=<provider>/<model>; the model pins every call (FORCE_MODEL) and the
+# provider selects the upstream. Provider auth is read from the provider's
+# native env var (OPENAI_API_KEY / ANTHROPIC_API_KEY) — the proxy injects it,
+# replacing the agent's placeholder sk-proxy. Listens on :4000, exposing
+# /openai/v1/chat/completions and /anthropic/v1/messages.
+set -eu
+
+: "${EVAL_MODEL:?EVAL_MODEL must be set to <provider>/<model>}"
+case "$EVAL_MODEL" in
+	*/*) PROVIDER=${EVAL_MODEL%%/*}; MODEL_NAME=${EVAL_MODEL#*/} ;;
+	*) echo "EVAL_MODEL must be of form <provider>/<model> (got: $EVAL_MODEL)" >&2; exit 2 ;;
+esac
+export FORCE_MODEL="$MODEL_NAME"
+
+# Provider -> upstream base URL (root, no /v1 suffix; the proxy appends the
+# canonical provider path). OPENAI_API_BASE may include /v1 — strip it.
+case "$PROVIDER" in
+	openai)
+		base="${OPENAI_API_BASE:-https://api.openai.com}"
+		export OPENAI_UPSTREAM="${base%/v1}"
+		;;
+	anthropic)
+		export ANTHROPIC_UPSTREAM="${ANTHROPIC_API_BASE:-https://api.anthropic.com}"
+		;;
+	*)
+		echo "unsupported provider for context-guru gateway: $PROVIDER" >&2
+		exit 2
+		;;
+esac
+
+export LISTEN_ADDR="${LISTEN_ADDR:-:${PORT:-4000}}"
+
+# Pipeline selection: CONTEXT_GURU_PIPELINE (comma-separated component names)
+# wins — it renders a one-line config so a sweep can pin any component combo
+# (including a single component, or an empty list for a passthrough baseline)
+# without new presets. Otherwise fall back to a named preset.
+# Non-empty CONTEXT_GURU_PIPELINE wins; an empty/unset value falls through to the
+# named preset (so an always-present-but-empty env var from compose doesn't force
+# passthrough — baseline uses CONTEXT_GURU_PRESET=off instead).
+if [ -n "${CONTEXT_GURU_PIPELINE:-}" ]; then
+	printf 'pipeline: [%s]\n' "${CONTEXT_GURU_PIPELINE}" > /tmp/cg-config.yaml
+	exec /opt/gateway/main --config /tmp/cg-config.yaml
+fi
+exec /opt/gateway/main --preset "${CONTEXT_GURU_PRESET:-balanced}"
