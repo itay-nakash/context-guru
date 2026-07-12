@@ -3,10 +3,8 @@ module github.com/kagenti/context-guru
 go 1.26.4
 
 // Bifrost provides the provider-agnostic message/request schema our components operate on,
-// plus the proxy engine the context-guru-proxy binary embeds. Pinned via local replace for now.
-require github.com/maximhq/bifrost/core v0.0.0
-
-replace github.com/maximhq/bifrost/core => ../bifrost/core
+// plus the proxy engine the context-guru-proxy binary embeds.
+require github.com/maximhq/bifrost/core v1.7.0
 
 require (
 	github.com/alexaandru/go-sitter-forest/c v1.9.4
