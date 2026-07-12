@@ -2,6 +2,7 @@ package all_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -18,6 +19,8 @@ type stubModel struct {
 }
 
 func (m stubModel) Complete(context.Context, string) (string, error) { return m.resp, m.err }
+
+var errBoom = errors.New("boom")
 
 func strp(s string) *string { return &s }
 
@@ -86,6 +89,67 @@ func TestSummarizeNoModelSkips(t *testing.T) {
 	keys, err := off.Offload(req, &rep, c)
 	if err != nil || len(keys) != 0 || !rep.Skipped || len(req.Input) != 3 {
 		t.Fatalf("no-model summarize must skip untouched: keys=%d skipped=%v len=%d err=%v", len(keys), rep.Skipped, len(req.Input), err)
+	}
+}
+
+// TestSummarizeModelErrorFailsOpen: a model error must surface as an error (the
+// pipeline reverts the component) and leave the transcript untouched.
+func TestSummarizeModelErrorFailsOpen(t *testing.T) {
+	off := newComp(t, "summarize", "keep_last: 1\nstart_from_message: 0\nmin_tokens: 1\n")
+	req := &bschemas.BifrostChatRequest{Input: []bschemas.ChatMessage{
+		{Role: bschemas.ChatMessageRoleSystem, Content: &bschemas.ChatMessageContent{ContentStr: strp("s")}},
+		toolMsg(strings.Repeat("output ", 100)),
+		{Role: bschemas.ChatMessageRoleUser, Content: &bschemas.ChatMessageContent{ContentStr: strp("u")}},
+	}}
+	before := len(req.Input)
+	c := &components.Ctx{Ctx: context.Background(), Store: store.NewMemory(store.Options{}),
+		Model: components.ModelSpec{Incoming: stubModel{err: errBoom}}}
+	var rep components.Report
+	_, err := off.Offload(req, &rep, c)
+	if err == nil {
+		t.Fatal("model error must be returned so the pipeline reverts")
+	}
+	if len(req.Input) != before {
+		t.Fatal("transcript must be untouched on model error")
+	}
+}
+
+// TestSummarizeEmptyResponseSkips: an empty model response is a no-op, not a
+// broken summary.
+func TestSummarizeEmptyResponseSkips(t *testing.T) {
+	off := newComp(t, "summarize", "keep_last: 1\nstart_from_message: 0\nmin_tokens: 1\n")
+	req := &bschemas.BifrostChatRequest{Input: []bschemas.ChatMessage{
+		{Role: bschemas.ChatMessageRoleSystem, Content: &bschemas.ChatMessageContent{ContentStr: strp("s")}},
+		toolMsg(strings.Repeat("output ", 100)),
+		{Role: bschemas.ChatMessageRoleUser, Content: &bschemas.ChatMessageContent{ContentStr: strp("u")}},
+	}}
+	c := &components.Ctx{Ctx: context.Background(), Store: store.NewMemory(store.Options{}),
+		Model: components.ModelSpec{Incoming: stubModel{resp: "   "}}}
+	var rep components.Report
+	keys, err := off.Offload(req, &rep, c)
+	if err != nil || len(keys) != 0 || !rep.Skipped || len(req.Input) != 3 {
+		t.Fatalf("empty summary must skip untouched: keys=%d skipped=%v len=%d err=%v", len(keys), rep.Skipped, len(req.Input), err)
+	}
+}
+
+// TestExtractRLMUsesModel: strategy=rlm currently maps to code and still runs the
+// model's filter (not silently deterministic).
+func TestExtractRLMUsesModel(t *testing.T) {
+	off := newComp(t, "extract", "strategy: rlm\nmin_tokens: 1\nmodel:\n  source: config\n")
+	st := store.NewMemory(store.Options{})
+	body := `[{"id":1,"name":"keep this one"},{"id":2,"name":"drop it"}]`
+	req := &bschemas.BifrostChatRequest{Input: []bschemas.ChatMessage{
+		{Role: bschemas.ChatMessageRoleUser, Content: &bschemas.ChatMessageContent{ContentStr: strp("find keep")}},
+		toolMsg(body),
+	}}
+	filter := "data = json.decode(INPUT)\nOUTPUT = json.encode([r for r in data if \"keep\" in r[\"name\"]])\n"
+	c := &components.Ctx{Ctx: context.Background(), Store: st, Model: components.ModelSpec{Static: stubModel{resp: filter}}}
+	var rep components.Report
+	if keys, err := off.Offload(req, &rep, c); err != nil || len(keys) != 1 {
+		t.Fatalf("rlm should run the model filter: keys=%v err=%v skipped=%v", keys, err, rep.Skipped)
+	}
+	if strings.Contains(schema.MessageText(req.Input[1]), "drop it") {
+		t.Fatal("rlm/code filter should have dropped the non-keep record")
 	}
 }
 

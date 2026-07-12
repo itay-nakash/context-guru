@@ -106,7 +106,7 @@ func (e *Extract) Offload(req *bschemas.BifrostChatRequest, rep *components.Repo
 func (e *Extract) reduce(c *components.Ctx, content, goal string, keepIDs []string, query map[string]struct{}, model components.Model) (string, bool) {
 	if model != nil && e.NeedsModel() {
 		cfg := extract.DefaultCfg()
-		cfg.Mode = e.strategy
+		cfg.Mode = "code" // rlm is deferred → use the Starlark code strategy
 		cfg.Floor = e.minTokens
 		if res, _ := extract.RunExtraction(c.Ctx, content, goal, keepIDs, schema.TextTokens(content), cfg, model); res != "" && res != content {
 			return res, true
