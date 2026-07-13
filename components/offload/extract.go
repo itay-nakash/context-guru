@@ -1,29 +1,45 @@
 package offload
 
 import (
+	"context"
 	"strings"
+	"time"
 
 	"github.com/kagenti/context-guru/components"
 	"github.com/kagenti/context-guru/expand"
+	"github.com/kagenti/context-guru/internal/extract"
 	"github.com/kagenti/context-guru/schema"
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"gopkg.in/yaml.v3"
 )
 
+// llmCallTimeout bounds a single in-request extract model call so a slow/hung
+// model fails open (the component falls back / reverts) instead of stalling the
+// agent. extract can make several calls per request (one per large tool output),
+// so this ceiling stays modest; the per-content result cache keeps repeats free.
+const llmCallTimeout = 60 * time.Second
+
 func init() { components.Register("extract", newExtract) }
 
 // Extract projects a large tool output down to the part relevant to the current
-// query, stashing the full original. v1 ships the deterministic strategy:
-// keep lines matching the recent query's keywords (plus head/tail context and
-// any error lines). The LLM strategies (code = model-generated Starlark filter
-// with a containment validator; rlm = recursive chunked) are the winnow-parity
-// refinement — they need a cheap-model client (ModelSpec), which is not yet
-// wired; selecting them falls back to deterministic with a note.
+// query, stashing the full original. Three strategies:
+//   - deterministic (default, no LLM): keep query-keyword + head/tail + error lines.
+//   - code: a cheap LLM writes a Starlark `extract_relevant_data` filter, run in a
+//     sandbox (no imports/IO, step+time limited); the output is accepted only if a
+//     containment + sanity check proves it's a lossless projection, else it falls
+//     back to deterministic. (winnow's llm_compact, ported.)
+//   - rlm: reserved for very large outputs; currently maps to code.
+//
+// The LLM strategies need a Model (Ctx.Model, per model.source); when none is
+// available they degrade to deterministic. The full original is always stashed
+// under a marker, so any reduction is reversible via the expand tool.
 type Extract struct {
-	minTokens int
-	head      int
-	tail      int
-	strategy  string
+	minTokens   int
+	head        int
+	tail        int
+	strategy    string
+	modelSource string
+	trigger     components.Trigger
 }
 
 type extractConfig struct {
@@ -31,6 +47,10 @@ type extractConfig struct {
 	Head      int    `yaml:"head_lines"`
 	Tail      int    `yaml:"tail_lines"`
 	Strategy  string `yaml:"strategy"` // deterministic | code | rlm
+	Model     struct {
+		Source string `yaml:"source"` // incoming (default) | config
+	} `yaml:"model"`
+	Trigger components.Trigger `yaml:"trigger"`
 }
 
 func newExtract(raw []byte) (components.Component, error) {
@@ -40,23 +60,49 @@ func newExtract(raw []byte) (components.Component, error) {
 			return nil, err
 		}
 	}
-	return &Extract{minTokens: cfg.MinTokens, head: cfg.Head, tail: cfg.Tail, strategy: cfg.Strategy}, nil
+	// Legacy min_tokens is the per-output floor; the canonical knob is
+	// trigger.min_output_tokens. Fold one into the other so both work.
+	if cfg.Trigger.MinOutputTokens == 0 {
+		cfg.Trigger.MinOutputTokens = cfg.MinTokens
+	}
+	return &Extract{minTokens: cfg.MinTokens, head: cfg.Head, tail: cfg.Tail, strategy: cfg.Strategy, modelSource: cfg.Model.Source, trigger: cfg.Trigger}, nil
+}
+
+// outputFloor is the minimum tokens a single tool output must have to be worth
+// offloading (the "large output" trigger).
+func (e *Extract) outputFloor() int {
+	if e.trigger.MinOutputTokens > 0 {
+		return e.trigger.MinOutputTokens
+	}
+	return e.minTokens
 }
 
 func (Extract) Name() string                 { return "extract" }
 func (Extract) Enabled(*components.Ctx) bool { return true }
 
-// NeedsModel reports whether the configured strategy calls an LLM. The pipeline
-// injects the ModelSpec when true. (The LLM path is not yet implemented; see the
-// package note — this reports intent for when the cheap-model client lands.)
+// NeedsModel reports whether the configured strategy calls an LLM.
 func (e *Extract) NeedsModel() bool { return e.strategy == "code" || e.strategy == "rlm" }
 
 func (e *Extract) Offload(req *bschemas.BifrostChatRequest, rep *components.Report, c *components.Ctx) ([]string, error) {
-	query := keywords(lastUserText(req))
+	// Request-level trigger: for the LLM strategies, don't spend a model call
+	// until the request is genuinely large / deep. Deterministic runs always
+	// (it's cheap). Zero thresholds fire always (backward compatible).
+	if e.NeedsModel() && !e.trigger.Fires(req) {
+		rep.Skipped = true
+		return nil, nil
+	}
+	goal := conversationGoal(req) // full task + recent turns, not one trailing sentence
+	query := keywords(goal)
 	if len(query) == 0 {
 		rep.Skipped = true
 		return nil, nil // nothing to condition relevance on
 	}
+	var model components.Model
+	if e.NeedsModel() {
+		model = c.Model.For(e.modelSource)
+	}
+	floor := e.outputFloor()
+	keepIDs := extract.HarvestIdentifiers(goal, 40)
 	var keys []string
 	for _, i := range toolIndices(req) {
 		msg := &req.Input[i]
@@ -64,13 +110,21 @@ func (e *Extract) Offload(req *bschemas.BifrostChatRequest, rep *components.Repo
 			continue // non-text blocks would be dropped by a text rewrite
 		}
 		content := schema.MessageText(*msg)
-		if content == "" || schema.TextTokens(content) < e.minTokens {
+		if content == "" || schema.TextTokens(content) < floor {
 			continue
 		}
 		if len(expand.ParseMarkers(content)) > 0 {
 			continue
 		}
-		projected, ok := e.project(content, query)
+		// Reuse a prior compaction of this exact output (marker/whitespace
+		// insensitive) — no LLM call, and the same bytes keep the prefix stable.
+		id := extract.ContentKey(content)
+		projected, ok := "", false
+		if cached, hit := getResult(c, id); hit {
+			projected, ok = string(cached), true
+		} else if projected, ok = e.reduce(c, content, goal, keepIDs, query, model); ok {
+			putResult(c, id, []byte(projected))
+		}
 		if !ok || schema.TextTokens(projected) >= schema.TextTokens(content) {
 			continue
 		}
@@ -83,6 +137,25 @@ func (e *Extract) Offload(req *bschemas.BifrostChatRequest, rep *components.Repo
 		rep.Skipped = true
 	}
 	return keys, nil
+}
+
+// reduce picks the strategy: for code/rlm with a model, run the sandboxed
+// LLM-generated filter (containment-validated inside RunExtraction, with its own
+// deterministic fallback); otherwise the deterministic line projection. Always
+// fail-open — any miss falls through to project().
+func (e *Extract) reduce(c *components.Ctx, content, goal string, keepIDs []string, query map[string]struct{}, model components.Model) (string, bool) {
+	if model != nil && e.NeedsModel() {
+		cfg := extract.DefaultCfg()
+		cfg.Mode = "code" // rlm is deferred → use the Starlark code strategy
+		cfg.Floor = e.outputFloor()
+		ctx, cancel := context.WithTimeout(c.Ctx, llmCallTimeout)
+		res, _ := extract.RunExtraction(ctx, content, goal, keepIDs, schema.TextTokens(content), cfg, model)
+		cancel()
+		if res != "" && res != content {
+			return res, true
+		}
+	}
+	return e.project(content, query)
 }
 
 // project keeps head/tail context plus every line relevant to the query or

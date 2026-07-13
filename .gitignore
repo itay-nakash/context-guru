@@ -170,4 +170,4 @@ cython_debug/
 coverage.txt
 
 # benchmark run output (results summarized in docs/PR, not tracked)
-deploy/eval-containers/sweep-results.csv
+deploy/eval-containers/sweep-results*.csv

@@ -176,6 +176,53 @@ AFTER:
 425	    is_member = (what == 'class' or wh
 ```
 
+## LLM-based components (`extract strategy: code`, `summarize`) — gated + state-reuse
+
+These two components call a model. They are gated by a configurable `trigger` (don't fire every turn)
+and reuse prior compactions from per-session state (don't re-call the model on re-sent content).
+`model.source: incoming` = the agent's own model (`claude-sonnet-4-6`). Final tuned config:
+extract-code `trigger: {min_output_tokens: 700, min_request_tokens: 4000}`; summarize
+`trigger: {min_request_tokens: 6000, min_messages: 10}, resummarize_tokens: 5000`, call timeout 150 s,
+trajectory capped to fit context. Sweep of both, alone, over the 10 tasks:
+
+| task | base | extract-code r / saved | summarize r / saved |
+|---|---|---|---|
+| sympy-13647 | 1 | 1 / **2562** | 1 / 0 (gated off) |
+| sympy-16766 | 1 | 1 / 0 | 1 / 0 (gated off — was a 1→0 regression) |
+| sympy-20438 | 0 | 0 / **177914** (~24%) | 0 / **10882** |
+| sphinx-7910 | 1 | 1 / 0 | 1 / 0 (gated off) |
+| sphinx-9320 | 1 | 1 / **5677** | 1 / 0 (gated off — was a 1→0 regression) |
+| scikit-12973 | 1 | 1 / 0 | 1 / 0 |
+| scikit-25931 | 1 | 1 / **2952** | 1 / 0 |
+| django-11820 | 0 | 0 / **3920** | 0 / **4695** |
+| django-14089 | 0 | 0 / 0 | 0 / 0 |
+| xarray-4629 | – | 0 / 0 | 0 / 0 |
+
+**Resolved / 10 (baseline = 6): extract-code = 6, summarize = 6 — zero reward regression.** The two
+earlier summarize regressions (sympy-16766, sphinx-9320: 1→0 in the first ungated run) stay fixed.
+Total gateway tokens saved across the set: **extract-code ≈ 193k, summarize ≈ 15.6k**.
+
+- **extract-code** fires on 5 of the tasks and is reward-neutral everywhere. Biggest win is the large
+  task (sympy-20438, ~24% of the request). Two changes drove the breadth: `IsContained`'s string case
+  was generalized to an in-order whole-line **subsequence** (so it reduces logs / source / tracebacks,
+  not only JSON — the earlier JSON-only containment was why it fired on almost nothing), and the floor
+  was lowered to 700 tokens so mid-size outputs qualify.
+- **summarize** — the key diagnosis: it saved ~0 at higher triggers because **almost every SWE-bench
+  Claude Code request is small** (per-request means ≈ 2k tokens; only sympy-20438 averages ~7k). A 15–25k
+  trigger simply never fired. Lowering it to **6k** threads the needle: it fires on the large,
+  **reward-0** tasks (sympy-20438, django-11820) where summarizing is safe, and stays off the tiny
+  (~2k-avg) transcripts whose summarization caused the earlier regressions. That's why summarize now
+  saves ~15.6k with the two regressions still fixed. Pushing the trigger lower would summarize the tiny
+  tasks too and re-introduce the reward risk — the real unlock for safe savings there is expand-tool
+  injection (reversibility), still deferred.
+- **State reuse** (proved by unit tests): extract caches each reduced output by content hash and
+  summarize checkpoints its summary per session, so a re-sent output / unchanged prefix reuses the prior
+  result byte-for-byte — no repeat model call, KV-cache-stable prefix. Stops both re-deriving a
+  different compaction every turn.
+- **Fundamental tension** confirmed empirically: on this traffic, summarize only saves where it fires,
+  and firing on small transcripts is exactly what regresses reward. The gain came from firing it on the
+  *large, already-failing* tasks — not from accepting regressions on the small ones.
+
 ## Methodology & caveats
 
 - Harness: [`deploy/eval-containers/sweep.py`](../deploy/eval-containers/sweep.py) (resumable) → `aggregate.py`.

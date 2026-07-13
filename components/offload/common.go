@@ -33,6 +33,59 @@ func lastUserText(req *bschemas.BifrostChatRequest) string {
 	return ""
 }
 
+// goalCap bounds the conversational context handed to an LLM component so a huge
+// task statement can't blow up every prompt. Generous — the point is to pass the
+// real task, not one trailing sentence.
+const goalCap = 8000
+
+// conversationGoal is the relevance/context signal for the LLM components: the
+// TASK the agent is working (first user turn — in agent traffic this holds the
+// problem statement), plus the most recent assistant and user turns (its current
+// intent). Passing this instead of just the last message is what lets extract /
+// summarize keep what actually matters, on any agent or benchmark. Tool outputs
+// are excluded — they are the bulk being reduced, not the goal.
+func conversationGoal(req *bschemas.BifrostChatRequest) string {
+	var firstUser, lastUser, lastAsst string
+	for i := range req.Input {
+		if req.Input[i].Role == bschemas.ChatMessageRoleUser {
+			firstUser = schema.MessageText(req.Input[i])
+			break
+		}
+	}
+	for i := len(req.Input) - 1; i >= 0; i-- {
+		switch req.Input[i].Role {
+		case bschemas.ChatMessageRoleUser:
+			if lastUser == "" {
+				lastUser = schema.MessageText(req.Input[i])
+			}
+		case bschemas.ChatMessageRoleAssistant:
+			if lastAsst == "" {
+				lastAsst = schema.MessageText(req.Input[i])
+			}
+		}
+		if lastUser != "" && lastAsst != "" {
+			break
+		}
+	}
+	var parts []string
+	seen := map[string]struct{}{}
+	for _, p := range []string{firstUser, lastAsst, lastUser} {
+		if p = strings.TrimSpace(p); p == "" {
+			continue
+		}
+		if _, dup := seen[p]; dup {
+			continue
+		}
+		seen[p] = struct{}{}
+		parts = append(parts, p)
+	}
+	g := strings.Join(parts, "\n\n")
+	if len(g) > goalCap {
+		g = g[:goalCap]
+	}
+	return g
+}
+
 // keywords extracts lowercased content words (>3 chars) as a set — a cheap
 // relevance signal without embeddings.
 func keywords(s string) map[string]struct{} {

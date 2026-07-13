@@ -86,6 +86,9 @@ var presets = map[string][]string{
 	// + dedup add relevance/supersession/dup wins; cacheinject keeps the prefix
 	// cacheable. Order: lossless first, then offload old-then-large, cache last.
 	"agent": {"format", "dedup", "failed_run", "mask", "extract", "cacheinject"},
+	// summarize restructures the whole transcript (changes the message count) — run
+	// it alone so no other component's in-place edits race apply's rebuild.
+	"summarize": {"summarize"},
 }
 
 // Build constructs the ordered pipeline from the config, wiring each named

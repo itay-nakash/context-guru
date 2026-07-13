@@ -58,17 +58,42 @@ type Configurable interface {
 	Configure(raw []byte) error
 }
 
-// NeedsModel is implemented by components that call a cheap LLM (extract,
-// summarize); the pipeline injects the resolved ModelSpec via the Ctx.
+// NeedsModel is implemented by components that call an LLM (extract's code/rlm
+// strategies, summarize). A component that needs a model but finds none
+// available (Ctx.Model.For returns nil) MUST degrade gracefully — fall back to a
+// deterministic path or no-op — never fail the request.
 type NeedsModel interface {
 	NeedsModel() bool
 }
 
-// ModelSpec tells a NeedsModel component where to get an LLM: a statically
-// configured client, or the proxied request's own model+credentials.
+// Model is the minimal LLM surface a component may call: one prompt in, text
+// out. internal/cheapmodel's Anthropic and OpenAI clients implement it.
+type Model interface {
+	Complete(ctx context.Context, prompt string) (string, error)
+}
+
+// ModelSpec carries the LLM clients a NeedsModel component may use, resolved per
+// request by the host adapter. Incoming is the proxied request's own model +
+// credentials (nil when unavailable, e.g. the AuthBridge host); Static is a
+// configured cheap model (nil when none is configured). A component selects one
+// by its own `model.source` config via For.
 type ModelSpec struct {
-	Source string // "config" | "incoming"
-	// concrete client wiring is added with the extract component (P4)
+	Incoming Model
+	Static   Model
+}
+
+// For returns the client the component's configured source asks for: "config" ->
+// the static cheap model; anything else ("incoming"/unset) -> the incoming model,
+// falling back to the static one when there is no incoming client. Returns nil
+// when nothing is available, and the caller must degrade gracefully.
+func (m ModelSpec) For(source string) Model {
+	if source == "config" {
+		return m.Static
+	}
+	if m.Incoming != nil {
+		return m.Incoming
+	}
+	return m.Static
 }
 
 // Ctx is the per-request runtime handed to every component.

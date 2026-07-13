@@ -83,11 +83,18 @@ type slot struct {
 	lossless bool   // wholeMessage: does bifrost round-trip this message without dropping fields
 }
 
-// Body runs the pipeline over the request body's messages and returns the
-// rewritten body. changed=false means "forward the original unchanged" (no
+// Body runs the pipeline with no LLM clients available (deterministic components
+// only). See BodyWithModel to supply model clients for LLM-based components.
+func Body(ctx context.Context, pipe *components.Pipeline, st store.Store, provider bschemas.ModelProvider, body []byte, explicitSession string, bypass bool) ([]byte, bool) {
+	return BodyWithModel(ctx, pipe, st, provider, body, explicitSession, bypass, components.ModelSpec{})
+}
+
+// BodyWithModel runs the pipeline over the request body's messages and returns
+// the rewritten body. changed=false means "forward the original unchanged" (no
 // messages array, unparseable, or a re-serialization problem) — always fail
 // open. explicitSession is the host-supplied session id ("" -> content hash).
-func Body(ctx context.Context, pipe *components.Pipeline, st store.Store, provider bschemas.ModelProvider, body []byte, explicitSession string, bypass bool) ([]byte, bool) {
+// models carries the LLM clients that NeedsModel components may call.
+func BodyWithModel(ctx context.Context, pipe *components.Pipeline, st store.Store, provider bschemas.ModelProvider, body []byte, explicitSession string, bypass bool, models components.ModelSpec) ([]byte, bool) {
 	msgsRaw := gjson.GetBytes(body, "messages")
 	if !msgsRaw.Exists() || !msgsRaw.IsArray() {
 		return body, false
@@ -107,15 +114,25 @@ func Body(ctx context.Context, pipe *components.Pipeline, st store.Store, provid
 		Ctx:     ctx,
 		Session: session.Resolve(explicitSession, sys, firstUser),
 		Store:   st,
+		Model:   models,
 		Bypass:  bypass,
+	}
+
+	// Canonical form of each normalized message BEFORE the pipeline, so a
+	// count-changing component (summarize) can be mapped back to the body.
+	normPre := make([][]byte, len(norm))
+	for i := range norm {
+		normPre[i], _ = json.Marshal(norm[i])
 	}
 
 	pipe.Run(chat, c)
 
-	// A component changed the message count (none of the v1 set does) — the slot
-	// map no longer aligns, so fail open and forward the original untouched.
+	// A component changed the message count (summarize restructures the transcript
+	// to [msg0, <summary>, last-K]). Rebuild the messages array preserving each
+	// retained message's ORIGINAL raw bytes (byte-lossless, incl. Anthropic
+	// tool_result) and marshaling only genuinely new messages (the summary).
 	if len(chat.Input) != len(norm) {
-		return body, false
+		return rebuildCountChanged(body, msgsRaw.Array(), normPre, slots, chat.Input)
 	}
 
 	out := body
@@ -288,6 +305,69 @@ func jsonEqual(a, b []byte) bool {
 		return false
 	}
 	return reflect.DeepEqual(av, bv)
+}
+
+// rebuildCountChanged reconstructs the messages array after a component changed
+// the message count. Each output message that byte-matches a pre-pipeline
+// normalized message (a survivor) is emitted as its ORIGINAL body raw bytes
+// (byte-lossless); genuinely new messages (the summary) are marshaled fresh.
+// Fail-open (returns body,false) if any survivor can't be mapped to the body.
+func rebuildCountChanged(body []byte, orig []gjson.Result, normPre [][]byte, slots []slot, out []bschemas.ChatMessage) ([]byte, bool) {
+	used := make([]bool, len(normPre))
+	var parts [][]byte
+	lastBodyIdx := -1
+	for i := range out {
+		mb, err := json.Marshal(out[i])
+		if err != nil {
+			return body, false
+		}
+		matched := -1
+		for k := range normPre {
+			if !used[k] && bytes.Equal(mb, normPre[k]) {
+				matched = k
+				break
+			}
+		}
+		if matched < 0 {
+			parts = append(parts, mb) // new message (e.g. the summary) — fresh, lossless (plain text)
+			lastBodyIdx = -1
+			continue
+		}
+		used[matched] = true
+		bi, ok := bodyIndexOf(slots[matched].path)
+		if !ok || bi < 0 || bi >= len(orig) {
+			return body, false
+		}
+		if bi == lastBodyIdx {
+			continue // several normalized messages share one body message — emit it once
+		}
+		parts = append(parts, []byte(orig[bi].Raw))
+		lastBodyIdx = bi
+	}
+	var buf bytes.Buffer
+	buf.WriteByte('[')
+	for i, p := range parts {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		buf.Write(p)
+	}
+	buf.WriteByte(']')
+	res, err := sjson.SetRawBytes(body, "messages", buf.Bytes())
+	if err != nil {
+		return body, false
+	}
+	return res, true
+}
+
+// bodyIndexOf extracts the leading messages.<i> index from a slot path.
+func bodyIndexOf(path string) (int, bool) {
+	s := strings.TrimPrefix(path, "messages.")
+	if dot := strings.IndexByte(s, '.'); dot >= 0 {
+		s = s[:dot]
+	}
+	i, err := strconv.Atoi(s)
+	return i, err == nil
 }
 
 func systemAndFirstUser(msgs []bschemas.ChatMessage) (sys, firstUser string) {

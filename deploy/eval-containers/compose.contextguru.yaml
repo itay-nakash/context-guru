@@ -30,6 +30,8 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?set to the litellm token}
       # pipeline selection: a non-empty list wins, else the preset is used
       CONTEXT_GURU_PIPELINE: ${CONTEXT_GURU_PIPELINE:-}
+      # full config document (per-component config, e.g. extract strategy/model)
+      CONTEXT_GURU_CONFIG_YAML: ${CONTEXT_GURU_CONFIG_YAML:-}
       CONTEXT_GURU_PRESET: ${CONTEXT_GURU_PRESET:-off}
       CONTEXT_GURU_DEBUG: ${CONTEXT_GURU_DEBUG:-}
       # when set, the gateway appends a before→after record per rewritten message

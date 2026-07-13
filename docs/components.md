@@ -16,16 +16,23 @@ messages (`role:"tool"`; for Anthropic, `tool_result` blocks normalized to that 
 | `collapse` | Offload | middle of an oversized output | via expand | any large tool output (fallback) | `max_tokens` (2000), `head_lines` (20), `tail_lines` (20) |
 | `failed_run` | Offload | earlier superseded test/build runs | via expand | ≥2 run-like outputs | `min_tokens` (100) |
 | `cmdfilter` | Offload | lines per declarative DSL filter | via expand | output matching a filter | `filters` ([]), `disable_builtins` (false) |
-| `extract` | Offload | query-irrelevant lines | via expand | large output + a recent query | `min_tokens` (300), `head_lines`/`tail_lines` (5), `strategy` (deterministic) |
+| `extract` | Offload | query-irrelevant lines (or an LLM-written filter) | via expand | large output + a recent query | `min_tokens` (300), `head_lines`/`tail_lines` (5), `strategy` (deterministic\|code\|rlm), `model.source`, `trigger` |
 | `smartcrush` | Offload | middle items of a JSON array | via expand | JSON-array tool output | `min_items` (5), `min_tokens` (200), `keep_first` (3), `keep_last` (2) |
 | `mask` | Offload | older tool outputs (age-based) | via expand | more than `keep_recent` outputs | `keep_recent` (3), `min_tokens` (100) |
 | `phi_evict` | Offload | lowest-scoring outputs over budget | via expand | transcript over `budget_tokens` | `budget_tokens` (120000), `weights` (balanced) |
+| `summarize` | Offload (LLM) | the middle of the transcript → one summary | via expand | long trajectories | `summary_level` (regular), `keep_last` (3), `min_tokens` (500), `resummarize_tokens` (6000), `model.source`, `trigger` |
 
 Presets (`config`): `off` `[]` · `safe` `[format, cacheinject]` · `balanced`
 `[format, dedup, failed_run, cmdfilter, cacheinject]` · `aggressive` adds `smartcrush, extract` ·
 `coding` `[format, skeleton, cmdfilter, cacheinject]` · `mcp` `[format, smartcrush, cacheinject]` ·
 **`agent`** `[format, dedup, failed_run, mask, extract, cacheinject]` — for long agentic sessions;
-`mask` is the biggest lever there (~27% content-token savings, no reward loss — see [RESULTS.md](RESULTS.md)).
+`mask` is the biggest lever there (~27% content-token savings, no reward loss — see [RESULTS.md](RESULTS.md)) ·
+`summarize` `[summarize]` (run alone — it restructures the whole transcript).
+
+**LLM-based components** (`extract` with `strategy: code`/`rlm`, and `summarize`) call a model, chosen by
+`model.source`: `incoming` (default — reuse the proxied request's own model + key) or `config` (a dedicated
+cheap model set via `CHEAP_MODEL*` env / the gateway's `CheapModel`). When no model is available they
+degrade — `extract` to its deterministic projection, `summarize` to a no-op. See [design.md](design.md#llm-components).
 
 Common gates every Offload respects: skip non-text (`Rewritable`) messages, skip content already
 carrying a marker (no double-offload), and skip if the rewrite (marker + hint included) isn't
@@ -157,11 +164,25 @@ after:   <head> … lines mentioning auth/timeout + any error lines … <tail>
          <<cg:…>> [full output: call context_guru_expand]
 ```
 
+The relevance signal is the **full conversational context** (the task in the first user turn +
+the most recent assistant/user turns), not just one trailing sentence — so it keeps what the agent
+actually needs on any agent/benchmark.
+
 - **Config:** `min_tokens` (300), `head_lines`/`tail_lines` (5), `strategy`
-  (`deterministic` | `code` | `rlm`). `NeedsModel()` is true for `code`/`rlm`, but the cheap-LLM
-  client isn't wired yet — those select-and-fall-back to deterministic. **Shines:** big
-  query-focused MCP/API outputs. **Inert:** no user query to score against, output < `min_tokens`,
-  projection not smaller.
+  (`deterministic` | `code` | `rlm`), `model.source`, `trigger`. With `code`, a cheap LLM writes a
+  Starlark filter run in a sandbox (no imports/IO, step + 2s limits); the result is accepted only if a
+  **containment** check proves it's a lossless subset (else fall back to deterministic). The `code`
+  strategy is **domain-agnostic**: JSON bodies are decoded and filtered by shape; **raw text** (logs,
+  source, tracebacks, search results) is kept as an in-order **line subset** — containment accepts a
+  whole-line subsequence, not just a contiguous substring. `rlm` currently maps to `code`.
+- **Gating + reuse (LLM strategies):** a `trigger` decides whether to spend a model call —
+  `min_output_tokens` (per tool output; folds in legacy `min_tokens`), `min_request_tokens`,
+  `min_messages` — so `code` fires only on a large output in a large request, not every turn. A reduced
+  output is cached per session by content hash, so the **same output re-sent on a later turn reuses the
+  prior compaction** (no new model call, byte-identical result → prefix stays KV-cache stable).
+- **Shines:** big query-focused MCP/API outputs, logs and file reads; structured JSON where a filter
+  selects records precisely. **Inert:** no user query, output below floor, request below `trigger`,
+  projection not smaller, or (for `code`) no model available → deterministic.
 
 ### `smartcrush`
 Statistical JSON-**array** compressor: parse the array, keep `keep_first` + `keep_last` items plus
@@ -202,6 +223,34 @@ $$\Phi = w_R\cdot\text{relevance} + w_H\cdot\text{recency} - w_C\cdot\text{cost}
 - **Shines:** very long transcripts that must fit a context budget. **Inert:** total tool tokens ≤
   budget, or ≤1 tool output. The scalar-ranking essence of lean-ctx's Context Field (the full
   heat-diffusion/MMR/bandit machinery is a documented refinement).
+
+### `summarize` (LLM)
+Compresses the **middle of the trajectory** into one LLM-written summary (ported from CE-Manager's
+ReSum-style summarizer). Restructures the message list to `[msg0, <summary system message>, last-K]`;
+the replaced span is stashed under a marker carried in the summary message, so `expand` restores the
+full earlier trajectory. This is the one component that changes the message count — `apply.Body`
+rebuilds the body keeping the retained messages byte-identical.
+
+```
+before:  [system, u1, tool, a1, tool, u2, … 30 turns …, uN-1, uN]
+after:   [system, "=== History Summary === … <summary> … <<cg:…>>", uN-1, uN]
+```
+
+The summarizer is grounded in the **current task** (first user turn + recent turns are passed as
+"summarize toward this"), not a blind digest of the middle.
+
+- **Config:** `summary_level` (`concise`|`regular`|`highly_detailed`), `keep_last` (3),
+  `min_tokens` (500 — span floor), `include_tool_calls` (false → tool outputs masked in the
+  trajectory), `model.source`, `trigger`, `resummarize_tokens` (6000).
+- **Gating + reuse:** a `trigger` (`min_request_tokens`, `min_messages`; legacy `start_from_message`
+  folds into `min_messages`) gates the first summary so it fires only on a large/deep transcript.
+  After that, the summary is **checkpointed per session** and **reused verbatim** (no model call, and
+  byte-identical so the prefix stays KV-cache stable) until the un-summarized tail grows past
+  `resummarize_tokens`, when the checkpoint rolls forward with a fresh summary. This is what stops it
+  re-summarizing every turn.
+- **Shines:** long agentic sessions where the bulk is stale middle context. **Inert:** transcript
+  below `trigger`, span below `min_tokens`, or no model available (no-op). Run it **alone** (its own
+  preset) — it restructures the whole transcript.
 
 ---
 

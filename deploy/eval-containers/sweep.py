@@ -58,7 +58,27 @@ CONFIGS = [
     ("cg-balanced", "claude-code", "cg:preset=balanced"),
     ("rtk", "claude-code-rtk", "cg:off"),
     ("headroom", "claude-code", "headroom"),
+    # LLM-based (model.source: incoming -> same model as the agent, claude-sonnet-4-6)
+    ("cg-extract-code", "claude-code", "yaml:extract-code"),
+    ("cg-summarize", "claude-code", "yaml:summarize"),
 ]
+
+# Full config documents for LLM-based configs (per-component config the simple
+# CONTEXT_GURU_PIPELINE list can't express). incoming source = the agent's own model.
+FULL_CONFIGS = {
+    # LLM components are gated by a `trigger` (don't fire every turn) and reuse
+    # prior compactions from session state (don't re-call the model on re-sent
+    # content). extract fires only on large tool outputs in a large request;
+    # summarize only on a large/deep transcript, then reuses its summary until the
+    # un-summarized tail grows past resummarize_tokens.
+    "extract-code": "pipeline: [extract]\ncomponents:\n"
+                    "  extract: {strategy: code, model: {source: incoming},\n"
+                    "            trigger: {min_output_tokens: 700, min_request_tokens: 4000}}\n",
+    "summarize": "pipeline: [summarize]\ncomponents:\n"
+                 "  summarize: {keep_last: 3, min_tokens: 1000, resummarize_tokens: 5000,\n"
+                 "              model: {source: incoming},\n"
+                 "              trigger: {min_request_tokens: 6000, min_messages: 10}}\n",
+}
 FIELDS = ["task", "config", "agent", "reward", "passed", "wall_s",
           "gw_requests", "gw_before", "gw_after", "gw_saved", "gw_pct", "note"]
 
@@ -133,6 +153,8 @@ def run_cell(task, name, agent, selector, base, token):
             env["CONTEXT_GURU_PRESET"] = selector.split("=", 1)[1]
         elif selector.startswith("cg:"):
             env["CONTEXT_GURU_PIPELINE"] = selector[3:]
+        elif selector.startswith("yaml:"):
+            env["CONTEXT_GURU_CONFIG_YAML"] = FULL_CONFIGS[selector[5:]]
 
     sh(f"docker compose -p {proj} down -v")
     up = sh(f"docker compose -p {proj} {files} up -d", cwd=SWE, env=env)

@@ -38,6 +38,13 @@ export LISTEN_ADDR="${LISTEN_ADDR:-:${PORT:-4000}}"
 # wins — it renders a one-line config so a sweep can pin any component combo
 # (including a single component, or an empty list for a passthrough baseline)
 # without new presets. Otherwise fall back to a named preset.
+# A full config document (CONTEXT_GURU_CONFIG_YAML) wins over everything — it lets
+# a sweep pin per-component config (e.g. extract strategy: code, model.source).
+if [ -n "${CONTEXT_GURU_CONFIG_YAML:-}" ]; then
+	printf '%s' "${CONTEXT_GURU_CONFIG_YAML}" > /tmp/cg-config.yaml
+	exec /opt/gateway/main --config /tmp/cg-config.yaml
+fi
+
 # Non-empty CONTEXT_GURU_PIPELINE wins; an empty/unset value falls through to the
 # named preset (so an always-present-but-empty env var from compose doesn't force
 # passthrough — baseline uses CONTEXT_GURU_PRESET=off instead).
