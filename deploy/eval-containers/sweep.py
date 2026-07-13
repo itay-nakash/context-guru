@@ -66,10 +66,18 @@ CONFIGS = [
 # Full config documents for LLM-based configs (per-component config the simple
 # CONTEXT_GURU_PIPELINE list can't express). incoming source = the agent's own model.
 FULL_CONFIGS = {
-    # higher floors than the deterministic default: an LLM call only pays off on
-    # genuinely large outputs, and keeps calls/task bounded.
-    "extract-code": "pipeline: [extract]\ncomponents:\n  extract: {strategy: code, min_tokens: 1500, model: {source: incoming}}\n",
-    "summarize": "pipeline: [summarize]\ncomponents:\n  summarize: {start_from_message: 6, keep_last: 3, min_tokens: 1500, model: {source: incoming}}\n",
+    # LLM components are gated by a `trigger` (don't fire every turn) and reuse
+    # prior compactions from session state (don't re-call the model on re-sent
+    # content). extract fires only on large tool outputs in a large request;
+    # summarize only on a large/deep transcript, then reuses its summary until the
+    # un-summarized tail grows past resummarize_tokens.
+    "extract-code": "pipeline: [extract]\ncomponents:\n"
+                    "  extract: {strategy: code, model: {source: incoming},\n"
+                    "            trigger: {min_output_tokens: 700, min_request_tokens: 4000}}\n",
+    "summarize": "pipeline: [summarize]\ncomponents:\n"
+                 "  summarize: {keep_last: 3, min_tokens: 1000, resummarize_tokens: 5000,\n"
+                 "              model: {source: incoming},\n"
+                 "              trigger: {min_request_tokens: 6000, min_messages: 10}}\n",
 }
 FIELDS = ["task", "config", "agent", "reward", "passed", "wall_s",
           "gw_requests", "gw_before", "gw_after", "gw_saved", "gw_pct", "note"]

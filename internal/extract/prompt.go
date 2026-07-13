@@ -37,8 +37,8 @@ func buildPrompt(bodyText, goal string, keepIDs []string) string {
 	if g == "" {
 		g = "(no explicit goal stated)"
 	}
-	if len(g) > 2000 {
-		g = g[:2000]
+	if len(g) > 8000 {
+		g = g[:8000]
 	}
 	keep := keepIDs
 	if len(keep) > 60 {
@@ -68,32 +68,47 @@ func buildPrompt(bodyText, goal string, keepIDs []string) string {
 // codeRules is the Starlark code-writing contract: the model writes a program that
 // runs over the real INPUT (it is NOT shown the full body), so the prompt stays cheap.
 // Same "select, never summarize, recall-first" discipline as buildPrompt, retargeted
-// from "return the value" to "write the filter".
+// from "return the value" to "write the filter". It is domain-agnostic: it works for
+// ANY tool output (JSON records, logs, source files, tracebacks, search results,
+// tables, command output) — not one benchmark or one shape.
 const codeRules = `Write a Starlark program (a safe Python subset) that filters this ONE tool output
-down to only what the agent needs next. Contract:
+down to only the parts the agent needs next. Works for ANY output — JSON, logs,
+source code, search results, tracebacks, tables, command output.
+Contract:
 - The global string INPUT holds the FULL tool output. The module ` + "`json`" + ` is available.
-- Start: data = json.decode(INPUT)
-- Select a SMALLER value of the SAME shape (e.g. drop irrelevant list records / fields).
-- End: OUTPUT = json.encode(result)   # OUTPUT must be a string
+- Assign a string global OUTPUT holding the KEPT content, same kind as INPUT.
+- If INPUT is JSON (it starts with { or [): result = json.decode(INPUT), keep a
+  SMALLER value of the SAME shape (drop irrelevant records/fields), then
+  OUTPUT = json.encode(result).
+- Otherwise treat INPUT as TEXT: lines = INPUT.split("\n"); keep only the relevant
+  lines (an in-order subset — never reorder or edit them); OUTPUT = "\n".join(kept).
 Rules, in priority order:
-1. RECALL FIRST. When unsure whether a record/field is relevant, KEEP IT.
-2. SELECT, NEVER SUMMARIZE. Keep whole records/values byte-for-byte. Never paraphrase,
-   truncate, round, reformat, or invent values — only DROP clearly-irrelevant ones.
-3. PRESERVE EXACTLY: ids, numbers, names, paths, timestamps, errors, stack traces —
-   and anything matching the KEEP list.
-4. NO imports (no load()), NO I/O, NO network. Use only json.decode/json.encode and
-   plain Starlark (list comprehensions, dict/list ops, string ops).
-5. If you cannot identify clearly-irrelevant content, set OUTPUT = INPUT.
+1. RECALL FIRST. When unsure whether a line/record is relevant, KEEP IT.
+2. SELECT, NEVER SUMMARIZE. Keep whole lines/records byte-for-byte. Never paraphrase,
+   truncate, reword, renumber, reformat, or invent — only DROP clearly-irrelevant ones.
+3. PRESERVE EXACTLY: ids, numbers, names, paths, signatures, timestamps, error
+   messages, stack traces — and anything matching the KEEP list.
+4. KEEP anything mentioning the goal or a KEEP identifier. DROP unrelated boilerplate:
+   banners, progress/spinner lines, repeated separators, unrelated files/records/tests.
+5. NO imports (no load()), NO I/O, NO network. Use only json.decode/json.encode and
+   plain Starlark (list comprehensions, dict/list/string ops, .split/.join/in).
+6. If you cannot identify clearly-irrelevant content, set OUTPUT = INPUT.
 Output ONLY the Starlark program — no prose, no markdown fences.`
 
-const codeExample = `EXAMPLE
-Goal: "Fix failing test test_auth_expiry; find the relevant hit."
-KEEP: ["test_auth_expiry","auth/session.py"]
+const codeExample = `EXAMPLE A (JSON records)
+Goal: "Fix failing test test_auth_expiry."   KEEP: ["test_auth_expiry","auth/session.py"]
 INPUT schema: list of {"path": str, "snippet": str}
 PROGRAM:
 data = json.decode(INPUT)
 result = [r for r in data if "auth" in r["path"] or "test_auth_expiry" in r["snippet"]]
-OUTPUT = json.encode(result)`
+OUTPUT = json.encode(result)
+
+EXAMPLE B (raw text / log)
+Goal: "Why does build fail?"   KEEP: ["compile_module","widget.c"]
+PROGRAM:
+lines = INPUT.split("\n")
+kept = [ln for ln in lines if "error" in ln.lower() or "widget.c" in ln or "compile_module" in ln]
+OUTPUT = "\n".join(kept)`
 
 // buildCodePrompt builds the prompt for the Starlark code-writing strategy. Unlike
 // buildPrompt it does NOT inline the full body — the program runs over the real INPUT.
@@ -103,8 +118,8 @@ func buildCodePrompt(bodyText, goal string, keepIDs []string) string {
 	if g == "" {
 		g = "(no explicit goal stated)"
 	}
-	if len(g) > 2000 {
-		g = g[:2000]
+	if len(g) > 8000 {
+		g = g[:8000]
 	}
 	keep := keepIDs
 	if len(keep) > 60 {

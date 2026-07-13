@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"time"
 
 	"github.com/kagenti/context-guru/components"
 	"github.com/kagenti/context-guru/expand"
@@ -13,6 +14,18 @@ import (
 )
 
 func init() { components.Register("summarize", newSummarize) }
+
+// summarizeCallTimeout bounds the single summarizer call. It is higher than
+// extract's ceiling because summarize makes ONE call over a large span, and a
+// big trajectory legitimately takes the model longer to read and compress.
+const summarizeCallTimeout = 150 * time.Second
+
+// maxTrajectoryChars caps the trajectory text sent to the summarizer so a very
+// large span still fits the model's context window (≈70k tokens, well under a
+// 200k window with room for the summary) instead of erroring and failing open.
+// The most recent turns are kept; the full original span is always stashed for
+// expand, so the older prefix is never lost — only left out of THIS summary.
+const maxTrajectoryChars = 280_000
 
 // Summarize compresses the middle of a long trajectory into one LLM-written
 // summary (ported from CE-Manager's ReSum-style summarizer). It restructures the
@@ -24,35 +37,48 @@ func init() { components.Register("summarize", newSummarize) }
 // This is the one component that changes the message count; apply.Body rebuilds
 // the body preserving the retained messages' original bytes.
 type Summarize struct {
-	level            string
-	keepLast         int
-	startFrom        int
-	minTokens        int
-	includeToolCalls bool
-	modelSource      string
+	level             string
+	keepLast          int
+	minTokens         int
+	resummarizeTokens int
+	includeToolCalls  bool
+	modelSource       string
+	trigger           components.Trigger
 }
 
 type summarizeConfig struct {
-	SummaryLevel     string `yaml:"summary_level"`      // concise | regular | highly_detailed
-	KeepLast         int    `yaml:"keep_last"`          // messages kept verbatim at the tail
-	StartFrom        int    `yaml:"start_from_message"` // no-op until the list reaches this length
-	MinTokens        int    `yaml:"min_tokens"`         // min content tokens in the span to bother
-	IncludeToolCalls bool   `yaml:"include_tool_calls"`
-	Model            struct {
+	SummaryLevel string `yaml:"summary_level"`      // concise | regular | highly_detailed
+	KeepLast     int    `yaml:"keep_last"`          // messages kept verbatim at the tail
+	StartFrom    int    `yaml:"start_from_message"` // legacy: folds into trigger.min_messages
+	MinTokens    int    `yaml:"min_tokens"`         // min content tokens in the span to bother
+	// ResummarizeTokens: once a summary exists, reuse it (no LLM call) until the
+	// un-summarized tail since the last checkpoint grows past this many tokens,
+	// then roll the checkpoint forward with a fresh summary. 0 = re-summarize
+	// every eligible turn (old behavior).
+	ResummarizeTokens int  `yaml:"resummarize_tokens"`
+	IncludeToolCalls  bool `yaml:"include_tool_calls"`
+	Model             struct {
 		Source string `yaml:"source"` // incoming (default) | config
 	} `yaml:"model"`
+	Trigger components.Trigger `yaml:"trigger"`
 }
 
 func newSummarize(raw []byte) (components.Component, error) {
-	cfg := summarizeConfig{SummaryLevel: "regular", KeepLast: 3, StartFrom: 6, MinTokens: 500}
+	cfg := summarizeConfig{SummaryLevel: "regular", KeepLast: 3, StartFrom: 6, MinTokens: 500, ResummarizeTokens: 6000}
 	if len(raw) > 0 {
 		if err := yaml.Unmarshal(raw, &cfg); err != nil {
 			return nil, err
 		}
 	}
+	// Legacy start_from_message is a message-count gate; the canonical knob is
+	// trigger.min_messages. Fold one into the other so both work.
+	if cfg.Trigger.MinMessages == 0 {
+		cfg.Trigger.MinMessages = cfg.StartFrom
+	}
 	return &Summarize{
-		level: cfg.SummaryLevel, keepLast: cfg.KeepLast, startFrom: cfg.StartFrom,
-		minTokens: cfg.MinTokens, includeToolCalls: cfg.IncludeToolCalls, modelSource: cfg.Model.Source,
+		level: cfg.SummaryLevel, keepLast: cfg.KeepLast,
+		minTokens: cfg.MinTokens, resummarizeTokens: cfg.ResummarizeTokens,
+		includeToolCalls: cfg.IncludeToolCalls, modelSource: cfg.Model.Source, trigger: cfg.Trigger,
 	}, nil
 }
 
@@ -64,7 +90,9 @@ func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 	msgs := req.Input
 	// Keep msg0 (system/first) + the last keepLast; summarize the span between.
 	start, end := 1, len(msgs)-s.keepLast
-	if len(msgs) < s.startFrom || end <= start {
+	// Request-level trigger: don't summarize (an LLM call) until the transcript
+	// is genuinely large / deep. Zero thresholds fire always (back-compat).
+	if !s.trigger.Fires(req) || end <= start {
 		rep.Skipped = true
 		return nil, nil
 	}
@@ -73,15 +101,25 @@ func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 		rep.Skipped = true // NeedsModel but none available → degrade gracefully
 		return nil, nil
 	}
+
+	// Reuse a prior summary if the covered prefix is unchanged and the tail since
+	// that checkpoint is still small — no LLM call, and the summary message stays
+	// byte-identical (KV-cache stable). Roll the checkpoint forward only once the
+	// tail grows past resummarize_tokens.
+	if out, keys, ok := s.tryReuse(c, msgs, start, end); ok {
+		req.Input = out
+		return keys, nil
+	}
+
 	span := msgs[start:end]
 	if schema.MessagesTokens(&bschemas.BifrostChatRequest{Input: span}) < s.minTokens {
 		rep.Skipped = true
 		return nil, nil
 	}
 
-	ctx, cancel := context.WithTimeout(c.Ctx, llmCallTimeout)
+	ctx, cancel := context.WithTimeout(c.Ctx, summarizeCallTimeout)
 	defer cancel()
-	summary, err := s.summarize(ctx, model, span)
+	summary, err := s.summarize(ctx, model, span, conversationGoal(req))
 	if err != nil {
 		return nil, err // fail-open: the pipeline reverts this component
 	}
@@ -98,8 +136,16 @@ func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 	key := hashKey(string(spanJSON))
 	c.Store.Put(key, spanJSON)
 
+	summaryText := summaryWrapper(summary, key)
 	summaryMsg := bschemas.ChatMessage{Role: bschemas.ChatMessageRoleSystem}
-	schema.SetMessageText(&summaryMsg, summaryWrapper(summary, key))
+	schema.SetMessageText(&summaryMsg, summaryText)
+
+	// Checkpoint: this summary subsumes the leading span (len(span) messages from
+	// index 1). A later turn appends messages, so this same prefix stays stable.
+	saveCheckpoint(c, sumCheckpoint{
+		SummaryMsg: summaryText, CoveredCount: end - start,
+		CoveredHash: spanHash(span), Key: key,
+	})
 
 	// [msg0, summary, last-K] — reassign; apply.Body rebuilds losslessly.
 	out := make([]bschemas.ChatMessage, 0, 2+s.keepLast)
@@ -109,13 +155,55 @@ func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 	return []string{key}, nil
 }
 
+// tryReuse re-emits the previous summary if (1) a checkpoint exists, (2) the
+// covered prefix (msgs[1:1+CoveredCount]) is byte-unchanged, and (3) the tail
+// since that boundary is below resummarize_tokens. It returns the rebuilt
+// [msg0, priorSummary, msgs[boundary:]] and the (refreshed) stash key. No LLM
+// call. ok=false means "re-summarize fresh".
+func (s *Summarize) tryReuse(c *components.Ctx, msgs []bschemas.ChatMessage, start, end int) ([]bschemas.ChatMessage, []string, bool) {
+	if s.resummarizeTokens <= 0 {
+		return nil, nil, false
+	}
+	cp, ok := loadCheckpoint(c)
+	if !ok || cp.CoveredCount <= 0 {
+		return nil, nil, false
+	}
+	boundary := start + cp.CoveredCount
+	if boundary > end { // covered prefix would overlap the kept tail — can't reuse
+		return nil, nil, false
+	}
+	covered := msgs[start:boundary]
+	if spanHash(covered) != cp.CoveredHash {
+		return nil, nil, false // prefix diverged (different session / edited) → fresh
+	}
+	// The un-summarized middle since the checkpoint (excludes the kept last-K).
+	if schema.MessagesTokens(&bschemas.BifrostChatRequest{Input: msgs[boundary:end]}) >= s.resummarizeTokens {
+		return nil, nil, false // grown enough — roll the checkpoint forward
+	}
+	// Refresh the stashed original span so expand keeps resolving it.
+	if b, err := json.Marshal(covered); err == nil {
+		c.Store.Put(cp.Key, b)
+	}
+	summaryMsg := bschemas.ChatMessage{Role: bschemas.ChatMessageRoleSystem}
+	schema.SetMessageText(&summaryMsg, cp.SummaryMsg)
+	out := make([]bschemas.ChatMessage, 0, 2+(len(msgs)-boundary))
+	out = append(out, msgs[0], summaryMsg)
+	out = append(out, msgs[boundary:]...)
+	return out, []string{cp.Key}, true
+}
+
 // summarize builds the trajectory string and asks the model once (bounded retry).
-func (s *Summarize) summarize(ctx context.Context, model components.Model, span []bschemas.ChatMessage) (string, error) {
+// goal is the current task + recent turns, so the summary is grounded in what the
+// agent is actually trying to do — not a blind digest of the middle.
+func (s *Summarize) summarize(ctx context.Context, model components.Model, span []bschemas.ChatMessage, goal string) (string, error) {
 	sys := summarizerSystemPrompt
 	if !s.includeToolCalls {
 		sys += summarizerMaskedNote
 	}
 	user := strings.Replace(summarizerUserPrompt, "{trajectory}", trajectoryString(span, s.includeToolCalls), 1)
+	if g := strings.TrimSpace(goal); g != "" {
+		user = "CURRENT TASK / QUESTION (summarize toward this):\n" + g + "\n\n" + user
+	}
 	if suffix := summaryLevelSuffix[s.level]; suffix != "" {
 		user += "\n" + suffix
 	}
@@ -149,7 +237,14 @@ func trajectoryString(span []bschemas.ChatMessage, includeToolCalls bool) string
 		b.WriteString("]\n")
 		b.WriteString(content)
 	}
-	return b.String()
+	s := b.String()
+	// Keep the trajectory within the model's context window: if it's huge, keep
+	// the most recent portion (the full original span is stashed for expand).
+	if len(s) > maxTrajectoryChars {
+		s = "…[older trajectory omitted from this summary; full original preserved for expand]\n\n" +
+			s[len(s)-maxTrajectoryChars:]
+	}
+	return s
 }
 
 func ensureSummaryTags(s string) string {
