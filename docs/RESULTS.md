@@ -219,6 +219,18 @@ Total gateway tokens saved across the set: **extract-code ≈ 193k, summarize �
   summarize checkpoints its summary per session, so a re-sent output / unchanged prefix reuses the prior
   result byte-for-byte — no repeat model call, KV-cache-stable prefix. Stops both re-deriving a
   different compaction every turn.
+
+### extract-code codegen — content-specific deletion (raw-text fix)
+
+The first extract-code cut showed the model only a 1500-char *sample*, so on a raw-text pytest log
+(196 lines) it wrote a blind generic keyword filter that kept every "test" line — **1.3%** reduction.
+Fix: show the model the **full** output (bounded ~32k chars) + give it regex helpers
+(`re_sub`/`re_findall`/`re_split`/`re_match`), and generalize the containment proof to a **character
+subsequence** (deletion-only) so it can trim within lines, not just drop whole ones. On the same
+pytest log the model now writes a filter *specific to the content it sees* and cuts **3487 → 157
+tokens (~95%)**, still containment-verified (a live, reproducible example —
+`internal/extract/zz_live_test.go`, run with `CG_LIVE=1`). Guarantee stays "never fabricates";
+`rewrite: true` is the opt-in that trades it for free rewrite.
 - **Fundamental tension** confirmed empirically: on this traffic, summarize only saves where it fires,
   and firing on small transcripts is exactly what regresses reward. The gain came from firing it on the
   *large, already-failing* tasks — not from accepting regressions on the small ones.

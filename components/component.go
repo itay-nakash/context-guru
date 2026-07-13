@@ -43,9 +43,10 @@ type Reformat interface {
 // returns the cache_keys under which it stashed the originals (via c.Store) —
 // one per offloaded item. If it shrinks the request but returns no keys, the
 // pipeline treats it as a failed offload and reverts (you cannot silently lose
-// data). Returning no keys AND leaving the request unchanged is a legitimate
-// no-op (set rep.Skipped). Examples: collapse, dedup, cmdfilter, extract,
-// smartcrush.
+// data) — UNLESS it set rep.Irreversible, the deliberate lossy drop a non-`full`
+// marker_mode makes (summary/off: no stash, no restoration). Returning no keys
+// AND leaving the request unchanged is a legitimate no-op (set rep.Skipped).
+// Examples: collapse, dedup, cmdfilter, extract, smartcrush.
 type Offload interface {
 	Component
 	Offload(req *schemas.BifrostChatRequest, rep *Report, c *Ctx) (cacheKeys []string, err error)
@@ -119,6 +120,7 @@ type Report struct {
 	CacheKeys    []string // set by Offload components (one per stashed original)
 	Skipped      bool     // component ran but chose not to act
 	Reverted     bool     // pipeline reverted it (error/panic/never-worse)
+	Irreversible bool     // Offload dropped content on purpose without stashing (marker_mode summary/off)
 	Err          error
 }
 

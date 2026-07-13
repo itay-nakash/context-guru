@@ -29,7 +29,7 @@ func TestRunStarlarkFiltersFullBody(t *testing.T) {
 		recs = append(recs, `{"id":`+strconv.Itoa(i)+`,"name":"`+name+`"}`)
 	}
 	body := "[" + strings.Join(recs, ",") + "]"
-	out := runStarlark(context.Background(), body, "find keep", nil, starlarkModel{})
+	out := runStarlark(context.Background(), body, "find keep", nil, starlarkModel{}, false)
 	if out == "" {
 		t.Fatal("expected a Starlark result")
 	}
@@ -52,7 +52,7 @@ func (evilModel) Complete(_ context.Context, _ string) (string, error) {
 }
 
 func TestRunStarlarkFailsOpenOnDisallowed(t *testing.T) {
-	if out := runStarlark(context.Background(), `[{"a":1}]`, "", nil, evilModel{}); out != "" {
+	if out := runStarlark(context.Background(), `[{"a":1}]`, "", nil, evilModel{}, false); out != "" {
 		t.Fatalf("disallowed program must fail open to \"\", got %q", out)
 	}
 }

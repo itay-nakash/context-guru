@@ -92,9 +92,11 @@ func (p *Pipeline) runOne(comp Component, req *schemas.BifrostChatRequest, c *Ct
 		rep.Reverted = true
 		rep.TokensAfter = rep.TokensBefore
 		rep.Err = err
-	case rep.Kind == "offload" && after < rep.TokensBefore && len(rep.CacheKeys) == 0 && !rep.Skipped:
+	case rep.Kind == "offload" && after < rep.TokensBefore && len(rep.CacheKeys) == 0 && !rep.Skipped && !rep.Irreversible:
 		// An Offload that dropped content without stashing an original is a
-		// contract violation — reversibility would be broken. Revert.
+		// contract violation — reversibility would be broken. Revert. (A
+		// deliberate lossy drop under marker_mode summary/off sets rep.Irreversible
+		// and is exempt: it chose no restoration, not forgot it.)
 		req.Input = before
 		rep.Reverted = true
 		rep.TokensAfter = rep.TokensBefore

@@ -128,17 +128,7 @@ func TestExtractProjectsRelevantLines(t *testing.T) {
 	}
 }
 
-// TestSkeletonSkipsNonToolMessages locks the role-scope fix: skeleton must
-// leave a user/assistant message's own code untouched (only tool outputs are
-// offloaded), otherwise it would mangle the caller's code with no live recovery.
-func TestSkeletonSkipsNonToolMessages(t *testing.T) {
-	code := "```go\nfunc Add(a, b int) int {\n\tsum := 0\n\tsum += a\n\tsum += b\n\tfor i := 0; i < 10; i++ { sum += i }\n\treturn sum\n}\n```"
-	req := &bschemas.BifrostChatRequest{Input: []bschemas.ChatMessage{userMsg(code)}}
-	run(t, "pipeline: [skeleton]\ncomponents:\n  skeleton: {min_tokens: 5}\n", req)
-	if got := schema.MessageText(req.Input[0]); got != code {
-		t.Fatalf("skeleton must not rewrite a non-tool message; got %q", got)
-	}
-}
+// TestSkeletonSkipsNonToolMessages moved to skeleton_test.go (cg_skeleton tag).
 
 func min(a, b int) int {
 	if a < b {

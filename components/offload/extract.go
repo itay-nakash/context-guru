@@ -40,6 +40,8 @@ type Extract struct {
 	strategy    string
 	modelSource string
 	trigger     components.Trigger
+	mode        markerMode
+	rewrite     bool
 }
 
 type extractConfig struct {
@@ -50,7 +52,12 @@ type extractConfig struct {
 	Model     struct {
 		Source string `yaml:"source"` // incoming (default) | config
 	} `yaml:"model"`
-	Trigger components.Trigger `yaml:"trigger"`
+	Trigger    components.Trigger `yaml:"trigger"`
+	MarkerMode string             `yaml:"marker_mode"` // full (default) | summary | off
+	// Rewrite (code strategy only): drop the deletion-only containment proof so the
+	// model may reword/summarize/rewrite. Lossy + unverified — pair with a non-full
+	// marker_mode. Default false keeps the verified deletion-only guarantee.
+	Rewrite bool `yaml:"rewrite"`
 }
 
 func newExtract(raw []byte) (components.Component, error) {
@@ -65,7 +72,7 @@ func newExtract(raw []byte) (components.Component, error) {
 	if cfg.Trigger.MinOutputTokens == 0 {
 		cfg.Trigger.MinOutputTokens = cfg.MinTokens
 	}
-	return &Extract{minTokens: cfg.MinTokens, head: cfg.Head, tail: cfg.Tail, strategy: cfg.Strategy, modelSource: cfg.Model.Source, trigger: cfg.Trigger}, nil
+	return &Extract{minTokens: cfg.MinTokens, head: cfg.Head, tail: cfg.Tail, strategy: cfg.Strategy, modelSource: cfg.Model.Source, trigger: cfg.Trigger, mode: parseMarkerMode(cfg.MarkerMode), rewrite: cfg.Rewrite}, nil
 }
 
 // outputFloor is the minimum tokens a single tool output must have to be worth
@@ -104,6 +111,7 @@ func (e *Extract) Offload(req *bschemas.BifrostChatRequest, rep *components.Repo
 	floor := e.outputFloor()
 	keepIDs := extract.HarvestIdentifiers(goal, 40)
 	var keys []string
+	changed := 0
 	for _, i := range toolIndices(req) {
 		msg := &req.Input[i]
 		if !schema.Rewritable(*msg) {
@@ -113,7 +121,7 @@ func (e *Extract) Offload(req *bschemas.BifrostChatRequest, rep *components.Repo
 		if content == "" || schema.TextTokens(content) < floor {
 			continue
 		}
-		if len(expand.ParseMarkers(content)) > 0 {
+		if expand.HasPlaceholder(content) {
 			continue
 		}
 		// Reuse a prior compaction of this exact output (marker/whitespace
@@ -128,12 +136,14 @@ func (e *Extract) Offload(req *bschemas.BifrostChatRequest, rep *components.Repo
 		if !ok || schema.TextTokens(projected) >= schema.TextTokens(content) {
 			continue
 		}
-		key := hashKey(content)
-		c.Store.Put(key, []byte(content))
-		schema.SetMessageText(msg, projected+"\n"+expand.Marker(key)+" [full output: call "+expand.ToolName+"]")
-		keys = append(keys, key)
+		tok, key := mark(c, rep, e.mode, content, " [full output: call "+expand.ToolName+"]")
+		schema.SetMessageText(msg, projected+"\n"+tok)
+		changed++
+		if key != "" {
+			keys = append(keys, key)
+		}
 	}
-	if len(keys) == 0 {
+	if changed == 0 {
 		rep.Skipped = true
 	}
 	return keys, nil
@@ -148,6 +158,7 @@ func (e *Extract) reduce(c *components.Ctx, content, goal string, keepIDs []stri
 		cfg := extract.DefaultCfg()
 		cfg.Mode = "code" // rlm is deferred → use the Starlark code strategy
 		cfg.Floor = e.outputFloor()
+		cfg.Rewrite = e.rewrite
 		ctx, cancel := context.WithTimeout(c.Ctx, llmCallTimeout)
 		res, _ := extract.RunExtraction(ctx, content, goal, keepIDs, schema.TextTokens(content), cfg, model)
 		cancel()

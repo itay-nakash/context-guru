@@ -54,30 +54,7 @@ func TestFormatCompactsJSON(t *testing.T) {
 	}
 }
 
-func TestSkeletonElidesBodies(t *testing.T) {
-	code := "```go\n" +
-		"package main\n\n" +
-		"func Add(a, b int) int {\n" +
-		"\tsum := 0\n\tsum += a\n\tsum += b\n\tfor i := 0; i < 10; i++ { sum += i }\n\treturn sum\n}\n\n" +
-		"func Mul(a, b int) int {\n\tp := 0\n\tfor i := 0; i < b; i++ { p += a }\n\treturn p\n}\n" +
-		"```"
-	req := &schemas.BifrostChatRequest{Input: []schemas.ChatMessage{toolMsg(code)}}
-	_, st := run(t, "pipeline: [skeleton]\ncomponents:\n  skeleton: {min_tokens: 5}\n", req)
-	got := schema.MessageText(req.Input[0])
-	if !strings.Contains(got, "func Add(a, b int) int") || !strings.Contains(got, "{ … }") {
-		t.Fatalf("skeleton should keep signatures and elide bodies: %q", got)
-	}
-	if strings.Contains(got, "sum += a") {
-		t.Fatalf("skeleton should have removed body statements: %q", got)
-	}
-	keys := expand.ParseMarkers(got)
-	if len(keys) != 1 {
-		t.Fatalf("expected expand marker, got %q", got)
-	}
-	if orig, ok := expand.Resolve(st, keys[0]); !ok || !strings.Contains(orig, "sum += a") {
-		t.Fatal("expand did not recover original source")
-	}
-}
+// TestSkeletonElidesBodies moved to skeleton_test.go (cg_skeleton build tag).
 
 func TestFailedRunSupersedes(t *testing.T) {
 	run1 := "=== test session starts ===\n" + strings.Repeat("detail line about the failing run\n", 20) + "3 failed, 2 passed in 1.2s\n"

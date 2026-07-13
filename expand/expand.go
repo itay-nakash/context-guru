@@ -11,12 +11,20 @@ package expand
 
 import (
 	"regexp"
+	"strings"
 
 	"github.com/kagenti/context-guru/store"
 )
 
 // ToolName is the model-callable tool that retrieves offloaded content.
 const ToolName = "context_guru_expand"
+
+// SummaryMarker is the non-resolvable sentinel an Offload component writes under
+// marker_mode "summary": it signals "content was compacted here" — to the model
+// and to cross-turn skip-detection — but carries no store key, so there is
+// nothing to expand (restoration is off). The human-readable description of what
+// was dropped stays inline in the message (the component's own note).
+const SummaryMarker = "⟪cg⟫"
 
 // Marker is the sentinel an Offload component writes in place of dropped
 // content. HASH is the store key. Sticky-on per session (headroom's golden
@@ -27,6 +35,15 @@ var markerRe = regexp.MustCompile(`<<cg:([A-Za-z0-9_-]{1,64})>>`)
 
 // Marker renders the sentinel for a given store key.
 func Marker(key string) string { return "<<cg:" + key + ">>" }
+
+// HasPlaceholder reports whether s already carries a context-guru placeholder —
+// a resolvable <<cg:HASH>> marker (full mode) OR a SummaryMarker sentinel
+// (summary mode). Components use it to skip content an earlier component/turn
+// already reduced, so a later turn re-sending the same message reduces to the
+// same bytes (provider prefix-cache stays warm).
+func HasPlaceholder(s string) bool {
+	return strings.Contains(s, SummaryMarker) || markerRe.MatchString(s)
+}
 
 // ParseMarkers returns the distinct store keys referenced by any markers in s,
 // in first-seen order.

@@ -21,10 +21,14 @@ var runMarkers = regexp.MustCompile(`(?i)(\d+ (passed|failed|error)|BUILD (SUCCE
 // the most recent run-like tool output is kept in full; earlier ones become a
 // pointer + stash. This is the "provable-reason" collapse — a superseded run is
 // safely recoverable via expand if the agent still needs it.
-type FailedRun struct{ minTokens int }
+type FailedRun struct {
+	minTokens int
+	mode      markerMode
+}
 
 type failedRunConfig struct {
-	MinTokens int `yaml:"min_tokens"`
+	MinTokens  int    `yaml:"min_tokens"`
+	MarkerMode string `yaml:"marker_mode"` // full (default) | summary | off
 }
 
 func newFailedRun(raw []byte) (components.Component, error) {
@@ -34,7 +38,7 @@ func newFailedRun(raw []byte) (components.Component, error) {
 			return nil, err
 		}
 	}
-	return &FailedRun{minTokens: cfg.MinTokens}, nil
+	return &FailedRun{minTokens: cfg.MinTokens, mode: parseMarkerMode(cfg.MarkerMode)}, nil
 }
 
 func (FailedRun) Name() string                 { return "failed_run" }
@@ -55,7 +59,7 @@ func (fr *FailedRun) Offload(req *schemas.BifrostChatRequest, rep *components.Re
 		if schema.TextTokens(content) < fr.minTokens {
 			continue
 		}
-		if len(expand.ParseMarkers(content)) > 0 {
+		if expand.HasPlaceholder(content) {
 			continue // already offloaded
 		}
 		if runMarkers.MatchString(content) {
@@ -71,10 +75,11 @@ func (fr *FailedRun) Offload(req *schemas.BifrostChatRequest, rep *components.Re
 	for _, i := range runs[:len(runs)-1] {
 		m := &req.Input[i]
 		content := schema.MessageText(*m)
-		key := hashKey(content)
-		c.Store.Put(key, []byte(content))
-		schema.SetMessageText(m, "[superseded by a later run] "+expand.Marker(key)+" [full output: call "+expand.ToolName+"]")
-		keys = append(keys, key)
+		tok, key := mark(c, rep, fr.mode, content, " [full output: call "+expand.ToolName+"]")
+		schema.SetMessageText(m, "[superseded by a later run] "+tok)
+		if key != "" {
+			keys = append(keys, key)
+		}
 	}
 	return keys, nil
 }

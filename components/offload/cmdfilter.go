@@ -22,11 +22,15 @@ func init() { components.Register("cmdfilter", newCmdfilter) }
 // Offload: it stashes the original before filtering so the expand tool can
 // recover it. Filters match on the tool output's first non-empty line (the
 // proxy-world stand-in for rtk's shell command).
-type Cmdfilter struct{ reg *dsl.Registry }
+type Cmdfilter struct {
+	reg  *dsl.Registry
+	mode markerMode
+}
 
 type cmdfilterConfig struct {
 	Filters         []string `yaml:"filters"`          // inline filter YAML documents
 	DisableBuiltins bool     `yaml:"disable_builtins"` // skip the bundled starter filters
+	MarkerMode      string   `yaml:"marker_mode"`      // full (default) | summary | off
 }
 
 func newCmdfilter(raw []byte) (components.Component, error) {
@@ -47,7 +51,7 @@ func newCmdfilter(raw []byte) (components.Component, error) {
 			return nil, err
 		}
 	}
-	return &Cmdfilter{reg: reg}, nil
+	return &Cmdfilter{reg: reg, mode: parseMarkerMode(cfg.MarkerMode)}, nil
 }
 
 func (Cmdfilter) Name() string { return "cmdfilter" }
@@ -56,6 +60,7 @@ func (f *Cmdfilter) Enabled(*components.Ctx) bool { return f.reg.Len() > 0 }
 
 func (f *Cmdfilter) Offload(req *schemas.BifrostChatRequest, rep *components.Report, c *components.Ctx) ([]string, error) {
 	var keys []string
+	changed := 0
 	for i := range req.Input {
 		m := &req.Input[i]
 		if m.Role != schemas.ChatMessageRoleTool {
@@ -76,19 +81,36 @@ func (f *Cmdfilter) Offload(req *schemas.BifrostChatRequest, rep *components.Rep
 		if out == content {
 			continue
 		}
-		// Compare the FULL rewritten text (marker + recovery hint included) against
-		// the original — the marker costs tokens too, so filtering that barely wins
-		// can still make the message larger (rtk never_worse, at the message level).
+		// Build the token that goes where the restoration marker would (per
+		// marker_mode) WITHOUT stashing yet, so the never-worse check below can
+		// still bail. Compare the FULL rewritten text (token included) against the
+		// original — the marker costs tokens too, so filtering that barely wins can
+		// still make the message larger (rtk never_worse, at the message level).
 		key := hashKey(content)
-		newText := out + "\n" + expand.Marker(key) + recoveryHint(loss)
+		var token string
+		switch f.mode {
+		case markerFull:
+			token = expand.Marker(key) + recoveryHint(loss)
+		case markerSummary:
+			token = expand.SummaryMarker
+		} // off: no token
+		newText := out
+		if token != "" {
+			newText += "\n" + token
+		}
 		if schema.TextTokens(newText) >= schema.TextTokens(content) {
 			continue
 		}
-		c.Store.Put(key, []byte(content))
+		if f.mode == markerFull {
+			c.Store.Put(key, []byte(content))
+			keys = append(keys, key)
+		} else {
+			rep.Irreversible = true
+		}
 		schema.SetMessageText(m, newText)
-		keys = append(keys, key)
+		changed++
 	}
-	if len(keys) == 0 {
+	if changed == 0 {
 		rep.Skipped = true
 	}
 	return keys, nil

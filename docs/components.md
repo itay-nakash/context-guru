@@ -169,12 +169,18 @@ the most recent assistant/user turns), not just one trailing sentence — so it 
 actually needs on any agent/benchmark.
 
 - **Config:** `min_tokens` (300), `head_lines`/`tail_lines` (5), `strategy`
-  (`deterministic` | `code` | `rlm`), `model.source`, `trigger`. With `code`, a cheap LLM writes a
-  Starlark filter run in a sandbox (no imports/IO, step + 2s limits); the result is accepted only if a
-  **containment** check proves it's a lossless subset (else fall back to deterministic). The `code`
-  strategy is **domain-agnostic**: JSON bodies are decoded and filtered by shape; **raw text** (logs,
-  source, tracebacks, search results) is kept as an in-order **line subset** — containment accepts a
-  whole-line subsequence, not just a contiguous substring. `rlm` currently maps to `code`.
+  (`deterministic` | `code` | `rlm`), `model.source`, `trigger`, `marker_mode`, `rewrite`. With
+  `code`, a cheap LLM writes a Starlark filter run in a sandbox (no imports/IO, step + 2s limits).
+  It sees the **full tool output** (bounded to ~32k chars) so it writes code **specific to that
+  content** — deleting the exact irrelevant lines/records AND words/sentences/parts within lines — not
+  a blind generic filter. It has regex helpers (`re_sub`/`re_findall`/`re_split`/`re_match`, RE2,
+  pure-Go). **Guarantee (default): deletion-only** — the result is accepted only if it is an in-order
+  **character subsequence** of the input (obtainable by deleting characters), so the model can trim
+  anything but provably cannot fabricate, reorder, or reword; else it falls back to deterministic.
+  JSON bodies are decoded and filtered structurally. `rlm` currently maps to `code`.
+- **`rewrite` (opt-in, code only):** drops the containment proof so the model may reword / summarize /
+  rewrite freely (lossy, **unverified** — only sanity + strictly-smaller apply). Pair with a non-`full`
+  `marker_mode`. Default `false` keeps the verified deletion-only guarantee.
 - **Gating + reuse (LLM strategies):** a `trigger` decides whether to spend a model call —
   `min_output_tokens` (per tool output; folds in legacy `min_tokens`), `min_request_tokens`,
   `min_messages` — so `code` fires only on a large output in a large request, not every turn. A reduced
