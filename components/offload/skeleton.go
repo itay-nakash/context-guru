@@ -1,3 +1,12 @@
+//go:build cg_skeleton
+
+// skeleton is the only cgo component (tree-sitter). It is gated behind the
+// cg_skeleton build tag so the default build — and the AuthBridge plugin that
+// embeds this module — stays pure-Go (CGO_ENABLED=0), static, and small. Build a
+// coding-agent variant that includes it with: go build -tags cg_skeleton (and
+// CGO_ENABLED=1). Without the tag, "skeleton" is simply not registered, so a
+// config naming it fails at config.Build with a clear "unknown component" error.
+
 package offload
 
 import (
@@ -23,10 +32,14 @@ func init() { components.Register("skeleton", newSkeleton) }
 //
 // v1 targets fenced ```lang code blocks (where the language is explicit); file
 // reads without a fence/path are a later addition.
-type Skeleton struct{ minTokens int }
+type Skeleton struct {
+	minTokens int
+	mode      markerMode
+}
 
 type skeletonConfig struct {
-	MinTokens int `yaml:"min_tokens"`
+	MinTokens  int    `yaml:"min_tokens"`
+	MarkerMode string `yaml:"marker_mode"` // full (default) | summary | off
 }
 
 func newSkeleton(raw []byte) (components.Component, error) {
@@ -36,7 +49,7 @@ func newSkeleton(raw []byte) (components.Component, error) {
 			return nil, err
 		}
 	}
-	return &Skeleton{minTokens: cfg.MinTokens}, nil
+	return &Skeleton{minTokens: cfg.MinTokens, mode: parseMarkerMode(cfg.MarkerMode)}, nil
 }
 
 func (Skeleton) Name() string                 { return "skeleton" }
@@ -57,6 +70,7 @@ var fenceLang = map[string]string{
 
 func (s *Skeleton) Offload(req *schemas.BifrostChatRequest, rep *components.Report, c *components.Ctx) ([]string, error) {
 	var keys []string
+	emitted := 0
 	for i := range req.Input {
 		m := &req.Input[i]
 		if m.Role != schemas.ChatMessageRoleTool {
@@ -94,12 +108,14 @@ func (s *Skeleton) Offload(req *schemas.BifrostChatRequest, rep *components.Repo
 			continue
 		}
 		out.WriteString(content[last:])
-		key := hashKey(content)
-		c.Store.Put(key, []byte(content))
-		schema.SetMessageText(m, out.String()+"\n"+expand.Marker(key)+" [full source: call "+expand.ToolName+"]")
-		keys = append(keys, key)
+		tok, key := mark(c, rep, s.mode, content, " [full source: call "+expand.ToolName+"]")
+		schema.SetMessageText(m, out.String()+"\n"+tok)
+		emitted++
+		if key != "" {
+			keys = append(keys, key)
+		}
 	}
-	if len(keys) == 0 {
+	if emitted == 0 {
 		rep.Skipped = true
 	}
 	return keys, nil

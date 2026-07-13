@@ -44,6 +44,7 @@ type Summarize struct {
 	includeToolCalls  bool
 	modelSource       string
 	trigger           components.Trigger
+	mode              markerMode
 }
 
 type summarizeConfig struct {
@@ -60,7 +61,8 @@ type summarizeConfig struct {
 	Model             struct {
 		Source string `yaml:"source"` // incoming (default) | config
 	} `yaml:"model"`
-	Trigger components.Trigger `yaml:"trigger"`
+	Trigger    components.Trigger `yaml:"trigger"`
+	MarkerMode string             `yaml:"marker_mode"` // full (default) | summary | off
 }
 
 func newSummarize(raw []byte) (components.Component, error) {
@@ -79,6 +81,7 @@ func newSummarize(raw []byte) (components.Component, error) {
 		level: cfg.SummaryLevel, keepLast: cfg.KeepLast,
 		minTokens: cfg.MinTokens, resummarizeTokens: cfg.ResummarizeTokens,
 		includeToolCalls: cfg.IncludeToolCalls, modelSource: cfg.Model.Source, trigger: cfg.Trigger,
+		mode: parseMarkerMode(cfg.MarkerMode),
 	}, nil
 }
 
@@ -107,6 +110,9 @@ func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 	// byte-identical (KV-cache stable). Roll the checkpoint forward only once the
 	// tail grows past resummarize_tokens.
 	if out, keys, ok := s.tryReuse(c, msgs, start, end); ok {
+		if len(keys) == 0 {
+			rep.Irreversible = true // reused a non-full checkpoint (nothing stashed)
+		}
 		req.Input = out
 		return keys, nil
 	}
@@ -128,15 +134,22 @@ func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 		return nil, nil
 	}
 
-	// Stash the replaced span so expand can restore it.
-	spanJSON, err := json.Marshal(span)
-	if err != nil {
-		return nil, err
+	// Stash the replaced span so expand can restore it — full mode only. In
+	// summary/off there is no restoration; flag the deliberate lossy drop so the
+	// pipeline's dropped-without-stash guard permits it.
+	var key string
+	if s.mode == markerFull {
+		spanJSON, err := json.Marshal(span)
+		if err != nil {
+			return nil, err
+		}
+		key = hashKey(string(spanJSON))
+		c.Store.Put(key, spanJSON)
+	} else {
+		rep.Irreversible = true
 	}
-	key := hashKey(string(spanJSON))
-	c.Store.Put(key, spanJSON)
 
-	summaryText := summaryWrapper(summary, key)
+	summaryText := summaryWrapper(summary, key, s.mode)
 	summaryMsg := bschemas.ChatMessage{Role: bschemas.ChatMessageRoleSystem}
 	schema.SetMessageText(&summaryMsg, summaryText)
 
@@ -152,7 +165,10 @@ func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 	out = append(out, msgs[0], summaryMsg)
 	out = append(out, msgs[end:]...)
 	req.Input = out
-	return []string{key}, nil
+	if key != "" {
+		return []string{key}, nil
+	}
+	return nil, nil
 }
 
 // tryReuse re-emits the previous summary if (1) a checkpoint exists, (2) the
@@ -180,16 +196,22 @@ func (s *Summarize) tryReuse(c *components.Ctx, msgs []bschemas.ChatMessage, sta
 	if schema.MessagesTokens(&bschemas.BifrostChatRequest{Input: msgs[boundary:end]}) >= s.resummarizeTokens {
 		return nil, nil, false // grown enough — roll the checkpoint forward
 	}
-	// Refresh the stashed original span so expand keeps resolving it.
-	if b, err := json.Marshal(covered); err == nil {
-		c.Store.Put(cp.Key, b)
+	// Refresh the stashed original span so expand keeps resolving it (full-mode
+	// checkpoints only — summary/off never stashed, so Key is empty).
+	if cp.Key != "" {
+		if b, err := json.Marshal(covered); err == nil {
+			c.Store.Put(cp.Key, b)
+		}
 	}
 	summaryMsg := bschemas.ChatMessage{Role: bschemas.ChatMessageRoleSystem}
 	schema.SetMessageText(&summaryMsg, cp.SummaryMsg)
 	out := make([]bschemas.ChatMessage, 0, 2+(len(msgs)-boundary))
 	out = append(out, msgs[0], summaryMsg)
 	out = append(out, msgs[boundary:]...)
-	return out, []string{cp.Key}, true
+	if cp.Key != "" {
+		return out, []string{cp.Key}, true
+	}
+	return out, nil, true
 }
 
 // summarize builds the trajectory string and asks the model once (bounded retry).
@@ -261,15 +283,24 @@ func ensureSummaryTags(s string) string {
 	return s
 }
 
-// summaryWrapper is the synthetic system message that replaces the span; it
-// carries the marker so the expand tool can recover the full original trajectory.
-func summaryWrapper(summary, key string) string {
-	return "=== History Summary ===\n" +
+// summaryWrapper is the synthetic system message that replaces the span. In full
+// mode it carries the <<cg:HASH>> marker so the expand tool can recover the full
+// original trajectory; in summary mode a non-resolvable ⟪cg⟫ sentinel; in off
+// mode nothing (the summary text itself is the only trace).
+func summaryWrapper(summary, key string, mode markerMode) string {
+	body := "=== History Summary ===\n" +
 		"The earlier trajectory is summarized below.\n\n" +
 		summary + "\n\n" +
 		"Use this summary as the older context, and use the following messages as the most recent context. " +
-		"Continue the task accordingly. Do not summarize the conversation again.\n" +
-		expand.Marker(key) + " [full earlier trajectory: call " + expand.ToolName + "]"
+		"Continue the task accordingly. Do not summarize the conversation again."
+	switch mode {
+	case markerFull:
+		return body + "\n" + expand.Marker(key) + " [full earlier trajectory: call " + expand.ToolName + "]"
+	case markerSummary:
+		return body + "\n" + expand.SummaryMarker
+	default: // off
+		return body
+	}
 }
 
 // Prompts ported verbatim from CE-Manager (src/ce_manager/prompts/summarizer.py).

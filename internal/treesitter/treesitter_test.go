@@ -1,3 +1,5 @@
+//go:build cg_skeleton
+
 package treesitter
 
 import "testing"

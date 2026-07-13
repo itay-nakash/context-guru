@@ -24,13 +24,15 @@ type SmartCrush struct {
 	minTokens int
 	keepFirst int
 	keepLast  int
+	mode      markerMode
 }
 
 type smartCrushConfig struct {
-	MinItems  int `yaml:"min_items"`
-	MinTokens int `yaml:"min_tokens"`
-	KeepFirst int `yaml:"keep_first"`
-	KeepLast  int `yaml:"keep_last"`
+	MinItems   int    `yaml:"min_items"`
+	MinTokens  int    `yaml:"min_tokens"`
+	KeepFirst  int    `yaml:"keep_first"`
+	KeepLast   int    `yaml:"keep_last"`
+	MarkerMode string `yaml:"marker_mode"` // full (default) | summary | off
 }
 
 func newSmartCrush(raw []byte) (components.Component, error) {
@@ -40,7 +42,7 @@ func newSmartCrush(raw []byte) (components.Component, error) {
 			return nil, err
 		}
 	}
-	return &SmartCrush{minItems: cfg.MinItems, minTokens: cfg.MinTokens, keepFirst: cfg.KeepFirst, keepLast: cfg.KeepLast}, nil
+	return &SmartCrush{minItems: cfg.MinItems, minTokens: cfg.MinTokens, keepFirst: cfg.KeepFirst, keepLast: cfg.KeepLast, mode: parseMarkerMode(cfg.MarkerMode)}, nil
 }
 
 func (SmartCrush) Name() string                 { return "smartcrush" }
@@ -48,12 +50,16 @@ func (SmartCrush) Enabled(*components.Ctx) bool { return true }
 
 func (s *SmartCrush) Offload(req *bschemas.BifrostChatRequest, rep *components.Report, c *components.Ctx) ([]string, error) {
 	var keys []string
+	changed := 0
 	for _, i := range toolIndices(req) {
 		msg := &req.Input[i]
 		if !schema.Rewritable(*msg) {
 			continue // non-text blocks would be dropped by a text rewrite
 		}
 		content := schema.MessageText(*msg)
+		if expand.HasPlaceholder(content) {
+			continue // already offloaded by an earlier component/turn
+		}
 		trimmed := strings.TrimSpace(content)
 		if len(trimmed) == 0 || trimmed[0] != '[' || schema.TextTokens(content) < s.minTokens {
 			continue
@@ -76,14 +82,15 @@ func (s *SmartCrush) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 		if err != nil {
 			continue
 		}
-		key := hashKey(content)
-		c.Store.Put(key, []byte(content))
-		note := fmt.Sprintf(" [%d of %d items shown; full array: call %s] %s",
-			len(kept), len(items), expand.ToolName, expand.Marker(key))
-		schema.SetMessageText(msg, string(crushed)+note)
-		keys = append(keys, key)
+		tok, key := mark(c, rep, s.mode, content, " [full array: call "+expand.ToolName+"]")
+		note := fmt.Sprintf(" [%d of %d items shown] ", len(kept), len(items))
+		schema.SetMessageText(msg, string(crushed)+note+tok)
+		changed++
+		if key != "" {
+			keys = append(keys, key)
+		}
 	}
-	if len(keys) == 0 {
+	if changed == 0 {
 		rep.Skipped = true
 	}
 	return keys, nil

@@ -22,12 +22,14 @@ type Collapse struct {
 	maxTokens int
 	headLines int
 	tailLines int
+	mode      markerMode
 }
 
 type collapseConfig struct {
-	MaxTokens int `yaml:"max_tokens"`
-	HeadLines int `yaml:"head_lines"`
-	TailLines int `yaml:"tail_lines"`
+	MaxTokens  int    `yaml:"max_tokens"`
+	HeadLines  int    `yaml:"head_lines"`
+	TailLines  int    `yaml:"tail_lines"`
+	MarkerMode string `yaml:"marker_mode"` // full (default) | summary | off
 }
 
 func newCollapse(raw []byte) (components.Component, error) {
@@ -37,7 +39,7 @@ func newCollapse(raw []byte) (components.Component, error) {
 			return nil, err
 		}
 	}
-	return &Collapse{maxTokens: cfg.MaxTokens, headLines: cfg.HeadLines, tailLines: cfg.TailLines}, nil
+	return &Collapse{maxTokens: cfg.MaxTokens, headLines: cfg.HeadLines, tailLines: cfg.TailLines, mode: parseMarkerMode(cfg.MarkerMode)}, nil
 }
 
 func (Collapse) Name() string                 { return "collapse" }
@@ -45,6 +47,7 @@ func (Collapse) Enabled(*components.Ctx) bool { return true }
 
 func (cl *Collapse) Offload(req *schemas.BifrostChatRequest, rep *components.Report, c *components.Ctx) ([]string, error) {
 	var keys []string
+	changed := 0
 	for i := range req.Input {
 		m := &req.Input[i]
 		if m.Role != schemas.ChatMessageRoleTool {
@@ -57,7 +60,7 @@ func (cl *Collapse) Offload(req *schemas.BifrostChatRequest, rep *components.Rep
 		if content == "" || schema.TextTokens(content) <= cl.maxTokens {
 			continue
 		}
-		if len(expand.ParseMarkers(content)) > 0 {
+		if expand.HasPlaceholder(content) {
 			continue // already offloaded by an earlier component
 		}
 		lines := strings.Split(content, "\n")
@@ -65,17 +68,19 @@ func (cl *Collapse) Offload(req *schemas.BifrostChatRequest, rep *components.Rep
 			continue // few long lines; head/tail wouldn't help
 		}
 		omitted := len(lines) - cl.headLines - cl.tailLines
+		tok, key := mark(c, rep, cl.mode, content, " [full output: call "+expand.ToolName+"]")
 		var b strings.Builder
 		b.WriteString(strings.Join(lines[:cl.headLines], "\n"))
 		fmt.Fprintf(&b, "\n... (%d lines omitted) ", omitted)
-		key := hashKey(content)
-		b.WriteString(expand.Marker(key) + " [full output: call " + expand.ToolName + "]\n")
+		b.WriteString(tok + "\n")
 		b.WriteString(strings.Join(lines[len(lines)-cl.tailLines:], "\n"))
-		c.Store.Put(key, []byte(content))
 		schema.SetMessageText(m, b.String())
-		keys = append(keys, key)
+		changed++
+		if key != "" {
+			keys = append(keys, key)
+		}
 	}
-	if len(keys) == 0 {
+	if changed == 0 {
 		rep.Skipped = true
 	}
 	return keys, nil

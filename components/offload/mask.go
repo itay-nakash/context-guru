@@ -17,11 +17,13 @@ func init() { components.Register("mask", newMask) }
 type Mask struct {
 	keepRecent int
 	minTokens  int
+	mode       markerMode
 }
 
 type maskConfig struct {
-	KeepRecent int `yaml:"keep_recent"`
-	MinTokens  int `yaml:"min_tokens"`
+	KeepRecent int    `yaml:"keep_recent"`
+	MinTokens  int    `yaml:"min_tokens"`
+	MarkerMode string `yaml:"marker_mode"` // full (default) | summary | off
 }
 
 func newMask(raw []byte) (components.Component, error) {
@@ -31,7 +33,7 @@ func newMask(raw []byte) (components.Component, error) {
 			return nil, err
 		}
 	}
-	return &Mask{keepRecent: cfg.KeepRecent, minTokens: cfg.MinTokens}, nil
+	return &Mask{keepRecent: cfg.KeepRecent, minTokens: cfg.MinTokens, mode: parseMarkerMode(cfg.MarkerMode)}, nil
 }
 
 func (Mask) Name() string                 { return "mask" }
@@ -44,6 +46,7 @@ func (m *Mask) Offload(req *bschemas.BifrostChatRequest, rep *components.Report,
 		return nil, nil
 	}
 	var keys []string
+	changed := 0
 	// Mask every tool output except the most recent keepRecent.
 	for _, i := range tools[:len(tools)-m.keepRecent] {
 		msg := &req.Input[i]
@@ -54,15 +57,17 @@ func (m *Mask) Offload(req *bschemas.BifrostChatRequest, rep *components.Report,
 		if content == "" || schema.TextTokens(content) < m.minTokens {
 			continue
 		}
-		if len(expand.ParseMarkers(content)) > 0 {
+		if expand.HasPlaceholder(content) {
 			continue
 		}
-		key := hashKey(content)
-		c.Store.Put(key, []byte(content))
-		schema.SetMessageText(msg, "[older tool output masked] "+expand.Marker(key)+" [full output: call "+expand.ToolName+"]")
-		keys = append(keys, key)
+		tok, key := mark(c, rep, m.mode, content, " [full output: call "+expand.ToolName+"]")
+		schema.SetMessageText(msg, "[older tool output masked] "+tok)
+		changed++
+		if key != "" {
+			keys = append(keys, key)
+		}
 	}
-	if len(keys) == 0 {
+	if changed == 0 {
 		rep.Skipped = true
 	}
 	return keys, nil

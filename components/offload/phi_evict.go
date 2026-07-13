@@ -25,13 +25,15 @@ func init() { components.Register("phi_evict", newPhiEvict) }
 type PhiEvict struct {
 	budget  int
 	weights weights
+	mode    markerMode
 }
 
 type weights struct{ R, H, C, D float64 }
 
 type phiConfig struct {
 	BudgetTokens int    `yaml:"budget_tokens"`
-	Weights      string `yaml:"weights"` // balanced | aggressive | conservative
+	Weights      string `yaml:"weights"`     // balanced | aggressive | conservative
+	MarkerMode   string `yaml:"marker_mode"` // full (default) | summary | off
 }
 
 func newPhiEvict(raw []byte) (components.Component, error) {
@@ -41,7 +43,7 @@ func newPhiEvict(raw []byte) (components.Component, error) {
 			return nil, err
 		}
 	}
-	return &PhiEvict{budget: cfg.BudgetTokens, weights: presetWeights(cfg.Weights)}, nil
+	return &PhiEvict{budget: cfg.BudgetTokens, weights: presetWeights(cfg.Weights), mode: parseMarkerMode(cfg.MarkerMode)}, nil
 }
 
 func presetWeights(name string) weights {
@@ -103,6 +105,7 @@ func (p *PhiEvict) Offload(req *bschemas.BifrostChatRequest, rep *components.Rep
 	sort.SliceStable(items, func(a, b int) bool { return items[a].phi < items[b].phi })
 
 	var keys []string
+	changed := 0
 	for _, it := range items {
 		if total <= p.budget {
 			break
@@ -115,16 +118,18 @@ func (p *PhiEvict) Offload(req *bschemas.BifrostChatRequest, rep *components.Rep
 			continue // non-text blocks would be dropped by a text rewrite
 		}
 		content := schema.MessageText(*msg)
-		if len(expand.ParseMarkers(content)) > 0 {
+		if expand.HasPlaceholder(content) {
 			continue
 		}
-		key := hashKey(content)
-		c.Store.Put(key, []byte(content))
-		schema.SetMessageText(msg, "[evicted to fit context budget] "+expand.Marker(key)+" [full output: call "+expand.ToolName+"]")
-		keys = append(keys, key)
+		tok, key := mark(c, rep, p.mode, content, " [full output: call "+expand.ToolName+"]")
+		schema.SetMessageText(msg, "[evicted to fit context budget] "+tok)
+		if key != "" {
+			keys = append(keys, key)
+		}
+		changed++
 		total -= it.tokens
 	}
-	if len(keys) == 0 {
+	if changed == 0 {
 		rep.Skipped = true
 	}
 	return keys, nil

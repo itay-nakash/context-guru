@@ -1,5 +1,10 @@
+//go:build cg_skeleton
+
 // Package treesitter wraps the tree-sitter binding for the reduce signals and
 // skeletonizer. CGO-backed; fail-open (unknown language / parse error => ok=false).
+// Gated behind the cg_skeleton build tag (its only consumer is the skeleton
+// component), so the default pure-Go build never links the tree-sitter cgo
+// bindings or the ~15 grammar subpackages. See stub.go for the no-tag package.
 //
 // It pairs the official github.com/tree-sitter/go-tree-sitter binding (which
 // owns the *Tree/*Language types and the explicit Close lifecycle the callers
