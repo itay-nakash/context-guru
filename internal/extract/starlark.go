@@ -19,11 +19,6 @@ const (
 // time limits — and returns OUTPUT, or "" on any failure (fail-open). Containment is
 // verified by the caller (RunExtraction).
 func runStarlark(ctx context.Context, body, goal string, keepIDs []string, model Model) (out string) {
-	defer func() {
-		if recover() != nil {
-			out = ""
-		}
-	}()
 	if model == nil {
 		return ""
 	}
@@ -31,8 +26,19 @@ func runStarlark(ctx context.Context, body, goal string, keepIDs []string, model
 	if err != nil {
 		return ""
 	}
-	src = stripFences(src)
+	return execStarlark(ctx, body, stripFences(src))
+}
 
+// execStarlark runs a Starlark filter source over the body (INPUT global, json
+// module, no imports, step + time limits) and returns OUTPUT, or "" on any
+// failure (fail-open). Split out from runStarlark so tests/examples can run a
+// captured source — the exact program the model wrote — deterministically.
+func execStarlark(ctx context.Context, body, src string) (out string) {
+	defer func() {
+		if recover() != nil {
+			out = ""
+		}
+	}()
 	ctx, cancel := context.WithTimeout(ctx, starlarkTimeout)
 	defer cancel()
 	thread := &starlark.Thread{Name: "extract"} // Load==nil => load() disabled
