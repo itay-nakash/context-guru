@@ -36,6 +36,10 @@ type Cfg struct {
 	// (code | single | rlm | deterministic) preserving the computed order. Empty means
 	// "all" — prior behavior. Lets config enable/disable strategies purely by name.
 	AllowedStrategies []string
+	// Rewrite opts out of the containment proof (deletion-only guarantee): the model
+	// may reword/summarize/rewrite freely. Lossy + unverified — the caller must accept
+	// that (e.g. a non-full marker_mode). Default false keeps the verified guarantee.
+	Rewrite bool
 }
 
 // DefaultCfg mirrors the reference prototype's ExtractCfg defaults.
@@ -180,6 +184,12 @@ func validateExtraction(resultText, bodyText string, keepIDs []string, cfg Cfg) 
 	if !extractionIsSane(bodyText, resultText, keepIDs, cfg.MinKeepRatio) {
 		return false
 	}
+	// Rewrite mode deliberately drops the lossless-projection proof (the caller
+	// accepted a lossy rewrite). Sanity + strictly-smaller (checked by the caller)
+	// still apply.
+	if cfg.Rewrite {
+		return true
+	}
 	return IsContained(parseBody(resultText), parseBody(bodyText))
 }
 
@@ -252,7 +262,7 @@ func RunExtraction(ctx context.Context, body, goal string, keepIDs []string, tok
 		var cand string
 		switch name {
 		case "code":
-			cand = runStarlark(ctx, body, goal, keepIDs, model)
+			cand = runStarlark(ctx, body, goal, keepIDs, model, cfg.Rewrite)
 		case "single":
 			cand = runSingle(ctx, body, goal, keepIDs, model)
 		case "rlm":

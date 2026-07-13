@@ -52,7 +52,7 @@ FAILED tests/test_matrices.py::test_col_insert - IndexError: Index out of range
 	defer cancel()
 	// One model call: capture the exact filter, then run THAT source (so the
 	// printed program is precisely the one that produced the result).
-	src, err := model.Complete(ctx, buildCodePrompt(body, goal, keep))
+	src, err := model.Complete(ctx, buildCodePrompt(body, goal, keep, false))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func TestLiveExtractCodeJSON(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	src, err := model.Complete(ctx, buildCodePrompt(body, goal, keep))
+	src, err := model.Complete(ctx, buildCodePrompt(body, goal, keep, false))
 	if err != nil {
 		t.Fatal(err)
 	}
