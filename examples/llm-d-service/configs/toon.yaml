@@ -1,0 +1,19 @@
+# Config 1 — deterministic reformatter (no LLM, no store, no markers).
+#
+# Re-encodes uniform JSON object-arrays in tool outputs as TOON (Token-Oriented
+# Object Notation): the field names are listed once, then one comma-separated row
+# per element — dropping the braces/keys/quotes that dominate a JSON array's token
+# cost. `format` first collapses pretty-printed JSON to compact JSON. Both are
+# lossless Reformats, so nothing is stashed and the store stays off.
+pipeline: [format, toon]
+
+components:
+  format:
+    min_tokens: 50
+  toon:
+    min_tokens: 50
+
+# No reversibility needed: this endpoint hands the compacted body straight back
+# to the caller, so the state store is disabled entirely.
+store:
+  enabled: false

@@ -1,0 +1,6 @@
+# = configs/summarize.yaml with triggers lowered for the small sample.
+pipeline: [summarize]
+components:
+  summarize: { summary_level: concise, keep_last: 2, min_tokens: 50, marker_mode: "off",
+               trigger: { min_messages: 4 }, model: { source: config } }
+store: { enabled: false }

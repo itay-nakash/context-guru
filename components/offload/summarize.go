@@ -43,6 +43,7 @@ type Summarize struct {
 	resummarizeTokens int
 	includeToolCalls  bool
 	modelSource       string
+	modelClient       components.Model // config-pinned client (model: block), or nil
 	trigger           components.Trigger
 	mode              markerMode
 }
@@ -56,13 +57,11 @@ type summarizeConfig struct {
 	// un-summarized tail since the last checkpoint grows past this many tokens,
 	// then roll the checkpoint forward with a fresh summary. 0 = re-summarize
 	// every eligible turn (old behavior).
-	ResummarizeTokens int  `yaml:"resummarize_tokens"`
-	IncludeToolCalls  bool `yaml:"include_tool_calls"`
-	Model             struct {
-		Source string `yaml:"source"` // incoming (default) | config
-	} `yaml:"model"`
-	Trigger    components.Trigger `yaml:"trigger"`
-	MarkerMode string             `yaml:"marker_mode"` // full (default) | summary | off
+	ResummarizeTokens int                `yaml:"resummarize_tokens"`
+	IncludeToolCalls  bool               `yaml:"include_tool_calls"`
+	Model             modelConfig        `yaml:"model"`
+	Trigger           components.Trigger `yaml:"trigger"`
+	MarkerMode        string             `yaml:"marker_mode"` // full (default) | summary | off
 }
 
 func newSummarize(raw []byte) (components.Component, error) {
@@ -80,7 +79,7 @@ func newSummarize(raw []byte) (components.Component, error) {
 	return &Summarize{
 		level: cfg.SummaryLevel, keepLast: cfg.KeepLast,
 		minTokens: cfg.MinTokens, resummarizeTokens: cfg.ResummarizeTokens,
-		includeToolCalls: cfg.IncludeToolCalls, modelSource: cfg.Model.Source, trigger: cfg.Trigger,
+		includeToolCalls: cfg.IncludeToolCalls, modelSource: cfg.Model.Source, modelClient: cfg.Model.Client(), trigger: cfg.Trigger,
 		mode: parseMarkerMode(cfg.MarkerMode),
 	}, nil
 }
@@ -99,7 +98,10 @@ func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 		rep.Skipped = true
 		return nil, nil
 	}
-	model := c.Model.For(s.modelSource)
+	model := s.modelClient // config-pinned client wins
+	if model == nil {
+		model = c.Model.For(s.modelSource)
+	}
 	if model == nil {
 		rep.Skipped = true // NeedsModel but none available → degrade gracefully
 		return nil, nil
@@ -137,8 +139,11 @@ func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 	// Stash the replaced span so expand can restore it — full mode only. In
 	// summary/off there is no restoration; flag the deliberate lossy drop so the
 	// pipeline's dropped-without-stash guard permits it.
+	// full is reversible only if the store persists the stash; otherwise degrade
+	// to an irreversible off-style drop (no unresolvable marker).
+	mode := effectiveMode(c, s.mode)
 	var key string
-	if s.mode == markerFull {
+	if mode == markerFull {
 		spanJSON, err := json.Marshal(span)
 		if err != nil {
 			return nil, err
@@ -149,7 +154,7 @@ func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 		rep.Irreversible = true
 	}
 
-	summaryText := summaryWrapper(summary, key, s.mode)
+	summaryText := summaryWrapper(summary, key, mode)
 	summaryMsg := bschemas.ChatMessage{Role: bschemas.ChatMessageRoleSystem}
 	schema.SetMessageText(&summaryMsg, summaryText)
 

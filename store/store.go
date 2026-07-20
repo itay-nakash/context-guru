@@ -28,6 +28,10 @@ type Store interface {
 	Sticky(session string) map[string]struct{}
 	// MarkSticky records that id was reduced in this session.
 	MarkSticky(session, id string)
+	// Persists reports whether Put actually retains payloads. false (the Nop
+	// store) means offloads cannot be made reversible, so a full marker_mode must
+	// degrade to an irreversible drop rather than leave an unresolvable marker.
+	Persists() bool
 }
 
 type entry struct {
@@ -53,10 +57,25 @@ type Memory struct {
 // Options configures a Memory store; the zero value yields sane defaults.
 // yaml tags let it drop straight into the config file's store: block.
 type Options struct {
-	TTLSeconds  int `yaml:"ttl_seconds"`
-	MaxEntries  int `yaml:"max_entries"`
-	MaxSessions int `yaml:"max_sessions"`
+	// Enabled toggles the state store. nil/absent => on (backward-compatible).
+	// false => no store: reversibility is off, so offload components must run
+	// marker_mode: off (a full-marker offload would leave dangling markers).
+	Enabled     *bool `yaml:"enabled"`
+	TTLSeconds  int   `yaml:"ttl_seconds"`
+	MaxEntries  int   `yaml:"max_entries"`
+	MaxSessions int   `yaml:"max_sessions"`
 }
+
+// Nop is a Store that persists nothing: Put discards, Get/Sticky always miss.
+// Used when the store is disabled — the expand loop resolves nothing and lossy
+// offloads become irreversible, which is why they must use marker_mode: off.
+type Nop struct{}
+
+func (Nop) Put(string, []byte)                {}
+func (Nop) Get(string) ([]byte, bool)         { return nil, false }
+func (Nop) Sticky(string) map[string]struct{} { return nil }
+func (Nop) MarkSticky(string, string)         {}
+func (Nop) Persists() bool                    { return false }
 
 // NewMemory builds an in-memory store. Zero/negative option fields fall back to
 // defaults (1800s TTL, 1000 entries, 100 sessions of sticky sets).
@@ -80,6 +99,8 @@ func NewMemory(o Options) *Memory {
 		now:    time.Now,
 	}
 }
+
+func (*Memory) Persists() bool { return true }
 
 func (m *Memory) Put(key string, payload []byte) {
 	m.mu.Lock()
