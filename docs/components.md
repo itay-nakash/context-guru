@@ -78,7 +78,7 @@ signatures survive). Stashes the whole original message.
 
 ```mermaid
 flowchart LR
-  A["```go fenced block<br/>full func bodies"] --> B{tree-sitter parse<br/>lang known? body ≥ min_tokens?}
+  A["go fenced block<br/>full func bodies"] --> B{"tree-sitter parse<br/>lang known? body ≥ min_tokens?"}
   B -->|no| A
   B -->|yes| C["signatures + { … }<br/>+ <<cg:HASH>> marker"]
   C --> D[(Store: original)]
@@ -269,7 +269,7 @@ wrapping `cmdfilter` component is an Offload (it stashes the original first).
 
 ```mermaid
 flowchart LR
-  I[input] --> S1[1 strip_ansi] --> S2[2 replace[]] --> S3[3 match_output[] + unless]
+  I[input] --> S1[1 strip_ansi] --> S2["2 replace[]"] --> S3["3 match_output[] + unless"]
   S3 --> S4[4 strip / keep lines] --> S5[5 truncate_lines_at] --> S6[6 head / tail]
   S6 --> S7[7 max_lines] --> S8[8 on_empty] --> O[output + Lossiness]
 ```

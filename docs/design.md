@@ -111,7 +111,7 @@ sequenceDiagram
   apply->>apply: normalize → []ChatMessage + write-back slots
   apply->>Pipe: Run(chat, ctx)
   Pipe-->>apply: mutated messages
-  apply->>apply: per message: unchanged → keep bytes;<br/>changed & lossless round-trip → sjson splice
+  apply->>apply: per message: unchanged → keep bytes,<br/>changed & lossless round-trip → sjson splice
   apply-->>Host: rewritten body (or original, fail open)
 ```
 
@@ -149,7 +149,7 @@ sequenceDiagram
   Store-->>Host: original bytes
   Host->>Up: append assistant tool-call + tool_result(original), re-invoke
   Up-->>M: final answer with full content in hand
-  Note over Host,Up: capped at 3 rounds; if the model also calls another tool,<br/>the loop bails and returns the response as-is
+  Note over Host,Up: capped at 3 rounds — if the model also calls another tool,<br/>the loop bails and returns the response as-is
 ```
 
 An expired/evicted original resolves to an explicit placeholder rather than being omitted (the
