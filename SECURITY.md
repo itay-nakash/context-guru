@@ -6,7 +6,7 @@ Please report security vulnerabilities privately. Do **not** open a public GitHu
 
 Use GitHub's private vulnerability reporting ("Report a vulnerability" under the
 repository's Security tab), or follow the disclosure process described in the main
-[Kagenti](https://github.com/kagenti/kagenti/blob/main/SECURITY.md) repository.
+[Rossoctl](https://github.com/rossoctl/rossoctl/blob/main/SECURITY.md) repository.
 
 We will acknowledge your report and work with you on a coordinated disclosure.
 

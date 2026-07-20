@@ -3,7 +3,7 @@ package config
 import (
 	"testing"
 
-	_ "github.com/kagenti/context-guru/components/all"
+	_ "github.com/rossoctl/context-guru/components/all"
 )
 
 func TestBuildUnknownComponentErrors(t *testing.T) {

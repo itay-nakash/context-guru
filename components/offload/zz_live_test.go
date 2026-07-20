@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kagenti/context-guru/internal/cheapmodel"
-	"github.com/kagenti/context-guru/schema"
+	"github.com/rossoctl/context-guru/internal/cheapmodel"
+	"github.com/rossoctl/context-guru/schema"
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 )
 

@@ -15,8 +15,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/kagenti/context-guru/components"
-	"github.com/kagenti/context-guru/store"
+	"github.com/rossoctl/context-guru/components"
+	"github.com/rossoctl/context-guru/store"
 	"gopkg.in/yaml.v3"
 )
 

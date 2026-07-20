@@ -21,7 +21,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/kagenti/context-guru/store"
+	"github.com/rossoctl/context-guru/store"
 	"github.com/maximhq/bifrost/core/schemas"
 )
 

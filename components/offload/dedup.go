@@ -1,8 +1,8 @@
 package offload
 
 import (
-	"github.com/kagenti/context-guru/components"
-	"github.com/kagenti/context-guru/schema"
+	"github.com/rossoctl/context-guru/components"
+	"github.com/rossoctl/context-guru/schema"
 	"github.com/maximhq/bifrost/core/schemas"
 	"gopkg.in/yaml.v3"
 )

@@ -5,7 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 
-	"github.com/kagenti/context-guru/components"
+	"github.com/rossoctl/context-guru/components"
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 )
 

@@ -13,7 +13,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/kagenti/context-guru/store"
+	"github.com/rossoctl/context-guru/store"
 )
 
 // ToolName is the model-callable tool that retrieves offloaded content.

@@ -1,4 +1,4 @@
-module github.com/kagenti/context-guru
+module github.com/rossoctl/context-guru
 
 go 1.26.4
 

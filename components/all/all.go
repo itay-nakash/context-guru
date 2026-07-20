@@ -3,10 +3,10 @@
 // import this package for its side effects, then build a pipeline by name from
 // config. Import it for effect:
 //
-//	import _ "github.com/kagenti/context-guru/components/all"
+//	import _ "github.com/rossoctl/context-guru/components/all"
 package all
 
 import (
-	_ "github.com/kagenti/context-guru/components/offload"
-	_ "github.com/kagenti/context-guru/components/reformat"
+	_ "github.com/rossoctl/context-guru/components/offload"
+	_ "github.com/rossoctl/context-guru/components/reformat"
 )

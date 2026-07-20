@@ -14,7 +14,7 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/kagenti/context-guru/components"
+	"github.com/rossoctl/context-guru/components"
 )
 
 // Tee fans a report out to several emitters.

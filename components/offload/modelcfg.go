@@ -3,8 +3,8 @@ package offload
 import (
 	"os"
 
-	"github.com/kagenti/context-guru/components"
-	"github.com/kagenti/context-guru/internal/cheapmodel"
+	"github.com/rossoctl/context-guru/components"
+	"github.com/rossoctl/context-guru/internal/cheapmodel"
 )
 
 // modelConfig is the shared `model:` block for the NeedsModel components

@@ -4,7 +4,7 @@ A repository maintainer is a committer with the additional privilege of merging 
 
 ## Current Maintainers
 
-This repository is part of the [Kagenti](https://github.com/kagenti/kagenti) platform and shares the platform's maintainers. You can find the full list in the main repository's [MAINTAINERS.md](https://github.com/kagenti/kagenti/blob/main/MAINTAINERS.md) file.
+This repository is part of the [Rossoctl](https://github.com/rossoctl/rossoctl) platform and shares the platform's maintainers. You can find the full list in the main repository's [MAINTAINERS.md](https://github.com/rossoctl/rossoctl/blob/main/MAINTAINERS.md) file.
 
 ## Becoming a Maintainer
 

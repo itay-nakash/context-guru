@@ -4,7 +4,7 @@
 package reformat
 
 import (
-	"github.com/kagenti/context-guru/components"
+	"github.com/rossoctl/context-guru/components"
 	"github.com/maximhq/bifrost/core/schemas"
 )
 

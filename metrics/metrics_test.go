@@ -3,7 +3,7 @@ package metrics
 import (
 	"testing"
 
-	"github.com/kagenti/context-guru/components"
+	"github.com/rossoctl/context-guru/components"
 )
 
 func TestAggregatorHonestMetrics(t *testing.T) {

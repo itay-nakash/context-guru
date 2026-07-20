@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kagenti/context-guru/internal/cheapmodel"
-	"github.com/kagenti/context-guru/internal/tokens"
+	"github.com/rossoctl/context-guru/internal/cheapmodel"
+	"github.com/rossoctl/context-guru/internal/tokens"
 )
 
 // Live, model-in-the-loop example of extract strategy: code on a realistic raw-text
