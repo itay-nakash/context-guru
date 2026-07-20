@@ -18,12 +18,12 @@ import (
 	"os"
 	"strings"
 
-	"github.com/kagenti/context-guru/components"
-	_ "github.com/kagenti/context-guru/components/all"
-	"github.com/kagenti/context-guru/config"
-	"github.com/kagenti/context-guru/internal/cheapmodel"
-	"github.com/kagenti/context-guru/metrics"
-	"github.com/kagenti/context-guru/proxy"
+	"github.com/rossoctl/context-guru/components"
+	_ "github.com/rossoctl/context-guru/components/all"
+	"github.com/rossoctl/context-guru/config"
+	"github.com/rossoctl/context-guru/internal/cheapmodel"
+	"github.com/rossoctl/context-guru/metrics"
+	"github.com/rossoctl/context-guru/proxy"
 )
 
 func main() {

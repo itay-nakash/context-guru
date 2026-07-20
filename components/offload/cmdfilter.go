@@ -8,10 +8,10 @@ import (
 	"encoding/hex"
 	"strings"
 
-	"github.com/kagenti/context-guru/components"
-	"github.com/kagenti/context-guru/components/dsl"
-	"github.com/kagenti/context-guru/expand"
-	"github.com/kagenti/context-guru/schema"
+	"github.com/rossoctl/context-guru/components"
+	"github.com/rossoctl/context-guru/components/dsl"
+	"github.com/rossoctl/context-guru/expand"
+	"github.com/rossoctl/context-guru/schema"
 	"github.com/maximhq/bifrost/core/schemas"
 	"gopkg.in/yaml.v3"
 )

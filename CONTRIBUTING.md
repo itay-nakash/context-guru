@@ -1,7 +1,7 @@
 # Contributing
 
 Thanks for your interest in `lab-context-engineering`, a component of the
-[Kagenti](https://github.com/kagenti/kagenti) platform.
+[Rossoctl](https://github.com/rossoctl/rossoctl) platform.
 
 ## Developer Certificate of Origin (DCO)
 

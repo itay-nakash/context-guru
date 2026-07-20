@@ -10,7 +10,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/kagenti/context-guru/internal/tokens"
+	"github.com/rossoctl/context-guru/internal/tokens"
 )
 
 // cgMarkerRe matches the offload marker so ContentKey is marker-insensitive (a

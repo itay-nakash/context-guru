@@ -13,7 +13,7 @@ package schema
 import (
 	"encoding/json"
 
-	"github.com/kagenti/context-guru/internal/tokens"
+	"github.com/rossoctl/context-guru/internal/tokens"
 	"github.com/maximhq/bifrost/core/schemas"
 )
 

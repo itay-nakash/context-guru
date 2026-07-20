@@ -8,11 +8,11 @@ import (
 	"strings"
 	"testing"
 
-	_ "github.com/kagenti/context-guru/components/all"
-	"github.com/kagenti/context-guru/config"
-	"github.com/kagenti/context-guru/metrics"
-	"github.com/kagenti/context-guru/proxy"
-	"github.com/kagenti/context-guru/store"
+	_ "github.com/rossoctl/context-guru/components/all"
+	"github.com/rossoctl/context-guru/config"
+	"github.com/rossoctl/context-guru/metrics"
+	"github.com/rossoctl/context-guru/proxy"
+	"github.com/rossoctl/context-guru/store"
 	"github.com/tidwall/gjson"
 )
 

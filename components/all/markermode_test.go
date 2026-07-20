@@ -7,11 +7,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kagenti/context-guru/apply"
-	"github.com/kagenti/context-guru/config"
-	"github.com/kagenti/context-guru/expand"
-	"github.com/kagenti/context-guru/schema"
-	"github.com/kagenti/context-guru/store"
+	"github.com/rossoctl/context-guru/apply"
+	"github.com/rossoctl/context-guru/config"
+	"github.com/rossoctl/context-guru/expand"
+	"github.com/rossoctl/context-guru/schema"
+	"github.com/rossoctl/context-guru/store"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/tidwall/gjson"
 )

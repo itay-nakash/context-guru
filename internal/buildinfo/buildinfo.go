@@ -2,7 +2,7 @@
 package buildinfo
 
 // Version is the released version, overridden at build time with
-// -ldflags "-X github.com/kagenti/lab-context-engineering/internal/buildinfo.Version=...".
+// -ldflags "-X github.com/rossoctl/lab-context-engineering/internal/buildinfo.Version=...".
 var Version = "dev"
 
 // Commit is the git commit the binary was built from.

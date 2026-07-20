@@ -1,8 +1,8 @@
 package offload
 
 import (
-	"github.com/kagenti/context-guru/components"
-	"github.com/kagenti/context-guru/expand"
+	"github.com/rossoctl/context-guru/components"
+	"github.com/rossoctl/context-guru/expand"
 )
 
 // markerMode selects what an Offload component leaves behind in place of the

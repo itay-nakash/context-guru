@@ -11,8 +11,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kagenti/context-guru/expand"
-	"github.com/kagenti/context-guru/schema"
+	"github.com/rossoctl/context-guru/expand"
+	"github.com/rossoctl/context-guru/schema"
 	"github.com/maximhq/bifrost/core/schemas"
 )
 

@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Guidance for working in `context-guru` (repo dir `lab-context-engineering`), a Kagenti
+Guidance for working in `context-guru` (repo dir `lab-context-engineering`), a Rossoctl
 platform component.
 
 ## What this repo is
@@ -14,8 +14,8 @@ reference — port its *logic*, re-implement its transport in Go.
 
 ## Hard boundaries
 
-- **No AuthBridge / kagenti-extensions code lives here.** That plugin is built in
-  `kagenti-extensions` and depends on this repo. Keep the public API (`components`,
+- **No AuthBridge / cortex code lives here.** That plugin is built in
+  `cortex` and depends on this repo. Keep the public API (`components`,
   `apply`, `schema`, `config`) clean and importable; never reach into another repo.
 - **Fail open, always.** Any component error/panic reverts that component only; the
   original request is always forwarded as a valid fallback. Every lossy Offload must be
@@ -23,7 +23,7 @@ reference — port its *logic*, re-implement its transport in Go.
 
 ## Conventions
 
-- Go 1.26, module `github.com/kagenti/context-guru`. Build needs `CGO_ENABLED=1` (tree-sitter).
+- Go 1.26, module `github.com/rossoctl/context-guru`. Build needs `CGO_ENABLED=1` (tree-sitter).
 - Match the surrounding code's style; keep packages small and single-purpose.
 - **Commits: DCO sign-off is mandatory** — `git commit -s`. Author as the repo owner.
   AI attribution uses `Assisted-By:` — never `Co-Authored-By`, never a "Generated with"
