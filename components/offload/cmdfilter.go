@@ -87,8 +87,10 @@ func (f *Cmdfilter) Offload(req *schemas.BifrostChatRequest, rep *components.Rep
 		// original — the marker costs tokens too, so filtering that barely wins can
 		// still make the message larger (rtk never_worse, at the message level).
 		key := hashKey(content)
+		// degrade full→off when the store can't persist (no unresolvable marker).
+		mode := effectiveMode(c, f.mode)
 		var token string
-		switch f.mode {
+		switch mode {
 		case markerFull:
 			token = expand.Marker(key) + recoveryHint(loss)
 		case markerSummary:
@@ -101,7 +103,7 @@ func (f *Cmdfilter) Offload(req *schemas.BifrostChatRequest, rep *components.Rep
 		if schema.TextTokens(newText) >= schema.TextTokens(content) {
 			continue
 		}
-		if f.mode == markerFull {
+		if mode == markerFull {
 			c.Store.Put(key, []byte(content))
 			keys = append(keys, key)
 		} else {

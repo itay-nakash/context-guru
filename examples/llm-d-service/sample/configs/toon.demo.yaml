@@ -1,0 +1,4 @@
+# = configs/toon.yaml with min_tokens lowered so the small sample array acts.
+pipeline: [format, toon]
+components: { format: { min_tokens: 20 }, toon: { min_tokens: 20 } }
+store: { enabled: false }

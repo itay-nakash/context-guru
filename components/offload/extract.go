@@ -39,19 +39,18 @@ type Extract struct {
 	tail        int
 	strategy    string
 	modelSource string
+	modelClient components.Model // config-pinned client (model: block), or nil
 	trigger     components.Trigger
 	mode        markerMode
 	rewrite     bool
 }
 
 type extractConfig struct {
-	MinTokens int    `yaml:"min_tokens"`
-	Head      int    `yaml:"head_lines"`
-	Tail      int    `yaml:"tail_lines"`
-	Strategy  string `yaml:"strategy"` // deterministic | code | rlm
-	Model     struct {
-		Source string `yaml:"source"` // incoming (default) | config
-	} `yaml:"model"`
+	MinTokens  int                `yaml:"min_tokens"`
+	Head       int                `yaml:"head_lines"`
+	Tail       int                `yaml:"tail_lines"`
+	Strategy   string             `yaml:"strategy"` // deterministic | code | rlm
+	Model      modelConfig        `yaml:"model"`
 	Trigger    components.Trigger `yaml:"trigger"`
 	MarkerMode string             `yaml:"marker_mode"` // full (default) | summary | off
 	// Rewrite (code strategy only): drop the deletion-only containment proof so the
@@ -72,7 +71,7 @@ func newExtract(raw []byte) (components.Component, error) {
 	if cfg.Trigger.MinOutputTokens == 0 {
 		cfg.Trigger.MinOutputTokens = cfg.MinTokens
 	}
-	return &Extract{minTokens: cfg.MinTokens, head: cfg.Head, tail: cfg.Tail, strategy: cfg.Strategy, modelSource: cfg.Model.Source, trigger: cfg.Trigger, mode: parseMarkerMode(cfg.MarkerMode), rewrite: cfg.Rewrite}, nil
+	return &Extract{minTokens: cfg.MinTokens, head: cfg.Head, tail: cfg.Tail, strategy: cfg.Strategy, modelSource: cfg.Model.Source, modelClient: cfg.Model.Client(), trigger: cfg.Trigger, mode: parseMarkerMode(cfg.MarkerMode), rewrite: cfg.Rewrite}, nil
 }
 
 // outputFloor is the minimum tokens a single tool output must have to be worth
@@ -106,7 +105,9 @@ func (e *Extract) Offload(req *bschemas.BifrostChatRequest, rep *components.Repo
 	}
 	var model components.Model
 	if e.NeedsModel() {
-		model = c.Model.For(e.modelSource)
+		if model = e.modelClient; model == nil { // config-pinned client wins
+			model = c.Model.For(e.modelSource)
+		}
 	}
 	floor := e.outputFloor()
 	keepIDs := extract.HarvestIdentifiers(goal, 40)

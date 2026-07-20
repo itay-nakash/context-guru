@@ -91,6 +91,15 @@ var presets = map[string][]string{
 	"summarize": {"summarize"},
 }
 
+// PresetPipeline returns the default pipeline (ordered component names) for a
+// named preset. It's the safe way to resolve a caller-supplied preset name (e.g.
+// a /compact ?preset= query param) — a plain map lookup, no YAML parsing of
+// untrusted input.
+func PresetPipeline(name string) ([]string, bool) {
+	p, ok := presets[name]
+	return append([]string(nil), p...), ok
+}
+
 // Build constructs the ordered pipeline from the config, wiring each named
 // component with its raw config block.
 func (c *Config) Build(e components.Emitter) (*components.Pipeline, error) {
@@ -113,5 +122,11 @@ func (c *Config) Build(e components.Emitter) (*components.Pipeline, error) {
 	return components.NewPipeline(comps, e), nil
 }
 
-// NewStore builds the configured state store (in-memory for v1).
-func (c *Config) NewStore() store.Store { return store.NewMemory(c.Store) }
+// NewStore builds the configured state store: an in-memory TTL+LRU by default,
+// or a no-op store when store.enabled is false (disables offload reversibility).
+func (c *Config) NewStore() store.Store {
+	if c.Store.Enabled != nil && !*c.Store.Enabled {
+		return store.Nop{}
+	}
+	return store.NewMemory(c.Store)
+}

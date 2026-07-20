@@ -40,6 +40,17 @@ func parseMarkerMode(s string) markerMode {
 	}
 }
 
+// effectiveMode degrades a full (reversible) marker to off when the store cannot
+// persist the stash (store disabled). Without this, a full marker would leave an
+// unresolvable <<cg:HASH>> in the request and silently lose the dropped content.
+// Every Offload that honors marker_mode routes its mode through this first.
+func effectiveMode(c *components.Ctx, mode markerMode) markerMode {
+	if mode == markerFull && !c.Store.Persists() {
+		return markerOff
+	}
+	return mode
+}
+
 // mark centralizes the three marker_modes for the spot where an Offload component
 // would write its restoration marker. It returns the token to splice there and
 // the store key to append to the component's cacheKeys (empty in summary/off).
@@ -51,7 +62,7 @@ func parseMarkerMode(s string) markerMode {
 // hint is the component-specific recovery hint (e.g. " [full output: call
 // context_guru_expand]"); it is only emitted in full mode, where expand works.
 func mark(c *components.Ctx, rep *components.Report, mode markerMode, original, hint string) (token, key string) {
-	if mode == markerFull {
+	if effectiveMode(c, mode) == markerFull {
 		key = hashKey(original)
 		c.Store.Put(key, []byte(original))
 		return expand.Marker(key) + hint, key

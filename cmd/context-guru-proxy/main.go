@@ -11,10 +11,12 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/kagenti/context-guru/components"
 	_ "github.com/kagenti/context-guru/components/all"
@@ -31,12 +33,16 @@ func main() {
 		preset    = flag.String("preset", envOr("PRESET", "balanced"), "preset to use when --config is absent")
 		openai    = flag.String("openai-upstream", envOr("OPENAI_UPSTREAM", "https://api.openai.com"), "OpenAI upstream base URL")
 		anthropic = flag.String("anthropic-upstream", envOr("ANTHROPIC_UPSTREAM", "https://api.anthropic.com"), "Anthropic upstream base URL")
+		storeFlag = flag.String("store", envOr("STORE", ""), "override state store: true|false (default: config store.enabled, else on)")
 	)
 	flag.Parse()
 
 	cfg, err := loadConfig(*cfgPath, *preset)
 	if err != nil {
 		log.Fatalf("config: %v", err)
+	}
+	if v, ok := parseBool(*storeFlag); ok {
+		cfg.Store.Enabled = &v // flag/env wins over the config file when set
 	}
 
 	agg := metrics.NewAggregator()
@@ -55,6 +61,22 @@ func main() {
 		AnthropicKey: os.Getenv("ANTHROPIC_API_KEY"),
 		ForceModel:   os.Getenv("FORCE_MODEL"), // eval-containers pins EVAL_MODEL's model here
 		CheapModel:   cheapModelFromEnv(),      // static "config"-source LLM for NeedsModel components
+		// Per-request /compact override: swap the pipeline (?preset / header) while
+		// keeping this config's component blocks. nil-safe in the handler.
+		PipelineFor: func(preset string, names []string) (*components.Pipeline, error) {
+			oc := *cfg // override Pipeline only; component blocks + store carry over
+			switch {
+			case len(names) > 0:
+				oc.Pipeline = names
+			case preset != "":
+				p, ok := config.PresetPipeline(preset) // map lookup, not YAML from request input
+				if !ok {
+					return nil, fmt.Errorf("unknown preset %q", preset)
+				}
+				oc.Pipeline = p
+			}
+			return oc.Build(emitter)
+		},
 	})
 
 	slog.Info("context-guru-proxy listening", "addr", addr, "pipeline", cfg.Pipeline)
@@ -75,6 +97,18 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// parseBool reads a permissive bool override; ok=false for an empty/unknown
+// value so the config file's setting is left untouched.
+func parseBool(s string) (v, ok bool) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "true", "1", "on", "yes":
+		return true, true
+	case "false", "0", "off", "no":
+		return false, true
+	}
+	return false, false
 }
 
 // cheapModelFromEnv builds the static "config"-source LLM client for NeedsModel

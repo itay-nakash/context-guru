@@ -49,6 +49,11 @@ type Options struct {
 	// components (nil = none). The "incoming"-source client is built per request
 	// from the route's upstream + the gateway's real key.
 	CheapModel components.Model
+	// PipelineFor builds a pipeline for a per-request override on /compact
+	// (?preset=… or x-context-guru-pipeline: a,b,c). nil = overrides ignored, the
+	// handler always uses the configured pipeline. Supplied by main (which holds
+	// the config + emitter) so proxy stays decoupled from the config package.
+	PipelineFor func(preset string, names []string) (*components.Pipeline, error)
 }
 
 // upstream binds a provider to its base URL, the canonical provider path to POST
@@ -91,10 +96,71 @@ func (h *Handler) Mux() *http.ServeMux {
 		path:   "/v1/messages",
 		setKey: headerKey("x-api-key", h.opts.AnthropicKey),
 	}))
+	m.HandleFunc("POST /compact", h.compact)
 	m.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
 	m.HandleFunc("GET /stats", h.stats)
 	m.HandleFunc("GET /expand", h.expand)
 	return m
+}
+
+// compact runs the pipeline over the request body's messages and returns the
+// rewritten body — without forwarding upstream. This is the "compact a context,
+// hand it back" endpoint: a caller (e.g. the llm-d-router request-inline-
+// compaction step) POSTs an inference request body and gets a smaller body of
+// the same shape back. Fail-open: any parse/serialize trouble returns the
+// original body with 200, so the caller's passthrough contract always holds.
+//
+// Provider defaults to OpenAI; ?provider=anthropic switches dialects. Config
+// overrides (when Options.PipelineFor is set): ?preset=<name> or header
+// x-context-guru-pipeline: comp1,comp2. Session/bypass honor the usual headers.
+func (h *Handler) compact(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "read body", http.StatusBadRequest)
+		return
+	}
+	provider := bschemas.OpenAI
+	if strings.EqualFold(r.URL.Query().Get("provider"), "anthropic") {
+		provider = bschemas.Anthropic
+	}
+
+	pipe := h.pipe
+	if h.opts.PipelineFor != nil {
+		preset := r.URL.Query().Get("preset")
+		var names []string
+		if hp := r.Header.Get("x-context-guru-pipeline"); hp != "" {
+			names = splitComma(hp)
+		}
+		if preset != "" || len(names) != 0 {
+			// ponytail: rebuild per override request; add an LRU cache if override QPS ever matters.
+			if p, err := h.opts.PipelineFor(preset, names); err == nil {
+				pipe = p
+			} // build error => fall back to the configured pipeline (fail open)
+		}
+	}
+
+	// No upstream here, so there is no "incoming" model; only the static
+	// "config"-source client (and any endpoint pinned in a component's model: block).
+	models := components.ModelSpec{Static: h.opts.CheapModel}
+	out, _ := apply.BodyWithModel(
+		r.Context(), pipe, h.store, provider, body,
+		r.Header.Get("x-context-guru-session"),
+		strings.EqualFold(r.Header.Get("x-context-guru-bypass"), "true"),
+		models,
+	)
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(out)
+}
+
+// splitComma splits a comma-separated header value into trimmed, non-empty names.
+func splitComma(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func bearerKey(key string) func(http.Header) {

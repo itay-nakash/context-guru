@@ -14,8 +14,8 @@ func init() { components.Register("format", newFormat) }
 
 // Format re-encodes JSON tool outputs denser without losing data (a Reformat):
 // pretty-printed JSON is re-marshaled compact. It's strictly lossless — same
-// value, fewer whitespace tokens — so no stash is needed. (A TOON encoder is a
-// planned future option; v1 ships json-compact only.)
+// value, fewer whitespace tokens — so no stash is needed. (For a denser tabular
+// re-encoding of uniform object arrays, see the `toon` component.)
 type Format struct{ minTokens int }
 
 type formatConfig struct {

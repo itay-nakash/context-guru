@@ -1,0 +1,28 @@
+# Config 3 — whole-transcript summarizer (the summarize component).
+#
+# A cheap LLM compresses the middle of a long conversation into a single summary
+# message, keeping msg0 (system/first) plus the last few turns verbatim. Best for
+# long agentic sessions where the transcript itself is the token cost. Marker
+# mode "off" + store disabled makes it irreversible: the summarized span is
+# replaced outright, no <<cg:…>> markers, nothing stashed.
+pipeline: [summarize]
+
+components:
+  summarize:
+    summary_level: regular    # concise | regular | highly_detailed
+    keep_last: 3              # turns kept verbatim at the tail
+    min_tokens: 500           # min span size worth summarizing
+    resummarize_tokens: 6000  # roll the summary forward once the fresh tail exceeds this
+    marker_mode: "off"
+    trigger:
+      min_messages: 12            # don't summarize short conversations
+      min_request_tokens: 40000   # …or small ones
+    model:
+      source: config
+      provider: openai
+      base_url: http://your-llm-endpoint:8000
+      model: gpt-4o-mini
+      api_key: ""
+
+store:
+  enabled: false
