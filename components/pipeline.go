@@ -3,8 +3,8 @@ package components
 import (
 	"fmt"
 
-	"github.com/rossoctl/context-guru/schema"
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/rossoctl/context-guru/schema"
 )
 
 // Pipeline runs an ordered list of components over a request. Order is set by

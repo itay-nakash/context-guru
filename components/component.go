@@ -21,8 +21,8 @@ import (
 	"context"
 	"time"
 
-	"github.com/rossoctl/context-guru/store"
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/rossoctl/context-guru/store"
 )
 
 // Component is the common surface: identity + a per-request enable check.

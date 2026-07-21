@@ -171,3 +171,6 @@ coverage.txt
 
 # benchmark run output (results summarized in docs/PR, not tracked)
 deploy/eval-containers/sweep-results*.csv
+
+# MkDocs build output
+site/

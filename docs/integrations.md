@@ -45,7 +45,7 @@ Key behaviors (`proxy/proxy.go`):
   (`event-stream`) responses skip the loop and pass through with flushing.
 - `x-context-guru-*` headers are stripped before forwarding upstream.
 
-Run it: see the [README](../README.md) flag table and [setup.md](setup.md).
+Run it: see the [README](https://github.com/rossoctl/context-guru/blob/main/README.md) flag table and [setup.md](setup.md).
 
 ## Option B — AuthBridge in-process plugin
 

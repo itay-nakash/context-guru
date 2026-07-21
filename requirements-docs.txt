@@ -1,0 +1,4 @@
+# Documentation site — Material for MkDocs (same generator as adk.dev).
+# Build: pip install -r requirements-docs.txt && mkdocs serve
+mkdocs-material>=9.5
+pymdown-extensions>=10.7

@@ -6,9 +6,9 @@ import (
 	"strings"
 	"testing"
 
+	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/expand"
 	"github.com/rossoctl/context-guru/schema"
-	bschemas "github.com/maximhq/bifrost/core/schemas"
 )
 
 func userMsg(text string) bschemas.ChatMessage {

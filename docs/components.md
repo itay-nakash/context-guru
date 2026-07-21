@@ -10,6 +10,7 @@ messages (`role:"tool"`; for Anthropic, `tool_result` blocks normalized to that 
 | Component | Kind | What it drops | Recoverable | Fires on | Key config (default) |
 |---|---|---|---|---|---|
 | `format` | Reformat | nothing (compacts JSON) | n/a (lossless) | pretty-printed JSON tool output | `min_tokens` (50) |
+| `toon` | Reformat | nothing (re-encodes JSON arrays as TOON) | n/a (lossless) | uniform flat JSON object-arrays | `min_tokens` (50) |
 | `cacheinject` | Reformat | nothing (adds `cache_control`) | n/a (lossless) | Anthropic-family requests | — |
 | `skeleton` | Offload | function/method bodies | via expand | fenced ` ```lang ` code blocks | `min_tokens` (80) |
 | `dedup` | Offload | later byte-identical tool outputs | via expand | repeated identical outputs | `min_tokens` (100) |
@@ -55,6 +56,27 @@ before:  { "id": 1,           after:  {"id":1,"name":"ada","tags":["x","y"]}
 
 - **Lossiness:** none — nothing stashed. **Shines:** verbose pretty-printed JSON/MCP payloads.
   **Inert:** already-compact JSON, non-JSON text, small outputs.
+
+### `toon`
+Re-encodes a JSON array of uniform, flat objects as **TOON** (Token-Oriented Object Notation):
+one header listing the field names once, then one comma-separated row per element. It drops the
+braces, repeated keys, and quotes that dominate a JSON array's token cost. It's a Reformat (repack
+in place, nothing stashed): every scalar value is preserved, with one small representational
+simplification — JSON `null` renders as an empty cell (indistinguishable from `""`). Only arrays
+whose elements share one key set and hold scalar values are encoded; anything nested, ragged, or
+non-array is left untouched, and the pipeline's never-worse guard reverts any case that fails to
+shrink.
+
+```
+before:  [{"id":1,"name":"Alice"},{"id":2,"name":"Bob"}]
+after:   [2]{id,name}:
+         1,Alice
+         2,Bob
+```
+
+- **Config:** `min_tokens` (50). **Lossiness:** none — nothing stashed (JSON `null` → empty cell).
+  **Shines:** long homogeneous JSON arrays (the llm-d TOON config). **Inert:** nested/ragged/non-array
+  output, or not smaller.
 
 ### `cacheinject`
 Places an Anthropic `cache_control: {type: ephemeral}` breakpoint on the last content block of

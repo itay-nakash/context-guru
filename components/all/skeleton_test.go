@@ -11,9 +11,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/expand"
 	"github.com/rossoctl/context-guru/schema"
-	"github.com/maximhq/bifrost/core/schemas"
 )
 
 func TestSkeletonElidesBodies(t *testing.T) {

@@ -1,0 +1,68 @@
+# Recover offloaded context
+
+Every lossy [Offload](../components.md#offload-lossy-reversible) is reversible. When a component
+drops bytes it writes a `<<cg:HASH>>` marker in place of the dropped content and stashes the
+original in the [store](../design.md#state-the-store) under that hash. Nothing is ever silently
+lost — an Offload that drops content but returns no cache key is treated as a failed offload and
+reverted.
+
+## The marker
+
+```text
+[older tool output masked] <<cg:b162e82de872a202>> [full output: call context_guru_expand]
+```
+
+The marker is the recovery handle. The model sees a short hint next to it, and the original bytes
+live in the store keyed by the hash.
+
+## Three ways to recover
+
+### 1. The model-callable `context_guru_expand` tool
+The host injects a `context_guru_expand(id)` tool into the request. When the model needs the full
+content behind a marker, it calls the tool with the hash.
+
+### 2. The host-side expand continuation loop
+The host resolves the hash, appends the original as a tool result, and re-invokes upstream so the
+model finishes with the full content in hand. The marker format, tool definition, response parsing,
+and continuation builder are shared in `expand/`; the loop itself is host glue because it must
+re-invoke upstream.
+
+```mermaid
+sequenceDiagram
+  participant M as Model
+  participant Host
+  participant Store
+  participant Up as Upstream
+  Host->>Up: request (content replaced by <<cg:HASH>> + expand tool)
+  Up-->>Host: response calls context_guru_expand(id=HASH)
+  Host->>Store: Resolve(HASH)
+  Store-->>Host: original bytes
+  Host->>Up: append assistant tool-call + tool_result(original), re-invoke
+  Up-->>M: final answer with full content in hand
+  Note over Host,Up: capped at 3 rounds — if the model also calls another tool,<br/>the loop bails and returns the response as-is
+```
+
+The loop is **capped at 3 rounds** (`maxExpandRounds = 3`). If the model calls another tool
+alongside the expand call, the loop bails and returns the response as-is. An expired or evicted
+original resolves to an explicit placeholder rather than being omitted — the provider requires one
+`tool_result` per `tool_call_id`. A store miss silently turns a lossless offload lossy: the known
+TTL edge.
+
+### 3. `GET /expand?id=`
+The proxy exposes `GET /expand?id=<hash>` to recover an offloaded original directly, out of band
+from the model loop.
+
+## Reversibility requires the store
+
+The store is the whole reversibility mechanism. It defaults to an in-memory TTL+LRU backend —
+**1800s TTL, 1000 entries, 100 sticky sessions** — shared by every host. It holds, per session:
+
+- **Rewind** — `cache_key → original bytes`, what the expand loop resolves.
+- **Sticky** — the set of content ids already reduced on prior turns (byte-stable output across
+  turns).
+
+!!! warning "No store, no recovery"
+    Set `store.enabled: false` and offloads become **one-way** — a `store.Nop` is wired in and
+    nothing is stashed. The [llm-d compaction service](../examples/llm-d-service.md) does this
+    deliberately (with `marker_mode: off`) so `/compact` returns a clean, marker-free,
+    directly-usable request body. Only disable the store when you don't need to recover.
