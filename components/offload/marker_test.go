@@ -3,8 +3,8 @@ package offload
 import (
 	"testing"
 
-	"github.com/kagenti/context-guru/components"
-	"github.com/kagenti/context-guru/store"
+	"github.com/rossoctl/context-guru/components"
+	"github.com/rossoctl/context-guru/store"
 )
 
 // A full (reversible) marker must degrade to an irreversible off-style drop when

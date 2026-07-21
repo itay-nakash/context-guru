@@ -3,7 +3,7 @@ package offload
 import (
 	"strings"
 
-	"github.com/kagenti/context-guru/schema"
+	"github.com/rossoctl/context-guru/schema"
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 )
 

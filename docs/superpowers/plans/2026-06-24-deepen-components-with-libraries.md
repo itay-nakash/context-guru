@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Go module `github.com/kagenti/lab-context-engineering`, Go 1.25. `make fmt lint test build` must stay green; lint = `go vet` + `gofmt -l` clean.
+- Go module `github.com/rossoctl/lab-context-engineering`, Go 1.25. `make fmt lint test build` must stay green; lint = `go vet` + `gofmt -l` clean.
 - **CGO is now required** (tree-sitter): CI sets `CGO_ENABLED=1` with a C toolchain; the Docker final stage moves from `distroless/static` to `distroless/base-debian12:nonroot` (glibc present).
 - **Fail-open is non-negotiable:** any error in any stage/strategy forwards the original content untouched. Every reduction stays reversible (markers + rewind store).
 - DCO sign-off on every commit (`git commit -s`); author Osher Elhadad; `Assisted-By:` trailer, never `Co-Authored-By`. Conventional-commit titles.
@@ -313,7 +313,7 @@ Expected: FAIL (`DoThing` missed by the regex, or `Ghost` wrongly included).
 Replace `defRe`, `isCodePath`, and `definedSymbols` in `signals.go` with:
 
 ```go
-// (top of file) import "github.com/kagenti/lab-context-engineering/internal/treesitter"
+// (top of file) import "github.com/rossoctl/lab-context-engineering/internal/treesitter"
 // and sitter "github.com/tree-sitter/go-tree-sitter"
 
 func isCodePath(fp string) bool { return treesitter.LangForExt(fp) != "" }

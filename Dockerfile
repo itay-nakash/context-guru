@@ -19,7 +19,7 @@ WORKDIR /src/lab-context-engineering
 ARG VERSION=dev
 ARG COMMIT=none
 RUN CGO_ENABLED=1 go build \
-	-ldflags "-s -w -X github.com/kagenti/context-guru/internal/buildinfo.Version=${VERSION} -X github.com/kagenti/context-guru/internal/buildinfo.Commit=${COMMIT}" \
+	-ldflags "-s -w -X github.com/rossoctl/context-guru/internal/buildinfo.Version=${VERSION} -X github.com/rossoctl/context-guru/internal/buildinfo.Commit=${COMMIT}" \
 	-o /out/context-guru-proxy ./cmd/context-guru-proxy
 
 FROM debian:bookworm-slim

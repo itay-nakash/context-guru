@@ -88,7 +88,7 @@ skips the pipeline.
 | Option | What | Where |
 |---|---|---|
 | **Proxy / gateway** | `context-guru-proxy` in front of the provider; the eval-containers gateway image | `proxy/`, `cmd/context-guru-proxy/` |
-| **In-process plugin** | AuthBridge (Kagenti sidecar) plugin importing this module, running the same pipeline on `pctx.Body` | plugin lives in `kagenti-extensions`; reuses `apply.Body` + `expand/` |
+| **In-process plugin** | AuthBridge (Rossoctl sidecar) plugin importing this module, running the same pipeline on `pctx.Body` | plugin lives in `cortex`; reuses `apply.Body` + `expand/` |
 | _(also)_ **bifrost LLMPlugin** | run the pipeline as a `PreRequestHook` inside any bifrost deployment | `adapters/bifrost/` |
 
 Details in [docs/integrations.md](docs/integrations.md).

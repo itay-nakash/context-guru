@@ -7,7 +7,7 @@ provider, and session id, and how they run the expand loop.
 | Option | Host code | Body source | Expand loop | Status |
 |---|---|---|---|---|
 | Proxy / gateway | `proxy/` + `cmd/context-guru-proxy/` | HTTP request body | server-side, wraps the chat route | shipped; the eval-containers gateway |
-| AuthBridge plugin | `kagenti-extensions` (imports this module) | `pctx.Body` | response path (`OnResponse`) | plugin lives externally |
+| AuthBridge plugin | `cortex` (imports this module) | `pctx.Body` | response path (`OnResponse`) | plugin lives externally |
 | bifrost `LLMPlugin` | `adapters/bifrost/` | `req.ChatRequest` | transport wrapper | adapter shipped |
 
 ## Option A — proxy / gateway
@@ -49,7 +49,7 @@ Run it: see the [README](https://github.com/kagenti/context-guru/blob/main/READM
 
 ## Option B — AuthBridge in-process plugin
 
-The plugin lives in **kagenti-extensions** (`authlib/plugins/contextguru/`) and imports only this
+The plugin lives in **cortex** (`authlib/plugins/contextguru/`) and imports only this
 module — not bifrost internals. It is an outbound `WritesBody` plugin gated to inference paths.
 
 ```mermaid

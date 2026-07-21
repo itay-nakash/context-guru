@@ -3,7 +3,7 @@ package expand
 import (
 	"testing"
 
-	"github.com/kagenti/context-guru/store"
+	"github.com/rossoctl/context-guru/store"
 )
 
 func TestToolDefShape(t *testing.T) {

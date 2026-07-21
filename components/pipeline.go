@@ -3,7 +3,7 @@ package components
 import (
 	"fmt"
 
-	"github.com/kagenti/context-guru/schema"
+	"github.com/rossoctl/context-guru/schema"
 	"github.com/maximhq/bifrost/core/schemas"
 )
 

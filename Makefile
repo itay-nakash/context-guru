@@ -1,5 +1,5 @@
 BINARY := context-guru-proxy
-PKG := github.com/kagenti/context-guru
+PKG := github.com/rossoctl/context-guru
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
 LDFLAGS := -s -w \
