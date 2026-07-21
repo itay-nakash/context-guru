@@ -124,7 +124,7 @@ How the gateway routes Bob's traffic:
     A lossless, LLM-free pipeline (`format`, `toon`, `dedup`, `failed_run`, `cmdfilter`)
     needs no cheap-model config and leaves the transcript reversible. Verified end-to-end:
     with `[format, toon]` Bob authenticates and answers correctly through the proxy, with
-    its model call reduced. For long Bob sessions, add `mask` (see [Choose a preset](../how-to/choose-a-preset.md)).
+    its model call reduced. For long Bob sessions, add `mask` (see [Choose a preset](how-to/choose-a-preset.md)).
 
 !!! note "Bob speaks its own backend protocol"
     Unlike Claude Code (`ANTHROPIC_BASE_URL`) or OpenAI-surface agents (`OPENAI_BASE_URL`),
