@@ -51,5 +51,11 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      # Switch the Pages source to "GitHub Actions" (build_type=workflow). Without
+      # this, deploy-pages fails with "HttpError: Not Found" when the repo's Pages
+      # is set to legacy "Deploy from a branch" mode.
+      - uses: actions/configure-pages@v5
+        with:
+          enablement: true
       - id: deployment
         uses: actions/deploy-pages@v4
