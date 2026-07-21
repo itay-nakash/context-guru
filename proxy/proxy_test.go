@@ -129,6 +129,78 @@ func TestAnthropicRouteReducesToolResult(t *testing.T) {
 	}
 }
 
+// TestBobGatewayReducesModelAndPassesControlPlane drives the Bob (BobShell)
+// gateway: the OpenAI-dialect model call on /inference/v1/chat/completions is
+// reduced like any chat and forwarded to the same path, while a control-plane
+// call (GET /admin/v1/profile) passes through to the upstream verbatim.
+func TestBobGatewayReducesModelAndPassesControlPlane(t *testing.T) {
+	type hit struct {
+		method, path string
+		body         []byte
+	}
+	var hits []hit
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		hits = append(hits, hit{r.Method, r.URL.Path, b})
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	cfg, err := config.LoadBytes([]byte("pipeline: [dedup]\ncomponents:\n  dedup: {min_tokens: 20}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	agg := metrics.NewAggregator()
+	pipe, err := cfg.Build(agg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := proxy.New(pipe, store.NewMemory(store.Options{}), agg, proxy.Options{BobUpstream: upstream.URL})
+	srv := httptest.NewServer(h.Mux())
+	defer srv.Close()
+
+	// 1) Model call on Bob's path is reduced (dedup) and forwarded to the same path.
+	dump := strings.Repeat("verbose repeated bob tool output line\n", 40)
+	body := openAIBody(
+		map[string]any{"role": "user", "content": "do it"},
+		map[string]any{"role": "tool", "tool_call_id": "a", "content": dump},
+		map[string]any{"role": "tool", "tool_call_id": "b", "content": dump},
+	)
+	resp, err := http.Post(srv.URL+"/inference/v1/chat/completions", "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	// 2) Control-plane call is proxied through verbatim.
+	cp, err := http.Get(srv.URL + "/admin/v1/profile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp.Body.Close()
+
+	if len(hits) != 2 {
+		t.Fatalf("want 2 upstream hits, got %d: %+v", len(hits), hits)
+	}
+	model, control := hits[0], hits[1]
+	if model.path != "/inference/v1/chat/completions" {
+		t.Fatalf("model call forwarded to wrong path: %q", model.path)
+	}
+	if !strings.Contains(gjson.GetBytes(model.body, "messages.2.content").String(), "identical to an earlier") {
+		t.Fatalf("dedup did not run on the bob model call: %s", model.body)
+	}
+	if len(model.body) >= len(body) {
+		t.Fatalf("bob model call not shrunk (before=%d after=%d)", len(body), len(model.body))
+	}
+	if control.method != "GET" || control.path != "/admin/v1/profile" {
+		t.Fatalf("control-plane not passed through verbatim: %s %s", control.method, control.path)
+	}
+	if len(control.body) != 0 {
+		t.Fatalf("control-plane GET should have empty body, got %d bytes", len(control.body))
+	}
+}
+
 func TestBypassHeaderForwardsUnchanged(t *testing.T) {
 	var got []byte
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
