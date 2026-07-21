@@ -6,10 +6,10 @@ import (
 	"strings"
 	"testing"
 
+	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/components"
 	"github.com/rossoctl/context-guru/schema"
 	"github.com/rossoctl/context-guru/store"
-	bschemas "github.com/maximhq/bifrost/core/schemas"
 )
 
 // stubModel is a fixed LLM used to drive the model-based components in tests.

@@ -13,11 +13,11 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/components"
 	"github.com/rossoctl/context-guru/expand"
 	"github.com/rossoctl/context-guru/internal/treesitter"
 	"github.com/rossoctl/context-guru/schema"
-	"github.com/maximhq/bifrost/core/schemas"
 	sitter "github.com/tree-sitter/go-tree-sitter"
 	"gopkg.in/yaml.v3"
 )

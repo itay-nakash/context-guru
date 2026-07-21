@@ -4,10 +4,10 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/components"
 	"github.com/rossoctl/context-guru/expand"
 	"github.com/rossoctl/context-guru/schema"
-	"github.com/maximhq/bifrost/core/schemas"
 	"gopkg.in/yaml.v3"
 )
 

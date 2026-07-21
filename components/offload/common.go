@@ -3,8 +3,8 @@ package offload
 import (
 	"strings"
 
-	"github.com/rossoctl/context-guru/schema"
 	bschemas "github.com/maximhq/bifrost/core/schemas"
+	"github.com/rossoctl/context-guru/schema"
 )
 
 // errWords mark a tool output (or an item) as carrying a failure — such items

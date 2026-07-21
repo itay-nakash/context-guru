@@ -4,8 +4,8 @@
 package reformat
 
 import (
-	"github.com/rossoctl/context-guru/components"
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/rossoctl/context-guru/components"
 )
 
 func init() { components.Register("cacheinject", newCacheinject) }

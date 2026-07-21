@@ -13,8 +13,8 @@ package schema
 import (
 	"encoding/json"
 
-	"github.com/rossoctl/context-guru/internal/tokens"
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/rossoctl/context-guru/internal/tokens"
 )
 
 // Provider identifies the wire dialect a request arrived in. It drives
