@@ -58,12 +58,12 @@ session id, and where they run the expand loop.
 | Option | Host code | Body source | Expand loop |
 |---|---|---|---|
 | **Proxy / gateway** | `proxy/` + `cmd/context-guru-proxy/` | HTTP request body | server-side, wraps the chat route |
-| **AuthBridge plugin** | `kagenti-extensions` (imports this module) | `pctx.Body` | response path (`OnResponse`) |
+| **AuthBridge plugin** | `cortex` (imports this module) | `pctx.Body` | response path (`OnResponse`) |
 | **bifrost `LLMPlugin`** | `adapters/bifrost/` | `req.ChatRequest` | transport wrapper |
 
 - **Proxy / gateway** — a standalone HTTP proxy that reuses bifrost's `ChatMessage` type (not its
   transport). One port serves both dialects; runs the expand loop itself.
-- **AuthBridge in-process plugin** — an outbound `WritesBody` plugin living in `kagenti-extensions`,
+- **AuthBridge in-process plugin** — an outbound `WritesBody` plugin living in `cortex`,
   reusing `apply.Body` on `pctx.Body` and running the continuation in `OnResponse`.
 - **bifrost `LLMPlugin`** — this page: embed the pipeline in an existing bifrost deployment via a
   `PreRequestHook`.

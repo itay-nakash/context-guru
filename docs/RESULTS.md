@@ -241,7 +241,7 @@ tokens (~95%)**, still containment-verified (a live, reproducible example —
 
 ## Methodology & caveats
 
-- Harness: [`deploy/eval-containers/sweep.py`](https://github.com/kagenti/context-guru/blob/main/deploy/eval-containers/sweep.py) (resumable) → `aggregate.py`.
+- Harness: [`deploy/eval-containers/sweep.py`](https://github.com/rossoctl/context-guru/blob/main/deploy/eval-containers/sweep.py) (resumable) → `aggregate.py`.
   One cell = one `(task, config)` run through the compose stack; reward from `output/task/result.json`,
   savings from the gateway `/stats` (within-run `tokens_before → tokens_after`), component time from the
   gateway's per-component `duration_ms` logs, example rewrites from `CONTEXT_GURU_DUMP`.

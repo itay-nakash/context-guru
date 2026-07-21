@@ -1,8 +1,8 @@
 package components
 
 import (
-	"github.com/rossoctl/context-guru/schema"
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/rossoctl/context-guru/schema"
 )
 
 // Trigger is the shared, configurable gate that decides whether an expensive

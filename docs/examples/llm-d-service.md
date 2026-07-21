@@ -7,7 +7,7 @@ A ready-to-run example that turns context-guru into a stateless HTTP **compactio
 
 !!! note "Full example on GitHub"
     Source, configs, build script, and Go client:
-    [`examples/llm-d-service`](https://github.com/kagenti/context-guru/tree/main/examples/llm-d-service).
+    [`examples/llm-d-service`](https://github.com/rossoctl/context-guru/tree/main/examples/llm-d-service).
 
 ## The contract
 

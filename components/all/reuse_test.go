@@ -6,10 +6,10 @@ import (
 	"sync"
 	"testing"
 
+	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/components"
 	"github.com/rossoctl/context-guru/schema"
 	"github.com/rossoctl/context-guru/store"
-	bschemas "github.com/maximhq/bifrost/core/schemas"
 )
 
 // countingModel is a stubModel that records how many times it was called, so a

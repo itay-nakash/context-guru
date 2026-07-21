@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/rossoctl/context-guru/store"
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/rossoctl/context-guru/store"
 )
 
 // --- fakes ---

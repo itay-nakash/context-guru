@@ -1,6 +1,6 @@
 # Community
 
-context-guru is a [Kagenti](https://github.com/kagenti/kagenti) platform
+context-guru is a [Rossoctl](https://github.com/rossoctl) platform
 component, licensed under **Apache-2.0**.
 
 ## Contributing
@@ -29,9 +29,9 @@ component, licensed under **Apache-2.0**.
 
 | Document | |
 |---|---|
-| [CONTRIBUTING.md](https://github.com/kagenti/context-guru/blob/main/CONTRIBUTING.md) | How to contribute, DCO, PR norms. |
-| [GOVERNANCE.md](https://github.com/kagenti/context-guru/blob/main/GOVERNANCE.md) | Project governance model. |
-| [MAINTAINERS.md](https://github.com/kagenti/context-guru/blob/main/MAINTAINERS.md) | Current maintainers. |
-| [SECURITY.md](https://github.com/kagenti/context-guru/blob/main/SECURITY.md) | Reporting security issues (do not open public issues for vulnerabilities). |
-| [CODE_OF_CONDUCT.md](https://github.com/kagenti/context-guru/blob/main/CODE_OF_CONDUCT.md) | Community standards. |
-| [LICENSE](https://github.com/kagenti/context-guru/blob/main/LICENSE) | Apache-2.0. |
+| [CONTRIBUTING.md](https://github.com/rossoctl/context-guru/blob/main/CONTRIBUTING.md) | How to contribute, DCO, PR norms. |
+| [GOVERNANCE.md](https://github.com/rossoctl/context-guru/blob/main/GOVERNANCE.md) | Project governance model. |
+| [MAINTAINERS.md](https://github.com/rossoctl/context-guru/blob/main/MAINTAINERS.md) | Current maintainers. |
+| [SECURITY.md](https://github.com/rossoctl/context-guru/blob/main/SECURITY.md) | Reporting security issues (do not open public issues for vulnerabilities). |
+| [CODE_OF_CONDUCT.md](https://github.com/rossoctl/context-guru/blob/main/CODE_OF_CONDUCT.md) | Community standards. |
+| [LICENSE](https://github.com/rossoctl/context-guru/blob/main/LICENSE) | Apache-2.0. |

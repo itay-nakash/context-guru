@@ -31,7 +31,7 @@ pipeline; the response path resolves any `context_guru_expand` calls automatical
 
 ## With a wrapper script
 
-[`scripts/with-guru.sh`](https://github.com/kagenti/context-guru/blob/main/scripts/with-guru.sh)
+[`scripts/with-guru.sh`](https://github.com/rossoctl/context-guru/blob/main/scripts/with-guru.sh)
 starts the proxy, exports the base-URL env, and runs any agent command through it:
 
 ```sh

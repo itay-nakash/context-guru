@@ -6,12 +6,12 @@ import (
 	"strings"
 	"testing"
 
+	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/apply"
 	"github.com/rossoctl/context-guru/components"
 	_ "github.com/rossoctl/context-guru/components/all"
 	"github.com/rossoctl/context-guru/config"
 	"github.com/rossoctl/context-guru/store"
-	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/tidwall/gjson"
 )
 

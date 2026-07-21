@@ -6,9 +6,9 @@ import (
 	"strings"
 	"testing"
 
+	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/internal/cheapmodel"
 	"github.com/rossoctl/context-guru/schema"
-	bschemas "github.com/maximhq/bifrost/core/schemas"
 )
 
 // Live example of the summarize component: real model compresses a realistic

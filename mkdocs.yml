@@ -2,12 +2,12 @@ site_name: context-guru
 site_description: >-
   Provider-agnostic context engineering for LLM agents — shrink the tokens a
   request carries, losslessly or lossy-but-reversibly, without touching the agent.
-site_url: https://kagenti.github.io/context-guru/
-repo_url: https://github.com/kagenti/context-guru
-repo_name: kagenti/context-guru
+site_url: https://rossoctl.github.io/context-guru/
+repo_url: https://github.com/rossoctl/context-guru
+repo_name: rossoctl/context-guru
 edit_uri: edit/main/docs/
 copyright: >-
-  Apache-2.0 &middot; a <a href="https://github.com/kagenti">Kagenti</a> platform component
+  Apache-2.0 &middot; a <a href="https://github.com/rossoctl">Rossoctl</a> platform component
 
 theme:
   name: material
@@ -98,9 +98,9 @@ extra_javascript:
 extra:
   social:
     - icon: fontawesome/brands/github
-      link: https://github.com/kagenti/context-guru
+      link: https://github.com/rossoctl/context-guru
     - icon: fontawesome/brands/golang
-      link: https://pkg.go.dev/github.com/kagenti/context-guru
+      link: https://pkg.go.dev/github.com/rossoctl/context-guru
 
 # Internal implementation plans live under docs/ but must never publish.
 exclude_docs: |
