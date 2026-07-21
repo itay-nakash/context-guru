@@ -134,6 +134,7 @@ nav:
           - summarize: components/summarize.md
       - The DSL filter engine: components/dsl.md
   - How-to Guides:
+      - Use with Claude Code: how-to/use-with-claude-code.md
       - Choose a preset: how-to/choose-a-preset.md
       - Run behind a proxy or gateway: integrations.md
       - Integrate as a bifrost plugin: how-to/bifrost-plugin.md
