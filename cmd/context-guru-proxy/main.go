@@ -33,6 +33,7 @@ func main() {
 		preset    = flag.String("preset", envOr("PRESET", "balanced"), "preset to use when --config is absent")
 		openai    = flag.String("openai-upstream", envOr("OPENAI_UPSTREAM", "https://api.openai.com"), "OpenAI upstream base URL")
 		anthropic = flag.String("anthropic-upstream", envOr("ANTHROPIC_UPSTREAM", "https://api.anthropic.com"), "Anthropic upstream base URL")
+		bob       = flag.String("bob-upstream", envOr("BOB_UPSTREAM", ""), "Bob (BobShell) backend base URL; enables the Bob gateway routes when set (e.g. https://api.us-east.bob.ibm.com)")
 		storeFlag = flag.String("store", envOr("STORE", ""), "override state store: true|false (default: config store.enabled, else on)")
 	)
 	flag.Parse()
@@ -55,6 +56,7 @@ func main() {
 	h := proxy.New(pipe, cfg.NewStore(), agg, proxy.Options{
 		OpenAIUpstream:    *openai,
 		AnthropicUpstream: *anthropic,
+		BobUpstream:       *bob, // enables the Bob gateway routes when set (BOB_UPSTREAM)
 		// Gateway mode: real provider keys live here (eval-containers passes them
 		// via env); the agent holds only a placeholder. Empty => pass client auth.
 		OpenAIKey:    os.Getenv("OPENAI_API_KEY"),

@@ -39,8 +39,14 @@ import (
 type Options struct {
 	OpenAIUpstream    string // e.g. https://api.openai.com
 	AnthropicUpstream string
-	OpenAIKey         string // injected as Authorization: Bearer <key>
-	AnthropicKey      string // injected as x-api-key: <key>
+	// BobUpstream, when set, enables the Bob (BobShell) gateway: Bob's
+	// OpenAI-dialect model calls (POST /inference/v1/chat/completions) are reduced
+	// and forwarded here, and every other path Bob calls (control-plane:
+	// /admin/v1/profile, /inference/v1/model/info, …) is proxied through verbatim
+	// so the CLI boots and authenticates. Point Bob's CUSTOM_BASE_URL at this proxy.
+	BobUpstream  string // e.g. https://api.us-east.bob.ibm.com
+	OpenAIKey    string // injected as Authorization: Bearer <key>
+	AnthropicKey string // injected as x-api-key: <key>
 	// ForceModel, when set, overwrites the request's "model" field. eval-containers
 	// uses this to pin every call to EVAL_MODEL regardless of what the agent asked for.
 	ForceModel string
@@ -100,7 +106,49 @@ func (h *Handler) Mux() *http.ServeMux {
 	m.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
 	m.HandleFunc("GET /stats", h.stats)
 	m.HandleFunc("GET /expand", h.expand)
+	// Bob (BobShell) gateway. Bob is OpenAI-compatible but calls Bob-specific
+	// paths: its model call is POST /inference/v1/chat/completions (reduced like
+	// any OpenAI chat), and its control-plane calls (/admin/v1/profile,
+	// /inference/v1/model/info, …) must pass through verbatim so the CLI boots and
+	// authenticates. The "/" catch-all is less specific than every route above, so
+	// it only receives what nothing else matched. Enabled only when BobUpstream is
+	// set, so default proxy behavior (unknown path => 404) is unchanged.
+	if h.opts.BobUpstream != "" {
+		m.HandleFunc("POST /inference/v1/chat/completions", h.chat(bschemas.OpenAI, upstream{
+			base: h.opts.BobUpstream,
+			path: "/inference/v1/chat/completions",
+			// setKey nil: pass Bob's own auth (BOBSHELL key) straight through.
+		}))
+		m.HandleFunc("/", h.passthrough(h.opts.BobUpstream))
+	}
 	return m
+}
+
+// passthrough transparently forwards a request to the Bob upstream unchanged —
+// for Bob's control-plane calls that must not be rewritten. Bob's own auth
+// header passes straight through (no key injection); the response is streamed
+// back as-is. Only the model route is reduced; everything else Bob calls lands
+// here and is proxied verbatim.
+func (h *Handler) passthrough(base string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		target := base + r.URL.Path
+		if r.URL.RawQuery != "" {
+			target += "?" + r.URL.RawQuery
+		}
+		req, err := http.NewRequestWithContext(r.Context(), r.Method, target, strings.NewReader(string(body)))
+		if err != nil {
+			http.Error(w, "proxy: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		copyHeaders(req.Header, r.Header)
+		resp, err := h.client.Do(req)
+		if err != nil {
+			http.Error(w, "upstream: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		h.stream(w, resp)
+	}
 }
 
 // compact runs the pipeline over the request body's messages and returns the

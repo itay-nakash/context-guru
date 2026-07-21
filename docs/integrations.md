@@ -89,3 +89,45 @@ p := bifrost.New(pipe, store)   // pipe from config.Build, store from config.New
   header / Anthropic `metadata.user_id`), else the content-hash fallback.
 - `PreLLMHook`/`PostLLMHook` are pass-throughs — the expand loop belongs in a transport wrapper
   (it must re-invoke upstream, which a hook cannot).
+
+## Use it with an agent — Bob (BobShell)
+
+IBM Bob is OpenAI-compatible via its `CUSTOM_BASE_URL`, but it calls **Bob-specific
+paths**: its model call is `POST /inference/v1/chat/completions`, and it makes
+control-plane calls (`GET /admin/v1/profile`, `/inference/v1/model/info`, …) that must
+reach the backend unmodified or the CLI won't boot. The proxy has an opt-in **Bob
+gateway** for exactly this shape — enable it with `BOB_UPSTREAM` (or `--bob-upstream`):
+
+```sh
+BOB_UPSTREAM=https://api.us-east.bob.ibm.com \
+  context-guru-proxy --preset balanced        # any deterministic preset/config
+```
+
+Then point Bob at the proxy and let it use its own key:
+
+```sh
+CUSTOM_BASE_URL=http://localhost:4000/v1 \
+BOBSHELL_DEFAULT_AUTH_TYPE=custom \
+BOBSHELL_API_KEY=<your bob key> \
+  bob --yolo "your task"
+```
+
+How the gateway routes Bob's traffic:
+
+- **Model calls** (`/inference/v1/chat/completions`) run through the pipeline like any
+  OpenAI chat and are forwarded to the same path on `BOB_UPSTREAM`. Bob's own auth is
+  passed straight through (no key injection).
+- **Control-plane calls** (everything else Bob hits) are proxied **verbatim** to
+  `BOB_UPSTREAM`, so Bob authenticates and starts normally.
+
+!!! tip "Start with deterministic components"
+    A lossless, LLM-free pipeline (`format`, `toon`, `dedup`, `failed_run`, `cmdfilter`)
+    needs no cheap-model config and leaves the transcript reversible. Verified end-to-end:
+    with `[format, toon]` Bob authenticates and answers correctly through the proxy, with
+    its model call reduced. For long Bob sessions, add `mask` (see [Choose a preset](../how-to/choose-a-preset.md)).
+
+!!! note "Bob speaks its own backend protocol"
+    Unlike Claude Code (`ANTHROPIC_BASE_URL`) or OpenAI-surface agents (`OPENAI_BASE_URL`),
+    Bob's `CUSTOM_BASE_URL` points at the proxy **host**; Bob supplies the `/inference` and
+    `/admin` paths itself. The gateway only activates when `BOB_UPSTREAM` is set, so it
+    never changes behavior for the other integrations above.
