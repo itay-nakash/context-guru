@@ -14,6 +14,10 @@ same gateway with an empty pipeline (passthrough); each `cg-*` = that one compon
   content-token savings on the resolved tasks, up to 93.5% on a long session**, reward preserved.
 - **Component overhead is single-digit milliseconds** — the token savings cost effectively no compute.
 
+<div class="cg-chart-box">
+  <canvas data-cg-chart="save-per-component"></canvas>
+</div>
+
 ## Per-component summary
 
 | component | fires on | mean save% (all 10) | mean save% (resolved 6) | reward kept | compute/req |
@@ -154,18 +158,18 @@ AFTER:
 ```text
 BEFORE:
 415	        directive.
-416	
+416
 417	    Returns
 418	    -------
 419	    bool
 420	        True if the member should be skipped during creation of the docs,
 421	        False if it should be included in the docs.
-422	
+422
 423	    """
 424	    has_doc …
 AFTER:
 415	        directive.
-416	
+416
 417	    Returns
 418	    -------
 419	    bool
@@ -237,7 +241,7 @@ tokens (~95%)**, still containment-verified (a live, reproducible example —
 
 ## Methodology & caveats
 
-- Harness: [`deploy/eval-containers/sweep.py`](../deploy/eval-containers/sweep.py) (resumable) → `aggregate.py`.
+- Harness: [`deploy/eval-containers/sweep.py`](https://github.com/kagenti/context-guru/blob/main/deploy/eval-containers/sweep.py) (resumable) → `aggregate.py`.
   One cell = one `(task, config)` run through the compose stack; reward from `output/task/result.json`,
   savings from the gateway `/stats` (within-run `tokens_before → tokens_after`), component time from the
   gateway's per-component `duration_ms` logs, example rewrites from `CONTEXT_GURU_DUMP`.

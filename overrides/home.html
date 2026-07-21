@@ -1,0 +1,126 @@
+{% extends "main.html" %}
+
+<!-- adk.dev-style marketing homepage. All landing content lives here; index.md
+     only sets `template: home.html`. The normal article/footer nav is suppressed. -->
+
+{% block tabs %}
+  {{ super() }}
+
+  <section class="cg-hero">
+    <div class="cg-hero__inner">
+      <span class="cg-hero__eyebrow">Context engineering for LLM agents</span>
+      <h1>Shrink agent context.<br>Don&rsquo;t touch the agent.</h1>
+      <p class="cg-hero__lede">
+        A provider-agnostic Go core that cuts the tokens every request carries &mdash;
+        losslessly, or lossy-but-reversibly &mdash; as an HTTP proxy or an in-process
+        plugin. Same request in, a smaller request of the exact same shape out.
+      </p>
+      <div class="cg-cta">
+        <a class="cg-btn cg-btn--primary" href="{{ 'get-started/quickstart-proxy/' | url }}">Start building &rarr;</a>
+        <a class="cg-btn cg-btn--ghost" href="https://github.com/kagenti/context-guru">View on GitHub</a>
+      </div>
+      <div class="cg-guarantees">
+        <span class="cg-pill">Fail open, always</span>
+        <span class="cg-pill">Never worse</span>
+        <span class="cg-pill">Reversible</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="cg-section">
+    <h2>Run it in one line</h2>
+    <p class="cg-section__sub">Point any agent at the proxy &mdash; one port serves both dialects.</p>
+    <div class="highlight" style="max-width:42rem;margin:0 auto;border-radius:10px;">
+<pre style="border-radius:10px;"><code>context-guru-proxy --preset balanced          <span style="opacity:.6"># or --config cg.yaml</span>
+
+ANTHROPIC_BASE_URL=http://localhost:4000/anthropic
+OPENAI_BASE_URL=http://localhost:4000/openai/v1</code></pre>
+    </div>
+  </section>
+
+  <section class="cg-section">
+    <h2>What it does</h2>
+    <div class="cg-cards">
+      <div class="cg-card">
+        <div class="cg-card__icon">🛟</div>
+        <h3>Fail open, always</h3>
+        <p>Any component error or panic reverts <em>that component only</em>. The original request is always a valid fallback.</p>
+      </div>
+      <div class="cg-card">
+        <div class="cg-card__icon">⚖️</div>
+        <h3>Never worse</h3>
+        <p>A component that grows the request is reverted. Token cost is measured on message content, so you never pay to compact.</p>
+      </div>
+      <div class="cg-card">
+        <div class="cg-card__icon">↩️</div>
+        <h3>Reversible</h3>
+        <p>Every lossy drop leaves a <code>&lt;&lt;cg:HASH&gt;&gt;</code> marker and stashes the original &mdash; recoverable on demand.</p>
+      </div>
+      <div class="cg-card">
+        <div class="cg-card__icon">🔌</div>
+        <h3>Three ways to run</h3>
+        <p>Proxy / gateway, in-process AuthBridge plugin, or a bifrost <code>LLMPlugin</code> &mdash; one core, unchanged.</p>
+      </div>
+      <div class="cg-card">
+        <div class="cg-card__icon">🧩</div>
+        <h3>13 stackable components</h3>
+        <p>Lossless reformatters and reversible offloaders, ordered by config. Presets for coding, MCP, and long agent sessions.</p>
+      </div>
+      <div class="cg-card">
+        <div class="cg-card__icon">📉</div>
+        <h3>Measured, not hand-wavy</h3>
+        <p>Benchmarked on SWE-bench with Claude Code: real token savings, zero task-reward change.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="cg-section">
+    <h2>Before &rarr; After</h2>
+    <p class="cg-section__sub">The <code>summarize</code> config on the sample 11-message transcript &mdash; same shape, far fewer tokens.</p>
+    <div class="cg-demo">
+      <div class="cg-demo__panel">
+        <h4>Before</h4>
+        <div class="cg-demo__big">11 msgs</div>
+        <div>2,667 bytes</div>
+      </div>
+      <div class="cg-demo__arrow">&rarr;</div>
+      <div class="cg-demo__panel">
+        <h4>After</h4>
+        <div class="cg-demo__big">4 msgs</div>
+        <div>1,298 bytes</div>
+      </div>
+    </div>
+    <p style="text-align:center;margin-top:1rem;">
+      <a class="cg-btn cg-btn--ghost" href="{{ 'examples/before-after/' | url }}">See all three configs &rarr;</a>
+    </p>
+  </section>
+
+  <section class="cg-section">
+    <h2>The numbers</h2>
+    <p class="cg-section__sub">SWE-bench &middot; Claude Code &middot; claude-sonnet-4-6 &middot; 10 tasks &times; 13 configs.</p>
+    <div class="cg-stats">
+      <div>
+        <div class="cg-stat__num">~27%</div>
+        <div class="cg-stat__label"><code>mask</code> mean token savings (resolved tasks)</div>
+      </div>
+      <div>
+        <div class="cg-stat__num">0</div>
+        <div class="cg-stat__label">tasks broken &mdash; reward preserved 6/6</div>
+      </div>
+      <div>
+        <div class="cg-stat__num">&lt;10ms</div>
+        <div class="cg-stat__label">component overhead per request</div>
+      </div>
+      <div>
+        <div class="cg-stat__num">93.5%</div>
+        <div class="cg-stat__label">peak savings on a long session</div>
+      </div>
+    </div>
+    <p style="text-align:center;margin-top:1.5rem;">
+      <a class="cg-btn cg-btn--primary" href="{{ 'RESULTS/' | url }}">Explore the benchmarks &rarr;</a>
+    </p>
+  </section>
+{% endblock %}
+
+{% block content %}{% endblock %}
+{% block footer %}{{ super() }}{% endblock %}

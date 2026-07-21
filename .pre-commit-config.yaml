@@ -6,6 +6,9 @@ repos:
       - id: trailing-whitespace
       - id: end-of-file-fixer
       - id: check-yaml
+        # --unsafe: validate syntax without resolving custom tags, so MkDocs'
+        # !!python/name: tags in mkdocs.yml don't break the hook.
+        args: [--unsafe]
       - id: check-added-large-files
 
   - repo: https://github.com/dnephin/pre-commit-golang

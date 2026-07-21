@@ -1,0 +1,151 @@
+site_name: context-guru
+site_description: >-
+  Provider-agnostic context engineering for LLM agents — shrink the tokens a
+  request carries, losslessly or lossy-but-reversibly, without touching the agent.
+site_url: https://kagenti.github.io/context-guru/
+repo_url: https://github.com/kagenti/context-guru
+repo_name: kagenti/context-guru
+edit_uri: edit/main/docs/
+copyright: >-
+  Apache-2.0 &middot; a <a href="https://github.com/kagenti">Kagenti</a> platform component
+
+theme:
+  name: material
+  custom_dir: overrides
+  language: en
+  icon:
+    repo: fontawesome/brands/github
+    logo: material/scissors-cutting
+  palette:
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/brightness-4
+        name: Switch to system preference
+  font:
+    text: Inter
+    code: JetBrains Mono
+  features:
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - navigation.indexes
+    - navigation.instant
+    - navigation.instant.progress
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - content.action.edit
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.arithmatex:
+      generic: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.keys
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+extra_css:
+  - stylesheets/extra.css
+
+extra_javascript:
+  - javascripts/mathjax.js
+  - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js
+  - https://cdn.jsdelivr.net/npm/chart.js@4
+  - javascripts/charts.js
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/kagenti/context-guru
+    - icon: fontawesome/brands/golang
+      link: https://pkg.go.dev/github.com/kagenti/context-guru
+
+# Internal implementation plans live under docs/ but must never publish.
+exclude_docs: |
+  superpowers/
+
+nav:
+  - Home: index.md
+  - Get Started:
+      - Technical Overview: get-started/overview.md
+      - "Quickstart: Proxy": get-started/quickstart-proxy.md
+      - "Quickstart: Compaction service": get-started/quickstart-compaction.md
+      - Setup & evaluation: setup.md
+  - Concepts:
+      - Architecture (deep dive): design.md
+  - Components:
+      - Overview: components.md
+      - Reformat:
+          - format: components/format.md
+          - toon: components/toon.md
+          - cacheinject: components/cacheinject.md
+      - "Offload (reversible)":
+          - skeleton: components/skeleton.md
+          - dedup: components/dedup.md
+          - collapse: components/collapse.md
+          - failed_run: components/failed_run.md
+          - cmdfilter: components/cmdfilter.md
+          - extract: components/extract.md
+          - smartcrush: components/smartcrush.md
+          - mask: components/mask.md
+          - phi_evict: components/phi_evict.md
+          - summarize: components/summarize.md
+      - The DSL filter engine: components/dsl.md
+  - How-to Guides:
+      - Choose a preset: how-to/choose-a-preset.md
+      - Run behind a proxy or gateway: integrations.md
+      - Integrate as a bifrost plugin: how-to/bifrost-plugin.md
+      - Write a custom DSL filter: how-to/custom-dsl-filter.md
+      - Recover offloaded context: how-to/recover-context.md
+      - Measure savings: how-to/measure-savings.md
+  - Examples:
+      - llm-d compaction service: examples/llm-d-service.md
+      - Before → After showcase: examples/before-after.md
+  - Benchmarks: RESULTS.md
+  - Reference:
+      - Routes & headers: reference/routes.md
+      - Config & environment: reference/config.md
+      - Presets: reference/presets.md
+  - Community: community.md

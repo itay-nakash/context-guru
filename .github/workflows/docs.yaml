@@ -1,0 +1,55 @@
+name: Docs
+
+# Build the Material for MkDocs site and publish to GitHub Pages.
+# Fully decoupled from ci.yaml — no Go, CGO, or bifrost checkout needed.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - docs/**
+      - overrides/**
+      - examples/**
+      - mkdocs.yml
+      - requirements-docs.txt
+      - .github/workflows/docs.yaml
+  pull_request:
+    paths:
+      - docs/**
+      - overrides/**
+      - examples/**
+      - mkdocs.yml
+      - requirements-docs.txt
+      - .github/workflows/docs.yaml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - run: pip install -r requirements-docs.txt
+      - run: mkdocs build --strict
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  # Deploy only from main; PRs just build (above) to catch --strict failures.
+  deploy:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

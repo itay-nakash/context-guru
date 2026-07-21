@@ -43,7 +43,7 @@ curl -s localhost:4000/stats | jq        # token-weighted savings rollup
 ## Example: SWE-bench + Claude Code through the gateway
 
 This uses the committed compose override
-[`deploy/eval-containers/compose.contextguru.yaml`](../deploy/eval-containers/compose.contextguru.yaml),
+[`deploy/eval-containers/compose.contextguru.yaml`](https://github.com/kagenti/context-guru/blob/main/deploy/eval-containers/compose.contextguru.yaml),
 which swaps the eval-containers gateway for `context-guru:local` and wires it to an
 Anthropic-native upstream (IBM litellm). Model: **`anthropic/claude-sonnet-4-6`**.
 
@@ -95,7 +95,7 @@ docker compose \
 
 ### 3. Sweep many task × config cells
 
-[`deploy/eval-containers/sweep.py`](../deploy/eval-containers/sweep.py) automates the matrix
+[`deploy/eval-containers/sweep.py`](https://github.com/kagenti/context-guru/blob/main/deploy/eval-containers/sweep.py) automates the matrix
 (baseline vs each component alone vs the `balanced` preset vs competitors) over a task list. It
 runs each cell, waits for the runner to exit, and appends reward + wall-clock + `/stats` savings
 to `deploy/eval-containers/sweep-results.csv`. It is **resumable** — cells already in the CSV are
