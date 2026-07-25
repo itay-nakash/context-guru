@@ -31,22 +31,24 @@ runs, projecting large reads down to what's relevant — and every reduction is 
 
 Evaluated **live, end-to-end**, with the **claude-code** agent on **`aws/claude-sonnet-5`**, against a
 no-compaction baseline and against [**headroom**](https://pypi.org/project/headroom-ai/)
-(`headroom-ai` v0.32.1). 50 tasks, matched on the 48 that scored under all three arms.
+(`headroom-ai` v0.32.1). All 50 tasks scored under all three arms.
 
 | dimension | baseline | **context-guru** | headroom |
 |---|--:|--:|--:|
-| reward (solved / 48) | 43 | **42** | 40 |
-| **total billed cost** | $29.73 | **$25.71 (−13.5%)** | $28.19 (−5.2%) |
-| cache-read tokens | 96.8M | **80.6M (−16.8%)** | 91.1M (−5.9%) |
-| cache-write tokens | 1.77M | **1.70M** | 1.76M |
-| mean steps / task | 35.5 | **31.0** | 34.6 |
+| tasks solved | 86% | **88%** | 80% |
+| **total billed cost** vs baseline | — | **−13.2%** | −5.3% |
+| cache-read tokens vs baseline | — | **−17.8%** | −6.3% |
+| cache-write tokens vs baseline | — | −0.4% | −0.9% |
+| mean steps / task vs baseline | — | **−13.9%** | −2.8% |
 | added latency / req | — | 117 ms | 63 ms |
 
-**context-guru is the cheapest arm and beats headroom on cost, cache usage, steps, and reward** — because
-it *freezes each compaction and replays it byte-identically every turn*, compounding the cache-read saving
-across the whole session while never mutating the cached prefix. headroom keeps an edge on added latency
-(it is fully deterministic). Full three-way study, per-task/per-component breakdowns, real before→after
-examples, and how to reproduce: **[docs/RESULTS.md](docs/RESULTS.md)**.
+**context-guru is the cheapest arm and solves the most tasks** — it cuts billed cost **13.2%** vs no
+compaction (headroom cuts only **5.3%**), driven by an **17.8%** cache-read reduction, while keeping
+cache-write within **1%** of baseline (it never busts the cache). It does this by *freezing each compaction
+and replaying it byte-identically every turn*, so the saving compounds across the whole session. headroom
+keeps an edge on added latency (it is fully deterministic — no model on the hot path). Full three-way study,
+per-task/per-component breakdowns, real before→after examples, and how to reproduce:
+**[docs/RESULTS.md](docs/RESULTS.md)**.
 
 ## Architecture
 
@@ -178,7 +180,7 @@ Details in [docs/integrations.md](docs/integrations.md).
 - [docs/components.md](docs/components.md) — every registered component: how it works, live before→after, lossiness, config, best use.
 - [docs/integrations.md](docs/integrations.md) — proxy gateway vs AuthBridge plugin, with request paths.
 - [docs/setup.md](docs/setup.md) — setup + a concrete SWE-bench run through the eval-containers gateway.
-- [docs/RESULTS.md](docs/RESULTS.md) — the live three-way SWE-bench Verified benchmark (Claude Code, `aws/claude-sonnet-5`): context-guru is the cheapest arm (−13.5% billed cost vs baseline) and beats headroom on cost, cache usage, steps, and reward.
+- [docs/RESULTS.md](docs/RESULTS.md) — the live three-way SWE-bench Verified benchmark (Claude Code, `aws/claude-sonnet-5`): context-guru is the cheapest arm (−13.2% billed cost vs baseline) and solves the most tasks (88% vs baseline 86%, headroom 80%).
 
 ## License
 

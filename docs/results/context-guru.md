@@ -6,7 +6,7 @@ Live through the harness, `claude-code` agent on `aws/claude-sonnet-5`. Cache-aw
 
 | tasks scored | solved | rate | total billed cost | mean steps | cache-hit | agent wall (sum) |
 |---|---|---|---|---|---|---|
-| 48 | 42 | 88% | $25.71 | 31.0 | 97.8% | 267 min |
+| 50 | 44 | 88% | $27.77 | 31.1 | 97.7% | 293 min |
 
 Context-guru proxy savings: **1.09%** content; own LLM cost $0.3071; added latency/req 116.9 ms; expand bounces 4.
 
@@ -33,6 +33,7 @@ Per-component tokens removed (cumulative): `extract_llm` 129,966, `extract` 34,2
 | django__django-14034 | 0 | 28 | 1,312,390 | 22,972 | $0.436 |
 | django__django-14349 | 1 | 14 | 584,640 | 20,203 | $0.200 |
 | django__django-14559 | 1 | 26 | 1,244,486 | 31,570 | $0.392 |
+| django__django-14792 | 1 | 31 | 1,701,547 | 63,420 | $0.634 |
 | django__django-15128 | 1 | 68 | 4,153,321 | 99,729 | $1.285 |
 | django__django-15380 | 1 | 31 | 1,559,464 | 31,702 | $0.471 |
 | django__django-15572 | 1 | 10 | 386,438 | 17,167 | $0.137 |
@@ -64,3 +65,4 @@ Per-component tokens removed (cumulative): `extract_llm` 129,966, `extract` 34,2
 | sympy__sympy-17318 | 1 | 44 | 2,337,329 | 33,639 | $0.720 |
 | sympy__sympy-19495 | 1 | 47 | 2,725,766 | 41,171 | $1.351 |
 | sympy__sympy-21379 | 1 | 29 | 1,420,186 | 26,175 | $0.458 |
+| sympy__sympy-23413 | 1 | 37 | 2,261,138 | 82,294 | $1.429 |

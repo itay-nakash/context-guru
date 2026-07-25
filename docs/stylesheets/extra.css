@@ -120,8 +120,10 @@
 .cg-section__sub {
   text-align: center;
   color: var(--md-default-fg-color--light);
+  font-size: 1.02rem;
+  line-height: 1.5;
   margin: -0.5rem auto 2rem;
-  max-width: 40rem;
+  max-width: 44rem;
 }
 
 /* ---- Feature cards ---- */
@@ -151,7 +153,8 @@
 }
 .cg-card p {
   margin: 0;
-  font-size: 0.86rem;
+  font-size: 0.95rem;
+  line-height: 1.5;
   color: var(--md-default-fg-color--light);
 }
 
@@ -192,20 +195,58 @@
   text-align: center;
 }
 
+/* ---- Bottom-line conclusion ---- */
+.cg-bottomline {
+  max-width: 46rem;
+  margin: 0 auto 2rem;
+  text-align: center;
+  font-size: 1.2rem;
+  line-height: 1.55;
+  color: var(--md-default-fg-color);
+}
+.cg-bottomline strong {
+  color: var(--md-primary-fg-color--dark);
+}
+[data-md-color-scheme="slate"] .cg-bottomline strong {
+  color: var(--md-primary-fg-color--light);
+}
+
 /* ---- Stat strip ---- */
 .cg-stats {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
-  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+  gap: 1.1rem;
   text-align: center;
 }
+.cg-stat {
+  border: 1px solid var(--md-default-fg-color--lightest);
+  border-radius: 12px;
+  padding: 1.4rem 1rem 1.2rem;
+  background: var(--md-default-bg-color);
+}
 .cg-stat__num {
-  font-size: 2.2rem;
+  font-size: 2.7rem;
   font-weight: 800;
+  line-height: 1;
   color: var(--md-primary-fg-color);
 }
 .cg-stat__label {
-  font-size: 0.82rem;
+  font-size: 1rem;
+  font-weight: 700;
+  margin-top: 0.55rem;
+  color: var(--md-default-fg-color);
+}
+.cg-stat__sub {
+  font-size: 0.86rem;
+  margin-top: 0.3rem;
+  color: var(--md-default-fg-color--light);
+}
+.cg-stats__foot {
+  max-width: 46rem;
+  margin: 1.75rem auto 0;
+  text-align: center;
+  font-size: 0.98rem;
+  line-height: 1.55;
   color: var(--md-default-fg-color--light);
 }
 
