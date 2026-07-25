@@ -535,7 +535,6 @@ func (h *Handler) stream(w http.ResponseWriter, resp *http.Response) {
 	}
 }
 
-
 func (h *Handler) stats(w http.ResponseWriter, _ *http.Request) {
 	if h.agg == nil {
 		w.Write([]byte("{}"))

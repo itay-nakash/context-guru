@@ -26,6 +26,11 @@ build: ## Build the context-guru-proxy binary into ./bin
 test: ## Run all tests with the race detector
 	go test -race ./...
 
+.PHONY: cover
+cover: ## Run all tests with race + cross-package coverage; write coverage.out and print total
+	go test -race -coverpkg=./... -coverprofile=coverage.out ./...
+	@go tool cover -func=coverage.out | tail -1
+
 .PHONY: fmt
 fmt: ## Format all Go source
 	gofmt -w .

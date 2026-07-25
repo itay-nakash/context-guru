@@ -91,7 +91,6 @@ func TestSmartCrushSamplesArrayKeepsErrors(t *testing.T) {
 	}
 }
 
-
 func TestExtractProjectsRelevantLines(t *testing.T) {
 	var b strings.Builder
 	for i := 0; i < 40; i++ {

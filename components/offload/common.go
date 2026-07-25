@@ -267,7 +267,6 @@ func keywords(s string) map[string]struct{} {
 	return out
 }
 
-
 // toolIndices returns the indices of tool-role messages, in order.
 func toolIndices(req *bschemas.BifrostChatRequest) []int {
 	var out []int
