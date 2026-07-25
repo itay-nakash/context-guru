@@ -83,6 +83,9 @@ func (s *Skeleton) Offload(req *schemas.BifrostChatRequest, rep *components.Repo
 		if content == "" || !strings.Contains(content, "```") {
 			continue
 		}
+		if skipReduce(c, content) {
+			continue // already carries a marker, or was expanded by the agent — don't re-reduce
+		}
 		matches := fenceRe.FindAllStringSubmatchIndex(content, -1)
 		if matches == nil {
 			continue
@@ -108,8 +111,14 @@ func (s *Skeleton) Offload(req *schemas.BifrostChatRequest, rep *components.Repo
 			continue
 		}
 		out.WriteString(content[last:])
-		tok, key := mark(c, rep, s.mode, content, " [full source: call "+expand.ToolName+"]")
-		schema.SetMessageText(m, out.String()+"\n"+tok)
+		body := out.String()
+		newText, key, eff, ok := tryMark(c, s.mode, content, " [full source: call "+expand.ToolName+"]",
+			func(tok string) string { return body + "\n" + tok })
+		if !ok {
+			continue // skeleton+marker wouldn't shrink this message; leave it verbatim
+		}
+		commitMark(c, rep, eff, key, content)
+		schema.SetMessageText(m, newText)
 		emitted++
 		if key != "" {
 			keys = append(keys, key)
@@ -120,6 +129,10 @@ func (s *Skeleton) Offload(req *schemas.BifrostChatRequest, rep *components.Repo
 	}
 	return keys, nil
 }
+
+// maxParseDepth bounds skeleton's tree-walk recursion over untrusted parse trees so
+// pathologically nested input can't overflow the Go stack (an uncatchable crash).
+const maxParseDepth = 5000
 
 // skeletonize parses src and replaces function/method/constructor bodies with a
 // placeholder, keeping everything else. Returns ok=false on parse failure or
@@ -135,8 +148,16 @@ func skeletonize(src []byte, grammar string) (string, bool) {
 		return "", false
 	}
 	var ranges [][2]uint
-	var walk func(n *sitter.Node, parentKind string)
-	walk = func(n *sitter.Node, parentKind string) {
+	var walk func(n *sitter.Node, parentKind string, depth int)
+	walk = func(n *sitter.Node, parentKind string, depth int) {
+		// Bound recursion depth: the parse tree comes from untrusted tool-output text,
+		// and a deeply nested input (thousands of nested blocks/parens) would overflow
+		// the Go stack — a FATAL runtime throw that recover() cannot catch, crashing the
+		// whole proxy. Past the limit we stop descending (fail-open: leave that subtree
+		// un-skeletonized). maxParseDepth is far beyond any real source nesting.
+		if depth > maxParseDepth {
+			return
+		}
 		kind := n.Kind()
 		if isBodyKind(kind) && isDeclKind(parentKind) {
 			ranges = append(ranges, [2]uint{n.StartByte(), n.EndByte()})
@@ -144,11 +165,11 @@ func skeletonize(src []byte, grammar string) (string, bool) {
 		}
 		for i := uint(0); i < n.ChildCount(); i++ {
 			if ch := n.Child(i); ch != nil {
-				walk(ch, kind)
+				walk(ch, kind, depth+1)
 			}
 		}
 	}
-	walk(root, "")
+	walk(root, "", 0)
 	if len(ranges) == 0 {
 		return "", false
 	}

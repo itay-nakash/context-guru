@@ -74,14 +74,31 @@ type Aggregator struct {
 	wasted   int64 // tokens re-served via expand (offloaded then needed back)
 	bounces  int64
 	perComp  map[string]*compStat
+	// End-to-end latency accounting (W7). addedMs is the wall time context-guru itself
+	// adds per request (normalize + pipeline + writeback); upstreamMs is the provider
+	// round-trip (incl. the expand loop). Split by bypass so a run can compare the
+	// with-CG path against a transparent (x-context-guru-bypass) baseline.
+	addedMs       float64
+	addedSamples  int64
+	upstreamMs    float64
+	upstreamMsByp float64 // upstream latency on bypassed (baseline) requests
+	upstreamN     int64
+	upstreamNByp  int64
 }
 
 type compStat struct {
-	Runs     int64 `json:"runs"`
-	Acted    int64 `json:"acted"`   // runs that actually saved tokens
-	Mutated  int64 `json:"mutated"` // runs that changed the request at all (may save 0 content tokens, e.g. cacheinject)
-	Reverted int64 `json:"reverted"`
-	Saved    int64 `json:"saved_tokens"`
+	Runs        int64 `json:"runs"`
+	Acted       int64 `json:"acted"`   // runs that actually saved tokens
+	Mutated     int64 `json:"mutated"` // runs that changed the request at all (may save 0 content tokens, e.g. cacheinject)
+	Reverted    int64 `json:"reverted"`
+	Saved       int64 `json:"saved_tokens"`        // CUMULATIVE: summed every turn the compaction re-appears
+	SavedUnique int64 `json:"saved_tokens_unique"` // UNIQUE: each distinct compaction counted once (deduped by content key)
+	// OvercountRatio = Saved / SavedUnique — how many times, on average, each distinct
+	// compaction was re-counted (the agent re-sends history verbatim every turn). ~1.0
+	// is honest; large values mean the cumulative figure is inflated by re-sends.
+	OvercountRatio float64             `json:"overcount_ratio"`
+	DurationMs     float64             `json:"duration_ms"` // cumulative wall time this component spent (its own latency cost on the hot path)
+	seenKeys       map[string]struct{} // content keys already counted toward SavedUnique (not serialized)
 }
 
 // NewAggregator returns an empty aggregator.
@@ -97,6 +114,30 @@ func (a *Aggregator) Component(r components.Report) {
 	}
 	cs.Runs++
 	cs.Saved += int64(r.Saved())
+	cs.DurationMs += r.DurationMs // per-component latency cost on the hot path
+	// Unique savings: dedup by the content-derived CacheKeys so the same compaction,
+	// re-sent verbatim on later turns, is not re-counted. Attribute this run's saved
+	// tokens proportionally to how many of its keys are NEW. Components that stash no
+	// key (rare) fall back to counting the run as unique.
+	if saved := int64(r.Saved()); saved > 0 && !r.Reverted && !r.Skipped {
+		if len(r.CacheKeys) == 0 {
+			cs.SavedUnique += saved
+		} else {
+			if cs.seenKeys == nil {
+				cs.seenKeys = map[string]struct{}{}
+			}
+			newKeys := 0
+			for _, k := range r.CacheKeys {
+				if _, seen := cs.seenKeys[k]; !seen {
+					cs.seenKeys[k] = struct{}{}
+					newKeys++
+				}
+			}
+			if newKeys > 0 {
+				cs.SavedUnique += saved * int64(newKeys) / int64(len(r.CacheKeys))
+			}
+		}
+	}
 	if r.Reverted {
 		cs.Reverted++
 	}
@@ -116,6 +157,29 @@ func (a *Aggregator) RecordExpand(tokens int) {
 	a.mu.Lock()
 	a.wasted += int64(tokens)
 	a.bounces++
+	a.mu.Unlock()
+}
+
+// RecordAddedLatency notes the wall time (ms) context-guru added to one request
+// (normalize + pipeline + writeback). Only meaningful on the active path.
+func (a *Aggregator) RecordAddedLatency(ms float64) {
+	a.mu.Lock()
+	a.addedMs += ms
+	a.addedSamples++
+	a.mu.Unlock()
+}
+
+// RecordUpstreamLatency notes one provider round-trip (ms), split by whether the
+// request bypassed context-guru — so a run can compare with-CG vs baseline latency.
+func (a *Aggregator) RecordUpstreamLatency(ms float64, bypassed bool) {
+	a.mu.Lock()
+	if bypassed {
+		a.upstreamMsByp += ms
+		a.upstreamNByp++
+	} else {
+		a.upstreamMs += ms
+		a.upstreamN++
+	}
 	a.mu.Unlock()
 }
 
@@ -143,6 +207,18 @@ type Snapshot struct {
 	// TopPassthrough names components that ran but never saved a token — dead
 	// weight in the pipeline, candidates to drop from the config.
 	TopPassthrough []string `json:"top_passthrough"`
+	// LLM* report the cheap (config-source) model usage the CONTEXT-GURU components
+	// themselves incurred (e.g. extract:code's Starlark-writer calls) — the CG
+	// components' OWN cost, separate from the agent. Priced externally.
+	LLMCalls        int64 `json:"llm_calls"`
+	LLMInputTokens  int64 `json:"llm_input_tokens"`
+	LLMOutputTokens int64 `json:"llm_output_tokens"`
+	// End-to-end latency (W7): mean ms context-guru added per request, and mean
+	// provider round-trip on the active vs bypassed (baseline) path — a with/without
+	// context-guru session-latency comparison.
+	AddedLatencyMsAvg     float64 `json:"cg_added_ms_avg"`
+	UpstreamMsAvg         float64 `json:"upstream_ms_avg"`
+	UpstreamMsAvgBypassed float64 `json:"upstream_ms_avg_bypassed"`
 }
 
 // Snapshot returns a point-in-time copy of the rollups.
@@ -157,7 +233,12 @@ func (a *Aggregator) Snapshot() Snapshot {
 	comps := make(map[string]compStat, len(a.perComp))
 	var passthrough []string
 	for k, v := range a.perComp {
-		comps[k] = *v
+		cs := *v
+		if cs.SavedUnique > 0 {
+			cs.OvercountRatio = float64(cs.Saved) / float64(cs.SavedUnique)
+		}
+		cs.seenKeys = nil // don't serialize the working set
+		comps[k] = cs
 		// Dead weight = ran but never changed the request at all (always skipped
 		// or reverted). A component that mutated but saved no content tokens (e.g.
 		// cacheinject adds provider cache_control) is NOT passthrough.
@@ -166,10 +247,21 @@ func (a *Aggregator) Snapshot() Snapshot {
 		}
 	}
 	sort.Strings(passthrough)
+	addedAvg, upAvg, upAvgByp := 0.0, 0.0, 0.0
+	if a.addedSamples > 0 {
+		addedAvg = a.addedMs / float64(a.addedSamples)
+	}
+	if a.upstreamN > 0 {
+		upAvg = a.upstreamMs / float64(a.upstreamN)
+	}
+	if a.upstreamNByp > 0 {
+		upAvgByp = a.upstreamMsByp / float64(a.upstreamNByp)
+	}
 	return Snapshot{
 		Requests: a.requests, TokensBefore: a.before, TokensAfter: a.after,
 		SavedTokens: saved, SavingsPct: pct,
 		WastedTokens: a.wasted, Bounces: a.bounces, AdjustedSaved: saved - a.wasted,
 		Components: comps, TopPassthrough: passthrough,
+		AddedLatencyMsAvg: addedAvg, UpstreamMsAvg: upAvg, UpstreamMsAvgBypassed: upAvgByp,
 	}
 }

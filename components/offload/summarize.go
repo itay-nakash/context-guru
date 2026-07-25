@@ -94,7 +94,7 @@ func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 	start, end := 1, len(msgs)-s.keepLast
 	// Request-level trigger: don't summarize (an LLM call) until the transcript
 	// is genuinely large / deep. Zero thresholds fire always (back-compat).
-	if !s.trigger.Fires(req) || end <= start {
+	if !s.trigger.Fires(req, c.CtxWindow) || end <= start {
 		rep.Skipped = true
 		return nil, nil
 	}

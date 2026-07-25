@@ -257,12 +257,21 @@ func rawStrategyOrder(tokenEst int, cfg Cfg) []string {
 // strictly smaller AND passes the validation gate, else ("", "none"). Fail-open: the
 // caller keeps the original on "none".
 func RunExtraction(ctx context.Context, body, goal string, keepIDs []string, tokenEst int, cfg Cfg, model Model) (string, string) {
+	out, _, strat := RunExtractionSummary(ctx, body, goal, keepIDs, tokenEst, cfg, model)
+	return out, strat
+}
+
+// RunExtractionSummary is RunExtraction plus the one-line SUMMARY the "code"
+// strategy's program optionally emitted (empty for the other strategies). The
+// summary is used as the marker digest so the agent sees the gist of the elided
+// output inline.
+func RunExtractionSummary(ctx context.Context, body, goal string, keepIDs []string, tokenEst int, cfg Cfg, model Model) (string, string, string) {
 	base := tokens.Count(body)
 	for _, name := range strategyOrder(tokenEst, cfg) {
-		var cand string
+		var cand, summary string
 		switch name {
 		case "code":
-			cand = runStarlark(ctx, body, goal, keepIDs, model, cfg.Rewrite)
+			cand, summary = runStarlark(ctx, body, goal, keepIDs, model, cfg.Rewrite)
 		case "single":
 			cand = runSingle(ctx, body, goal, keepIDs, model)
 		case "rlm":
@@ -274,10 +283,10 @@ func RunExtraction(ctx context.Context, body, goal string, keepIDs []string, tok
 			continue
 		}
 		if validateExtraction(cand, body, keepIDs, cfg) {
-			return cand, name
+			return cand, summary, name
 		}
 	}
-	return "", "none"
+	return "", "", "none"
 }
 
 // runSingle asks the model for the filtered subset in one call. It is a FALLBACK

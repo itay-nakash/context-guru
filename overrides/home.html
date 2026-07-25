@@ -31,7 +31,7 @@
     <h2>Run it in one line</h2>
     <p class="cg-section__sub">Point any agent at the proxy &mdash; one port serves both dialects.</p>
     <div class="highlight" style="max-width:42rem;margin:0 auto;border-radius:10px;">
-<pre style="border-radius:10px;"><code>context-guru-proxy --preset balanced          <span style="opacity:.6"># or --config cg.yaml</span>
+<pre style="border-radius:10px;"><code>context-guru-proxy --preset general            <span style="opacity:.6"># recommended; or --config cg.yaml</span>
 
 ANTHROPIC_BASE_URL=http://localhost:4000/anthropic
 OPENAI_BASE_URL=http://localhost:4000/openai/v1</code></pre>
@@ -69,7 +69,7 @@ OPENAI_BASE_URL=http://localhost:4000/openai/v1</code></pre>
       <div class="cg-card">
         <div class="cg-card__icon">📉</div>
         <h3>Measured, not hand-wavy</h3>
-        <p>Benchmarked on SWE-bench with Claude Code: real token savings, zero task-reward change.</p>
+        <p>Benchmarked live on SWE-bench Verified with Claude Code: the cheapest arm, and higher reward than headroom.</p>
       </div>
     </div>
   </section>
@@ -97,23 +97,23 @@ OPENAI_BASE_URL=http://localhost:4000/openai/v1</code></pre>
 
   <section class="cg-section">
     <h2>The numbers</h2>
-    <p class="cg-section__sub">SWE-bench &middot; Claude Code &middot; claude-sonnet-4-6 &middot; 10 tasks &times; 13 configs.</p>
+    <p class="cg-section__sub">SWE-bench Verified &middot; Claude Code agent &middot; <code>aws/claude-sonnet-5</code> &middot; live, vs a no-compaction baseline and headroom (48 matched tasks).</p>
     <div class="cg-stats">
       <div>
-        <div class="cg-stat__num">~27%</div>
-        <div class="cg-stat__label"><code>mask</code> mean token savings (resolved tasks)</div>
+        <div class="cg-stat__num">&minus;13.5%</div>
+        <div class="cg-stat__label">total billed cost vs baseline &mdash; the <em>cheapest</em> arm</div>
       </div>
       <div>
-        <div class="cg-stat__num">0</div>
-        <div class="cg-stat__label">tasks broken &mdash; reward preserved 6/6</div>
+        <div class="cg-stat__num">42/48</div>
+        <div class="cg-stat__label">tasks solved &mdash; beats headroom (40), matches baseline</div>
       </div>
       <div>
-        <div class="cg-stat__num">&lt;10ms</div>
-        <div class="cg-stat__label">component overhead per request</div>
+        <div class="cg-stat__num">&minus;16.8%</div>
+        <div class="cg-stat__label">cache-read tokens vs baseline (headroom &minus;5.9%)</div>
       </div>
       <div>
-        <div class="cg-stat__num">93.5%</div>
-        <div class="cg-stat__label">peak savings on a long session</div>
+        <div class="cg-stat__num">31.0</div>
+        <div class="cg-stat__label">mean steps / task (baseline 35.5, headroom 34.6)</div>
       </div>
     </div>
     <p style="text-align:center;margin-top:1.5rem;">

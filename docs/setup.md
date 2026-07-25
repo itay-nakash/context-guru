@@ -5,27 +5,23 @@ SWE-bench task driven by Claude Code.
 
 ## Prerequisites
 
-- **Go 1.26** and a **C toolchain** — `CGO_ENABLED=1` is required (the `skeleton` component
-  binds tree-sitter via cgo).
-- The **bifrost** repo checked out beside this one — `go.mod` pins it with
-  `replace github.com/maximhq/bifrost/core => ../bifrost/core`.
+- **Go 1.26** and a **C toolchain** — `CGO_ENABLED=1` (bifrost's tokenizer and, with the
+  `cg_skeleton` tag, tree-sitter, use cgo). bifrost is an ordinary module dependency; nothing
+  to check out beside this repo.
 - **Docker** (for the gateway image / eval-containers), and the **eval-containers** repo.
 
 ## Build
 
-Local binary (build from the parent dir so the `replace` resolves):
+Local binary (from the repo root):
 
 ```sh
-cd .../context-engineering
-CGO_ENABLED=1 go build -o bin/context-guru-proxy \
-  ./lab-context-engineering/cmd/context-guru-proxy
+CGO_ENABLED=1 go build -tags cg_skeleton -o bin/context-guru-proxy ./cmd/context-guru-proxy
 ```
 
-Gateway image (the build context is the parent dir that holds both repos):
+Gateway image:
 
 ```sh
-cd .../context-engineering
-docker build -f lab-context-engineering/Dockerfile -t context-guru:local .
+docker build -t context-guru:local .
 ```
 
 The image entrypoint is `deploy/eval-containers/start`, which reads `EVAL_MODEL`, targets the
@@ -35,7 +31,7 @@ upstream, injects the real key, and selects the pipeline. It exposes `:4000` wit
 ## Quick local smoke test
 
 ```sh
-context-guru-proxy --preset balanced
+./bin/context-guru-proxy --preset general
 # then, from an agent or curl, against http://localhost:4000/anthropic/v1/messages
 curl -s localhost:4000/stats | jq        # token-weighted savings rollup
 ```
@@ -45,12 +41,12 @@ curl -s localhost:4000/stats | jq        # token-weighted savings rollup
 This uses the committed compose override
 [`deploy/eval-containers/compose.contextguru.yaml`](https://github.com/rossoctl/context-guru/blob/main/deploy/eval-containers/compose.contextguru.yaml),
 which swaps the eval-containers gateway for `context-guru:local` and wires it to an
-Anthropic-native upstream (IBM litellm). Model: **`anthropic/claude-sonnet-4-6`**.
+Anthropic-native upstream (IBM litellm). Model: **`aws/claude-sonnet-5`**.
 
 ```mermaid
 flowchart LR
   R[SWE-bench runner<br/>claude-code agent] -->|sk-proxy| G[context-guru:local gateway<br/>:4000 /anthropic]
-  G -->|real token| U[litellm upstream<br/>claude-sonnet-4-6]
+  G -->|real token| U[litellm upstream<br/>claude-sonnet-5]
   G -->|/stats| CSV[sweep-results.csv]
   G -->|CONTEXT_GURU_DUMP| V[(output volume)]
 ```
@@ -61,7 +57,7 @@ flowchart LR
 cd .../eval-containers/containers/benchmarks/swe-bench
 
 export EVAL_TASK_ID=django__django-11820
-export EVAL_MODEL=anthropic/claude-sonnet-4-6
+export EVAL_MODEL=aws/claude-sonnet-5
 export EVAL_AGENT=claude-code
 export ANTHROPIC_API_BASE=<IBM litellm base URL>
 export ANTHROPIC_API_KEY=<litellm token>

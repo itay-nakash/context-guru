@@ -57,8 +57,8 @@ func (s *SmartCrush) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 			continue // non-text blocks would be dropped by a text rewrite
 		}
 		content := schema.MessageText(*msg)
-		if expand.HasPlaceholder(content) {
-			continue // already offloaded by an earlier component/turn
+		if skipReduce(c, content) {
+			continue // already offloaded by an earlier component/turn, or expanded by the agent
 		}
 		trimmed := strings.TrimSpace(content)
 		if len(trimmed) == 0 || trimmed[0] != '[' || schema.TextTokens(content) < s.minTokens {
@@ -82,9 +82,14 @@ func (s *SmartCrush) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 		if err != nil {
 			continue
 		}
-		tok, key := mark(c, rep, s.mode, content, " [full array: call "+expand.ToolName+"]")
 		note := fmt.Sprintf(" [%d of %d items shown] ", len(kept), len(items))
-		schema.SetMessageText(msg, string(crushed)+note+tok)
+		newText, key, eff, ok := tryMark(c, s.mode, content, " [full array: call "+expand.ToolName+"]",
+			func(tok string) string { return string(crushed) + note + tok })
+		if !ok {
+			continue // crushed array+marker wouldn't shrink this message; leave it verbatim
+		}
+		commitMark(c, rep, eff, key, content)
+		schema.SetMessageText(msg, newText)
 		changed++
 		if key != "" {
 			keys = append(keys, key)

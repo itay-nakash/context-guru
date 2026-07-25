@@ -78,11 +78,14 @@ func TestSummarizeReusesCheckpoint(t *testing.T) {
 // TestExtractReusesResultCache: the same large tool output re-sent on a later turn
 // reuses the prior compaction — no second model call — and is still reduced.
 func TestExtractReusesResultCache(t *testing.T) {
-	off := newComp(t, "extract", "strategy: code\nmin_tokens: 1\nmodel:\n  source: config\n")
+	off := newComp(t, "extract_llm", "strategy: code\nmin_tokens: 1\nmodel:\n  source: config\n")
 	st := store.NewMemory(store.Options{})
 	filter := "data = json.decode(INPUT)\nOUTPUT = json.encode([r for r in data if \"keep\" in r[\"name\"]])\n"
 	cm := &countingModel{resp: filter}
-	body := `[{"id":1,"name":"keep this"},{"id":2,"name":"drop this"},{"id":3,"name":"keep that"}]`
+	// Records padded so dropping the non-keep record shrinks the output by far more
+	// than the recovery marker costs (marker-inclusive never-worse guard, D1).
+	pad := strings.Repeat("padding ", 40)
+	body := `[{"id":1,"name":"keep this ` + pad + `"},{"id":2,"name":"drop this ` + pad + `"},{"id":3,"name":"keep that ` + pad + `"}]`
 	run := func() *bschemas.BifrostChatRequest {
 		req := &bschemas.BifrostChatRequest{Input: []bschemas.ChatMessage{
 			userMsg("find the keep records"), toolMsg(body),

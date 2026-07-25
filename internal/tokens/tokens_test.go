@@ -26,3 +26,23 @@ func TestCountStableAcrossCalls(t *testing.T) {
 		t.Fatalf("non-deterministic: %d vs %d", a, b)
 	}
 }
+
+func TestCountCacheHitMatchesFresh(t *testing.T) {
+	// A cacheable (>= minCacheLen) string: first call encodes, second is a cache
+	// hit. Both must agree with a direct encode of the same content.
+	s := "the quick brown fox jumps over the lazy dog, repeatedly and verbosely"
+	if len(s) < minCacheLen {
+		t.Fatal("test string too short to exercise the cache")
+	}
+	first := Count(s)
+	second := Count(s) // served from countMap
+	if first != second {
+		t.Fatalf("cache hit disagreed: %d vs %d", first, second)
+	}
+	cacheMu.Lock()
+	_, cached := countMap[cacheHash(s)]
+	cacheMu.Unlock()
+	if !cached {
+		t.Fatal("cacheable string was not memoized")
+	}
+}

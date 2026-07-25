@@ -52,10 +52,37 @@ func LoadBytes(b []byte) (*Config, error) {
 	return &c, nil
 }
 
-// applyPreset fills an empty Pipeline from the named preset. Explicit fields in
-// the document always win (they were already decoded).
+// applyPreset fills an empty Pipeline (and, for rich presets, default component
+// configs) from the named preset. Explicit fields in the document always win — they
+// were already decoded, so the preset only supplies what the user left unset.
 func (c *Config) applyPreset() error {
 	if c.Preset == "" {
+		return nil
+	}
+	// Rich preset: a full config doc carrying tuned per-component settings a bare
+	// pipeline name-list can't express (e.g. extract_llm's cheap-model routing +
+	// thresholds). Decode it into a scratch Config, then use its values only where the
+	// user didn't specify (pipeline; per-component config merged with user override).
+	if doc, ok := presetConfigs[c.Preset]; ok {
+		var pc Config
+		dec := yaml.NewDecoder(bytes.NewReader([]byte(doc)))
+		dec.KnownFields(true)
+		if err := dec.Decode(&pc); err != nil {
+			return fmt.Errorf("config: preset %q: %w", c.Preset, err)
+		}
+		if len(c.Pipeline) == 0 {
+			c.Pipeline = pc.Pipeline
+		}
+		if len(pc.Components) > 0 {
+			merged := make(map[string]yaml.Node, len(pc.Components)+len(c.Components))
+			for k, v := range pc.Components {
+				merged[k] = v
+			}
+			for k, v := range c.Components { // user config wins per component
+				merged[k] = v
+			}
+			c.Components = merged
+		}
 		return nil
 	}
 	p, ok := presets[c.Preset]
@@ -75,7 +102,7 @@ var presets = map[string][]string{
 	"off":        {}, // passthrough: no components (baseline / A-B control)
 	"safe":       {"format", "cacheinject"},
 	"balanced":   {"format", "dedup", "failed_run", "cmdfilter", "cacheinject"},
-	"aggressive": {"format", "dedup", "failed_run", "cmdfilter", "smartcrush", "extract", "cacheinject"},
+	"aggressive": {"format", "dedup", "failed_run", "cmdfilter", "smartcrush", "extract", "extract_llm", "cacheinject"},
 	"coding":     {"format", "skeleton", "cmdfilter", "cacheinject"},
 	"mcp":        {"format", "smartcrush", "cacheinject"},
 	// agent: tuned for long agentic sessions (e.g. Claude Code on SWE-bench),
@@ -85,10 +112,60 @@ var presets = map[string][]string{
 	// eval-containers SWE-bench sweep (see docs/RESULTS.md); extract + failed_run
 	// + dedup add relevance/supersession/dup wins; cacheinject keeps the prefix
 	// cacheable. Order: lossless first, then offload old-then-large, cache last.
-	"agent": {"format", "dedup", "failed_run", "mask", "extract", "cacheinject"},
+	"agent": {"format", "dedup", "failed_run", "mask", "extract", "extract_llm", "cacheinject"},
+	// general: the recommended all-round pipeline, safe+effective for any agent/
+	// benchmark. Ordered by pipeline semantics: lossless repack first (format, toon)
+	// so downstream token counts are honest; cheap structural offloaders next (dedup,
+	// failed_run, cmdfilter); age-based mask; relevance-based extract; the blind
+	// head/tail collapse as the last-resort catch-all for anything still oversized;
+	// cacheinject last so the cache breakpoint sits on the final bytes. Every offloader
+	// defaults to marker_mode:full (reversible via the injected expand tool) and skips
+	// content already carrying a placeholder, so they never double-reduce. Combines the
+	// levers that proved reward-neutral in the benchmark sweeps without stacking the
+	// two overlapping old-context reducers (mask is the one kept; summarize
+	// is its own preset — see docs/components.md redundancy notes).
+	"general": {"format", "toon", "dedup", "failed_run", "cmdfilter", "mask", "extract", "extract_llm", "collapse", "cacheinject"},
 	// summarize restructures the whole transcript (changes the message count) — run
 	// it alone so no other component's in-place edits race apply's rebuild.
 	"summarize": {"summarize"},
+	// codesmart / codesafe are the SWE-bench study's winning configs, shipped as the
+	// recommended defaults (codesmart is the proxy default). Their tuned per-component
+	// settings live in presetConfigs; the name-lists here keep PresetPipeline (used by
+	// /compact?preset=) resolving them.
+	"codesmart": {"format", "dedup", "failed_run", "cmdfilter", "extract_llm", "extract", "cacheinject"},
+	"codesafe":  {"format", "dedup", "failed_run", "cmdfilter", "extract", "collapse", "cacheinject"},
+}
+
+// presetConfigs carries FULL config docs for presets whose behavior depends on tuned
+// per-component settings a bare pipeline name-list cannot express. Kept verbatim from
+// the SWE-bench study (deploy/harbor/swebench.py):
+//   - codesmart (the winning cache-aware config, and the proxy default): the LLM
+//     relevance-trimmer extract_llm routed to the CHEAP model (model.source: config,
+//     nil-when-unset ⇒ it silently no-ops to deterministic — see docs), gated at 3000
+//     tok so most turns make no model call, ≤4 calls/req; the free deterministic extract
+//     catches smaller noise; cacheinject keeps the prefix warm.
+//   - codesafe: the deterministic-only variant (NO LLM, by policy) — same structural
+//     offloaders plus a blind collapse fallback, zero model calls.
+//
+// Component defaults are left untouched, so general/agent/aggressive are unaffected.
+var presetConfigs = map[string]string{
+	"codesmart": `pipeline: [format, dedup, failed_run, cmdfilter, extract_llm, extract, cacheinject]
+components:
+  extract:
+    min_tokens: 400
+  extract_llm:
+    strategy: code
+    model:
+      source: config
+    min_tokens: 3000
+    trigger:
+      min_request_tokens: 3000
+    llm_every_n_requests: 1
+    llm_max_per_request: 4`,
+	"codesafe": `pipeline: [format, dedup, failed_run, cmdfilter, extract, collapse, cacheinject]
+components:
+  collapse:
+    max_tokens: 3000`,
 }
 
 // PresetPipeline returns the default pipeline (ordered component names) for a

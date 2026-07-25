@@ -21,8 +21,15 @@ jobs:
           check-latest: true
       - name: Lint
         run: make lint
-      - name: Test
-        run: make test
+      - name: Test & coverage
+        run: |
+          make cover
+          # Accurate cross-package total (statement-weighted) → PR/run job summary + log.
+          total=$(go tool cover -func=coverage.out | awk '/^total:/ {print $3}')
+          echo "### Test coverage: ${total} (cross-package, statement-weighted)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Total coverage: ${total}"
+      - name: Per-package coverage (log)
+        run: go test -cover ./... | sed 's/[[:space:]]\+/ /g'
       - name: Build
         run: make build
 

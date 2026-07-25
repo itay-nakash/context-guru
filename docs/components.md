@@ -17,18 +17,35 @@ messages (`role:"tool"`; for Anthropic, `tool_result` blocks normalized to that 
 | `collapse` | Offload | middle of an oversized output | via expand | any large tool output (fallback) | `max_tokens` (2000), `head_lines` (20), `tail_lines` (20) |
 | `failed_run` | Offload | earlier superseded test/build runs | via expand | ≥2 run-like outputs | `min_tokens` (100) |
 | `cmdfilter` | Offload | lines per declarative DSL filter | via expand | output matching a filter | `filters` ([]), `disable_builtins` (false) |
-| `extract` | Offload | query-irrelevant lines (or an LLM-written filter) | via expand | large output + a recent query | `min_tokens` (300), `head_lines`/`tail_lines` (5), `strategy` (deterministic\|code\|rlm), `model.source`, `trigger` |
+| `extract` | Offload | obvious noise (repeated lines/blocks, blank runs, progress bars) | via expand | any large output | `min_tokens` (300), `trigger` |
+| `extract_llm` | Offload (LLM) | query-irrelevant content via an LLM-written sandboxed filter | via expand | large output in a large request | `strategy` (code), `model.source`, `trigger`, `rewrite`, `skip_file_reads` |
 | `smartcrush` | Offload | middle items of a JSON array | via expand | JSON-array tool output | `min_items` (5), `min_tokens` (200), `keep_first` (3), `keep_last` (2) |
-| `mask` | Offload | older tool outputs (age-based) | via expand | more than `keep_recent` outputs | `keep_recent` (3), `min_tokens` (100) |
-| `phi_evict` | Offload | lowest-scoring outputs over budget | via expand | transcript over `budget_tokens` | `budget_tokens` (120000), `weights` (balanced) |
+| `mask` | Offload | older tool outputs (age-based) | via expand | more than `keep_recent` outputs | `keep_recent` (3), `min_tokens` (100), `keep_head_chars` (96) |
 | `summarize` | Offload (LLM) | the middle of the transcript → one summary | via expand | long trajectories | `summary_level` (regular), `keep_last` (3), `min_tokens` (500), `resummarize_tokens` (6000), `model.source`, `trigger` |
 
 Presets (`config`): `off` `[]` · `safe` `[format, cacheinject]` · `balanced`
 `[format, dedup, failed_run, cmdfilter, cacheinject]` · `aggressive` adds `smartcrush, extract` ·
 `coding` `[format, skeleton, cmdfilter, cacheinject]` · `mcp` `[format, smartcrush, cacheinject]` ·
 **`agent`** `[format, dedup, failed_run, mask, extract, cacheinject]` — for long agentic sessions;
-`mask` is the biggest lever there (~27% content-token savings, no reward loss — see [RESULTS.md](RESULTS.md)) ·
+`mask` is the biggest lever there (~27–30% content-token savings, no reward loss — see [RESULTS.md](RESULTS.md)) ·
+**`general`** `[format, toon, dedup, failed_run, cmdfilter, mask, extract, collapse, cacheinject]` — the
+recommended all-round pipeline: the reward-neutral levers of `agent` plus the situational shrinkers
+(`toon`/`cmdfilter`/`collapse`) that cost nothing when they don't fire. `balanced` is **not** recommended
+for agentic traffic — it omits `mask`, so it barely helps (6% vs 31% in the Terminal-Bench replay) ·
 `summarize` `[summarize]` (run alone — it restructures the whole transcript).
+
+**Dynamic, model-aware triggers.** Trigger thresholds can be expressed as **fractions of the model's
+context window** (resolved dynamically via LiteLLM's public model map, no hand-maintained list):
+`min_request_frac`, `min_output_frac`, and a hard `huge_output_frac` ("huge tool call" — act regardless of
+the request-level gate). `collapse.max_frac` scales its size budget likewise.
+Absolutes (`min_request_tokens`, etc.) still win; when the window is unknown, fractions are ignored and
+absolutes apply (backward compatible). This lets one config generalize across models/benchmarks.
+
+**Reversibility in practice.** The `context_guru_expand` tool is advertised on outgoing requests
+(`INJECT_EXPAND=auto|always|never`, default `auto` = only when the request already declares tools and the
+store persists), so Offload markers are genuinely recoverable — not just described in marker text. Every
+offloader also applies a **marker-inclusive** never-worse check per message, so a rewrite never grows a
+message by the marker's tokens.
 
 **LLM-based components** (`extract` with `strategy: code`/`rlm`, and `summarize`) call a model, chosen by
 `model.source`: `incoming` (default — reuse the proxied request's own model + key) or `config` (a dedicated
@@ -176,41 +193,53 @@ after:   <failures + summary, passing noise stripped, ≤80 lines> <<cg:…>> [f
   filter, or where filtering doesn't shrink it.
 
 ### `extract`
-Projects a large tool output down to what's relevant to the **most recent user query**. v1 ships
-the `deterministic` strategy: keep `head`/`tail` context, every line overlapping the query's
-keywords, and every line carrying an error word; collapse the gaps with `…`. Stashes the original.
+**Deterministic, no-LLM.** Collapses only *obvious, provably redundant* noise: consecutively repeated
+lines/blocks (up to 12 lines), runs of blank lines, and progress-bar/spinner churn — keeping every
+unique informative line verbatim. Runs cheaply on every request; stashes the original.
 
 ```
-before:  <300-line API dump>   (query mentions "auth timeout")
-after:   <head> … lines mentioning auth/timeout + any error lines … <tail>
-         <<cg:…>> [full output: call context_guru_expand]
+before:  resolved 200 packages                after:  resolved 200 packages
+         warning: peer dependency unmet                warning: peer dependency unmet
+         warning: peer dependency unmet   (×15)        build complete in 4.2s
+         …                                             <<cg:40b571fdebccdcd4>> [full output: …]
+         build complete in 4.2s
 ```
+*(captured live: 15 identical warnings → 1, blank runs collapsed.)*
 
-The relevance signal is the **full conversational context** (the task in the first user turn +
-the most recent assistant/user turns), not just one trailing sentence — so it keeps what the agent
-actually needs on any agent/benchmark.
+- **Config:** `min_tokens` (300), `trigger`, `marker_mode`. **Shines:** build/install logs,
+  package-manager output, anything with repeated warnings/progress bars. **Inert:** below floor,
+  nothing obviously redundant, or not smaller once the marker is added. Full page:
+  [extract](components/extract.md).
 
-- **Config:** `min_tokens` (300), `head_lines`/`tail_lines` (5), `strategy`
-  (`deterministic` | `code` | `rlm`), `model.source`, `trigger`, `marker_mode`, `rewrite`. With
-  `code`, a cheap LLM writes a Starlark filter run in a sandbox (no imports/IO, step + 2s limits).
-  It sees the **full tool output** (bounded to ~32k chars) so it writes code **specific to that
-  content** — deleting the exact irrelevant lines/records AND words/sentences/parts within lines — not
-  a blind generic filter. It has regex helpers (`re_sub`/`re_findall`/`re_split`/`re_match`, RE2,
-  pure-Go). **Guarantee (default): deletion-only** — the result is accepted only if it is an in-order
-  **character subsequence** of the input (obtainable by deleting characters), so the model can trim
-  anything but provably cannot fabricate, reorder, or reword; else it falls back to deterministic.
-  JSON bodies are decoded and filtered structurally. `rlm` currently maps to `code`.
-- **`rewrite` (opt-in, code only):** drops the containment proof so the model may reword / summarize /
-  rewrite freely (lossy, **unverified** — only sanity + strictly-smaller apply). Pair with a non-`full`
-  `marker_mode`. Default `false` keeps the verified deletion-only guarantee.
-- **Gating + reuse (LLM strategies):** a `trigger` decides whether to spend a model call —
-  `min_output_tokens` (per tool output; folds in legacy `min_tokens`), `min_request_tokens`,
-  `min_messages` — so `code` fires only on a large output in a large request, not every turn. A reduced
-  output is cached per session by content hash, so the **same output re-sent on a later turn reuses the
-  prior compaction** (no new model call, byte-identical result → prefix stays KV-cache stable).
-- **Shines:** big query-focused MCP/API outputs, logs and file reads; structured JSON where a filter
-  selects records precisely. **Inert:** no user query, output below floor, request below `trigger`,
-  projection not smaller, or (for `code`) no model available → deterministic.
+### `extract_llm` (LLM)
+The relevance-aware counterpart to `extract`: a **cheap model writes a sandboxed Starlark filter**
+(no imports/IO, step + 2s limits) specific to that output, deleting the irrelevant lines/records and
+— in `rewrite` mode — rewording/collapsing spans, while keeping ids/paths/errors verbatim. It sees
+the full output (bounded ~32k chars). JSON bodies are filtered structurally.
+
+```
+before:  2024 GET /users/0 200 12ms   (×60)   after:  2024 GET /users/58 200 12ms
+         ERROR auth timeout on token refresh          2024 GET /users/59 200 12ms
+         2024 GET /items/0 200 8ms    (×60)            ERROR auth timeout on token refresh
+                                                       2024 GET /items/0 200 8ms
+                                                       2024 GET /items/1 200 8ms
+                                                       [auth timeout error + context; repetitive
+                                                        successful requests elided] <<cg:9233…>>
+```
+*(captured live via `aws/claude-haiku-4-5`; query: "find the auth timeout error and nearby context".)*
+
+- **Guarantee:** `rewrite: false` accepts a result only if it is an in-order **character subsequence**
+  of the input (deletion-only, provably no fabrication/reorder). Default `rewrite: true` is the more
+  powerful mode (sanity + strictly-smaller only; ids/paths/errors still required verbatim).
+- **Model:** `model.source` = `incoming` (proxied model+key) or `config` (`CHEAP_MODEL*`). No model →
+  no-op.
+- **Throttled + reused:** gated by `trigger` and throttled per session (`llm_every_n_requests`) / per
+  request (`llm_max_per_request`); a reduced output is checkpointed per session and **reused
+  byte-for-byte** on later turns (no new call, prefix stays KV-cache stable). `skip_file_reads` (auto)
+  leaves prompt-cached source dumps verbatim since they already bill cheap.
+- **Config:** `strategy` (`code`), `min_tokens`, `model.source`, `trigger`, `rewrite`,
+  `llm_every_n_requests`, `llm_max_per_request`, `skip_file_reads`, `marker_mode`. Full page:
+  [extract_llm](components/extract_llm.md).
 
 ### `smartcrush`
 Statistical JSON-**array** compressor: parse the array, keep `keep_first` + `keep_last` items plus
@@ -232,25 +261,16 @@ Age-based garbage collection: keep the newest `keep_recent` tool outputs verbati
 ones (≥ `min_tokens`) with a short marker + stash. Complementary to the content-based offloaders.
 
 ```
-after (older):  [older tool output masked] <<cg:…>> [full output: call context_guru_expand]
+after (older):  [older tool output masked; starts: 700 701 def __rmul__(self, m): 702 …] <<cg:…>> [full output: call context_guru_expand]
 ```
 
-- **Config:** `keep_recent` (3), `min_tokens` (100). **Shines:** long agent trajectories where old
-  tool results are unlikely to matter. **Inert:** ≤ `keep_recent` tool outputs, small outputs.
-
-### `phi_evict`
-Ranks tool outputs by a lean-ctx-style context-field score and evicts the lowest until the
-transcript fits `budget_tokens`. Never evicts the most recent tool output.
-
-$$\Phi = w_R\cdot\text{relevance} + w_H\cdot\text{recency} - w_C\cdot\text{cost} - w_D\cdot\text{redundancy}$$
-
-- **relevance** = keyword overlap with the last user message; **recency** = position (newest = 1);
-  **cost** = share of total tool tokens; **redundancy** = 1 if a duplicate seen earlier.
-- **Config:** `budget_tokens` (120000), `weights` — `balanced` `{R.40,H.20,C.30,D.10}`,
-  `aggressive` (punish cost: `{.30,.10,.45,.15}`), `conservative` (`{.45,.20,.05,.05}`).
-- **Shines:** very long transcripts that must fit a context budget. **Inert:** total tool tokens ≤
-  budget, or ≤1 tool output. The scalar-ranking essence of lean-ctx's Context Field (the full
-  heat-diffusion/MMR/bandit machinery is a documented refinement).
+- **Config:** `keep_recent` (3), `min_tokens` (100), `keep_head_chars` (96). **Shines:** long agent
+  trajectories where old tool results are unlikely to matter (top lever on terminal/code traffic: 27.5%
+  on Terminal-Bench, 12.5% on SWE-bench; scales down to ~4% on small structured customer-service outputs).
+  **Inert:** ≤ `keep_recent` tool outputs, small outputs.
+- **`keep_head_chars`** leaves a one-line head-peek of the hidden output inside the marker (see above) so
+  the model knows *what* was masked without a blind `expand` round-trip — evidence showed a bare marker on
+  a masked source-file read forces needless expands. Set `0` for the opaque marker (≈2pp more savings).
 
 ### `summarize` (LLM)
 Compresses the **middle of the trajectory** into one LLM-written summary (ported from CE-Manager's

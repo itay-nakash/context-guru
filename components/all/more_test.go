@@ -9,6 +9,7 @@ import (
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/components"
 	_ "github.com/rossoctl/context-guru/components/all"
+	"github.com/rossoctl/context-guru/components/offload"
 	"github.com/rossoctl/context-guru/config"
 	"github.com/rossoctl/context-guru/expand"
 	"github.com/rossoctl/context-guru/schema"
@@ -75,6 +76,50 @@ func TestFailedRunSupersedes(t *testing.T) {
 	}
 }
 
+// A PASSED earlier run is a distinct result the agent may still reference, so it
+// must NOT be collapsed as "superseded" — only failed earlier runs are.
+func TestFailedRunKeepsPassedRun(t *testing.T) {
+	pass1 := "=== test session starts ===\n" + strings.Repeat("detail line about test suite A\n", 20) + "0 failed, 7 passed in 1.1s\n"
+	pass2 := "=== test session starts ===\n" + strings.Repeat("detail line about test suite B\n", 20) + "0 failed, 4 passed in 0.9s\n"
+	req := &schemas.BifrostChatRequest{Input: []schemas.ChatMessage{toolMsg(pass1), toolMsg(pass2)}}
+	run(t, "pipeline: [failed_run]\n", req)
+	if strings.Contains(schema.MessageText(req.Input[0]), "superseded") {
+		t.Fatalf("a PASSED earlier run must be kept verbatim, got: %q", schema.MessageText(req.Input[0]))
+	}
+	if !strings.Contains(schema.MessageText(req.Input[0]), "7 passed") {
+		t.Fatal("passed earlier run content must remain")
+	}
+}
+
+// In cache-aware mode a superseded FAILED run that sits in the already-cached
+// prefix (index <= MaxCachedIdx) must NOT be collapsed — doing so would mutate the
+// cached prefix and force a provider cache-write. Only runs in the uncached tail
+// are collapsible.
+func TestFailedRunCacheAwareTailOnly(t *testing.T) {
+	run1 := "=== test session starts ===\n" + strings.Repeat("detail line about the failing run\n", 20) + "3 failed, 2 passed in 1.2s\n"
+	run2 := "=== test session starts ===\n" + strings.Repeat("detail line about the passing run\n", 20) + "0 failed, 5 passed in 1.0s\n"
+	req := &schemas.BifrostChatRequest{Input: []schemas.ChatMessage{toolMsg(run1), toolMsg("some unrelated note"), toolMsg(run2)}}
+
+	cfg, err := config.LoadBytes([]byte("pipeline: [failed_run]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pipe, err := cfg.Build(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Boundary at index 0: run1 (index 0) is "already cached", so it must be left
+	// verbatim even though a later run supersedes it.
+	c := &components.Ctx{Ctx: context.Background(), Session: "s", Store: store.NewMemory(store.Options{}), CacheAware: true, MaxCachedIdx: 0}
+	pipe.Run(req, c)
+	if strings.Contains(schema.MessageText(req.Input[0]), "superseded") {
+		t.Fatalf("cache-aware: cached-prefix run must stay verbatim, got: %q", schema.MessageText(req.Input[0]))
+	}
+	if !strings.Contains(schema.MessageText(req.Input[0]), "3 failed") {
+		t.Fatal("cached-prefix run content must remain intact")
+	}
+}
+
 func TestCollapseHeadTail(t *testing.T) {
 	var b strings.Builder
 	for i := 0; i < 30; i++ {
@@ -93,5 +138,67 @@ func TestCollapseHeadTail(t *testing.T) {
 		t.Fatal("collapse should leave an expand marker")
 	} else if _, ok := expand.Resolve(st, keys[0]); !ok {
 		t.Fatal("collapse original must be recoverable")
+	}
+}
+
+// TestMaskFreezeByteStableAcrossTurns is the core cache-stability regression: once mask
+// hides an output, it must replay the IDENTICAL masked bytes on every later turn even
+// after that output slides into the already-cached prefix. Before the fix, mask gated on
+// TailOnly with no freeze/reapply, so on turn 2 the cached-prefix output reverted to full
+// (masked→full→…), churning the provider KV cache every turn.
+func TestMaskFreezeByteStableAcrossTurns(t *testing.T) {
+	cfg, err := config.LoadBytes([]byte("pipeline: [mask]\ncomponents:\n  mask: {keep_recent: 1, min_tokens: 20}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pipe, err := cfg.Build(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := store.NewMemory(store.Options{})
+	big := strings.Repeat("older tool output content line that is long enough to mask\n", 30)
+
+	// Turn 1: whole request is the uncached tail (MaxCachedIdx -1); index 0 gets masked.
+	req1 := &schemas.BifrostChatRequest{Input: []schemas.ChatMessage{toolMsg(big), toolMsg("newest tiny output")}}
+	c1 := &components.Ctx{Ctx: context.Background(), Session: "s", Store: st, CacheAware: true, MaxCachedIdx: -1}
+	pipe.Run(req1, c1)
+	masked1 := schema.MessageText(req1.Input[0])
+	if !strings.Contains(masked1, "masked") {
+		t.Fatalf("turn 1 should mask index 0: %q", masked1)
+	}
+
+	// Turn 2: the agent re-sends index 0's FULL original; it is now in the cached prefix
+	// (MaxCachedIdx 1 ⇒ TailOnly(0)=false). mask must replay the frozen bytes, not revert.
+	req2 := &schemas.BifrostChatRequest{Input: []schemas.ChatMessage{toolMsg(big), toolMsg("newest tiny output"), toolMsg("turn 2 new output")}}
+	c2 := &components.Ctx{Ctx: context.Background(), Session: "s", Store: st, CacheAware: true, MaxCachedIdx: 1}
+	pipe.Run(req2, c2)
+	masked2 := schema.MessageText(req2.Input[0])
+	if masked2 != masked1 {
+		t.Fatalf("mask must replay byte-identically across turns (cache-stable):\n turn1=%q\n turn2=%q", masked1, masked2)
+	}
+}
+
+// TestKeptVerbatimNotRecompacted: after the agent expands an offloaded output (the proxy
+// marks it kept-verbatim), no offloader may re-compact it on the next turn — otherwise the
+// model expands it again, a per-turn bounce loop. Before the fix only extract_llm honored
+// the flag; mask/collapse/extract/dedup/etc. ignored it.
+func TestKeptVerbatimNotRecompacted(t *testing.T) {
+	cfg, err := config.LoadBytes([]byte("pipeline: [mask]\ncomponents:\n  mask: {keep_recent: 1, min_tokens: 20}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pipe, err := cfg.Build(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := store.NewMemory(store.Options{})
+	big := strings.Repeat("recoverable content the agent just expanded and needs verbatim\n", 30)
+	offload.MarkKeptVerbatim(st, big) // simulate the proxy's expand loop
+
+	req := &schemas.BifrostChatRequest{Input: []schemas.ChatMessage{toolMsg(big), toolMsg("newest tiny output")}}
+	c := &components.Ctx{Ctx: context.Background(), Session: "s", Store: st}
+	pipe.Run(req, c)
+	if strings.Contains(schema.MessageText(req.Input[0]), "masked") {
+		t.Fatalf("kept-verbatim content must not be re-masked: %q", schema.MessageText(req.Input[0]))
 	}
 }

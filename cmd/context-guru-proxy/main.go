@@ -22,6 +22,7 @@ import (
 	_ "github.com/rossoctl/context-guru/components/all"
 	"github.com/rossoctl/context-guru/config"
 	"github.com/rossoctl/context-guru/internal/cheapmodel"
+	"github.com/rossoctl/context-guru/internal/modelinfo"
 	"github.com/rossoctl/context-guru/metrics"
 	"github.com/rossoctl/context-guru/proxy"
 )
@@ -30,7 +31,7 @@ func main() {
 	var (
 		addr      = envOr("LISTEN_ADDR", ":4000")
 		cfgPath   = flag.String("config", envOr("CONFIG", ""), "path to context-guru YAML config")
-		preset    = flag.String("preset", envOr("PRESET", "balanced"), "preset to use when --config is absent")
+		preset    = flag.String("preset", envOr("PRESET", "codesmart"), "preset to use when --config is absent (codesmart = the SWE-bench-winning cache-aware config; codesafe = deterministic-only)")
 		openai    = flag.String("openai-upstream", envOr("OPENAI_UPSTREAM", "https://api.openai.com"), "OpenAI upstream base URL")
 		anthropic = flag.String("anthropic-upstream", envOr("ANTHROPIC_UPSTREAM", "https://api.anthropic.com"), "Anthropic upstream base URL")
 		bob       = flag.String("bob-upstream", envOr("BOB_UPSTREAM", ""), "Bob (BobShell) backend base URL; enables the Bob gateway routes when set (e.g. https://api.us-east.bob.ibm.com)")
@@ -61,8 +62,12 @@ func main() {
 		// via env); the agent holds only a placeholder. Empty => pass client auth.
 		OpenAIKey:    os.Getenv("OPENAI_API_KEY"),
 		AnthropicKey: os.Getenv("ANTHROPIC_API_KEY"),
-		ForceModel:   os.Getenv("FORCE_MODEL"), // eval-containers pins EVAL_MODEL's model here
-		CheapModel:   cheapModelFromEnv(),      // static "config"-source LLM for NeedsModel components
+		ForceModel:   os.Getenv("FORCE_MODEL"),   // eval-containers pins EVAL_MODEL's model here
+		CheapModel:   cheapModelFromEnv(),        // static "config"-source LLM for NeedsModel components
+		InjectExpand: os.Getenv("INJECT_EXPAND"), // auto (default) | always | never
+		CacheMode:    os.Getenv("CACHE_MODE"),    // auto (default) | on | off — cache-aware compaction
+		Windows:      modelWindows(),             // dynamic context-window resolver (fraction triggers)
+
 		// Per-request /compact override: swap the pipeline (?preset / header) while
 		// keeping this config's component blocks. nil-safe in the handler.
 		PipelineFor: func(preset string, names []string) (*components.Pipeline, error) {
@@ -111,6 +116,20 @@ func parseBool(s string) (v, ok bool) {
 		return false, true
 	}
 	return false, false
+}
+
+// modelWindows builds the dynamic context-window resolver used for fraction-based
+// triggers. Default chain: LiteLLM's public prices map (cached) -> small embedded
+// fallback. MODEL_INFO_URL overrides the map source; MODEL_INFO=off disables it
+// (windows unknown => fraction triggers ignored, absolutes apply).
+func modelWindows() modelinfo.Resolver {
+	if strings.EqualFold(os.Getenv("MODEL_INFO"), "off") {
+		return nil
+	}
+	return modelinfo.Chain{
+		modelinfo.NewLiteLLM(os.Getenv("MODEL_INFO_URL"), nil, 0),
+		modelinfo.DefaultStatic(),
+	}
 }
 
 // cheapModelFromEnv builds the static "config"-source LLM client for NeedsModel
