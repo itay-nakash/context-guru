@@ -5,17 +5,17 @@ SWE-bench Verified** — evaluated live, end-to-end, with the **claude-code** ag
 **`aws/claude-sonnet-5`**, against a no-compaction baseline and against
 [**headroom**](https://pypi.org/project/headroom-ai/) (`headroom-ai` v0.32.1).
 
-50 tasks, matched on the 48 that scored under all three arms.
+50 tasks, all of which scored under all three arms (zero infrastructure exceptions).
 
 ![headline](img/benchmark/headline.png)
 
 | dimension | baseline | **context-guru** | headroom |
 |---|--:|--:|--:|
-| reward (solved / 48) | 43 | **42** | 40 |
-| **billed cost** (matched total) | $29.73 | **$25.71 (−13.5%)** | $28.19 (−5.2%) |
-| cache-read tokens | 96.8M | **80.6M** | 91.1M |
-| cache-write tokens | 1.77M | **1.70M** | 1.76M |
-| mean steps / task | 35.5 | **31.0** | 34.6 |
+| reward (solved / 50) | 43 | **44** | 40 |
+| **billed cost** (matched total) | $31.98 | **$27.77 (−13.2%)** | $30.30 (−5.3%) |
+| cache-read tokens | 102.8M | **84.5M** | 96.4M |
+| cache-write tokens | 1.855M | 1.847M | 1.839M |
+| mean steps / task | 36.1 | **31.1** | 35.1 |
 | added latency / req | — | 117 ms | 63 ms |
 | tool LLM cost | $0 | $0.31 | $0 |
 

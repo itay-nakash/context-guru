@@ -8,7 +8,7 @@ neither busts the cache. They differ in *how* they compress: context-guru is a *
 (deterministic passes + a cheap LLM for relevance-aware skeletonization), headroom is
 **fully deterministic** (AST / ML-scorer / structural compressors, no generative model).
 
-All numbers are from the matched 48-task run (see [comparison.md](comparison.md)).
+All numbers are from the matched 50-task run (see [comparison.md](comparison.md)).
 
 ---
 
@@ -147,26 +147,27 @@ overhead, 0 failures.
 | approach | hybrid (deterministic + haiku LLM) | fully deterministic | — |
 | trigger | pipeline; `extract_llm` on newest output ≥3000 tok, ≤4/req | per-block content-type detect, ≥500 chars | — |
 | live-zone-only | yes (TailOnly + freeze/reapply) | yes (frozen prefix + protection windows) | tie |
-| **billed cost** (matched) | **$25.71** | $28.19 | **context-guru** |
-| **cache-read / cache-write** | **80.6M / 1.70M** | 91.1M / 1.76M | **context-guru** |
-| reward (solved/48) | **42** | 40 | **context-guru** |
-| mean steps | **31.0** | 34.6 | **context-guru** |
+| **billed cost** (matched) | **$27.77** | $30.30 | **context-guru** |
+| **cache-read tokens** | **84.5M** | 96.4M | **context-guru** |
+| **cache-write tokens** | 1.847M | **1.839M** | ≈ tie (within 0.4%) |
+| reward (solved/50) | **44** | 40 | **context-guru** |
+| mean steps | **31.1** | 35.1 | **context-guru** |
 | added latency / req | 117 ms | **63 ms** | **headroom** |
 | tool's own LLM cost | $0.31 | **$0** | **headroom** |
 | raw content removed / req | 1.09% | **2.64%** | **headroom** |
 | reversibility on streaming | **`expand` works** (SSE aggregation) | CCR off (corrupts claude-code SSE) | **context-guru** |
-| exceptions (of 50) | 2 | **0** | **headroom** |
+| exceptions (of 50) | 0 | 0 | tie |
 
 **The key nuance:** headroom removes more *raw* content per request (2.64% vs 1.09%), yet
-context-guru ends up **cheaper** with **lower cache-read** (80.6M vs 91.1M). Why?
+context-guru ends up **cheaper** with **lower cache-read** (84.5M vs 96.4M). Why?
 context-guru **freezes each compaction and replays it byte-identically every turn**, so a
 reduction compounds across the whole session's re-sent history; and its LLM
 skeletonization targets the biggest file reads that headroom's deterministic passes leave
-larger. Both keep cache-write at/below baseline (1.70M vs 1.76M vs 1.77M) — **neither busts
-the cache**.
+larger. Cache-write is a three-way wash (baseline 1.855M · context-guru 1.847M · headroom
+1.839M — within 0.9%) — **none of the arms busts the cache**.
 
-**Verdict.** context-guru wins the dollar-and-reward metrics (cost, cache usage, steps,
-reward-vs-headroom) and stays reversible on streaming; headroom wins the overhead metrics
-(latency, $0 tool cost, zero exceptions) because it never puts a model on the hot path.
+**Verdict.** context-guru wins the dollar-and-reward metrics (cost, cache-read, steps, and
+the most tasks solved — 44 vs 43 vs 40) and stays reversible on streaming; headroom wins the
+overhead metrics (latency, $0 tool cost) because it never puts a model on the hot path.
 The gap on each side is the direct consequence of hybrid-LLM vs fully-deterministic
 compaction.

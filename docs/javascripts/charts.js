@@ -1,14 +1,14 @@
 // Interactive benchmark charts (Chart.js via CDN). Numbers are inlined here from
 // docs/results/comparison.md (SWE-bench Verified, claude-code agent on
-// aws/claude-sonnet-5, matched 48-task set). A <canvas data-cg-chart="NAME"> in
+// aws/claude-sonnet-5, matched 50-task set). A <canvas data-cg-chart="NAME"> in
 // the markdown is rendered by the matching function below.
 // ponytail: inline data, not wired to the results CSV — swap to a fetch of
 // deploy/eval-containers/results/*.csv if the numbers should track the sweep automatically.
 
-// Matched 48-task totals, from docs/results/comparison.md.
+// Matched 50-task totals, from docs/results/comparison.md.
 const CG_ARMS = ["baseline", "context-guru", "headroom"];
-const CG_COST = [29.73, 25.71, 28.19]; // total billed $ (lower is better)
-const CG_CACHE_READ = [96.8, 80.6, 91.1]; // cache-read tokens, millions (lower is better)
+const CG_COST = [31.98, 27.77, 30.30]; // total billed $ (lower is better)
+const CG_CACHE_READ = [102.8, 84.5, 96.4]; // cache-read tokens, millions (lower is better)
 
 function cgTeal(alpha) {
   return `rgba(0, 150, 136, ${alpha})`;
@@ -72,10 +72,10 @@ function cgRenderAll() {
     if (typeof Chart === "undefined") return;
     switch (canvas.dataset.cgChart) {
       case "billed-cost":
-        cgBar(canvas, CG_COST, "Total billed cost (matched 48 tasks)", " $");
+        cgBar(canvas, CG_COST, "Total billed cost (matched 50 tasks)", " $");
         break;
       case "cache-read":
-        cgBar(canvas, CG_CACHE_READ, "Cache-read tokens (matched 48 tasks)", " M");
+        cgBar(canvas, CG_CACHE_READ, "Cache-read tokens (matched 50 tasks)", " M");
         break;
     }
   });

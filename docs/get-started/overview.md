@@ -97,6 +97,7 @@ The deep dive lives in [Architecture](../design.md).
 
 - :material-chart-bar: **[Benchmarks](../RESULTS.md)**
 
-    Per-component SWE-bench results — `mask` ≈ 27% token savings, no reward loss.
+    Live three-way SWE-bench Verified study — context-guru is the cheapest arm
+    (−13.2% billed cost vs baseline) and solves the most tasks (88%).
 
 </div>

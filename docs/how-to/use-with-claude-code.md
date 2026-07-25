@@ -24,10 +24,11 @@ pipeline; the response path resolves any `context_guru_expand` calls automatical
 
 !!! tip "Which preset?"
     Claude Code sessions are long and dominated by re-sent tool outputs (file reads,
-    command logs), so `--preset agent` (`mask` + `dedup` + `failed_run` + `extract`)
-    is the biggest lever — ~27% token savings with no task-reward change in the
-    [benchmarks](../RESULTS.md). Use `coding` if you want `skeleton` to strip function
-    bodies from big source reads. See [Choose a preset](choose-a-preset.md).
+    command logs). The default **`codesmart`** preset is the cache-aware config that won
+    the live [benchmarks](../RESULTS.md) — the cheapest arm (**−13.2%** billed cost vs a
+    no-compaction baseline) at the **highest** reward (88% tasks solved). Use `coding` if
+    you want `skeleton` to strip function bodies from big source reads. See
+    [Choose a preset](choose-a-preset.md).
 
 ## With a wrapper script
 
