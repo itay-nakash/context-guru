@@ -51,14 +51,22 @@ func (d *Dedup) Offload(req *schemas.BifrostChatRequest, rep *components.Report,
 		if content == "" || schema.TextTokens(content) < d.minTokens {
 			continue
 		}
+		if skipReduce(c, content) {
+			continue // already carries a marker, or was expanded by the agent — don't re-reduce
+		}
 		h := hashKey(content)
 		if _, dup := seen[h]; !dup {
 			seen[h] = i
 			continue
 		}
 		// Later duplicate: collapse to a pointer (stash+marker in full mode).
-		tok, key := mark(c, rep, d.mode, content, "")
-		schema.SetMessageText(m, "[identical to an earlier tool output] "+tok)
+		newText, key, eff, ok := tryMark(c, d.mode, content, "",
+			func(tok string) string { return "[identical to an earlier tool output] " + tok })
+		if !ok {
+			continue // pointer+marker wouldn't shrink this duplicate; leave it verbatim
+		}
+		commitMark(c, rep, eff, key, content)
+		schema.SetMessageText(m, newText)
 		changed++
 		if key != "" {
 			keys = append(keys, key)

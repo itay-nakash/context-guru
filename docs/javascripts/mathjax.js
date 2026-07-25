@@ -1,4 +1,4 @@
-// MathJax config for pymdownx.arithmatex (generic mode) — renders the phi_evict Φ formula.
+// MathJax config for pymdownx.arithmatex (generic mode) — renders inline/blocks math in the docs.
 window.MathJax = {
   tex: {
     inlineMath: [["\\(", "\\)"]],

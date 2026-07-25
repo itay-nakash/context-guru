@@ -10,6 +10,7 @@
 package expand
 
 import (
+	"encoding/json"
 	"regexp"
 	"strings"
 
@@ -94,4 +95,59 @@ func ToolDef(provider string) map[string]any {
 			"function": map[string]any{"name": ToolName, "description": desc, "parameters": params},
 		}
 	}
+}
+
+// toolDesc / the JSON schema for the expand tool's one argument. Kept as typed
+// structs (not map[string]any) so the serialized bytes have a FIXED key order —
+// injecting the same tool on every turn produces byte-identical `tools` entries,
+// which is what keeps the provider prefix cache warm across turns (Inject relies on this).
+const toolDesc = "Retrieve the full original content that was compressed and replaced by a <<cg:HASH>> marker."
+
+type idProp struct {
+	Type        string `json:"type"`
+	Description string `json:"description"`
+}
+type toolSchema struct {
+	Type       string            `json:"type"`
+	Properties map[string]idProp `json:"properties"`
+	Required   []string          `json:"required"`
+}
+
+func schemaLiteral() toolSchema {
+	return toolSchema{
+		Type: "object",
+		Properties: map[string]idProp{
+			"id": {Type: "string", Description: "The HASH from a <<cg:HASH>> marker to retrieve in full."},
+		},
+		Required: []string{"id"},
+	}
+}
+
+// openAIToolDef / anthropicToolDef are the ordered wire shapes.
+type openAIFn struct {
+	Name        string     `json:"name"`
+	Description string     `json:"description"`
+	Parameters  toolSchema `json:"parameters"`
+}
+type openAIToolDef struct {
+	Type     string   `json:"type"`
+	Function openAIFn `json:"function"`
+}
+type anthropicToolDef struct {
+	Name        string     `json:"name"`
+	Description string     `json:"description"`
+	InputSchema toolSchema `json:"input_schema"`
+}
+
+// ToolDefRaw returns the expand tool definition for a provider as deterministic
+// JSON bytes (stable key order). Inject appends these to the request's tools array.
+func ToolDefRaw(provider string) json.RawMessage {
+	var v any
+	if provider == "anthropic" {
+		v = anthropicToolDef{Name: ToolName, Description: toolDesc, InputSchema: schemaLiteral()}
+	} else {
+		v = openAIToolDef{Type: "function", Function: openAIFn{Name: ToolName, Description: toolDesc, Parameters: schemaLiteral()}}
+	}
+	b, _ := json.Marshal(v)
+	return b
 }

@@ -1,6 +1,7 @@
 package proxy_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -303,6 +304,75 @@ func TestExpandToolLoop(t *testing.T) {
 	}
 	if gjson.GetBytes(secondBody, "messages.#").Int() != 3 {
 		t.Fatalf("continuation should append assistant + tool turns: %s", secondBody)
+	}
+}
+
+// TestExpandSSELoop proves restoration now works on the STREAMING path (the real
+// claude-code case). The first upstream reply is an Anthropic event-stream whose only
+// tool_use is context_guru_expand; the request carries a <<cg:HASH>> marker so the
+// proxy buffers+aggregates the SSE, resolves the original, and re-invokes upstream.
+func TestExpandSSELoop(t *testing.T) {
+	var calls int
+	var secondBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		calls++
+		if calls == 1 {
+			w.Header().Set("Content-Type", "text/event-stream")
+			// A minimal Anthropic tool_use SSE: start, block start (tool_use), the input
+			// json as one delta, stops.
+			w.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"role\":\"assistant\"}}\n\n" +
+				"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"context_guru_expand\"}}\n\n" +
+				"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"id\\\":\\\"HASH\\\"}\"}}\n\n" +
+				"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+				"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n" +
+				"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
+			return
+		}
+		secondBody = b
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"role\":\"assistant\"}}\n\n" +
+			"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" +
+			"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"done\"}}\n\n" +
+			"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	h, st := buildHandler(t, "pipeline: []\n", upstream.URL)
+	st.Put("HASH", []byte("THE ORIGINAL CONTENT"))
+	srv := httptest.NewServer(h.Mux())
+	defer srv.Close()
+
+	// The request must advertise a tool (so expand injection fires) and carry a marker.
+	// Build without Go's HTML-escaping so the literal "<<cg:HASH>>" reaches the proxy
+	// (real Anthropic/OpenAI SDK clients do not HTML-escape "<").
+	var bb bytes.Buffer
+	enc := json.NewEncoder(&bb)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(map[string]any{
+		"model":  "claude",
+		"stream": true,
+		"tools":  []map[string]any{{"name": "Bash", "description": "run", "input_schema": map[string]any{"type": "object"}}},
+		"messages": []map[string]any{
+			{"role": "user", "content": "look at <<cg:HASH>> and finish"},
+		},
+	})
+	body := bb.Bytes()
+	resp, err := http.Post(srv.URL+"/anthropic/v1/messages", "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	final, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if calls != 2 {
+		t.Fatalf("expected 2 upstream calls (SSE expand + continuation), got %d", calls)
+	}
+	if !strings.Contains(string(secondBody), "THE ORIGINAL CONTENT") {
+		t.Fatalf("continuation must carry the resolved original, got %s", secondBody)
+	}
+	if !strings.Contains(string(final), "done") {
+		t.Fatalf("client should receive the final streamed answer, got %s", final)
 	}
 }
 

@@ -38,6 +38,67 @@ func TestUnknownPresetErrors(t *testing.T) {
 	}
 }
 
+// TestRichPresetCarriesComponentConfig verifies the codesmart preset expands to both
+// its pipeline AND its tuned per-component config (which a bare name-list can't carry) —
+// specifically that extract_llm is routed to the cheap "config" model, not the default.
+func TestRichPresetCarriesComponentConfig(t *testing.T) {
+	c, err := LoadBytes([]byte("preset: codesmart\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"format", "dedup", "failed_run", "cmdfilter", "extract_llm", "extract", "cacheinject"}
+	if strings.Join(c.Pipeline, ",") != strings.Join(want, ",") {
+		t.Fatalf("codesmart pipeline = %v, want %v", c.Pipeline, want)
+	}
+	node, ok := c.Components["extract_llm"]
+	if !ok {
+		t.Fatal("codesmart must carry extract_llm component config")
+	}
+	var got struct {
+		Model struct {
+			Source string `yaml:"source"`
+		} `yaml:"model"`
+		MinTokens int `yaml:"min_tokens"`
+	}
+	if err := node.Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Model.Source != "config" {
+		t.Fatalf("extract_llm.model.source = %q, want config (cheap model)", got.Model.Source)
+	}
+	if got.MinTokens != 3000 {
+		t.Fatalf("extract_llm.min_tokens = %d, want 3000", got.MinTokens)
+	}
+}
+
+// TestRichPresetUserOverrideWins: an explicit component config overrides the preset's.
+func TestRichPresetUserOverrideWins(t *testing.T) {
+	c, err := LoadBytes([]byte("preset: codesmart\ncomponents:\n  extract_llm:\n    min_tokens: 9999\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		MinTokens int `yaml:"min_tokens"`
+	}
+	node := c.Components["extract_llm"]
+	if err := node.Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.MinTokens != 9999 {
+		t.Fatalf("user min_tokens should win: got %d, want 9999", got.MinTokens)
+	}
+	// and codesafe (deterministic-only) must contain NO extract_llm.
+	cs, err := LoadBytes([]byte("preset: codesafe\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range cs.Pipeline {
+		if name == "extract_llm" {
+			t.Fatal("codesafe must be deterministic-only (no extract_llm)")
+		}
+	}
+}
+
 func TestStoreOptionsParse(t *testing.T) {
 	c, err := LoadBytes([]byte("store: {ttl_seconds: 60, max_entries: 5}\n"))
 	if err != nil {

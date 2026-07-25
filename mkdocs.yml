@@ -102,10 +102,6 @@ extra:
     - icon: fontawesome/brands/golang
       link: https://pkg.go.dev/github.com/rossoctl/context-guru
 
-# Internal implementation plans live under docs/ but must never publish.
-exclude_docs: |
-  superpowers/
-
 nav:
   - Home: index.md
   - Get Started:
@@ -128,9 +124,9 @@ nav:
           - failed_run: components/failed_run.md
           - cmdfilter: components/cmdfilter.md
           - extract: components/extract.md
+          - extract_llm: components/extract_llm.md
           - smartcrush: components/smartcrush.md
           - mask: components/mask.md
-          - phi_evict: components/phi_evict.md
           - summarize: components/summarize.md
       - The DSL filter engine: components/dsl.md
   - How-to Guides:
@@ -142,9 +138,17 @@ nav:
       - Recover offloaded context: how-to/recover-context.md
       - Measure savings: how-to/measure-savings.md
   - Examples:
+      - Live component captures: examples/live-captures.md
       - llm-d compaction service: examples/llm-d-service.md
       - Before → After showcase: examples/before-after.md
-  - Benchmarks: RESULTS.md
+  - Benchmarks:
+      - Overview: RESULTS.md
+      - Full comparison (vs headroom): results/comparison.md
+      - Component internals & examples: results/components.md
+      - "Results: baseline": results/baseline.md
+      - "Results: context-guru": results/context-guru.md
+      - "Results: headroom": results/headroom.md
+      - Reproduce the results: results/REPRODUCE.md
   - Reference:
       - Routes & headers: reference/routes.md
       - Config & environment: reference/config.md

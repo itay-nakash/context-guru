@@ -1,14 +1,52 @@
+<div align="center">
+
 # context-guru
 
-Provider-agnostic **context engineering** for LLM agents: a Go library that shrinks the
-tokens a request carries — losslessly, or lossy-but-reversible — without touching the
-agent. Same core runs as an **HTTP proxy/gateway** or an **in-process plugin**.
+**Provider-agnostic context engineering for LLM agents.**
+Shrink the tokens every request carries — losslessly, or lossy-but-reversibly — **without touching the agent.**
 
-- **Fail open, always** — any component error/panic reverts *that component only*; the
-  original request is always a valid fallback.
-- **Never worse** — a component that grows the request is reverted.
+[![Docs](https://img.shields.io/badge/docs-online-009688.svg)](https://rossoctl.github.io/context-guru/)
+[![Go Reference](https://img.shields.io/badge/pkg.go.dev-reference-007d9c.svg)](https://pkg.go.dev/github.com/rossoctl/context-guru)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Go 1.26](https://img.shields.io/badge/go-1.26-00ADD8.svg)](go.mod)
+
+[Quickstart](#quickstart-60-seconds) · [Why it wins](#benchmark-the-cheapest--highest-reward-arm-on-swe-bench-verified) · [Components](#the-pipeline) · [Docs](https://rossoctl.github.io/context-guru/) · [Reproduce](docs/results/REPRODUCE.md)
+
+</div>
+
+---
+
+context-guru is a single Go core that reduces the token cost of LLM-agent traffic. The **same core**
+runs as an **HTTP proxy/gateway** (drop-in, any language, zero agent changes) or as an **in-process
+plugin**. It operates on the messages array — dropping redundant tool output, collapsing superseded
+runs, projecting large reads down to what's relevant — and every reduction is **safe by construction**:
+
+- **Fail open, always** — any component error or panic reverts *that component only*; the original
+  request is always a valid fallback.
+- **Never worse** — a component that would grow a message is reverted. You never pay to compact.
 - **Reversible** — every lossy drop leaves a `<<cg:HASH>>` marker and stashes the original,
   recoverable via a model-callable `context_guru_expand` tool or `GET /expand`.
+
+## Benchmark: the cheapest & highest-reward arm on SWE-bench Verified
+
+Evaluated **live, end-to-end**, with the **claude-code** agent on **`aws/claude-sonnet-5`**, against a
+no-compaction baseline and against [**headroom**](https://pypi.org/project/headroom-ai/)
+(`headroom-ai` v0.32.1). 50 tasks, matched on the 48 that scored under all three arms.
+
+| dimension | baseline | **context-guru** | headroom |
+|---|--:|--:|--:|
+| reward (solved / 48) | 43 | **42** | 40 |
+| **total billed cost** | $29.73 | **$25.71 (−13.5%)** | $28.19 (−5.2%) |
+| cache-read tokens | 96.8M | **80.6M (−16.8%)** | 91.1M (−5.9%) |
+| cache-write tokens | 1.77M | **1.70M** | 1.76M |
+| mean steps / task | 35.5 | **31.0** | 34.6 |
+| added latency / req | — | 117 ms | 63 ms |
+
+**context-guru is the cheapest arm and beats headroom on cost, cache usage, steps, and reward** — because
+it *freezes each compaction and replays it byte-identically every turn*, compounding the cache-read saving
+across the whole session while never mutating the cached prefix. headroom keeps an edge on added latency
+(it is fully deterministic). Full three-way study, per-task/per-component breakdowns, real before→after
+examples, and how to reproduce: **[docs/RESULTS.md](docs/RESULTS.md)**.
 
 ## Architecture
 
@@ -33,55 +71,96 @@ Components implement one of two lossiness-typed interfaces and are stacked in co
 ```mermaid
 flowchart TD
   C["Component — Name() · Enabled(ctx)"]
-  C --> R["Reformat: lossless repack<br/>format · cacheinject"]
-  C --> O["Offload: drop + stash, returns cache_keys<br/>skeleton · dedup · collapse · failed_run<br/>cmdfilter · extract · smartcrush · mask · phi_evict"]
+  C --> R["Reformat: lossless repack<br/>format · toon · cacheinject"]
+  C --> O["Offload: drop + stash, returns cache_keys<br/>skeleton · dedup · collapse · failed_run<br/>cmdfilter · extract · extract_llm · smartcrush · mask · summarize"]
 ```
 
 ## Install
 
-Requires **Go 1.26** and a **C toolchain** (`CGO_ENABLED=1`; the `skeleton` component uses
-tree-sitter via cgo). The module pins bifrost with a local `replace` to `../bifrost/core`,
-so build from the parent directory that holds both repos:
+Requires **Go 1.26** and a **C toolchain** (`CGO_ENABLED=1`). Build from the repo root:
 
 ```sh
-cd .../context-engineering            # dir containing lab-context-engineering/ and bifrost/
-CGO_ENABLED=1 go build -o bin/context-guru-proxy \
-  ./lab-context-engineering/cmd/context-guru-proxy
+CGO_ENABLED=1 go build -tags cg_skeleton -o bin/context-guru-proxy ./cmd/context-guru-proxy
 ```
 
-Or build the gateway image (see [docs/setup.md](docs/setup.md)):
+The `cg_skeleton` build tag pulls in tree-sitter (via cgo) so the `skeleton` component can parse code.
+It is **optional** — omit the tag and the tree-sitter dependency for a pure-Go build; the `skeleton`
+component is simply inert without it, everything else works. Or build the gateway image
+(see [docs/setup.md](docs/setup.md)):
 
 ```sh
-docker build -f lab-context-engineering/Dockerfile -t context-guru:local .
+docker build -t context-guru:local .
 ```
 
-## Run the proxy
+## Quickstart (60 seconds)
 
 ```sh
-context-guru-proxy --preset balanced          # or --config cg.yaml
+# 1 — run the proxy (ships with the SWE-bench-winning cache-aware config by default)
+./bin/context-guru-proxy                          # --preset codesmart; listens on :4000 (LISTEN_ADDR to change)
+
+# 2 — point any agent at it (one port serves both dialects)
+export ANTHROPIC_BASE_URL=http://localhost:4000/anthropic
+export OPENAI_BASE_URL=http://localhost:4000/openai/v1
+claude                                            # e.g. Claude Code
+
+# 3 — watch the savings add up
+curl -s localhost:4000/stats | jq                 # token-weighted savings rollup
 ```
 
-Point any agent at it (one port serves both dialects):
+Or drive it directly with an Anthropic-style request (this is exactly how the quickstart is tested — see
+[docs/get-started/quickstart-proxy.md](docs/get-started/quickstart-proxy.md)):
 
 ```sh
-ANTHROPIC_BASE_URL=http://localhost:4000/anthropic
-OPENAI_BASE_URL=http://localhost:4000/openai/v1
+curl -s localhost:4000/anthropic/v1/messages \
+  -H 'content-type: application/json' \
+  -H "Authorization: Bearer $YOUR_KEY" \
+  -d '{"model":"...","max_tokens":64,"messages":[ ... ]}'
 ```
+
+Presets: **`codesmart`** (the default — the SWE-bench-winning cache-aware config
+`[format, dedup, failed_run, cmdfilter, extract_llm, extract, cacheinject]`), **`codesafe`** (the same
+minus the LLM pass — deterministic-only `[format, dedup, failed_run, cmdfilter, extract, collapse, cacheinject]`,
+zero model calls by policy), plus `general`, `agent`, `coding`, `mcp`, `balanced`, `safe`, `summarize`, `off`.
+`codesmart`'s LLM relevance-trimmer (`extract_llm`) engages only when a cheap model is configured
+(`CHEAP_MODEL*`); without one it safely no-ops and behaves like `codesafe`.
+See [docs/components.md](docs/components.md) and [docs/reference/presets.md](docs/reference/presets.md).
 
 | Flag / env | Default | Purpose |
 |---|---|---|
-| `--preset` / `PRESET` | `balanced` | pipeline preset when no `--config` |
+| `--preset` / `PRESET` | `codesmart` | pipeline preset when no `--config` |
 | `--config` / `CONFIG` | — | YAML config (overrides preset) |
 | `LISTEN_ADDR` | `:4000` | listen address |
-| `--openai-upstream` / `OPENAI_UPSTREAM` | `https://api.openai.com` | OpenAI upstream base |
 | `--anthropic-upstream` / `ANTHROPIC_UPSTREAM` | `https://api.anthropic.com` | Anthropic upstream base |
+| `--openai-upstream` / `OPENAI_UPSTREAM` | `https://api.openai.com` | OpenAI upstream base |
 | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | — | real key injected on forward (gateway mode); empty = pass client auth through |
+| `CHEAP_MODEL` (+ `CHEAP_MODEL_*`) | — | dedicated cheap model for the LLM components (`extract_llm`, `summarize`) |
 | `FORCE_MODEL` | — | overwrite the request `model` (eval-containers `EVAL_MODEL`) |
 
 Routes: `POST /openai/v1/chat/completions`, `POST /anthropic/v1/messages`, `GET /healthz`,
-`GET /stats` (savings rollups), `GET /expand?id=` (recover an offloaded original).
-Per-request: header `x-context-guru-session` sets the session key; `x-context-guru-bypass: true`
-skips the pipeline.
+`GET /stats` (savings rollups), `GET /expand?id=` (recover an offloaded original). Per-request: header
+`x-context-guru-session` sets the session key; `x-context-guru-bypass: true` skips the pipeline.
+
+## The pipeline
+
+Every component operates on tool-output messages. **Reformat** = lossless repack; **Offload** = drop
+bytes, stash the original, leave a recoverable marker. Real, live-captured before→after examples for each
+are in **[docs/components.md](docs/components.md)** and **[docs/results/components.md](docs/results/components.md)**.
+
+| Component | Kind | What it does |
+|---|---|---|
+| `format` | Reformat | re-encodes pretty JSON tool output as compact JSON |
+| `toon` | Reformat | re-encodes a uniform JSON array as TOON (header once, one row per item) |
+| `cacheinject` | Reformat | adds an Anthropic `cache_control` breakpoint on a stable prefix boundary |
+| `dedup` | Offload | replaces a byte-identical earlier tool output with a pointer |
+| `failed_run` | Offload | collapses superseded test/build runs, keeps the latest in full |
+| `cmdfilter` | Offload | shrinks structured command output via declarative DSL filters |
+| `extract` | Offload | deterministic noise collapse (repeated lines, blank runs, progress bars) |
+| `extract_llm` | Offload (LLM) | a cheap model writes a sandboxed filter that trims to what's relevant |
+| `collapse` | Offload | head/tail window on any oversized output (last-resort fallback) |
+| `mask` | Offload | age-based GC — keep the newest N tool outputs, stash older ones |
+| `skeleton` | Offload | replaces code-block function bodies with signatures (needs `cg_skeleton`) |
+| `smartcrush` | Offload | keeps anchor items of a long JSON array, drops the middle |
+| `summarize` | Offload (LLM) | compresses the middle of the trajectory into one summary (run alone) |
 
 ## Integrate
 
@@ -96,11 +175,11 @@ Details in [docs/integrations.md](docs/integrations.md).
 ## Docs
 
 - [docs/design.md](docs/design.md) — architecture: component model, fail-open pipeline, store, session, expand loop, metrics.
-- [docs/components.md](docs/components.md) — every registered component: how it works, before→after, lossiness, config, best use.
+- [docs/components.md](docs/components.md) — every registered component: how it works, live before→after, lossiness, config, best use.
 - [docs/integrations.md](docs/integrations.md) — proxy gateway vs AuthBridge plugin, with request paths.
 - [docs/setup.md](docs/setup.md) — setup + a concrete SWE-bench run through the eval-containers gateway.
-- [docs/RESULTS.md](docs/RESULTS.md) — per-component SWE-bench benchmark (Claude Code, claude-sonnet-4-6): `mask` ≈27% token savings, no reward loss.
+- [docs/RESULTS.md](docs/RESULTS.md) — the live three-way SWE-bench Verified benchmark (Claude Code, `aws/claude-sonnet-5`): context-guru is the cheapest arm (−13.5% billed cost vs baseline) and beats headroom on cost, cache usage, steps, and reward.
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+Apache-2.0. See [LICENSE](LICENSE). A [Rossoctl](https://github.com/rossoctl) platform component.

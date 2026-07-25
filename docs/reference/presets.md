@@ -7,10 +7,12 @@ taken exactly from the `presets` map in `config/config.go`.
 
 | Preset | Ordered pipeline | When to use |
 |---|---|---|
+| `codesmart` | `format` → `dedup` → `failed_run` → `cmdfilter` → `extract_llm` → `extract` → `cacheinject` | **The default.** The SWE-bench-winning cache-aware config: structural offloaders + a cheap-model relevance-trimmer (`extract_llm`, routed to `CHEAP_MODEL`, gated so most turns make no model call) + deterministic `extract`. `extract_llm` no-ops (→ deterministic) when no cheap model is configured. |
+| `codesafe` | `format` → `dedup` → `failed_run` → `cmdfilter` → `extract` → `collapse` → `cacheinject` | `codesmart` minus the LLM pass — **deterministic-only, zero model calls by policy**. The safe control / the choice when you don't want an LLM on the hot path. |
 | `off` | *(empty)* | Passthrough — no components. The baseline / A-B control. |
 | `safe` | `format` → `cacheinject` | Lossless only: repack JSON compactly and add `cache_control`. Zero risk of dropping content. |
-| `balanced` | `format` → `dedup` → `failed_run` → `cmdfilter` → `cacheinject` | The default. Lossless repack + conservative offloads (dedupe, drop superseded/failed runs, filter command noise) + cache. |
-| `aggressive` | `format` → `dedup` → `failed_run` → `cmdfilter` → `smartcrush` → `extract` → `cacheinject` | `balanced` plus `smartcrush` (crush long homogeneous arrays) and `extract` (LLM relevance filter) for deeper savings. |
+| `balanced` | `format` → `dedup` → `failed_run` → `cmdfilter` → `cacheinject` | Lossless repack + conservative offloads (dedupe, drop superseded/failed runs, filter command noise) + cache. |
+| `aggressive` | `format` → `dedup` → `failed_run` → `cmdfilter` → `smartcrush` → `extract` → `extract_llm` → `cacheinject` | `balanced` plus `smartcrush` (crush long homogeneous arrays), deterministic `extract` (noise collapse), and `extract_llm` (cheap-model relevance trim) for deeper savings. |
 | `coding` | `format` → `skeleton` → `cmdfilter` → `cacheinject` | Coding agents: `skeleton` reduces big source-file reads to their structure via tree-sitter. |
 | `mcp` | `format` → `smartcrush` → `cacheinject` | Tool/MCP servers returning long homogeneous JSON arrays (list endpoints, search hits). |
 | `agent` | `format` → `dedup` → `failed_run` → `mask` → `extract` → `cacheinject` | Long agentic sessions (e.g. Claude Code on SWE-bench) where re-sent tool outputs dominate cost. `mask` is the biggest lever — ~27% content-token savings with no task-reward loss (see [Benchmarks](../RESULTS.md)). |

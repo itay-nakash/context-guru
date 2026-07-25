@@ -72,10 +72,15 @@ func (a Anthropic) Complete(ctx context.Context, prompt string) (string, error) 
 		Content []struct {
 			Text string `json:"text"`
 		} `json:"content"`
+		Usage struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+		} `json:"usage"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return "", err
 	}
+	recordUsage(out.Usage.InputTokens, out.Usage.OutputTokens) // track CG component LLM cost
 	// Return the first content block that carries text. A leading non-text block
 	// (e.g. "thinking") has an empty Text, so we skip it rather than returning "".
 	for _, c := range out.Content {

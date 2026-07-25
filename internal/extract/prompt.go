@@ -51,11 +51,14 @@ func buildPrompt(bodyText, goal string, keepIDs []string) string {
 			"whose value matches any of these, verbatim:\n" + string(kb) + "\n\n"
 	}
 
-	// Show the actual value (pretty-printed JSON if it parses), truncated.
+	// Show the actual value (pretty-printed JSON only if the whole body is a JSON
+	// container — never mangle a numeric-prefixed text/file read), truncated.
 	sample := bodyText
-	if v := parseBody(bodyText); !isRawString(v) {
-		if b, err := json.MarshalIndent(v, "", "  "); err == nil {
-			sample = string(b)
+	if isJSONContainer(bodyText) {
+		if v := parseBody(bodyText); !isRawString(v) {
+			if b, err := json.MarshalIndent(v, "", "  "); err == nil {
+				sample = string(b)
+			}
 		}
 	}
 	sample = truncate(sample, sampleChars)
@@ -65,59 +68,116 @@ func buildPrompt(bodyText, goal string, keepIDs []string) string {
 		keepBlock + sampleMarker + sample + "\n\n" + rules + "\n\n" + example
 }
 
-// codeRules is the Starlark code-writing contract for the DEFAULT deletion-only
-// mode: the model sees the FULL output (below) and writes a program specific to
-// THIS content that DELETES the irrelevant parts. The result is verified to be a
-// character subsequence of the input (no fabrication/reorder/rewrite), so the
-// model can trim freely and still never corrupt what the agent relies on.
-const codeRules = `Write a Starlark program (a safe Python subset) that trims THIS ONE tool output
-(shown in full below) down to only what the agent needs next. Be SPECIFIC to the
-content you see — target the exact noise in it, not a generic filter.
-Contract:
-- The global string INPUT holds the FULL tool output (identical to what's shown).
-- Assign a string global OUTPUT with the kept content.
-- Available: the ` + "`json`" + ` module, and regex helpers
+// codeContract is the shared preamble: the sandbox API and the always-safe
+// defaults. Because the program runs inside a function body (top-level assignments
+// are locals), OUTPUT may be reassigned as many times as you like — there is no
+// "assign once" restriction.
+const codeContract = `Write a Starlark program (a safe Python subset) that reduces THIS ONE tool output
+(shown in full below) to only what the agent needs next. Be SPECIFIC to the content
+you see — target its exact noise, not a generic filter. This is GENERAL: the output
+may come from any tool for any agent (coding, tool/API use, research, ops, a task for
+a user), and you do not know exactly what the agent does next, so RECALL FIRST — when
+unsure whether something matters, keep it. Deleting a line the agent needed makes it
+re-run the tool and redo work; keeping a borderline line costs only a few tokens.
+Sandbox:
+- INPUT (string) holds the FULL tool output, identical to what's shown below.
+- OUTPUT (string) starts equal to INPUT; assign it the reduced content. You MAY
+  reassign OUTPUT freely (build it up step by step).
+- SUMMARY (string) starts empty; OPTIONALLY set it to ONE short line naming the gist
+  of what you elided (e.g. "pytest: 3 failed, 710 passed" or "npm install: ok, 42
+  pkgs"). It is shown to the agent inline next to the recovery marker. Leave it "" if
+  a plain reduction needs no digest.
+- Available: the ` + "`json`" + ` module and regex helpers
   re_sub(pattern, repl, s) -> s, re_findall(pattern, s) -> [str],
-  re_split(pattern, s) -> [str], re_match(pattern, s) -> bool.
-- JSON input (starts with { or [): result = json.decode(INPUT); drop irrelevant
-  records/fields; OUTPUT = json.encode(result).
-- Text input: keep relevant lines AND trim within them — drop irrelevant words,
-  sentences, columns, repeated whitespace, banners, progress bars. Use string ops
-  and re_sub for surgical removal. OUTPUT = the trimmed text.
-Hard rule — DELETION ONLY:
-1. You may only DELETE characters. NEVER add, reorder, reword, renumber, translate,
-   or rephrase. The output MUST be obtainable by removing characters from INPUT
-   (it is verified as a subsequence — a rewrite is rejected and wastes the call).
-2. PRESERVE EXACTLY, verbatim: ids, numbers, names, paths, signatures, timestamps,
-   error messages, stack traces, and anything matching the KEEP list.
-3. RECALL FIRST: when unsure whether something is relevant, keep it.
-4. NO imports (no load()), NO I/O, NO network.
-5. If nothing is clearly irrelevant, set OUTPUT = INPUT.
+  re_split(pattern, s) -> [str], re_match(pattern, s) -> bool. RE2 syntax.
+- NO imports (no load()), NO I/O, NO network.
+Rule for SOURCE-CODE FILES (a file read: imports + function/class defs). A large
+file read is the MOST important thing to reduce — produce a SKELETON. Do NOT return it
+unchanged; a large file always has bodies to elide, and bodies are recoverable via
+expand, so PREFER eliding. Concretely, go line by line and KEEP a line verbatim iff it
+is one of:
+  * an import / from / require / #include / package / using line;
+  * a signature or structural line — contains "def ", "class ", "func ", "function ",
+    "interface ", "type ", "struct ", "enum ", "public/private/protected", a decorator
+    ("@..."), or ends with "{" / ":" at a low indent;
+  * a module-level constant / assignment (low indent);
+  * a docstring/comment line immediately under a kept signature;
+  * ANY line containing a KEEP-list identifier or clearly central to the goal.
+Otherwise the line is body detail: DROP it, and collapse each run of dropped lines
+into ONE marker line that keeps the run's indentation, e.g.
+  "        # … 14 lines elided (call context_guru_expand) …".
+KEEP the FULL body (do NOT elide) when ANY of these hold — this protects the agent from
+having to re-read (which wastes far more than it saves):
+  * the definition's name or a line in it matches the KEEP list or the goal;
+  * the body is SHORT (a rough rule: ≤ ~15 lines) — eliding it saves little but risks a
+    re-read;
+  * the definition is adjacent to a KEEP-matching one (the agent is likely working nearby).
+Only elide the LONG bodies (> ~15 lines) of definitions with no KEEP/goal relevance.
+When in doubt about a body, KEEP it. Kept lines must be BYTE-IDENTICAL (keep any leading
+line numbers). A big file with many unrelated long defs should still shrink a lot; a
+small or highly-relevant file may barely shrink — that is correct.
+Always PRESERVE EXACTLY, verbatim: ids, numbers, names, paths, signatures,
+timestamps, error messages, stack traces, and anything matching the KEEP list.
+For NON-code output, if nothing is clearly reducible, leave OUTPUT = INPUT.`
+
+// codeRules is the DEFAULT (powerful) contract: the program may delete OR rewrite
+// via regex/string ops — collapse repeated blocks, strip progress columns/banners,
+// keep only relevant records/lines — as long as the verbatim-preservation rule holds.
+const codeRules = codeContract + `
+You MAY delete AND rewrite: collapse runs, strip noise columns, drop irrelevant
+records/lines, replace verbose boilerplate with a shorter form — provided every
+preserved item above stays byte-for-byte intact.
 Output ONLY the Starlark program — no prose, no markdown fences.`
 
-// codeRewriteRules is the opt-in (rewrite:true) contract: containment is NOT
-// enforced, so the model may reword/summarize/rewrite freely. Lossy + unverified —
-// used only when a caller explicitly accepts that (e.g. AuthBridge summary mode).
-const codeRewriteRules = `Write a Starlark program (a safe Python subset) that rewrites THIS ONE tool output
-(shown in full below) down to only what the agent needs next.
-Contract:
-- The global string INPUT holds the FULL tool output.
-- Assign a string global OUTPUT with the condensed content.
-- Available: the ` + "`json`" + ` module and regex helpers re_sub/re_findall/re_split/re_match.
-- You MAY delete, reword, summarize, collapse, or rewrite freely — but PRESERVE
-  exactly every id, number, path, error message, and KEEP-list identifier verbatim.
-- Keep it strictly smaller than INPUT. NO imports, NO I/O, NO network.
+// codeDeletionRules is the strict (rewrite:false) contract: deletion only, verified
+// as a character subsequence of INPUT (no reorder/reword/fabrication).
+const codeDeletionRules = codeContract + `
+DELETION ONLY: you may only DELETE characters — never add, reorder, reword, renumber,
+translate, or rephrase. The result MUST be obtainable by removing characters from
+INPUT (verified as a subsequence; a rewrite is rejected and wastes the call). SUMMARY
+is the ONE exception — it is separate from OUTPUT and may be free text.
 Output ONLY the Starlark program — no prose, no markdown fences.`
 
-const codeExample = `EXAMPLE A (JSON) — drop irrelevant records:
+const codeExample = `EXAMPLE A (JSON search hits) — keep only the relevant records:
   data = json.decode(INPUT)
-  OUTPUT = json.encode([r for r in data if "col_insert" in r["match"] or "common.py" in r["path"]])
-EXAMPLE B (pytest log) — delete the passing/progress noise, keep the failure:
+  kept = [r for r in data if "col_insert" in r["match"] or "common.py" in r["path"]]
+  OUTPUT = json.encode(kept)
+  SUMMARY = "search: %d of %d hits kept" % (len(kept), len(data))
+EXAMPLE B (pytest log) — drop passing/progress noise, strip the % progress column,
+keep failures and the summary line:
   lines = INPUT.split("\n")
   kept = [ln for ln in lines if "PASSED" not in ln and not re_match("^\\s*$", ln)]
-  OUTPUT = "\n".join(kept)
-EXAMPLE C (within-line trim) — strip trailing progress columns with regex:
-  OUTPUT = re_sub(" +\\[ *[0-9]+%\\]", "", INPUT)`
+  OUTPUT = re_sub(" +\\[ *[0-9]+%\\]", "", "\n".join(kept))
+  SUMMARY = "pytest failures + summary kept; passing lines elided"
+EXAMPLE C (verbose install log) — collapse the "already satisfied" noise:
+  lines = [ln for ln in INPUT.split("\n") if "already satisfied" not in ln]
+  OUTPUT = "\n".join(lines)
+EXAMPLE D (source-code FILE READ; goal/KEEP mentions "parse_config") — skeleton:
+keep imports, every signature, and the relevant def; collapse each run of other body
+lines into one indented marker. Kept lines stay byte-identical (line numbers kept).
+  keep_ids = ["parse_config"]   # from KEEP / the goal
+  out = []
+  pending = 0    # consecutive elided body lines
+  indent = ""
+  for ln in INPUT.split("\n"):
+    s = ln.strip()
+    struct = ("def " in s or "class " in s or "func " in s or "function " in s or
+              s.startswith("import ") or s.startswith("from ") or s.startswith("@") or
+              s.endswith(":") or s.endswith("{"))
+    keep = s == "" or struct or any([k in ln for k in keep_ids])
+    if keep:
+      if pending > 0:
+        out.append(indent + "# ... " + str(pending) + " lines elided (call context_guru_expand) ...")
+        pending = 0
+      out.append(ln)
+    else:
+      if pending == 0:
+        indent = ln[:len(ln) - len(s)]
+      pending = pending + 1
+  if pending > 0:
+    out.append(indent + "# ... " + str(pending) + " lines elided (call context_guru_expand) ...")
+  OUTPUT = "\n".join(out)
+  SUMMARY = "skeleton: imports + signatures + parse_config kept; bodies elided"`
 
 // maxCodeContentChars bounds the full output shown to the model. Big enough to be
 // content-specific (~8k tokens), bounded so a giant output can't blow up the prompt;
@@ -148,11 +208,16 @@ func buildCodePrompt(bodyText, goal string, keepIDs []string, rewrite bool) stri
 			string(kb) + "\n\n"
 	}
 
-	// Show the FULL content (pretty-printed if JSON) so the program can be specific.
+	// Show the FULL content. Pretty-print ONLY when the WHOLE body is a valid JSON
+	// object/array — never for text that merely starts with a number (a line-numbered
+	// file read like "55\t…" would otherwise be parsed as the JSON number 55 and shown
+	// to the model as just "55", destroying the input).
 	shown := bodyText
-	if v := parseBody(bodyText); !isRawString(v) {
-		if b, err := json.MarshalIndent(v, "", "  "); err == nil {
-			shown = string(b)
+	if isJSONContainer(bodyText) {
+		if v := parseBody(bodyText); !isRawString(v) {
+			if b, err := json.MarshalIndent(v, "", "  "); err == nil {
+				shown = string(b)
+			}
 		}
 	}
 	label := "FULL TOOL OUTPUT (INPUT is exactly this):"
@@ -162,19 +227,29 @@ func buildCodePrompt(bodyText, goal string, keepIDs []string, rewrite bool) stri
 		label = "TOOL OUTPUT (head+tail; the real INPUT at runtime is the FULL output):"
 	}
 	rules := codeRules
-	if rewrite {
-		rules = codeRewriteRules
+	if !rewrite {
+		rules = codeDeletionRules
 	}
 	return "You write a Starlark program that reduces ONE tool output to what the agent needs next.\n\n" +
 		"WHAT THE AGENT IS DOING NOW (reduce toward this):\n" + g + "\n\n" +
 		keepBlock + label + "\n" + shown + "\n\n" + rules + "\n\n" + codeExample
 }
 
-const codeSampleChars = 1500
-
 func isRawString(v any) bool {
 	_, ok := v.(string)
 	return ok
+}
+
+// isJSONContainer reports whether the WHOLE trimmed body is a valid JSON object or
+// array. Used to decide whether to pretty-print the body for the model — a bare
+// number, a line-numbered file read, or a log that merely begins with a digit must
+// NOT be treated as JSON (json.Decode would consume a leading number and mangle it).
+func isJSONContainer(s string) bool {
+	t := strings.TrimSpace(s)
+	if t == "" || (t[0] != '{' && t[0] != '[') {
+		return false
+	}
+	return json.Valid([]byte(t))
 }
 
 func truncate(s string, n int) string {

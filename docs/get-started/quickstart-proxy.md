@@ -6,31 +6,24 @@ Anthropic dialects.
 
 ## Prerequisites
 
-- **Go 1.26** and a **C toolchain** — `CGO_ENABLED=1` is required (the
-  `skeleton` component binds tree-sitter via cgo).
-- The **bifrost** repo checked out beside this one — `go.mod` pins it with
-  `replace github.com/maximhq/bifrost/core => ../bifrost/core`, so build from the
-  parent directory that holds both repos.
+- **Go 1.26** and a **C toolchain** — `CGO_ENABLED=1` (bifrost's tokenizer and,
+  with the `cg_skeleton` tag, tree-sitter, use cgo).
 
-!!! warning "Build from the parent directory"
-    The local `replace` only resolves when `context-guru/` and `bifrost/` are
-    siblings:
-
-    ```
-    <parent>/
-      context-guru/     ← this repo (dir: lab-context-engineering)
-      bifrost/          ← https://github.com/maximhq/bifrost
-    ```
+bifrost is a normal module dependency (`go.mod` pins `github.com/maximhq/bifrost/core`),
+so there is nothing to check out beside this repo — build straight from the repo root.
 
 ## Build
 
 === "go build"
 
     ```sh
-    cd .../context-engineering            # dir containing lab-context-engineering/ and bifrost/
-    CGO_ENABLED=1 go build -o bin/context-guru-proxy \
-      ./lab-context-engineering/cmd/context-guru-proxy
+    # from the repo root
+    CGO_ENABLED=1 go build -tags cg_skeleton -o bin/context-guru-proxy ./cmd/context-guru-proxy
     ```
+
+    The `cg_skeleton` tag is optional — it enables the tree-sitter–backed `skeleton`
+    component. Drop it (and the cgo tree-sitter dependency) for a pure-Go build; every
+    other component is unaffected and `skeleton` is simply inert.
 
 === "make"
 
@@ -41,14 +34,13 @@ Anthropic dialects.
 === "docker"
 
     ```sh
-    # build context is the parent dir that holds both repos
-    docker build -f lab-context-engineering/Dockerfile -t context-guru:local .
+    docker build -t context-guru:local .
     ```
 
 ## Run
 
 ```sh
-context-guru-proxy --preset balanced          # or --config cg.yaml
+./bin/context-guru-proxy                       # default preset: codesmart; or --preset <name> / --config cg.yaml
 ```
 
 It listens on `:4000` by default (set `LISTEN_ADDR` to change). See
@@ -77,18 +69,44 @@ through.
 
 ## Send a request
 
-```sh
-curl -s -XPOST localhost:4000/openai/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -d '{
-    "model": "gpt-4o-mini",
-    "messages": [
-      {"role": "user", "content": "list users"},
-      {"role": "tool", "tool_call_id": "c1",
-       "content": "[{\"id\":1,\"name\":\"Alice\"},{\"id\":2,\"name\":\"Bob\"}]"}
-    ]
-  }'
-```
+=== "OpenAI"
+
+    ```sh
+    curl -s -XPOST localhost:4000/openai/v1/chat/completions \
+      -H 'content-type: application/json' \
+      -H "Authorization: Bearer $YOUR_KEY" \
+      -d '{
+        "model": "gpt-4o-mini",
+        "messages": [
+          {"role": "user", "content": "list users"},
+          {"role": "tool", "tool_call_id": "c1",
+           "content": "[{\"id\":1,\"name\":\"Alice\"},{\"id\":2,\"name\":\"Bob\"}]"}
+        ]
+      }'
+    ```
+
+=== "Anthropic"
+
+    ```sh
+    curl -s localhost:4000/anthropic/v1/messages \
+      -H 'content-type: application/json' \
+      -H "Authorization: Bearer $YOUR_KEY" \
+      -d '{
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 64,
+        "messages": [
+          {"role": "user", "content": "read the config"},
+          {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}]},
+          {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1",
+             "content": "[{\"id\":1,\"name\":\"Alice\"},{\"id\":2,\"name\":\"Bob\"}]"}]}
+        ]
+      }'
+    ```
+
+    Tool outputs on the Anthropic dialect ride in `tool_result` blocks inside a user
+    message; `apply` normalizes them so every component sees them the same way.
 
 ## Check savings
 

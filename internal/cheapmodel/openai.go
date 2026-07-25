@@ -59,10 +59,15 @@ func (o OpenAI) Complete(ctx context.Context, prompt string) (string, error) {
 				Content string `json:"content"`
 			} `json:"message"`
 		} `json:"choices"`
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+		} `json:"usage"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return "", err
 	}
+	recordUsage(out.Usage.PromptTokens, out.Usage.CompletionTokens) // track CG component LLM cost
 	if len(out.Choices) == 0 {
 		return "", nil
 	}

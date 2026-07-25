@@ -13,13 +13,14 @@ names the caveats before you commit.
 
 | Your workload | Preset |
 |---|---|
+| **Most agents — the default (SWE-bench-winning cache-aware config)** | **`codesmart`** |
+| Same, but no LLM on the hot path (deterministic-only) | `codesafe` |
 | Nothing — A/B baseline / passthrough control | `off` |
 | Any traffic, want a guaranteed-safe win only | `safe` |
-| General agent traffic, good default | `balanced` |
 | Squeeze harder, tolerate LLM/structural offload | `aggressive` |
 | Coding agent reading big source files | `coding` |
 | MCP / list-endpoint JSON arrays | `mcp` |
-| Long agentic sessions (SWE-bench-style, re-sent transcripts) | `agent` |
+| Long agentic sessions, age-based masking | `agent` / `general` |
 | One long transcript to compress, run standalone | `summarize` |
 
 ## The presets

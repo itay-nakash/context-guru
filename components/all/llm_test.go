@@ -135,9 +135,10 @@ func TestSummarizeEmptyResponseSkips(t *testing.T) {
 // TestExtractRLMUsesModel: strategy=rlm currently maps to code and still runs the
 // model's filter (not silently deterministic).
 func TestExtractRLMUsesModel(t *testing.T) {
-	off := newComp(t, "extract", "strategy: rlm\nmin_tokens: 1\nmodel:\n  source: config\n")
+	off := newComp(t, "extract_llm", "strategy: rlm\nmin_tokens: 1\nmodel:\n  source: config\n")
 	st := store.NewMemory(store.Options{})
-	body := `[{"id":1,"name":"keep this one"},{"id":2,"name":"drop it"}]`
+	pad := strings.Repeat("padding ", 40) // so reduction beats the marker cost (D1 guard)
+	body := `[{"id":1,"name":"keep this one ` + pad + `"},{"id":2,"name":"drop it ` + pad + `"}]`
 	req := &bschemas.BifrostChatRequest{Input: []bschemas.ChatMessage{
 		{Role: bschemas.ChatMessageRoleUser, Content: &bschemas.ChatMessageContent{ContentStr: strp("find keep")}},
 		toolMsg(body),
@@ -156,9 +157,10 @@ func TestExtractRLMUsesModel(t *testing.T) {
 // TestExtractCodeUsesModel: the code strategy runs the model's Starlark filter and
 // keeps only the matching records (a contained subset), with a marker.
 func TestExtractCodeUsesModel(t *testing.T) {
-	off := newComp(t, "extract", "strategy: code\nmin_tokens: 1\nmodel:\n  source: config\n")
+	off := newComp(t, "extract_llm", "strategy: code\nmin_tokens: 1\nmodel:\n  source: config\n")
 	st := store.NewMemory(store.Options{})
-	body := `[{"id":1,"name":"keep this"},{"id":2,"name":"drop this"},{"id":3,"name":"keep that"}]`
+	pad := strings.Repeat("padding ", 40) // so reduction beats the marker cost (D1 guard)
+	body := `[{"id":1,"name":"keep this ` + pad + `"},{"id":2,"name":"drop this ` + pad + `"},{"id":3,"name":"keep that ` + pad + `"}]`
 	req := &bschemas.BifrostChatRequest{Input: []bschemas.ChatMessage{
 		{Role: bschemas.ChatMessageRoleUser, Content: &bschemas.ChatMessageContent{ContentStr: strp("find the keep records")}},
 		toolMsg(body),
@@ -182,9 +184,11 @@ func TestExtractCodeUsesModel(t *testing.T) {
 	}
 }
 
-// TestExtractCodeNilModelFallsBack: strategy=code but no model -> deterministic.
-func TestExtractCodeNilModelFallsBack(t *testing.T) {
-	off := newComp(t, "extract", "strategy: code\nmin_tokens: 1\nhead_lines: 1\ntail_lines: 1\nmodel:\n  source: config\n")
+// With the extract split, the deterministic noise collapse is the separate `extract`
+// component. Repeated identical lines are collapsed by it (no LLM needed), with a
+// recovery marker.
+func TestDeterministicExtractCollapsesRepeats(t *testing.T) {
+	off := newComp(t, "extract", "min_tokens: 1\n")
 	st := store.NewMemory(store.Options{})
 	lines := make([]string, 30)
 	for i := range lines {
@@ -195,13 +199,36 @@ func TestExtractCodeNilModelFallsBack(t *testing.T) {
 		{Role: bschemas.ChatMessageRoleUser, Content: &bschemas.ChatMessageContent{ContentStr: strp("find keep")}},
 		toolMsg(strings.Join(lines, "\n")),
 	}}
-	c := &components.Ctx{Ctx: context.Background(), Store: st} // no model -> deterministic
+	c := &components.Ctx{Ctx: context.Background(), Store: st}
 	var rep components.Report
 	if _, err := off.Offload(req, &rep, c); err != nil {
 		t.Fatal(err)
 	}
-	// deterministic projection still runs and marks the message.
 	if !strings.Contains(schema.MessageText(req.Input[1]), "<<cg:") {
-		t.Fatal("code strategy with no model must fall back to deterministic projection")
+		t.Fatal("deterministic extract must collapse repeated lines with a marker")
+	}
+	if !strings.Contains(schema.MessageText(req.Input[1]), "the keep marker line") {
+		t.Fatal("the unique informative line must be kept verbatim")
+	}
+}
+
+// extract_llm with no model available is a clean no-op (deterministic collapse is a
+// separate component now — extract_llm never silently falls back to it).
+func TestExtractLLMNilModelSkips(t *testing.T) {
+	off := newComp(t, "extract_llm", "strategy: code\nmin_tokens: 1\nmodel:\n  source: config\n")
+	st := store.NewMemory(store.Options{})
+	body := strings.Repeat("some log line\n", 40)
+	req := &bschemas.BifrostChatRequest{Input: []bschemas.ChatMessage{
+		{Role: bschemas.ChatMessageRoleUser, Content: &bschemas.ChatMessageContent{ContentStr: strp("find keep")}},
+		toolMsg(body),
+	}}
+	c := &components.Ctx{Ctx: context.Background(), Store: st} // no model
+	var rep components.Report
+	keys, err := off.Offload(req, &rep, c)
+	if err != nil || len(keys) != 0 || !rep.Skipped {
+		t.Fatalf("extract_llm with no model must skip: keys=%d skipped=%v err=%v", len(keys), rep.Skipped, err)
+	}
+	if strings.Contains(schema.MessageText(req.Input[1]), "<<cg:") {
+		t.Fatal("extract_llm must not touch content without a model")
 	}
 }

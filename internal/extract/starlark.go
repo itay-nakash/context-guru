@@ -3,6 +3,8 @@ package extract
 import (
 	"context"
 	"regexp"
+	"runtime"
+	"strings"
 	"time"
 
 	starjson "go.starlark.net/lib/json"
@@ -12,6 +14,19 @@ import (
 const (
 	starlarkMaxSteps = 50_000_000
 	starlarkTimeout  = 2 * time.Second
+	// maxSandboxInput caps the body handed to the interpreter. The step/time limits
+	// only preempt at Starlark step boundaries, so a single native operation (a giant
+	// string concat/repeat) can't be interrupted mid-flight — bounding the input keeps
+	// those native ops proportionate. A model-written filter should never need to see
+	// more than ~1 MiB; above it we fail open to the deterministic path.
+	maxSandboxInput = 1 << 20 // 1 MiB
+	// maxSandboxHeapGrowth bounds how much a running program may grow the process heap
+	// before the watchdog cancels it — the backstop for a program that balloons memory
+	// (e.g. OUTPUT = OUTPUT + OUTPUT in a loop), which the step limit does not catch.
+	maxSandboxHeapGrowth = 256 << 20 // 256 MiB
+	// sandboxWatchInterval is how often the watchdog samples heap use. Coarse on purpose:
+	// runtime.ReadMemStats stops the world, so we keep the sampling rate low.
+	sandboxWatchInterval = 200 * time.Millisecond
 )
 
 // reBuiltins are the regex helpers injected into the sandbox so a model-written
@@ -62,41 +77,79 @@ func reBuiltins() starlark.StringDict {
 }
 
 // runStarlark asks the model for a Starlark program whose contract is: read the
-// global string INPUT (the full tool output), assign a string global OUTPUT (the
-// filtered value). It runs sandboxed over the FULL body — no imports, no I/O, step +
-// time limits — and returns OUTPUT, or "" on any failure (fail-open). Containment is
-// verified by the caller (RunExtraction).
-func runStarlark(ctx context.Context, body, goal string, keepIDs []string, model Model, rewrite bool) (out string) {
+// global string INPUT (the full tool output), assign the string OUTPUT (the trimmed
+// value) and optionally the string SUMMARY (a one-line digest for the marker). It
+// runs sandboxed over the FULL body — no imports, no I/O, step + time limits — and
+// returns (OUTPUT, SUMMARY), or ("","") on any failure (fail-open). Containment/
+// sanity is verified by the caller (RunExtraction).
+func runStarlark(ctx context.Context, body, goal string, keepIDs []string, model Model, rewrite bool) (out, summary string) {
 	if model == nil {
-		return ""
+		return "", ""
 	}
 	src, err := model.Complete(ctx, buildCodePrompt(body, goal, keepIDs, rewrite))
 	if err != nil {
-		return ""
+		return "", ""
 	}
-	return execStarlark(ctx, body, stripFences(src))
+	return execStarlarkSummary(ctx, body, stripFences(src))
 }
 
-// execStarlark runs a Starlark filter source over the body (INPUT global, json
-// module, no imports, step + time limits) and returns OUTPUT, or "" on any
-// failure (fail-open). Split out from runStarlark so tests/examples can run a
-// captured source — the exact program the model wrote — deterministically.
-func execStarlark(ctx context.Context, body, src string) (out string) {
+// execStarlark runs a Starlark filter source over the body and returns OUTPUT (or ""
+// on failure). Thin wrapper over execStarlarkSummary for callers/tests that don't
+// care about the SUMMARY.
+func execStarlark(ctx context.Context, body, src string) string {
+	out, _ := execStarlarkSummary(ctx, body, src)
+	return out
+}
+
+// execStarlarkSummary runs a model-written filter over the body and returns
+// (OUTPUT, SUMMARY). The program is ALWAYS wrapped in a function body so top-level
+// assignments are reassignable locals — this makes the natural multi-step style
+// (OUTPUT = filter(...); OUTPUT = re_sub(...)) work directly, so there is no
+// "cannot reassign global OUTPUT" error and no retry. OUTPUT defaults to INPUT and
+// SUMMARY to "" (so a program that sets neither is a clean no-op miss). Sandboxed:
+// json module + regex helpers, no imports, no I/O, step + time limits. Fail-open to
+// ("","") on any error/panic.
+func execStarlarkSummary(ctx context.Context, body, src string) (out, summary string) {
 	defer func() {
 		if recover() != nil {
-			out = ""
+			out, summary = "", ""
 		}
 	}()
+	if len(body) > maxSandboxInput {
+		return "", "" // oversized: fail open, let the deterministic path handle it
+	}
 	ctx, cancel := context.WithTimeout(ctx, starlarkTimeout)
 	defer cancel()
 	thread := &starlark.Thread{Name: "extract"} // Load==nil => load() disabled
 	thread.SetMaxExecutionSteps(starlarkMaxSteps)
+	var startHeap uint64
+	{
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		startHeap = m.HeapAlloc
+	}
 	done := make(chan struct{})
 	go func() {
-		select {
-		case <-ctx.Done():
-			thread.Cancel(ctx.Err().Error())
-		case <-done:
+		// Cancel on timeout OR on runaway heap growth. thread.Cancel takes effect at the
+		// next Starlark step boundary — enough to stop a doubling loop between iterations
+		// (each iteration is a step), bounding peak memory instead of letting it OOM.
+		t := time.NewTicker(sandboxWatchInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				thread.Cancel(ctx.Err().Error())
+				return
+			case <-done:
+				return
+			case <-t.C:
+				var m runtime.MemStats
+				runtime.ReadMemStats(&m)
+				if m.HeapAlloc > startHeap+maxSandboxHeapGrowth {
+					thread.Cancel("memory limit exceeded")
+					return
+				}
+			}
 		}
 	}()
 	defer close(done)
@@ -108,13 +161,33 @@ func execStarlark(ctx context.Context, body, src string) (out string) {
 	for k, v := range reBuiltins() {
 		predeclared[k] = v
 	}
-	globals, err := starlark.ExecFile(thread, "extract.star", src, predeclared)
+
+	// Wrap: OUTPUT/SUMMARY start as locals with safe defaults, the model's program
+	// runs as the function body (any top-level assignment is a local reassignment),
+	// and we return both. Indent the source one tab.
+	var b strings.Builder
+	b.WriteString("def _cg_main():\n\tOUTPUT = INPUT\n\tSUMMARY = \"\"\n")
+	for _, ln := range strings.Split(src, "\n") {
+		b.WriteString("\t")
+		b.WriteString(ln)
+		b.WriteString("\n")
+	}
+	b.WriteString("\treturn (OUTPUT, SUMMARY)\n_CG_RES = _cg_main()\n")
+
+	globals, err := starlark.ExecFile(thread, "extract.star", b.String(), predeclared)
 	if err != nil {
-		return ""
+		return "", ""
 	}
-	res, ok := globals["OUTPUT"].(starlark.String)
+	tup, ok := globals["_CG_RES"].(starlark.Tuple)
+	if !ok || len(tup) != 2 {
+		return "", ""
+	}
+	res, ok := tup[0].(starlark.String)
 	if !ok {
-		return ""
+		return "", ""
 	}
-	return string(res)
+	if sum, ok := tup[1].(starlark.String); ok {
+		summary = strings.TrimSpace(string(sum))
+	}
+	return string(res), summary
 }

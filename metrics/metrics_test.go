@@ -32,6 +32,47 @@ func TestAggregatorHonestMetrics(t *testing.T) {
 	}
 }
 
+// TestUniqueSavingsDedupsByKey: the same compaction (same CacheKey) re-sent every
+// turn inflates cumulative saved_tokens, but saved_tokens_unique counts it once, and
+// overcount_ratio surfaces the inflation.
+func TestUniqueSavingsDedupsByKey(t *testing.T) {
+	a := NewAggregator()
+	// Turn 1: failed_run collapses one run (saved 300), stashed under key "k1".
+	// Turns 2-4: the agent re-sends it verbatim, the proxy re-collapses to the SAME
+	// bytes/key each turn — cumulative grows, unique does not.
+	for turn := 0; turn < 4; turn++ {
+		a.Component(components.Report{Component: "failed_run", TokensBefore: 400, TokensAfter: 100, CacheKeys: []string{"k1"}})
+	}
+	s := a.Snapshot()
+	cs := s.Components["failed_run"]
+	if cs.Saved != 1200 {
+		t.Fatalf("cumulative saved=%d want 1200 (300*4)", cs.Saved)
+	}
+	if cs.SavedUnique != 300 {
+		t.Fatalf("unique saved=%d want 300 (counted once)", cs.SavedUnique)
+	}
+	if cs.OvercountRatio != 4 {
+		t.Fatalf("overcount_ratio=%v want 4", cs.OvercountRatio)
+	}
+}
+
+// TestLatencyAverages: added + upstream latencies average correctly, split by bypass.
+func TestLatencyAverages(t *testing.T) {
+	a := NewAggregator()
+	a.RecordAddedLatency(10)
+	a.RecordAddedLatency(20)
+	a.RecordUpstreamLatency(100, false)
+	a.RecordUpstreamLatency(300, false)
+	a.RecordUpstreamLatency(80, true)
+	s := a.Snapshot()
+	if s.AddedLatencyMsAvg != 15 {
+		t.Fatalf("added avg=%v want 15", s.AddedLatencyMsAvg)
+	}
+	if s.UpstreamMsAvg != 200 || s.UpstreamMsAvgBypassed != 80 {
+		t.Fatalf("upstream avg=%v byp=%v want 200/80", s.UpstreamMsAvg, s.UpstreamMsAvgBypassed)
+	}
+}
+
 // TestMutatedZeroSavingsNotPassthrough locks the fix for cacheinject-style
 // components: they change the request (add cache_control) but save no content
 // tokens, so they must NOT be flagged as dead weight in top_passthrough.

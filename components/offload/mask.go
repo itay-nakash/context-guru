@@ -15,15 +15,19 @@ func init() { components.Register("mask", newMask) }
 // older ones are replaced with a short marker + stash. Age-based, complementary
 // to the content-based offloaders.
 type Mask struct {
-	keepRecent int
-	minTokens  int
-	mode       markerMode
+	keepRecent    int
+	minTokens     int
+	keepHeadChars int
+	mode          markerMode
 }
 
 type maskConfig struct {
-	KeepRecent int    `yaml:"keep_recent"`
-	MinTokens  int    `yaml:"min_tokens"`
-	MarkerMode string `yaml:"marker_mode"` // full (default) | summary | off
+	KeepRecent int `yaml:"keep_recent"`
+	MinTokens  int `yaml:"min_tokens"`
+	// KeepHeadChars leaves a one-line peek of the masked output inside the marker
+	// so the model knows what was hidden (cuts blind expand round-trips); 0 disables.
+	KeepHeadChars *int   `yaml:"keep_head_chars"`
+	MarkerMode    string `yaml:"marker_mode"` // full (default) | summary | off
 }
 
 func newMask(raw []byte) (components.Component, error) {
@@ -33,7 +37,11 @@ func newMask(raw []byte) (components.Component, error) {
 			return nil, err
 		}
 	}
-	return &Mask{keepRecent: cfg.KeepRecent, minTokens: cfg.MinTokens, mode: parseMarkerMode(cfg.MarkerMode)}, nil
+	keepHead := 96 // default: one-line cue in the marker
+	if cfg.KeepHeadChars != nil {
+		keepHead = *cfg.KeepHeadChars
+	}
+	return &Mask{keepRecent: cfg.KeepRecent, minTokens: cfg.MinTokens, keepHeadChars: keepHead, mode: parseMarkerMode(cfg.MarkerMode)}, nil
 }
 
 func (Mask) Name() string                 { return "mask" }
@@ -54,14 +62,43 @@ func (m *Mask) Offload(req *bschemas.BifrostChatRequest, rep *components.Report,
 			continue // non-text blocks would be dropped by a text rewrite
 		}
 		content := schema.MessageText(*msg)
-		if content == "" || schema.TextTokens(content) < m.minTokens {
+		if content == "" {
 			continue
 		}
-		if expand.HasPlaceholder(content) {
+		// Reapply a previously-frozen mask on EVERY turn (cache-stable), regardless of
+		// the tail boundary: the agent re-sends the original, so we must re-mask it to the
+		// same bytes or it reverts full→masked→full and churns the provider KV cache. This
+		// also skips kept-verbatim content (see reapplyFrozen).
+		if fk, saved, ok := reapplyFrozen(c, m.Name(), msg); ok {
+			rep.TokensBefore += saved // (report best-effort; pipeline recomputes exact)
+			changed++
+			keys = append(keys, fk...)
 			continue
 		}
-		tok, key := mark(c, rep, m.mode, content, " [full output: call "+expand.ToolName+"]")
-		schema.SetMessageText(msg, "[older tool output masked] "+tok)
+		if skipReduce(c, content) {
+			continue // already offloaded, or expanded by the agent — don't re-hide
+		}
+		if schema.TextTokens(content) < m.minTokens {
+			continue
+		}
+		// A NEW mask only in the uncached tail: masking content the provider already
+		// cached flips it full→masked and forces a cache-write of the suffix. Frozen masks
+		// are replayed everywhere above; new ones stay in the tail.
+		if !c.TailOnly(i) {
+			continue
+		}
+		prefix := "[older tool output masked] "
+		if peek := headPeek(content, m.keepHeadChars); peek != "" {
+			prefix = "[older tool output masked; starts: " + peek + "] "
+		}
+		newText, key, eff, ok := tryMark(c, m.mode, content, " [full output: call "+expand.ToolName+"]",
+			func(tok string) string { return prefix + tok })
+		if !ok {
+			continue // marker-inclusive rewrite wouldn't shrink this message; leave it verbatim
+		}
+		commitMark(c, rep, eff, key, content)
+		schema.SetMessageText(msg, newText)
+		freeze(c, m.Name(), content, newText) // freeze so later turns replay it (no churn)
 		changed++
 		if key != "" {
 			keys = append(keys, key)

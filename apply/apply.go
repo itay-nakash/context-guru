@@ -26,6 +26,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/components"
@@ -95,6 +96,34 @@ func Body(ctx context.Context, pipe *components.Pipeline, st store.Store, provid
 // open. explicitSession is the host-supplied session id ("" -> content hash).
 // models carries the LLM clients that NeedsModel components may call.
 func BodyWithModel(ctx context.Context, pipe *components.Pipeline, st store.Store, provider bschemas.ModelProvider, body []byte, explicitSession string, bypass bool, models components.ModelSpec) ([]byte, bool) {
+	return BodyWithModelWindow(ctx, pipe, st, provider, body, explicitSession, bypass, models, 0)
+}
+
+// BodyWithModelWindow is BodyWithModel plus the model's resolved context window
+// (max input tokens, 0 = unknown) so fraction-based Trigger thresholds can scale
+// with the model. Hosts that resolve the window (the proxy, via internal/modelinfo)
+// call this; window=0 reproduces the pre-D3 behavior exactly.
+func BodyWithModelWindow(ctx context.Context, pipe *components.Pipeline, st store.Store, provider bschemas.ModelProvider, body []byte, explicitSession string, bypass bool, models components.ModelSpec, window int) ([]byte, bool) {
+	return BodyFull(ctx, pipe, st, provider, body, explicitSession, bypass, models, window, "auto")
+}
+
+// BodyFull is BodyWithModelWindow plus the cache mode ("auto"|"on"|"off",
+// default "auto") controlling cache-aware compaction. "auto" turns on
+// cache-awareness when the backend is a prompt-caching provider or the request
+// already carries cache_control breakpoints; "on" forces it; "off" restores the
+// legacy compact-everything behavior (correct for confirmed non-caching backends).
+func BodyFull(ctx context.Context, pipe *components.Pipeline, st store.Store, provider bschemas.ModelProvider, body []byte, explicitSession string, bypass bool, models components.ModelSpec, window int, cacheMode string) (result []byte, changedBody bool) {
+	// Top-level fail-open backstop: the per-component recover in pipeline.runOne only
+	// covers component code. A panic anywhere else on the rewrite path (normalize, the
+	// sjson splice, rebuildCountChanged, a marshal) must NOT 500 the client — forward
+	// the original body unchanged. This makes CLAUDE.md's fail-open invariant hold for
+	// the whole entry point, not just inside components.
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("context-guru: recovered from panic in BodyFull; forwarding original request", "panic", r)
+			result, changedBody = body, false
+		}
+	}()
 	msgsRaw := gjson.GetBytes(body, "messages")
 	if !msgsRaw.Exists() || !msgsRaw.IsArray() {
 		return body, false
@@ -110,12 +139,26 @@ func BodyWithModel(ctx context.Context, pipe *components.Pipeline, st store.Stor
 	}
 	chat := &bschemas.BifrostChatRequest{Provider: provider, Input: norm}
 	sys, firstUser := systemAndFirstUser(norm)
+	sessionID := session.Resolve(explicitSession, sys, firstUser)
+	cacheAware := resolveCacheAware(cacheMode, provider, body)
+	maxCachedIdx := -1
+	if cacheAware && !bypass {
+		// Messages present on the previous turn of this session are already committed
+		// to the provider cache; only the new tail is being cache-written this turn.
+		// Restrict supersession/age offloaders to that tail so they never mutate the
+		// cached prefix. Growth-based (dialect-agnostic; needs no cache_control mapping).
+		maxCachedIdx = prevLen(st, sessionID) - 1
+		defer putLen(st, sessionID, len(norm))
+	}
 	c := &components.Ctx{
-		Ctx:     ctx,
-		Session: session.Resolve(explicitSession, sys, firstUser),
-		Store:   st,
-		Model:   models,
-		Bypass:  bypass,
+		Ctx:          ctx,
+		Session:      sessionID,
+		Store:        st,
+		Model:        models,
+		Bypass:       bypass,
+		CtxWindow:    window,
+		CacheAware:   cacheAware,
+		MaxCachedIdx: maxCachedIdx,
 	}
 
 	// Canonical form of each normalized message BEFORE the pipeline, so a
@@ -181,6 +224,92 @@ func BodyWithModel(ctx context.Context, pipe *components.Pipeline, st store.Stor
 	return out, changed
 }
 
+// resolveCacheAware decides whether cache-aware compaction is active for this
+// request. "off" disables it; "on" forces it; "auto" (default) enables it when the
+// backend is a prompt-caching provider OR the request already carries cache_control
+// breakpoints (so we assume caching even when the provider isn't in the static set —
+// covers "backend caches but we can't see it from the provider name").
+func resolveCacheAware(mode string, provider bschemas.ModelProvider, body []byte) bool {
+	switch mode {
+	case "off":
+		return false
+	case "on":
+		return true
+	default: // "auto" / ""
+		switch provider {
+		case bschemas.Anthropic, bschemas.Bedrock, bschemas.BedrockMantle, bschemas.Vertex:
+			return true
+		}
+		return hasCacheBreakpoint(body)
+	}
+}
+
+// hasCacheBreakpoint reports whether the request carries a REAL prompt-cache
+// breakpoint — a structural cache_control / cachePoint field on a message, content
+// block, system block, or tool. This is deliberately structural (gjson path queries),
+// not a substring scan of the whole body: a tool output whose text merely contains the
+// string "cache_control" must NOT flip the request into cache-aware mode (that would
+// wrongly restrict offloaders to the tail on a non-caching backend). A key inside a
+// JSON string value never matches these paths.
+func hasCacheBreakpoint(body []byte) bool {
+	paths := []string{
+		"messages.#.content.#.cache_control",
+		"messages.#.cache_control",
+		"system.#.cache_control",
+		"tools.#.cache_control",
+		"messages.#.content.#.cachePoint",
+	}
+	for _, p := range paths {
+		r := gjson.GetBytes(body, p)
+		if !r.Exists() {
+			continue
+		}
+		found := false
+		r.ForEach(func(_, v gjson.Result) bool {
+			// nested arrays (content-of-messages) surface as arrays here; recurse one level
+			if v.IsArray() {
+				v.ForEach(func(_, vv gjson.Result) bool {
+					if vv.IsObject() {
+						found = true
+						return false
+					}
+					return true
+				})
+			} else if v.IsObject() {
+				found = true
+			}
+			return !found
+		})
+		if found {
+			return true
+		}
+	}
+	return false
+}
+
+// prevLen / putLen track, per session, how many normalized messages the previous
+// turn carried — the boundary between the already-cached prefix and this turn's
+// uncached tail. Stored in the same Store as offload state (TTL+LRU); a miss (first
+// turn / expired) yields 0 so the whole request is treated as tail.
+func prevLen(st store.Store, session string) int {
+	b, ok := st.Get("cg:len:" + session)
+	if !ok || len(b) == 0 {
+		return 0
+	}
+	n := 0
+	for _, ch := range b {
+		if ch < '0' || ch > '9' {
+			return 0
+		}
+		n = n*10 + int(ch-'0')
+	}
+	return n
+}
+
+func putLen(st store.Store, session string, n int) {
+	st.Put("cg:len:"+session, []byte(strconv.Itoa(n)))
+}
+
 // change is one rewritten message, captured for the CONTEXT_GURU_DUMP trace so a
 // human can see exactly what context-guru did to the wire.
 type change struct {
@@ -202,6 +331,10 @@ func clip(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
+	// truncate on a rune boundary so the trace stays valid UTF-8
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
 	return s[:n] + "…[+" + strconv.Itoa(len(s)-n) + " bytes]"
 }
 
@@ -209,7 +342,7 @@ var dumpPath = os.Getenv("CONTEXT_GURU_DUMP")
 
 // dumpChanges appends one JSON line describing this request's rewrites.
 func dumpChanges(session string, changes []change) {
-	f, err := os.OpenFile(dumpPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(dumpPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return
 	}

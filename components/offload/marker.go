@@ -3,6 +3,7 @@ package offload
 import (
 	"github.com/rossoctl/context-guru/components"
 	"github.com/rossoctl/context-guru/expand"
+	"github.com/rossoctl/context-guru/schema"
 )
 
 // markerMode selects what an Offload component leaves behind in place of the
@@ -61,6 +62,13 @@ func effectiveMode(c *components.Ctx, mode markerMode) markerMode {
 //
 // hint is the component-specific recovery hint (e.g. " [full output: call
 // context_guru_expand]"); it is only emitted in full mode, where expand works.
+//
+// Deprecated: mark stashes eagerly, before the caller knows whether the marker-
+// bearing rewrite is actually smaller than the original. New offloaders should use
+// tryMark + commitMark, which apply a marker-INCLUSIVE never-worse check per message
+// and only stash on a committed win (avoids growing a single message by the marker's
+// ~10-15 tokens, and avoids orphan store entries for rewrites that are then rejected).
+// Retained only for tests; all shipped offloaders use tryMark.
 func mark(c *components.Ctx, rep *components.Report, mode markerMode, original, hint string) (token, key string) {
 	if effectiveMode(c, mode) == markerFull {
 		key = hashKey(original)
@@ -72,4 +80,48 @@ func mark(c *components.Ctx, rep *components.Report, mode markerMode, original, 
 		return expand.SummaryMarker, ""
 	}
 	return "", "" // off
+}
+
+// markToken computes the marker token and store key for a mode WITHOUT stashing.
+// It returns the effective mode (full degrades to off when the store can't persist).
+// This is the "plan" half of the split that lets a component build its candidate
+// rewrite and size-check it (marker included) before committing any side effect.
+func markToken(c *components.Ctx, mode markerMode, original, hint string) (token, key string, eff markerMode) {
+	eff = effectiveMode(c, mode)
+	switch eff {
+	case markerFull:
+		key = hashKey(original)
+		return expand.Marker(key) + hint, key, eff
+	case markerSummary:
+		return expand.SummaryMarker, "", eff
+	default: // off
+		return "", "", eff
+	}
+}
+
+// tryMark builds the candidate replacement text an Offload wants to write —
+// assemble(token), where the component's layout closure places the marker token —
+// and reports whether that text is strictly smaller than the original, MARKER
+// INCLUDED. It performs no side effects (no stash), so a caller that gets ok=false
+// leaves the message verbatim. This is the shared marker-inclusive never-worse guard
+// (the aggregate pipeline guard is per-request, not per-message, so without this a
+// single small output could grow by the marker's tokens while the request still net-shrinks).
+func tryMark(c *components.Ctx, mode markerMode, original, hint string, assemble func(token string) string) (newText, key string, eff markerMode, ok bool) {
+	token, key, eff := markToken(c, mode, original, hint)
+	newText = assemble(token)
+	ok = schema.TextTokens(newText) < schema.TextTokens(original)
+	return newText, key, eff, ok
+}
+
+// commitMark performs the side effects once a caller accepts a tryMark candidate:
+// stash the original under key (full mode) or record the deliberate lossy drop
+// (summary/off set rep.Irreversible so the pipeline's "dropped without stashing"
+// guard doesn't revert them). Call only when tryMark returned ok.
+func commitMark(c *components.Ctx, rep *components.Report, eff markerMode, key, original string) {
+	if eff == markerFull {
+		c.Store.Put(key, []byte(original))
+		recordOwner(c, key) // scope GET /expand retrieval to this session
+		return
+	}
+	rep.Irreversible = true
 }

@@ -41,11 +41,19 @@ func (p *Pipeline) Run(req *schemas.BifrostChatRequest, c *Ctx) *RunReport {
 		rep := p.runOne(comp, req, c)
 		rr.Components = append(rr.Components, rep)
 		rr.DurationMs += rep.DurationMs
-		p.emitter.Component(rep)
+		safeEmit(func() { p.emitter.Component(rep) })
 	}
 	rr.TokensAfter = schema.MessagesTokens(req)
-	p.emitter.Run(*rr)
+	safeEmit(func() { p.emitter.Run(*rr) })
 	return rr
+}
+
+// safeEmit runs an emitter callback under recover: metrics/observability must never
+// break a request. A panicking emitter is swallowed (fail-open) rather than propagating
+// out of Run, where — unlike component code — no other recover would catch it.
+func safeEmit(fn func()) {
+	defer func() { _ = recover() }()
+	fn()
 }
 
 // runOne executes a single component with snapshot/restore isolation and the

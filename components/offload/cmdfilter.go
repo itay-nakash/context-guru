@@ -73,6 +73,10 @@ func (f *Cmdfilter) Offload(req *schemas.BifrostChatRequest, rep *components.Rep
 		if content == "" {
 			continue
 		}
+		if skipReduce(c, content) {
+			continue // marker-bearing (a filter rule could drop the marker line and orphan
+			// the stash) or expanded by the agent — leave it verbatim
+		}
 		filt := f.reg.Match(selectorKey(content))
 		if filt == nil {
 			continue
@@ -105,6 +109,7 @@ func (f *Cmdfilter) Offload(req *schemas.BifrostChatRequest, rep *components.Rep
 		}
 		if mode == markerFull {
 			c.Store.Put(key, []byte(content))
+			recordOwner(c, key) // scope GET /expand retrieval to this session
 			keys = append(keys, key)
 		} else {
 			rep.Irreversible = true

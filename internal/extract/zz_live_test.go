@@ -18,8 +18,8 @@ func TestLiveExtractCodeExample(t *testing.T) {
 		t.Skip("set CG_LIVE=1 CG_BASE=... CG_TOKEN=... to run the live example")
 	}
 	model := cheapmodel.Anthropic{
-		BaseURL: os.Getenv("CG_BASE"), APIKey: os.Getenv("CG_TOKEN"),
-		Model: "claude-sonnet-4-6", MaxTokens: 4096,
+		BaseURL: os.Getenv("CG_BASE"), APIKey: os.Getenv("CG_TOKEN"), AuthScheme: "bearer",
+		Model: liveModel(), MaxTokens: 4096,
 	}
 	// A realistic pytest run: 1 failure + traceback buried in many PASSED lines.
 	var b strings.Builder
@@ -106,6 +106,52 @@ func TestLiveExtractCodeJSON(t *testing.T) {
 	t.Logf("\n----- MODEL-WRITTEN STARLARK FILTER -----\n%s\n", src)
 	t.Logf("\n----- RESULT -----\nbefore=%d tokens (%d records)  after=%d tokens  accepted=%v\n\n--- AFTER ---\n%s\n",
 		tokens.Count(body), len(recs), tokens.Count(out), ok, out)
+	if !ok {
+		t.Fatalf("expected accepted reduction; got %d->%d", tokens.Count(body), tokens.Count(out))
+	}
+}
+
+func liveModel() string {
+	if m := os.Getenv("CG_MODEL"); m != "" {
+		return m
+	}
+	return "aws/claude-sonnet-5"
+}
+
+// TestLiveExtractRewriteSummary exercises the DEFAULT (rewrite:true) contract plus
+// the SUMMARY global on a verbose install log — the new powerful path. Prints the
+// program, the reduction, and the captured SUMMARY.
+func TestLiveExtractRewriteSummary(t *testing.T) {
+	if os.Getenv("CG_LIVE") == "" {
+		t.Skip("set CG_LIVE=1 CG_BASE=... CG_TOKEN=... to run")
+	}
+	model := cheapmodel.Anthropic{
+		BaseURL: os.Getenv("CG_BASE"), APIKey: os.Getenv("CG_TOKEN"), AuthScheme: "bearer",
+		Model: liveModel(), MaxTokens: 4096,
+	}
+	var b strings.Builder
+	b.WriteString("Collecting Sphinx==4.0.0\n")
+	for i := 0; i < 40; i++ {
+		b.WriteString("Requirement already satisfied: dep-" + itoa(i) + "<=1.0 in /opt/miniconda3/lib/python3.11/site-packages (from Sphinx)\n")
+	}
+	b.WriteString("Installing collected packages: Sphinx\n  Attempting uninstall: Sphinx\n    Found existing installation: Sphinx 4.0.0\nSuccessfully installed Sphinx-4.0.0\n")
+	body := b.String()
+	goal := "Install Sphinx and run the docs build."
+	keep := HarvestIdentifiers(goal, 40)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	src, err := model.Complete(ctx, buildCodePrompt(body, goal, keep, true)) // rewrite=true (default)
+	if err != nil {
+		t.Fatal(err)
+	}
+	src = stripFences(src)
+	out, summary := execStarlarkSummary(ctx, body, src)
+	cfg := DefaultCfg()
+	cfg.Rewrite = true
+	ok := out != "" && out != body && validateExtraction(out, body, keep, cfg)
+	t.Logf("\n----- PROGRAM -----\n%s\n----- RESULT -----\nbefore=%d tok after=%d tok accepted=%v\nSUMMARY=%q\n--- AFTER ---\n%s\n",
+		src, tokens.Count(body), tokens.Count(out), ok, summary, out)
 	if !ok {
 		t.Fatalf("expected accepted reduction; got %d->%d", tokens.Count(body), tokens.Count(out))
 	}

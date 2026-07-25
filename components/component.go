@@ -105,6 +105,34 @@ type Ctx struct {
 	Model   ModelSpec
 	// Bypass short-circuits the whole pipeline (x-context-guru-bypass header).
 	Bypass bool
+	// CtxWindow is the model's max input tokens for THIS request, resolved by the
+	// host (dynamically, via internal/modelinfo). 0 = unknown, in which case
+	// fraction-based Trigger thresholds are ignored and only absolutes apply. Stored
+	// as a resolved int so Trigger stays a pure, network-free, unit-testable function.
+	CtxWindow int
+	// CacheAware is true when this request goes to a prompt-caching backend and the
+	// pipeline should avoid mutating already-cached content. When true, supersession/
+	// age-based offloaders (failed_run, mask, collapse) must restrict their
+	// mutations to the uncached tail (message index > MaxCachedIdx) so they don't
+	// invalidate the provider's KV cache at a full→collapsed transition. Deterministic
+	// tail/in-place offloaders (dedup, cmdfilter, extract) are already byte-stable on
+	// the unchanged prefix and ignore this. False = legacy compact-everything.
+	CacheAware bool
+	// MaxCachedIdx is the highest req.Input index considered already committed to the
+	// provider cache (the messages present on the previous turn of this session).
+	// -1 = unknown/first turn/cache off ⇒ no tail restriction. Only meaningful when
+	// CacheAware is true.
+	MaxCachedIdx int
+}
+
+// TailOnly reports whether a supersession/age-based offloader may mutate the message
+// at index i without risking the provider's cached prefix. When cache-awareness is
+// off or the boundary is unknown, every index is fair game (legacy behavior).
+func (c *Ctx) TailOnly(i int) bool {
+	if c == nil || !c.CacheAware || c.MaxCachedIdx < 0 {
+		return true
+	}
+	return i > c.MaxCachedIdx
 }
 
 // Report is the per-component result, modelled after lean-ctx's ToolOutput

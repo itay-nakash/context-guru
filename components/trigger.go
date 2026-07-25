@@ -1,6 +1,8 @@
 package components
 
 import (
+	"math"
+
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/schema"
 )
@@ -21,17 +23,66 @@ type Trigger struct {
 	MinRequestTokens int `yaml:"min_request_tokens"` // whole request must be at least this many tokens
 	MinMessages      int `yaml:"min_messages"`       // …and carry at least this many messages (≈ steps)
 	MinOutputTokens  int `yaml:"min_output_tokens"`  // per-item floor: only offload an output at least this big
+
+	// Context-window fractions (0 = unset) make triggers general across models:
+	// each is resolved against Ctx.CtxWindow (the model's max input tokens, obtained
+	// dynamically). When the window is unknown (0) fractions are ignored and only the
+	// absolute thresholds apply — fully backward compatible.
+	MinRequestFrac float64 `yaml:"min_request_frac"` // fire when request >= frac*window (e.g. 0.6)
+	MinOutputFrac  float64 `yaml:"min_output_frac"`  // per-item: only offload an output >= frac*window
+	HugeOutputFrac float64 `yaml:"huge_output_frac"` // HARD per-item trigger: a single output >= frac*window
 }
 
-// Fires reports whether the request-level thresholds are met. Both are ANDed;
-// a zero threshold imposes no constraint. It does not consider MinOutputTokens
-// (that is a per-item floor the component applies itself).
-func (t Trigger) Fires(req *schemas.BifrostChatRequest) bool {
+// frac converts a fraction of the window to an absolute token count (0 if either is unset).
+func frac(f float64, window int) int {
+	if f <= 0 || window <= 0 {
+		return 0
+	}
+	return int(math.Ceil(f * float64(window)))
+}
+
+// Fires reports whether the request-level thresholds are met, given the resolved
+// model context window (0 = unknown). The effective request-token threshold is the
+// MAX of the absolute MinRequestTokens and the fraction MinRequestFrac*window; the
+// message-count threshold is unchanged. Thresholds are ANDed; a zero threshold
+// imposes no constraint. Does not consider the per-item floors (OutputFloor/IsHuge).
+func (t Trigger) Fires(req *schemas.BifrostChatRequest, window int) bool {
 	if t.MinMessages > 0 && len(req.Input) < t.MinMessages {
 		return false
 	}
-	if t.MinRequestTokens > 0 && schema.MessagesTokens(req) < t.MinRequestTokens {
+	reqFloor := t.MinRequestTokens
+	if f := frac(t.MinRequestFrac, window); f > reqFloor {
+		reqFloor = f
+	}
+	if reqFloor > 0 && schema.MessagesTokens(req) < reqFloor {
 		return false
 	}
 	return true
+}
+
+// OutputFloor is the per-item minimum size an Offload should act on: the absolute
+// MinOutputTokens if set, else MinOutputFrac*window, else legacyDefault (the
+// component's pre-trigger min_tokens default). Lets a component keep firing sensibly
+// whether configured absolutely, as a fraction, or not at all.
+func (t Trigger) OutputFloor(window, legacyDefault int) int {
+	// The absolute floor is the base; the window fraction only RAISES it (never replaces
+	// it). Returning the fraction outright was a footgun: on a large-window model
+	// (e.g. 1M) a small frac like 0.0075 resolved to 7500, silently overriding a 1500
+	// absolute and suppressing nearly all compaction. max() keeps both meaningful.
+	base := legacyDefault
+	if t.MinOutputTokens > 0 {
+		base = t.MinOutputTokens
+	}
+	if f := frac(t.MinOutputFrac, window); f > base {
+		return f
+	}
+	return base
+}
+
+// IsHuge reports whether a single tool output is large enough (>= HugeOutputFrac*window)
+// to be a "huge tool call" hard trigger — worth acting on regardless of the request-level
+// Fires gate. Returns false when the window is unknown or HugeOutputFrac is unset.
+func (t Trigger) IsHuge(outputTokens, window int) bool {
+	h := frac(t.HugeOutputFrac, window)
+	return h > 0 && outputTokens >= h
 }

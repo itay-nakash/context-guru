@@ -37,6 +37,30 @@ func TestMaskHidesOlderToolOutputs(t *testing.T) {
 	if orig, ok := expand.Resolve(st, keys[0]); !ok || !strings.Contains(orig, "output 0") {
 		t.Fatal("masked original must be recoverable")
 	}
+	// The marker must carry a one-line head-peek by default (so the model knows
+	// WHAT was masked without a blind expand round-trip). msg 0 began with "output 0".
+	m0 := schema.MessageText(req.Input[0])
+	if !strings.Contains(m0, "starts:") || !strings.Contains(m0, "output 0") {
+		t.Fatalf("mask marker must include a head-peek cue, got %q", m0)
+	}
+}
+
+func TestMaskHeadPeekDisabled(t *testing.T) {
+	big := strings.Repeat("secret older tool output line\n", 30)
+	msgs := make([]bschemas.ChatMessage, 5)
+	for i := range msgs {
+		msgs[i] = toolMsg(fmt.Sprintf("output %d\n%s", i, big))
+	}
+	req := &bschemas.BifrostChatRequest{Input: msgs}
+	// keep_head_chars: 0 restores the opaque marker (no content peek leaked).
+	run(t, "pipeline: [mask]\ncomponents:\n  mask: {keep_recent: 2, min_tokens: 10, keep_head_chars: 0}\n", req)
+	m0 := schema.MessageText(req.Input[0])
+	if strings.Contains(m0, "starts:") || strings.Contains(m0, "secret") {
+		t.Fatalf("keep_head_chars:0 must not leak a peek, got %q", m0)
+	}
+	if !strings.Contains(m0, "masked") {
+		t.Fatalf("msg 0 should still be masked, got %q", m0)
+	}
 }
 
 func TestSmartCrushSamplesArrayKeepsErrors(t *testing.T) {
@@ -67,37 +91,6 @@ func TestSmartCrushSamplesArrayKeepsErrors(t *testing.T) {
 	}
 }
 
-func TestPhiEvictTrimsToBudgetKeepsNewest(t *testing.T) {
-	filler := strings.Repeat("irrelevant verbose padding content here\n", 40)
-	req := &bschemas.BifrostChatRequest{Input: []bschemas.ChatMessage{
-		userMsg("please summarize the deployment rollout status"),
-		toolMsg(filler),
-		toolMsg(filler + "unrelated"),
-		toolMsg("the deployment rollout status is green and healthy\n" + filler),
-	}}
-	before := schema.MessagesTokens(req)
-	_, st := run(t, "pipeline: [phi_evict]\ncomponents:\n  phi_evict: {budget_tokens: 400, weights: aggressive}\n", req)
-	after := schema.MessagesTokens(req)
-	if after >= before {
-		t.Fatalf("phi_evict should trim toward budget: before=%d after=%d", before, after)
-	}
-	// newest tool output (index 3) must survive.
-	if strings.Contains(schema.MessageText(req.Input[3]), "evicted") {
-		t.Fatal("most recent tool output must not be evicted")
-	}
-	// at least one earlier one evicted + recoverable.
-	var found bool
-	for _, i := range []int{1, 2} {
-		if keys := expand.ParseMarkers(schema.MessageText(req.Input[i])); len(keys) == 1 {
-			if _, ok := expand.Resolve(st, keys[0]); ok {
-				found = true
-			}
-		}
-	}
-	if !found {
-		t.Fatal("expected an evicted, recoverable earlier output")
-	}
-}
 
 func TestExtractProjectsRelevantLines(t *testing.T) {
 	var b strings.Builder
