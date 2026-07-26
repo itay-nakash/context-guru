@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/img/context-guru.png" alt="context-guru" width="160" />
+<img src="docs/img/context-guru.png" alt="context-guru" width="320" />
 
 # context-guru
 
