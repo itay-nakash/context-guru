@@ -8,6 +8,7 @@
 
   <section class="cg-hero">
     <div class="cg-hero__inner">
+      <img src="{{ 'img/context-guru.png' | url }}" alt="context-guru logo" class="cg-hero__logo" />
       <span class="cg-hero__eyebrow">Context engineering for LLM agents</span>
       <h1>Shrink agent context.<br>Don&rsquo;t touch the agent.</h1>
       <p class="cg-hero__lede">
@@ -19,6 +20,11 @@
         <a class="cg-btn cg-btn--primary" href="{{ 'get-started/quickstart-proxy/' | url }}">Start building &rarr;</a>
         <a class="cg-btn cg-btn--ghost" href="https://github.com/rossoctl/context-guru">View on GitHub</a>
       </div>
+      <div class="cg-star-wrap">
+        <a class="cg-btn cg-btn--star" href="https://github.com/rossoctl/context-guru" target="_blank" rel="noopener">
+          &#9733; Star on GitHub
+        </a>
+      </div>
       <div class="cg-guarantees">
         <span class="cg-pill">Fail open, always</span>
         <span class="cg-pill">Never worse</span>
@@ -29,9 +35,9 @@
 
   <section class="cg-section">
     <h2>Run it in one line</h2>
-    <p class="cg-section__sub">Point any agent at the proxy &mdash; one port serves both dialects.</p>
+    <p class="cg-section__sub cg-section__sub--large">Point any agent at the proxy &mdash; one port serves both dialects.</p>
     <div class="highlight" style="max-width:42rem;margin:0 auto;border-radius:10px;">
-<pre style="border-radius:10px;"><code>context-guru-proxy --preset general            <span style="opacity:.6"># recommended; or --config cg.yaml</span>
+<pre style="border-radius:10px;font-size:1rem;line-height:1.65;"><code>context-guru-proxy --preset general            <span style="opacity:.6"># recommended; or --config cg.yaml</span>
 
 ANTHROPIC_BASE_URL=http://localhost:4000/anthropic
 OPENAI_BASE_URL=http://localhost:4000/openai/v1</code></pre>

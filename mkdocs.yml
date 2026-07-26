@@ -13,9 +13,10 @@ theme:
   name: material
   custom_dir: overrides
   language: en
+  logo: img/context-guru.png
+  favicon: img/context-guru.png
   icon:
     repo: fontawesome/brands/github
-    logo: material/scissors-cutting
   palette:
     - media: "(prefers-color-scheme)"
       toggle:

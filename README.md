@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/img/context-guru.png" alt="context-guru" width="160" />
+
 # context-guru
 
 **Provider-agnostic context engineering for LLM agents.**
