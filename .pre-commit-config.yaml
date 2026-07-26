@@ -10,6 +10,7 @@ repos:
         # !!python/name: tags in mkdocs.yml don't break the hook.
         args: [--unsafe]
       - id: check-added-large-files
+        args: ['--maxkb=2000']
 
   - repo: https://github.com/dnephin/pre-commit-golang
     rev: v0.5.1
