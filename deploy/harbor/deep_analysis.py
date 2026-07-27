@@ -20,7 +20,14 @@ SRC = {
     "baseline":     ("/tmp/cg-runs/final50/rows-off.json",            None),
     "context-guru": ("/tmp/cg-runs/final50-v6/rows-codesmart.json",   "/tmp/cg-runs/final50-v6/summary.json"),
     "headroom":     ("/tmp/hd-runs/swe50/rows-hd-cache.json",         None),
+    # rtk (Rust Token Killer): in-container bash-output compression via a Claude
+    # Code PreToolUse hook. A 4th arm; its rows carry an extra `rtk` sub-dict with
+    # rtk's own bash-output savings ledger. Optional — only included if present, so
+    # the published 3-way matched set is unchanged unless the rtk run is supplied.
+    "rtk":          ("/tmp/rtk-runs/swe50/rows-rtk.json",             "/tmp/rtk-runs/swe50/summary.json"),
 }
+# Drop arms whose rows file is missing so the script still runs pre-rtk-run.
+SRC = {k: v for k, v in SRC.items() if Path(v[0]).exists()}
 
 
 def billed(r):
@@ -107,6 +114,41 @@ def main():
                                 saved_tokens=hr.get("saved_tokens"))
     except Exception:
         pass
+
+    # rtk tool metrics: $0 own-LLM cost + deterministic; its native metric is
+    # bash-OUTPUT bytes saved (bytes/4 estimate), a DIFFERENT denominator than the
+    # proxies' whole-request content%, so it is reported separately. Reversibility
+    # is a tee-file on failure (no expand/retrieve bounce), so bounces=0.
+    if "rtk" in configs:
+        rrows = json.load(open(SRC["rtk"][0]))
+        bycmd = {}
+        for r in rrows:
+            for c in ((r.get("rtk") or {}).get("by_command") or []):
+                name = c.get("command") or c.get("name") or "?"
+                key = " ".join(str(name).split()[:2])  # e.g. "rtk pytest"
+                e = bycmd.setdefault(key, {"count": 0, "saved": 0})
+                e["count"] += c.get("count") or 0
+                e["saved"] += c.get("saved") or c.get("saved_tokens") or 0
+        try:
+            rs = next(x for x in json.load(open(SRC["rtk"][1]))["configs"])
+        except Exception:
+            rs = {}
+        # Prefer the per-command aggregate built from the rtk `gain --history` "By
+        # Command" tables (the --format json output has no per-command array); fall
+        # back to whatever the rows carried.
+        try:
+            bc = json.load(open("/tmp/rtk-runs/rtk_by_command.json"))
+            bycmd = {k: {"count": v["count"], "saved": v["saved"]} for k, v in bc.items()}
+        except Exception:
+            pass
+        tool["rtk"] = dict(
+            llm_cost=0.0, added_ms=0.0, bounces=0,
+            content_pct=rs.get("rtk_bash_savings_pct"),  # NB: bash-output denom, not whole-request
+            bash_tokens_before=rs.get("rtk_bash_tokens_before"),
+            bash_tokens_after=rs.get("rtk_bash_tokens_after"),
+            bash_tokens_saved=rs.get("rtk_bash_tokens_saved"),
+            commands=rs.get("rtk_commands"),
+            per_command=dict(sorted(bycmd.items(), key=lambda x: -x[1]["saved"])))
 
     out = dict(matched_tasks=len(common), configs=configs, aggregate=aggregate,
                tool=tool, per_task=per_task)

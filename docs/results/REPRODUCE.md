@@ -93,10 +93,55 @@ python3 /tmp/hd-runs/swebench_headroom.py --tasks /tmp/cg-runs/swe50.txt \
 Use a **different proxy port** (e.g. 4010) and jobs-root than context-guru so the two
 never collide; reuse the same authenticated Docker Hub + `--no-delete`.
 
+## 4b. Run rtk (Rust Token Killer)
+
+rtk is **not** a request-stream proxy — it is a Claude Code **`PreToolUse` hook** that
+rewrites Bash commands (`pytest …` → `rtk pytest …`, `cat f` → `rtk read f`,
+`git status` → `rtk git status`) **inside the task container**, compressing bash output
+at the shell before it enters the model context. So there is nothing to proxy for
+compaction: model routing is made **identical to the baseline** by running the same
+context-guru `off` passthrough proxy on `:4000`. The only difference from baseline is
+the in-container bash compression.
+
+**1) Fetch the rtk binary** (static-musl, runs on any SWE-bench image):
+
+```
+mkdir -p /tmp/rtk-runs && cd /tmp/rtk-runs
+curl -fsSL -o rtk.tgz https://github.com/rtk-ai/rtk/releases/download/v0.43.0/rtk-x86_64-unknown-linux-musl.tar.gz
+tar xzf rtk.tgz && chmod +x rtk && ./rtk --version   # rtk 0.43.0
+```
+
+**2) Add the `claude-code-rtk` agent to the Harbor checkout** (one new file + two lines).
+The agent subclasses the stock `claude-code` agent and, per trial: uploads the rtk binary
+to `/usr/local/bin/rtk`, installs the rtk `PreToolUse` hook into the exact
+`CLAUDE_CONFIG_DIR` Claude Code reads (`rtk init -g --auto-patch`, which honors that
+env var — `--auto-patch` is **required** headless, else the piped-stdin patch defaults to
+"no"), and dumps `rtk gain --all --format json` to `/logs/agent/rtk-gain.json`.
+
+- add `harbor/src/harbor/agents/installed/claude_code_rtk.py` (a copy lives at
+  [`deploy/harbor/claude_code_rtk_agent.py`](https://github.com/rossoctl/context-guru/blob/main/deploy/harbor/claude_code_rtk_agent.py));
+- register it: `CLAUDE_CODE_RTK = "claude-code-rtk"` in `harbor/src/harbor/models/agent/name.py`
+  and `AgentName.CLAUDE_CODE_RTK: "harbor.agents.installed.claude_code_rtk:ClaudeCodeRTK"`
+  in `harbor/src/harbor/agents/factory.py`.
+
+**3) Run the 50 tasks** (starts the `off` proxy, runs `-a claude-code-rtk`):
+
+```
+cd /home/vpcuser/projects/context-engineering/context-guru
+RTK_BIN_HOST=/tmp/rtk-runs/rtk python3 -u deploy/harbor/swebench_rtk.py \
+  --tasks /tmp/cg-runs/swe50.txt --jobs-root /tmp/rtk-runs/swe50 --n 2
+```
+
+End-to-end metrics (reward, steps, cache-read/write, billed cost, cache-hit, wall) come
+from the unchanged claude-code trajectory parser — measured **identically** to the other
+three arms. Each trial's `agent/rtk-gain.json` also carries rtk's own bash-output savings
+ledger (its native `bytes/4` estimate, a bash-output denominator — **not** the whole-request
+content% the proxies report).
+
 ## 5. Analyze & plot
 
 ```
-# Three-way matched analysis (baseline vs context-guru vs headroom) — every dimension,
+# Four-way matched analysis (baseline vs context-guru vs headroom vs rtk) — every dimension,
 # per-task + aggregate + per-component, cumulative & unique tokens → deep_analysis.json:
 python3 deploy/harbor/deep_analysis.py --out /tmp/cg-runs/deep
 # Figures (validated CVD-safe palette) → docs/img/benchmark/:
@@ -106,9 +151,12 @@ python3 deploy/harbor/gen_result_docs.py <rows.json> "<label>" docs/results/<con
 # Per-component unique-vs-cumulative token savings from the change-log dump:
 python3 deploy/harbor/dump_unique.py /tmp/cg-runs/dump-swebench-codesmart.jsonl
 ```
-(`deep_analysis.py` reads the three runs' `rows-*.json` at the paths in its `SRC` map —
+(`deep_analysis.py` reads each run's `rows-*.json` at the paths in its `SRC` map —
 `/tmp/cg-runs/final50/rows-off.json`, `/tmp/cg-runs/final50-v6/rows-codesmart.json`,
-`/tmp/hd-runs/swe50/rows-hd-cache.json`.)
+`/tmp/hd-runs/swe50/rows-hd-cache.json`, and — when present —
+`/tmp/rtk-runs/swe50/rows-rtk.json`. Arms whose rows file is missing are dropped, so the
+matched set is the intersection of tasks scored with **no exception** in every arm
+supplied.)
 
 Metrics collected per trial: reward, steps, prompt/cached/creation/read/completion
 tokens, cache-aware billed cost (fresh $2/M · cache-read $0.20/M · cache-write $2.50/M ·
@@ -121,4 +169,5 @@ bounces.
 - [`baseline.md`](baseline.md) — baseline (`off`) full results.
 - [`context-guru.md`](context-guru.md) — context-guru `codesmart` full results.
 - [`headroom.md`](headroom.md) — headroom full results.
-- [`comparison.md`](comparison.md) — the three-way comparison across all metrics.
+- [`rtk.md`](rtk.md) — rtk (Rust Token Killer) full results.
+- [`comparison.md`](comparison.md) — the four-way comparison across all metrics.

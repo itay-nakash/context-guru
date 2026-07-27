@@ -144,11 +144,12 @@ nav:
       - Before → After showcase: examples/before-after.md
   - Benchmarks:
       - Overview: RESULTS.md
-      - Full comparison (vs headroom): results/comparison.md
+      - Full comparison (vs headroom & rtk): results/comparison.md
       - Component internals & examples: results/components.md
       - "Results: baseline": results/baseline.md
       - "Results: context-guru": results/context-guru.md
       - "Results: headroom": results/headroom.md
+      - "Results: rtk": results/rtk.md
       - Reproduce the results: results/REPRODUCE.md
   - Reference:
       - Routes & headers: reference/routes.md

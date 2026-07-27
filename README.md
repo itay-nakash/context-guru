@@ -32,25 +32,29 @@ runs, projecting large reads down to what's relevant — and every reduction is 
 ## Benchmark: the cheapest & highest-reward arm on SWE-bench Verified
 
 Evaluated **live, end-to-end**, with the **claude-code** agent on **`aws/claude-sonnet-5`**, against a
-no-compaction baseline and against [**headroom**](https://pypi.org/project/headroom-ai/)
-(`headroom-ai` v0.32.1). All 50 tasks scored under all three arms.
+no-compaction baseline, against the [**headroom**](https://pypi.org/project/headroom-ai/) request-stream
+proxy, and against [**rtk**](https://github.com/rtk-ai/rtk) (Rust Token Killer, a shell-level Bash-output
+hook). All 50 tasks scored under all **four** arms.
 
-| dimension | baseline | **context-guru** | headroom |
-|---|--:|--:|--:|
-| tasks solved | 86% | **88%** | 80% |
-| **total billed cost** vs baseline | — | **−13.2%** | −5.3% |
-| cache-read tokens vs baseline | — | **−17.8%** | −6.3% |
-| cache-write tokens vs baseline | — | −0.4% | −0.9% |
-| mean steps / task vs baseline | — | **−13.9%** | −2.8% |
-| added latency / req | — | 117 ms | 63 ms |
+| dimension | baseline | **context-guru** | headroom | rtk |
+|---|--:|--:|--:|--:|
+| tasks solved | 86% | **88%** | 80% | 86% |
+| **total billed cost** vs baseline | — | **−13.2%** | −5.3% | −9.0% |
+| cache-read tokens vs baseline | — | **−17.8%** | −6.3% | −10.8% |
+| cache-write tokens vs baseline | — | −0.4% | −0.9% | −1.1% |
+| mean steps / task vs baseline | — | **−13.9%** | −2.8% | −8.0% |
+| added latency / req | — | 117 ms | 63 ms | **0 ms** |
+| tool's own LLM cost | — | $0.31 | $0 | $0 |
 
 **context-guru is the cheapest arm and solves the most tasks** — it cuts billed cost **13.2%** vs no
-compaction (headroom cuts only **5.3%**), driven by an **17.8%** cache-read reduction, while keeping
-cache-write within **1%** of baseline (it never busts the cache). It does this by *freezing each compaction
-and replaying it byte-identically every turn*, so the saving compounds across the whole session. headroom
-keeps an edge on added latency (it is fully deterministic — no model on the hot path). Full three-way study,
-per-task/per-component breakdowns, real before→after examples, and how to reproduce:
-**[docs/RESULTS.md](docs/RESULTS.md)**.
+compaction, driven by an **17.8%** cache-read reduction, while keeping cache-write within **1%** of baseline
+(it never busts the cache). It does this by *freezing each compaction and replaying it byte-identically every
+turn*, so the saving compounds across the whole session. The surprise is **rtk**: a simple deterministic
+shell filter is the **2nd-cheapest** arm (**−9.0%**), **reward-neutral** (86% = baseline), at **zero
+request-path latency and $0 tool cost** — it **beats the headroom proxy on both cost and reward**. rtk's
+ceiling is that it only compresses **Bash-tool** output (Claude Code's built-in `Read`/`Grep`/`Glob` bypass
+its hook), which is why the whole-request proxy goes deeper. Full four-way study, per-task/per-component
+breakdowns, real before→after examples, and how to reproduce: **[docs/RESULTS.md](docs/RESULTS.md)**.
 
 ## Architecture
 
@@ -182,7 +186,7 @@ Details in [docs/integrations.md](docs/integrations.md).
 - [docs/components.md](docs/components.md) — every registered component: how it works, live before→after, lossiness, config, best use.
 - [docs/integrations.md](docs/integrations.md) — proxy gateway vs AuthBridge plugin, with request paths.
 - [docs/setup.md](docs/setup.md) — setup + a concrete SWE-bench run through the eval-containers gateway.
-- [docs/RESULTS.md](docs/RESULTS.md) — the live three-way SWE-bench Verified benchmark (Claude Code, `aws/claude-sonnet-5`): context-guru is the cheapest arm (−13.2% billed cost vs baseline) and solves the most tasks (88% vs baseline 86%, headroom 80%).
+- [docs/RESULTS.md](docs/RESULTS.md) — the live four-way SWE-bench Verified benchmark (Claude Code, `aws/claude-sonnet-5`): context-guru is the cheapest arm (−13.2% billed cost vs baseline) and solves the most tasks (88%); headroom −5.3%/80%; rtk (shell-level Bash-output hook) −9.0%/86% at $0 tool cost.
 
 ## License
 
