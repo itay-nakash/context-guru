@@ -75,7 +75,7 @@ OPENAI_BASE_URL=http://localhost:4000/openai/v1</code></pre>
       <div class="cg-card">
         <div class="cg-card__icon">📉</div>
         <h3>Measured, not hand-wavy</h3>
-        <p>Benchmarked live on SWE-bench Verified with Claude Code: the cheapest arm <em>and</em> the highest reward of the three &mdash; 13% cheaper than no compaction.</p>
+        <p>Benchmarked live on SWE-bench Verified with Claude Code against a baseline, the headroom proxy, and the rtk shell filter: the cheapest arm <em>and</em> the highest reward of the four &mdash; 13% cheaper than no compaction.</p>
       </div>
     </div>
   </section>
@@ -103,13 +103,13 @@ OPENAI_BASE_URL=http://localhost:4000/openai/v1</code></pre>
 
   <section class="cg-section">
     <h2>The numbers</h2>
-    <p class="cg-section__sub">SWE-bench Verified &middot; Claude Code agent &middot; <code>aws/claude-sonnet-5</code> &middot; live, all 50 tasks scored under all three arms.</p>
+    <p class="cg-section__sub">SWE-bench Verified &middot; Claude Code agent &middot; <code>aws/claude-sonnet-5</code> &middot; live, all 50 tasks scored under all four arms.</p>
 
     <p class="cg-bottomline">
       On a ~98%-cached coding agent, <strong>context-guru is the cheapest arm and
       solves the most tasks</strong> &mdash; it cuts billed cost <strong>13%</strong> vs
-      no compaction, <em>2.5&times; more</em> than headroom&rsquo;s 5%, while never busting
-      the cache.
+      no compaction, more than the headroom proxy (5%) and the rtk shell filter (9%),
+      while never busting the cache.
     </p>
 
     <div class="cg-stats">
@@ -137,8 +137,10 @@ OPENAI_BASE_URL=http://localhost:4000/openai/v1</code></pre>
 
     <p class="cg-stats__foot">
       Cache-<strong>write</strong> stays within <strong>1%</strong> of baseline across all
-      three arms &mdash; none of them busts the cache. headroom&rsquo;s one edge is added
-      latency (63&nbsp;ms/req vs 117&nbsp;ms), because it runs no model on the hot path.
+      four arms &mdash; none of them busts the cache. The efficiency surprise is
+      <strong>rtk</strong>, a deterministic shell-level Bash-output filter: 2nd-cheapest
+      (&minus;9%), reward-neutral, at <strong>0&nbsp;ms</strong> request latency and $0 tool
+      cost &mdash; it beats the headroom proxy on both cost and reward.
     </p>
 
     <p style="text-align:center;margin-top:1.5rem;">

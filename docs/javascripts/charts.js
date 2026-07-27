@@ -6,9 +6,9 @@
 // deploy/eval-containers/results/*.csv if the numbers should track the sweep automatically.
 
 // Matched 50-task totals, from docs/results/comparison.md.
-const CG_ARMS = ["baseline", "context-guru", "headroom"];
-const CG_COST = [31.98, 27.77, 30.30]; // total billed $ (lower is better)
-const CG_CACHE_READ = [102.8, 84.5, 96.4]; // cache-read tokens, millions (lower is better)
+const CG_ARMS = ["baseline", "context-guru", "headroom", "rtk"];
+const CG_COST = [31.98, 27.77, 30.30, 29.09]; // total billed $ (lower is better)
+const CG_CACHE_READ = [102.8, 84.5, 96.4, 91.7]; // cache-read tokens, millions (lower is better)
 
 function cgTeal(alpha) {
   return `rgba(0, 150, 136, ${alpha})`;

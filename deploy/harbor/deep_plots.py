@@ -12,8 +12,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 SURFACE = "#fcfcfb"; INK = "#0b0b0b"; INK2 = "#52514e"; GRID = "#e6e5e2"
-# baseline grey, context-guru blue, headroom orange
-COL = {"baseline": "#8a8985", "context-guru": "#2a78d6", "headroom": "#eb6834"}
+# baseline grey, context-guru blue, headroom orange, rtk teal-green
+COL = {"baseline": "#8a8985", "context-guru": "#2a78d6", "headroom": "#eb6834", "rtk": "#1baf7a"}
 COMP = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"]
 plt.rcParams.update({
     "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "savefig.facecolor": SURFACE,
@@ -58,7 +58,7 @@ def fig_headline(A, out):
     ax[1][2].set_xticks(range(len(cfgs))); ax[1][2].set_xticklabels(cfgs, fontsize=9)
     ax[1][2].set_title("Compaction latency added / request"); ax[1][2].set_ylabel("ms")
     ax[1][2].grid(axis="x", visible=False); style(ax[1][2])
-    fig.suptitle("baseline vs context-guru vs headroom — SWE-bench Verified (matched %d tasks)" % A["matched_tasks"],
+    fig.suptitle("%s — SWE-bench Verified (matched %d tasks)" % (" vs ".join(cfgs), A["matched_tasks"]),
                  fontsize=13, fontweight="bold")
     fig.tight_layout(); fig.savefig(out); plt.close(fig)
 
@@ -87,11 +87,14 @@ def fig_per_task_cost(A, out):
     rows = sorted(A["per_task"], key=lambda r: r["baseline"]["cost"])
     n = len(rows)
     fig, ax = plt.subplots(figsize=(8, max(6, n * 0.22)))
+    lo = lambda r: min(r[c]["cost"] for c in A["configs"] if c != "baseline")
+    hi = lambda r: max(r[c]["cost"] for c in A["configs"] if c != "baseline")
     for i, r in enumerate(rows):
-        ax.plot([r["headroom"]["cost"], r["context-guru"]["cost"]], [i, i], color=GRID, lw=1.5, zorder=1)
-    for c, mk in [("baseline", "|"), ("headroom", "o"), ("context-guru", "o")]:
-        ax.scatter([r[c]["cost"] for r in rows], range(n), s=30, color=COL[c], zorder=3, label=c,
-                   marker=mk if c != "baseline" else "D")
+        ax.plot([lo(r), hi(r)], [i, i], color=GRID, lw=1.5, zorder=1)
+    markers = {"baseline": "D", "headroom": "o", "context-guru": "o", "rtk": "s"}
+    for c in A["configs"]:
+        ax.scatter([r[c]["cost"] for r in rows], range(n), s=26, color=COL[c], zorder=3, label=c,
+                   marker=markers.get(c, "o"))
     ax.set_yticks(range(n)); ax.set_yticklabels([r["task"] for r in rows], fontsize=6)
     ax.set_xlabel("billed input cost per task ($)"); ax.set_title("Per-task cost")
     ax.legend(loc="lower right", frameon=False, fontsize=8); ax.grid(axis="y", visible=False); style(ax)
@@ -118,7 +121,9 @@ def fig_components(A, out):
     cg = A["tool"]["context-guru"]
     uq = (cg.get("unique") or {}).get("components", {})
     hr = A["tool"]["headroom"].get("per_strategy", {})
-    fig, axes = plt.subplots(1, 2, figsize=(11, 3.6))
+    rtk = (A["tool"].get("rtk") or {}).get("per_command", {})
+    npanel = 3 if rtk else 2
+    fig, axes = plt.subplots(1, npanel, figsize=(5.5 * npanel, 3.6))
     # context-guru: cumulative vs unique
     items = [(k, v.get("cum", 0), (uq.get(k, {}) or {}).get("uniq_saved", 0)) for k, v in cg["per_component"].items() if v.get("cum")]
     # map dump categories to component names best-effort
@@ -138,6 +143,16 @@ def fig_components(A, out):
     ax.set_yticks(range(len(hs))); ax.set_yticklabels([k for k, _ in hs], fontsize=8)
     ax.set_xlabel("tokens removed"); ax.set_title("headroom — per compressor")
     ax.grid(axis="y", visible=False); style(ax)
+    # rtk per-command (bash-output tokens saved)
+    if rtk:
+        rs = sorted([(k, v.get("saved", 0)) for k, v in rtk.items() if v.get("saved")], key=lambda x: x[1])
+        ax = axes[2]
+        ax.barh(range(len(rs)), [v for _, v in rs], color="#1baf7a", height=0.6, zorder=2)
+        for i, (k, v) in enumerate(rs):
+            ax.text(v, i, f"  {int(v):,}", va="center", fontsize=8, color=INK)
+        ax.set_yticks(range(len(rs))); ax.set_yticklabels([k for k, _ in rs], fontsize=8)
+        ax.set_xlabel("bash-output tokens removed"); ax.set_title("rtk — per command")
+        ax.grid(axis="y", visible=False); style(ax)
     fig.tight_layout(); fig.savefig(out); plt.close(fig)
 
 
