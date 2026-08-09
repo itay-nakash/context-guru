@@ -123,3 +123,19 @@ func (p *Pipeline) runOne(comp Component, req *schemas.BifrostChatRequest, c *Ct
 func tokensOf(msgs []schemas.ChatMessage) int {
 	return schema.MessagesTokens(&schemas.BifrostChatRequest{Input: msgs})
 }
+
+// Has reports whether a component with this name is configured in the pipeline.
+// Hosts use it to gate body-level work that belongs to a component's concern but
+// cannot be done inside it — e.g. cacheinject's cache-prefix repair, which must
+// touch the top-level `system` array that components never see.
+func (p *Pipeline) Has(name string) bool {
+	if p == nil {
+		return false
+	}
+	for _, c := range p.comps {
+		if c != nil && c.Name() == name {
+			return true
+		}
+	}
+	return false
+}
