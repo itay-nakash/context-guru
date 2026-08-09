@@ -34,6 +34,9 @@ cost and reward**. Its ceiling is that it only compresses **Bash-tool** output (
 
 ## The results suite
 
+- **[vs headroom & rtk — what we did and why it won](results/vs-competitors.md)** — the
+  mechanism summary: where each design intercepts, both benchmarks side by side, and which
+  design choice the money landed on. **Start here.**
 - **[Full comparison](results/comparison.md)** — all four arms, cost decomposition,
   per-task plots, per-component breakdown, and the honest caveats.
 - **[Component internals & real examples](results/components.md)** — how every
