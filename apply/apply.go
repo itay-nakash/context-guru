@@ -129,9 +129,20 @@ func BodyFull(ctx context.Context, pipe *components.Pipeline, st store.Store, pr
 		return body, false
 	}
 
+	// Volatile-tail split, before anything else touches the body. This is a
+	// body-level concern rather than a component one: the pipeline operates on
+	// `messages`, but the block that needs splitting lives in the top-level `system`
+	// array, which components never see. Gated on cacheinject being configured, so it
+	// is opt-in via the same pipeline entry and adds no new config surface. See
+	// prefixsplit.go for what it splits and why.
+	systemSplit := false
+	if !bypass && pipe != nil && pipe.Has("cacheinject") {
+		body, systemSplit = splitVolatileTail(body, provider)
+	}
+
 	norm, slots := normalize(provider, msgsRaw.Array())
 	if len(norm) == 0 {
-		return body, false
+		return body, systemSplit // keep the split even with nothing to compact
 	}
 
 	if debugTraffic {
@@ -175,11 +186,17 @@ func BodyFull(ctx context.Context, pipe *components.Pipeline, st store.Store, pr
 	// retained message's ORIGINAL raw bytes (byte-lossless, incl. Anthropic
 	// tool_result) and marshaling only genuinely new messages (the summary).
 	if len(chat.Input) != len(norm) {
-		return rebuildCountChanged(body, msgsRaw.Array(), normPre, slots, chat.Input)
+		nb, ok := rebuildCountChanged(body, msgsRaw.Array(), normPre, slots, chat.Input)
+		if !ok && systemSplit {
+			return body, true // keep the split even when the rebuild declined
+		}
+		return nb, ok || systemSplit
 	}
 
 	out := body
-	changed := false
+	// The tail split already rewrote `body`, so the result must be forwarded even
+	// if no component changes a message.
+	changed := systemSplit
 	var changes []change
 	for i := range chat.Input {
 		s := slots[i]
