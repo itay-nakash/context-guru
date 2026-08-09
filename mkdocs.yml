@@ -144,6 +144,7 @@ nav:
       - Before → After showcase: examples/before-after.md
   - Benchmarks:
       - Overview: RESULTS.md
+      - vs headroom & rtk (summary): results/vs-competitors.md
       - Full comparison (vs headroom & rtk): results/comparison.md
       - Component internals & examples: results/components.md
       - "Results: baseline": results/baseline.md
