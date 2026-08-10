@@ -6,9 +6,10 @@ four-way](comparison.md) is the first.
 
 !!! tip "A fifth arm was added on 2026-08-10"
     The [merged-system section](#the-merged-system-a-fifth-arm-2026-08-10) below re-measures
-    context-guru after 15 PRs of cache/filter/observe work. Headline: **61 solved vs baseline 53**,
-    **cache-write back to baseline parity** (1.86% vs the previous arm's 2.86%), **$0** own-LLM
-    cost, and **−7.8% median per task** — read the median rather than the −16.4% aggregate, which
+    context-guru after 15 PRs of cache/filter/observe work. Headline: **65 of 89 solved — the most
+    of any arm** — and **$94.95, the first arm to beat baseline on the raw total**. Cache-write is
+    back to baseline parity (1.86% vs the previous arm's 2.86%), own-LLM cost is **$0**, and the
+    typical task is **−7.7%** — read the median rather than the −15.4% clean-set aggregate, which
     one task dominates. The original four-arm study is unchanged below it.
 
 The four original arms:
@@ -86,28 +87,47 @@ per-component evidence, not on maximal token reduction. Three components exclude
 that figure is a single-task replay, it drops whole messages, and it is the one offloader that
 reaches inside the cached prefix.
 
-### Results (81 clean tasks, paired per task)
+### Results — all 89 tasks
+
+The run completed after the first publication of this section; these are the final figures.
+Both reference arms reproduce their published totals **exactly** (baseline $100.81,
+context-guru-old $102.55), which is the check that the harness and cost model are unchanged.
+
+| | baseline | cg (old) | headroom\* | rtk\* | **cg (merged)** |
+|---|--:|--:|--:|--:|--:|
+| solved / 89 | 56 | 58 | 64 | 55 | **65 (73.0%)** |
+| **total billed** | $100.81 | $102.55 | $114.75 | $118.83 | **$94.95 (−5.8%)** |
+| cache-write | 4.01M | 6.53M | 12.37M | 7.05M | **3.90M** |
+| cache-hit | 98.15% | 96.86% | 94.1% | 97.3% | **98.16%** |
+| own LLM cost | $0 | $3.26 | $0 | $0 | **$0** |
+
+\* headroom and rtk are **cited from the original study, not re-derived** — their trial
+artifacts have been pruned from disk.
+
+**This is the first arm to beat baseline on the raw 89-task total.** No arm in the original
+study managed that, and it also solves the most. The earlier correction box below explains why
+the raw total is the harder bar: six degenerate baseline trials flatter the baseline column.
+
+### Results (82 clean tasks, paired per task)
 
 | | baseline | context-guru (old) | **context-guru (merged)** |
 |---|--:|--:|--:|
-| solved | 53 | 55 | **61** |
-| steps | 3,067 | 2,811 | 2,815 |
-| cache-write | 3.90M | **5.04M** | **3.36M** |
+| solved | 54 | — | **62** |
+| steps | 3,117 | — | **2,865** |
+| cache-write | 3.97M | — | **3.52M** |
 | **cache-write / cache-read** | **1.86%** | **2.86%** | **1.86%** |
-| cache-hit | 98.16% | 97.18% | 98.12% |
-| own LLM cost | $0 | $2.97 | **$0** |
+| own LLM cost | $0 | $3.00 | **$0** |
 | context-guru added latency | — | 449.8 ms | **38.5 ms** |
-| **total billed** | **$94.85** | $85.72 (−9.6%) | **$79.32 (−16.4%)** |
+| **total billed** | **$98.70** | $86.34 | **$83.52 (−15.4%)** |
 
 !!! warning "Read the median, not the aggregate"
-    **−16.4% is single-task sensitive.** `path-tracing` alone contributes most of it: dropping
-    that one task gives **−9.1%**, and an independent re-derivation with a stricter degenerate
-    rule (76 clean tasks) gave **−13.7% → −2.8%** on the same exclusion.
+    **−15.4% is single-task sensitive.** `path-tracing` alone contributes about half of it:
+    dropping that one task gives **−8.3%**, and an independent re-derivation with a stricter
+    degenerate rule (76 clean tasks) gave **−13.7% → −2.8%** on the same exclusion.
 
-    The **median per-task ratio is 0.922, i.e. −7.8%**, with **49/81 tasks cheaper**. That is the
-    figure to quote for "what this does to a normal task"; the aggregate answers the different
-    question "what would the whole benchmark have cost". Both are reported because they differ
-    by 9 points.
+    The **median per-task ratio is −7.7%**, with **49/82 tasks cheaper**. That is the figure to
+    quote for "what this does to a normal task"; the aggregate answers the different question
+    "what would the whole benchmark have cost". Both are reported because they differ by half.
 
     Reward is **+11 / −3 = net +8** at a single trial per task, so the churn matters more than
     the net. All three losses were read from their verifier output and are **capability
@@ -158,7 +178,10 @@ the predicted mechanism operated. Each claim below names the counter that proves
 - **Single trial per task**, as in the original study.
 - Every token figure here is **unique**, never cumulative — the measured overcount ratios were
   **44.5× (cmdfilter)** and **18.4× (extract)**.
-- One task (`circuit-fibsqrt`) was still running at report time; 88 of 89 are scored.
+- **`caffe-cifar-10` is unscored** (`reward=None` after 2,361 s of its 4,800 s budget): it is in
+  the clean set for cost and out of it for the solve count. Baseline also failed it.
+- Five arm exceptions are genuine 4× wall-clock timeouts, counted as reward-0 as in the original
+  study.
 
 ---
 
