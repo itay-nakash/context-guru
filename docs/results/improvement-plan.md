@@ -49,9 +49,15 @@ headroom's $24.65 nominal regression**, and it is a task where the baseline did 
 | arm | all-in $ | Δ vs baseline | steps |
 |---|--:|--:|--:|
 | baseline | 100.17 | — | 38.1 |
-| context-guru | 90.51 | **−9.7%** | 34.9 (−3.1) |
+| context-guru | 90.34 | **−9.8%** | 34.9 (−3.1) |
 | headroom | 84.19 | **−16.0%** | 34.1 |
 | rtk | 106.59 | +6.4% | 39.7 |
+
+Reproduced independently from the row files: baseline **$100.17**, context-guru **$87.47** model cost
+(**−12.7%**) or **$90.34** including its own haiku cost (**−9.8%**), solving **56 vs 54** with
+**2,899 vs 3,160** total steps (**−8.3%**). Note the published baseline is a *two-stage* merge
+(`rows-off-final.json` + the 11-task 4x rerun); the intermediate file alone sums to $71.44 and does
+not reproduce the published $100.81 — see REPRODUCE.md §7.
 
 So: **both proxies save ~10–16% on TB too; only rtk genuinely regresses; and context-guru
 *reduces* steps on clean TB, it does not raise them.** (Action item F0: re-run those 6 baselines and
@@ -210,13 +216,46 @@ value is already replay, so this removes 450 ms/req and $3.26 with negligible sa
 `keep_head_chars`; add the same ~15-token peek to `extract`/`dedup`/`extract_llm` markers so the
 model can decide whether an expand is worth a turn instead of bouncing blindly.
 
-### C. Cross-turn dedup — the biggest untapped token lever, no LLM (39.8× amplification)
+### C. Cross-turn dedup — ~~the biggest untapped token lever~~ **REFUTED by measurement**
 
-**C1. New `xdedup` component.** Per session, map `contentHash → (firstSeenMsgIdx, markerKey)`; when a
-tool output's hash was already sent in an **earlier turn**, replace it with `[same as output at step
-N] <<cg:HASH>>`, frozen. Unlike today's `dedup` (intra-request only) this catches the real waste.
-*Example:* one 21,957-token source file was re-sent **167×** = 3.67M tokens → send once + 166×~20 tok
-= **−99.3%** on that output. Must land in the tail first and freeze (needs C3).
+!!! failure "C1 was wrong. The re-send factor is real; the interpretation was not."
+    **`xdedup` is unbuildable, and would be harmful if built.** Measured on the raw request
+    captures (1,325 requests / 51 sessions across `capture-tb`, `capture-swe`, `capture-swebench`
+    — *not* the change-log dumps, which only record messages a component already acted on and so
+    cannot answer this question):
+
+    - **232 of 232** re-sent large outputs live at exactly **one stable message index** for their
+      entire session. Independently re-checked: of **77** distinct >4 KB tool outputs tracked per
+      session, **0 ever appeared at a second index**.
+    - **1124/1124 = 100%** of consecutive turn pairs have the entire previous turn as a
+      byte-identical prefix (comparing *content*, ignoring `cache_control` annotations).
+    - **Zero** compaction/rewind events on swebench — the message count never shrank.
+
+    So a "re-read" is not a re-read. **The agent appends.** Turn N's copy of a file sits at the
+    index it has always occupied, inside the byte-identical cached prefix, billing at the
+    **cache-read** rate. The load-bearing claim — "content genuinely re-sent as new bytes" — is
+    false.
+
+    `xdedup` could only act where the first copy is absent *and* the repeat is in the mutable tail.
+    Across 1,325 requests that intersection is **empty**: 5,314 re-send events (5.46M tokens) sit in
+    the cached prefix, where `TailOnly` correctly refuses — and rewriting them is precisely the
+    full → referenced flip that converts cache-reads into cache-writes at **11.5×**. The genuinely
+    duplicated cases are already caught by `dedup` (23 acts on the TB run, **0 tokens missed** above
+    the size gate). Implemented with its guards intact, the component is a permanent no-op.
+
+    **Where the token mass actually is:** those 5.46M tokens are real but **already cheap**. The
+    lever is not removing them, it is keeping the prefix stable so they *stay* cache-reads — which
+    is `cacheinject`'s territory, and consistent with cross-session prefix repair measuring ≈−14%
+    while placement tuning measured ≈0%. See the finding that `cacheinject`'s breakpoints never
+    reach the wire at all (46 applied, 0 forwarded).
+
+    **One caveat left open:** `capture-tb` showed 19 turns where the message count shrank.
+    Compaction is the one regime that could make cross-turn dedup viable, since it removes the first
+    copy while later re-reads land in the tail. Even there 0 actionable cases were measured, but the
+    premise is worth re-testing if aggressive compaction is enabled.
+
+    Tracked as [#27](https://github.com/rossoctl/context-guru/issues/27), closed as
+    measurement-refuted. C2 and C3 below are unaffected and still stand.
 
 **C2. Recurrence-aware floor.** Track `seenCount[hash]`; effective floor `= floor / max(1,seenCount)`.
 A 298-token output re-sent 40× is worth 12k tokens but is invisible to the 3000-token floor today —
@@ -317,14 +356,16 @@ cache-write. context-guru is the only one positioned to hold **all** of the good
    the live zone (headroom's mistake), never expire a frozen decision.
 3. **Compact *more* than headroom without the penalty** — add its lossless layers (D1–D5) *and* keep
    `mask`'s aggressive-but-reward-neutral offload, because our freeze-replay makes aggression safe.
-4. **Attack the 39.8× re-send** (C1/C2) — the largest token lever on both benchmarks, LLM-free.
+4. **Unlock the sub-floor token mass** (C2) — a recurrence-aware floor reaches the 64% of tool-token
+   mass currently invisible to the 3000-token threshold, LLM-free. (C1/`xdedup` is refuted — the
+   re-sends it targeted are cached-prefix reads, already cheap; see §C.)
 5. **Cover the built-in tools** (E1) — rtk's structural ceiling, our free extension.
 6. **Reduce steps, and account in the currency of the bill** (B, E4) — the only thing correlated 0.95
    with cost, and the path to beating headroom on reward: register the expand tool (stop the re-work),
    gate small tasks, free context so long tasks finish within the timeout.
 
 **Plausible stacked outcome:** sticky-anchor (−23%) + freeze-fix (recovers the ~$6 cache-write gap) +
-tail-only (−44%) compose to **−57%** in simulation before adding xdedup (cache-read −20–40%), tool-
-schema compaction, and the step-reduction levers — i.e. a path to **substantially beyond headroom's
+tail-only (−44%) compose to **−57%** in simulation, before adding tool-schema compaction, the
+recurrence-aware floor, and the step-reduction levers — i.e. a path to **substantially beyond headroom's
 −16%**, while being strictly cache-safe and reward-neutral-to-positive. The prerequisites are the
 three cache bugs (A2/A3) and the expand-tool fix (B2); everything else compounds on top.

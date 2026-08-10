@@ -216,6 +216,37 @@ given an extended **`--agent-mult 4.0`** budget to measure capability. Merge the
 per task (`/tmp/tb-runs/merge_tb.py`). Any task that still times out at 4× is a genuine failure
 (reward 0). All 89 tasks carry a scored outcome (solved / failed / timeout).
 
+**Baseline row provenance (needed to reproduce the published $100.81).** The published baseline is
+a *two-stage* merge, and the intermediate file alone does not reproduce the totals:
+
+1. `merge_tb.py` overlays the `n=6` rerun onto the clean `n=24` rows → `rows-off-final.json`
+   (sums to $71.44 — **not** the published figure);
+2. the 11 long-horizon tasks rerun at `--agent-mult 4.0` (`/tmp/tb-runs/tb-rerun2/rows-off.json`:
+   `caffe-cifar-10`, `circuit-fibsqrt`, `cobol-modernization`, `feal-linear-cryptanalysis`,
+   `gpt2-codegolf`, `make-doom-for-mips`, `make-mips-interpreter`, `path-tracing`,
+   `path-tracing-reverse`, `schemelike-metacircular-eval`, `write-compressor`) are then overlaid
+   on top → the published 89-task baseline (215,971,427 cache-read / 4,011,068 cache-write /
+   58,893 fresh / 4,746,887 output = **$100.81**).
+
+Do stage 2 explicitly; `merge_tb.py` does not do it. Keep the merged file so the totals stay
+reconstructible:
+
+```
+python3 - <<'PY'
+import json
+fin={r['task']:r for r in json.load(open('/tmp/tb-runs/tb89/rows-off-final.json'))}
+for r in json.load(open('/tmp/tb-runs/tb-rerun2/rows-off.json')): fin[r['task']]=r
+json.dump(list(fin.values()), open('/tmp/tb-runs/tb89/rows-off-published.json','w'), indent=1)
+PY
+```
+
+**Excluding degenerate trials.** A trial where the *baseline* aborted in a handful of steps is not
+a measurement: the per-task delta then reflects the baseline not doing the work. Six tasks are in
+this class (`extract-moves-from-video`, `polyglot-rust-c`, `mteb-leaderboard`, `regex-chess`,
+`write-compressor`, `code-from-image`). Compare **per task, paired**, and report the clean subset
+alongside the raw total — per-arm sums hide this entirely. See the
+[comparison](terminal-bench-comparison.md) correction box.
+
 Analyze → doc (totals, cache-aware cost, by-difficulty/category, timeouts, per-task):
 ```
 # task metadata (difficulty/category) from Harbor's task cache — needs py3.11+ (tomllib):

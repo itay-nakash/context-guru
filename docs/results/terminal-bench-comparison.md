@@ -16,17 +16,35 @@ adds the tool's own compaction-LLM cost (context-guru's haiku calls). All 89 tas
 scored outcome; timeouts (agent exceeded its wall-clock budget) count as reward-0 failures.
 See [REPRODUCE.md](REPRODUCE.md) and the [baseline page](terminal-bench-baseline.md).
 
-!!! danger "Correction pending — the cost figures below overstate the regression"
-    Six baseline trials are **degenerate**: the baseline aborted in 2–6 steps (16–800 s)
-    where the compaction arms ran 50–160 steps, so the per-task cost delta on those six is
-    an artifact of the baseline not doing the work, not of compaction. `extract-moves-from-video`
-    alone accounts for **$24.10 of headroom's $24.65 "regression"**.
+!!! danger "Read the 89-task cost figures with this correction"
+    **Six baseline trials are degenerate.** On these tasks the baseline aborted almost
+    immediately while the compaction arms did the real work, so the per-task cost delta
+    measures *the baseline not doing the job*, not the cost of compaction:
 
-    Recomputed over the **83 clean tasks**: context-guru **−9.7%**, headroom **−16.0%**,
-    rtk **+6.4%**. Both proxies *save* on Terminal-Bench; only rtk regresses. The tables
-    below are the raw 89-task figures and will be regenerated once those six baselines are
-    re-run at low concurrency. See [improvement-plan.md](improvement-plan.md) §1 for the
-    full recompute.
+    | task | baseline | context-guru |
+    |---|--:|--:|
+    | `mteb-leaderboard` | $0.08 (4 steps) | $6.05 (147 steps) |
+    | `polyglot-rust-c` | $0.08 (3 steps) | $2.81 (50 steps) |
+    | `extract-moves-from-video` | $0.02 (2 steps) | $2.69 (112 steps) |
+    | `regex-chess` · `write-compressor` · `code-from-image` | 4–6 steps each | comparable |
+
+    Those three rows alone are **$11.5 of apparent regression**. Recomputed over the
+    **83 clean tasks** (same cache-aware model, context-guru's own haiku cost included):
+
+    | | baseline | context-guru | delta |
+    |---|--:|--:|--:|
+    | billed model cost | $100.17 | $87.47 | **−12.7%** |
+    | + context-guru's LLM cost | — | $90.34 | **−9.8%** |
+    | solved | 54 | **56** | +2 |
+    | total steps | 3,160 | **2,899** | **−8.3%** |
+
+    So on the clean set context-guru is **cheaper, solves more, and takes fewer steps** —
+    the same direction as its SWE-bench result, not the reversal the 89-task total implies.
+    headroom recomputes to ≈**−16%** and rtk remains a genuine regression (≈**+6%**).
+
+    The tables below are the raw 89-task figures, kept as measured. They will be
+    regenerated once the six baselines are re-run at low concurrency; that re-run is
+    tracked as follow-up work. See [improvement-plan.md](improvement-plan.md) §1.
 
 !!! warning "Two caveats that shape how to read this"
     **1. Single trial per task (`n-attempts=1`).** Unlike the SWE study (2 trials), each task
@@ -41,10 +59,12 @@ See [REPRODUCE.md](REPRODUCE.md) and the [baseline page](terminal-bench-baseline
 
 ## Headline
 
-**On long-horizon terminal tasks, compaction is far harder to make pay off than on SWE-bench:
-no arm beats baseline on cost.** context-guru stays roughly cost-neutral while nudging reward
-up; headroom buys the most reward at a real cost premium; **rtk backfires** — the mirror image
-of its SWE-bench result.
+**On long-horizon terminal tasks the raw 89-task totals show no arm beating baseline on cost —
+but that is dominated by six degenerate baseline trials** (see the correction above). On the
+83 clean tasks **both proxies save**: context-guru −9.8% (solving +2, with 8.3% fewer steps)
+and headroom ≈−16%. **rtk is the one genuine cost regression**, the mirror image of its
+SWE-bench result. Read the tables below as measured, and the clean-set figures as the
+conclusion.
 
 | dimension | baseline | **context-guru** | headroom | **rtk** | best |
 |---|--:|--:|--:|--:|:--|
@@ -60,16 +80,16 @@ of its SWE-bench result.
 
 ### Verdict
 
-- **baseline is the cheapest and most cache-friendly arm.** With a 98.2% cache-hit and the
-  lowest cache-write, it is the arm to beat — and on this benchmark none of the three
-  compaction layers beats it on cost.
-- **context-guru is the only cost-neutral compaction arm (+1.7%)** and nudges reward up (+2,
-  within noise). It genuinely cuts the cache-aware **input** bill (−1.5%, cache-read −5.3%),
-  but on Terminal-Bench's huge contexts its `extract_llm` haiku pass costs **$3.26** and adds
-  **450 ms/req**, which erases the input saving. Nothing like its **−13%** SWE-bench win.
+- **baseline has the best cache behaviour** — a 98.2% cache-hit and the lowest cache-write —
+  and on the *raw* 89-task total it is the cheapest arm. On the 83 clean tasks it is not.
+- **context-guru saves on the clean set: −9.8% including its own LLM cost** (−12.7% on model
+  cost alone), while solving **+2** and taking **8.3% fewer steps** — the same shape as its
+  −13% SWE-bench win. Its `extract_llm` haiku pass still costs **$3.26** and adds **450 ms/req**,
+  which is a real drag on the margin (and is why that component is being reworked), but it does
+  not erase the saving. The **+1.7%** in the table below is the six degenerate baselines.
 - **headroom solves the most (+8, and +5 on `hard` tasks)** — the clearest real reward signal —
-  but at **+13.8%**, because compressing the live zone mutates cached content and triggers a
-  **3× cache-write blow-up** (12.4M vs 4.0M tokens).
+  and recomputes to ≈**−16%** on the clean set. Its **3× cache-write blow-up** (12.4M vs 4.0M
+  tokens) from rewriting the live zone is nonetheless real, and is the mechanism to avoid.
 - **rtk backfires (+17.9%, −1 solved).** On SWE-bench it was the −9% efficiency surprise; here
   its 94% Bash-output compression **discards information the agent needs on open-ended tasks**,
   so the agent takes **+27% more steps (40 vs 31.5)** → more round-trips → the **highest
@@ -148,9 +168,20 @@ upside; on Terminal-Bench it is not (yet) enough to offset the cache-write and L
 
 ## Bottom line
 
-On Terminal-Bench 2.0 the ranking inverts the SWE-bench story. **baseline wins on cost and
-cache-friendliness**; **headroom wins on reward** (+8 solved) but pays +14%; **context-guru** is
-the balanced middle (cost-neutral, small reward gain); **rtk regresses** on this long-horizon,
-open-ended workload. The transferable lesson: a compaction layer's value is workload-dependent —
-what compounds into savings on localized, smaller-context SWE-bench tasks becomes a cache-write
-(and, for LLM/hook layers, a compute/step) tax on Terminal-Bench's long-horizon contexts.
+Terminal-Bench 2.0 does **not** invert the SWE-bench story once the six degenerate baselines are
+removed. On the 83 clean tasks **context-guru saves −9.8%** while solving +2 with 8.3% fewer
+steps, and **headroom saves ≈−16%** while solving +8 (its gains clustered on `hard`). **rtk is
+the one real regression.**
+
+What *is* genuinely different here is the **mechanism**, and it survives the correction:
+**cache-write, a rounding error on SWE-bench, is the deciding term on Terminal-Bench's ~1.7M-token
+contexts.** Any layer that mutates already-cached content pays 11.5× for it — headroom's live-zone
+rewriting triples cache-write, and rtk's information loss costs +27% more steps. The transferable
+lesson is therefore not "compaction fails on long horizons" but **"on long horizons, cache-write
+avoidance and step count dominate token removal"** — which is exactly what the
+[improvement plan](improvement-plan.md) is built around.
+
+Two methodological lessons worth carrying forward, both learned the hard way here:
+**a trial where the baseline aborts is not a measurement**, and it must be excluded rather than
+averaged; and **per-arm totals hide this**, so a per-task paired comparison is the only honest
+default.
