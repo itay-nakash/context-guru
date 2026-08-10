@@ -2,7 +2,16 @@
 
 **Terminal-Bench 2.0 · 89 tasks · `claude-code` agent on `aws/claude-sonnet-5`**, run live
 through the harness. This is the second benchmark of the study; the [SWE-bench Verified
-four-way](comparison.md) is the first. The four arms are the same:
+four-way](comparison.md) is the first.
+
+!!! tip "A fifth arm was added on 2026-08-10"
+    The [merged-system section](#the-merged-system-a-fifth-arm-2026-08-10) below re-measures
+    context-guru after 15 PRs of cache/filter/observe work. Headline: **61 solved vs baseline 53**,
+    **cache-write back to baseline parity** (1.86% vs the previous arm's 2.86%), **$0** own-LLM
+    cost, and **−7.8% median per task** — read the median rather than the −16.4% aggregate, which
+    one task dominates. The original four-arm study is unchanged below it.
+
+The four original arms:
 
 - **baseline** — no compaction (context-guru `off` passthrough; identical routing).
 - **context-guru** (`codesmart`) — cache-aware request-stream proxy, hybrid deterministic + a
@@ -56,6 +65,102 @@ See [REPRODUCE.md](REPRODUCE.md) and the [baseline page](terminal-bench-baseline
     used 1.5× for most tasks and 4× for the long-horizon set. This is fair: every task a
     framework "gained" over baseline was one the baseline *completed and got wrong* at 1.5×
     (more time would not have changed it), not a baseline timeout.
+
+## The merged system — a fifth arm (2026-08-10)
+
+Everything below this section is the **original four-way study**. This section is the
+re-measurement of context-guru after the cache/filter/observe work landed on `main`
+(15 PRs: SSE fast path, `cacheinject` reaching the wire, freeze TTL, 24 cmdfilter filters,
+observe mode, and the `extract_llm` economic gate).
+
+**Configuration `cgfinal` = `[format, dedup, cmdfilter, extract, cachesplit]`.** Chosen on
+per-component evidence, not on maximal token reduction. Three components excluded:
+
+| excluded | measurement |
+|---|---|
+| `extract_llm` | saved 197,548 unique tokens — worth **$0.0395** at the cache-read rate they actually bill at — for **$3.26** and 1,592,467 ms of blocking time. **82× underwater.** (The plan's earlier "8×" priced those tokens as *fresh*; they sit in the cached prefix.) |
+| `failed_run` | `acted=0`, 28,757 ms spent scanning. Pure latency. |
+| `cacheinject` | removed from all nine presets — see [cacheinject](../components/cacheinject.md). Now that its breakpoints reach the wire, enabling it pushes **cache-write**, the deciding term here, the wrong way. |
+
+`mask` was deliberately **not** added despite being the largest known token lever (~29.5%):
+that figure is a single-task replay, it drops whole messages, and it is the one offloader that
+reaches inside the cached prefix.
+
+### Results (81 clean tasks, paired per task)
+
+| | baseline | context-guru (old) | **context-guru (merged)** |
+|---|--:|--:|--:|
+| solved | 53 | 55 | **61** |
+| steps | 3,067 | 2,811 | 2,815 |
+| cache-write | 3.90M | **5.04M** | **3.36M** |
+| **cache-write / cache-read** | **1.86%** | **2.86%** | **1.86%** |
+| cache-hit | 98.16% | 97.18% | 98.12% |
+| own LLM cost | $0 | $2.97 | **$0** |
+| context-guru added latency | — | 449.8 ms | **38.5 ms** |
+| **total billed** | **$94.85** | $85.72 (−9.6%) | **$79.32 (−16.4%)** |
+
+!!! warning "Read the median, not the aggregate"
+    **−16.4% is single-task sensitive.** `path-tracing` alone contributes most of it: dropping
+    that one task gives **−9.1%**, and an independent re-derivation with a stricter degenerate
+    rule (76 clean tasks) gave **−13.7% → −2.8%** on the same exclusion.
+
+    The **median per-task ratio is 0.922, i.e. −7.8%**, with **49/81 tasks cheaper**. That is the
+    figure to quote for "what this does to a normal task"; the aggregate answers the different
+    question "what would the whole benchmark have cost". Both are reported because they differ
+    by 9 points.
+
+    Reward is **+11 / −3 = net +8** at a single trial per task, so the churn matters more than
+    the net. All three losses were read from their verifier output and are **capability
+    failures, not information loss**: an HTTP 404, a wrong-cased flag
+    (`gcod3_iz_ch4llenging` vs `gc0d3_iz_ch4LLenGiNg`), and a rejected non-fast-forward push.
+    Two of the three used *fewer* steps than baseline, which argues against the
+    "compaction hid something, agent redid work" mechanism.
+
+### The one result that needs no caveat
+
+**cache-write / cache-read returns to 1.86% — identical to baseline** — where the previous arm
+ran at **2.86% (+54%)**. That is the "cache-write tax" this study identified as the deciding
+term on Terminal-Bench, eliminated. It holds under every exclusion rule tried, because it is a
+ratio rather than a sum.
+
+### Mechanisms verified fired — and one that could not be
+
+Per the [F-1 rule](improvement-plan.md), an aggregate moving the predicted way is not evidence
+the predicted mechanism operated. Each claim below names the counter that proves it:
+
+| PR | status | evidence |
+|---|---|---|
+| #33 SSE fast path | **verified** | 44.2% of streams buffered, down from an unconditional **100%**; a marker-free probe streamed through, which was impossible before |
+| #42 cmdfilter | **verified, large** | `acted` **950/3,311 (28.7%)** vs the old arm's **34/3,827 (0.9%)** — a 32× firing rate, 35.7× unique tokens |
+| #36 cacheinject wire | code verified, **value inert here** | `cachesplit acted=0` for a *structural* reason: TB runs the Claude Agent **SDK**, which never appends the git/env snapshot the CLI does, so all 73 captured requests carry 3 system blocks and **zero** volatile-tail markers. The −34.1% split figure came from SWE-bench CLI traffic and does not transfer |
+| #40 freeze TTL | **NOT EXERCISED — unverified** | all five `frozen_*` counters are 0, because its only callers are `mask`, `failed_run` and `extract_llm` — all three excluded by this config. **This arm is not evidence for or against #40 in either direction**, and none of the cost improvement above may be credited to it |
+| #43 observe | off by design | `mode: sync` |
+
+### Regressions, stated plainly
+
+1. **`system-administration`: +17.2% cost *and* −2 solved (7→5).** The only category losing on
+   both axes, and the clearest genuine regression in the run.
+2. **`security`: +25.6%.** Better than the previous arm's +121%, still the wrong direction.
+3. **`fresh_input` is 3.8× baseline** (101,152 vs 26,901) — worth ~$0.20 against $0.05, under
+   0.3% of the bill, but directionally wrong.
+4. **Small tasks still inflate**, exactly as §1b predicts: `optimization` +311% (n=1),
+   `games` +50.7%, `model-training` +28.1%. Marker overhead is not recovered below ~1M prompt
+   tokens, so **size-gating remains an unclaimed win**.
+5. **The honest framing of the headline.** `cgfinal`'s raw *model* cost is nearly tied with the
+   old arm ($79.32 vs $82.75) and its cache-read is **higher** (180.4M vs 176.4M) — the LLM pass
+   genuinely removed more content. `cgfinal` wins mainly by **not spending $2.97** on haiku.
+
+### Limitations
+
+- **headroom and rtk cannot be re-derived.** Their trial artifacts have been pruned from disk,
+  so those two columns are **cited from the original study, not recomputed**. Baseline and the
+  old context-guru arm both reproduce their published totals exactly.
+- **Single trial per task**, as in the original study.
+- Every token figure here is **unique**, never cumulative — the measured overcount ratios were
+  **44.5× (cmdfilter)** and **18.4× (extract)**.
+- One task (`circuit-fibsqrt`) was still running at report time; 88 of 89 are scored.
+
+---
 
 ## Headline
 

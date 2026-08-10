@@ -295,6 +295,41 @@ Each writes `rows-<cfg>.json` + `summary.json` under its jobs-root (headroom als
 Per-arm pages via `gen_tb_docs.py --kind arm --label "<name>"`; the four-way
 [comparison](terminal-bench-comparison.md) is assembled from the four `rows-*.json`.
 
+### 7c. The merged-system arm (2026-08-10)
+
+After the cache/filter/observe work landed on `main` (15 PRs), context-guru was re-measured as a
+fifth arm. Two things differ from §7b and both matter for reproduction.
+
+**The config is not `codesmart`.** It is `cgfinal = [format, dedup, cmdfilter, extract, cachesplit]`,
+chosen on per-component evidence rather than maximal token reduction. `extract_llm` (82× underwater
+at cache-read prices), `failed_run` (`acted=0`, 28.8 s of scanning) and `cacheinject` (removed from
+every preset by #36) are excluded. See the
+[comparison](terminal-bench-comparison.md#the-merged-system-a-fifth-arm-2026-08-10).
+
+**Verify the mechanism fired before crediting it.** Each claim must name a counter:
+
+```
+# after the run, from /stats:
+llm_calls == 0                 # extract_llm genuinely never ran
+cmdfilter.acted / requests     # #42 firing rate (0.9% before, 28.7% after)
+sse_buffered_pct               # #33 fast path (100% before, 44.2% after)
+frozen_*                       # #40 -- ZERO here, because its only callers are excluded.
+                               # That is the expected result, NOT evidence about #40.
+cachesplit.acted               # 0 on TB: the Agent SDK sends no volatile tail to split
+```
+
+Two analysis requirements, both learned from earlier errors in this study:
+
+- **Report the median per-task ratio and a leave-one-out beside any aggregate.** The −16.4%
+  aggregate becomes −9.1% without `path-tracing` alone. A sum over heterogeneous tasks can be
+  one task.
+- **Use unique, never cumulative, token figures.** Measured overcount was **44.5×** for
+  `cmdfilter` and **18.4×** for `extract` — a cumulative number is wrong by an order of magnitude.
+
+The per-arm run commands are otherwise identical to §7b, with a distinct binary name, port and
+jobs-root. Note that the harnesses `pkill` by binary **name**, so two concurrent runs sharing a
+name will kill each other's proxy — this happened twice during the study and invalidated two arms.
+
 ## 8. Result docs
 
 - [`baseline.md`](baseline.md) — SWE-bench baseline (`off`) full results.
