@@ -23,6 +23,11 @@ import "sync"
 // Tracker holds the per-session state the modes need, each session's fields guarded
 // by one lock so concurrent turns of a session cannot interleave a read and a write.
 //
+// Session lifetime is the bound, not an explicit end-of-session call: there is no
+// session-end signal on this wire (an agent simply stops sending), so the tracker
+// evicts under its own cap and a forgotten session restarts at generation 0 — correct,
+// just missing the pending job's savings.
+//
 // It also owns prevLen — the number of normalized messages the previous turn carried,
 // which is the already-cached/uncached boundary. That used to live in the TTL store
 // and was read then written back in a `defer`, so two concurrent turns of one session
@@ -112,14 +117,6 @@ func (t *Tracker) CommitIfCurrent(session string, gen uint64, commit func()) boo
 	}
 	s.gen++
 	return true
-}
-
-// Forget drops a session's state (session end / eviction). The next turn starts over
-// at generation 0, which only costs the pending job's savings.
-func (t *Tracker) Forget(session string) {
-	t.mu.Lock()
-	delete(t.m, session)
-	t.mu.Unlock()
 }
 
 // Sessions reports how many sessions are tracked (test/telemetry aid).

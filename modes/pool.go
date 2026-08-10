@@ -166,16 +166,6 @@ func (p *Pool) RecordStale() {
 	p.mu.Unlock()
 }
 
-// RecordError notes a job that ran but produced nothing usable.
-func (p *Pool) RecordError() {
-	if p == nil {
-		return
-	}
-	p.mu.Lock()
-	p.errors++
-	p.mu.Unlock()
-}
-
 // Stats returns the counter tuple.
 func (p *Pool) Stats() Stats {
 	if p == nil {

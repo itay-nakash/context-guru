@@ -117,13 +117,9 @@ func TestConcurrentTurnsDoNotCorruptState(t *testing.T) {
 	}
 }
 
-func TestForgetAndBound(t *testing.T) {
-	tr := NewTracker(0)
-	tr.Turn("s", 3)
-	tr.Forget("s")
-	if pl, gen := tr.Turn("s", 1); pl != 0 || gen != 0 {
-		t.Fatalf("forgotten session did not reset: (%d,%d)", pl, gen)
-	}
+// The tracker's session cap IS its eviction policy (there is no session-end signal to
+// hook), so the cap must actually hold under an unbounded stream of distinct sessions.
+func TestTrackerStaysBounded(t *testing.T) {
 	small := NewTracker(2)
 	for i := 0; i < 20; i++ {
 		small.Turn(string(rune('a'+i)), 1)
@@ -263,7 +259,8 @@ func TestStatsExposesTheWholeTuple(t *testing.T) {
 	p := NewPool(0, 1)
 	defer p.Stop()
 	p.RecordStale()
-	p.RecordError()
+	p.Enqueue("boom", func(context.Context) { panic("x") })
+	waitFor(t, func() bool { return p.Stats().Errors == 1 })
 	s := p.Stats()
 	if s.StaleDiscarded != 1 || s.Errors != 1 {
 		t.Fatalf("counters not recorded: %+v", s)
