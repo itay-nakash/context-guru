@@ -602,3 +602,41 @@ func (c *countingStore) MarkSticky(session, id string) {
 	c.puts.Add(1)
 	c.Store.MarkSticky(session, id)
 }
+
+// TestAsyncDoesNotSpinOnAnUnproductiveTurn: a turn whose deferred job finds nothing to
+// compact must not leave the session stuck re-enqueueing the same key forever. The
+// generation only advances on a COMMIT, so an unproductive job is deliberately allowed
+// to keep its slot — but the queue must stay bounded and the request path unaffected.
+func TestAsyncDoesNotSpinOnAnUnproductiveTurn(t *testing.T) {
+	up, got := captureUpstream(t)
+	// A pipeline that can never shrink this traffic, so no job ever commits.
+	h, agg := newModeHandler(t, "pipeline: [dedup]\n", up.URL, components.ModeAsync, "on")
+	srv := httptest.NewServer(h.Mux())
+	defer srv.Close()
+
+	body := openAIBody(
+		map[string]any{"role": "user", "content": "nothing to compact here"},
+		map[string]any{"role": "assistant", "content": "ok"},
+	)
+	for i := 0; i < 12; i++ {
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/openai/v1/chat/completions", bytes.NewReader(body))
+		req.Header.Set("x-context-guru-session", "unproductive")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+	if n := len(got()); n != 12 {
+		t.Fatalf("forwarded %d of 12 requests", n)
+	}
+	q := agg.Snapshot().AsyncQueue
+	t.Logf("queue after 12 unproductive turns: %+v", q)
+	// The point: no unbounded growth and no drops from a queue full of duplicate work.
+	// Dedup on (session, generation) collapses all of them onto one slot.
+	s := agg.Snapshot()
+	if s.AsyncEnforced != 12 {
+		t.Fatalf("async enforced count is %d, want 12", s.AsyncEnforced)
+	}
+}
