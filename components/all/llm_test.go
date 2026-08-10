@@ -135,7 +135,11 @@ func TestSummarizeEmptyResponseSkips(t *testing.T) {
 // TestExtractRLMUsesModel: strategy=rlm currently maps to code and still runs the
 // model's filter (not silently deterministic).
 func TestExtractRLMUsesModel(t *testing.T) {
-	off := newComp(t, "extract_llm", "strategy: rlm\nmin_tokens: 1\nmodel:\n  source: config\n")
+	// economic_gate: false — this is a MECHANISM test (does the model-written filter
+	// run and reduce?), and its small fixture output is genuinely uneconomic, so the
+	// #28 gate would correctly suppress the call. Gate economics are tested in
+	// components/offload/extract_econ_test.go against the dollar figures directly.
+	off := newComp(t, "extract_llm", "strategy: rlm\nmin_tokens: 1\neconomic_gate: false\nmodel:\n  source: config\n")
 	st := store.NewMemory(store.Options{})
 	pad := strings.Repeat("padding ", 40) // so reduction beats the marker cost (D1 guard)
 	body := `[{"id":1,"name":"keep this one ` + pad + `"},{"id":2,"name":"drop it ` + pad + `"}]`
@@ -157,7 +161,11 @@ func TestExtractRLMUsesModel(t *testing.T) {
 // TestExtractCodeUsesModel: the code strategy runs the model's Starlark filter and
 // keeps only the matching records (a contained subset), with a marker.
 func TestExtractCodeUsesModel(t *testing.T) {
-	off := newComp(t, "extract_llm", "strategy: code\nmin_tokens: 1\nmodel:\n  source: config\n")
+	// economic_gate: false — this is a MECHANISM test (does the model-written filter
+	// run and reduce?), and its small fixture output is genuinely uneconomic, so the
+	// #28 gate would correctly suppress the call. Gate economics are tested in
+	// components/offload/extract_econ_test.go against the dollar figures directly.
+	off := newComp(t, "extract_llm", "strategy: code\nmin_tokens: 1\neconomic_gate: false\nmodel:\n  source: config\n")
 	st := store.NewMemory(store.Options{})
 	pad := strings.Repeat("padding ", 40) // so reduction beats the marker cost (D1 guard)
 	body := `[{"id":1,"name":"keep this ` + pad + `"},{"id":2,"name":"drop this ` + pad + `"},{"id":3,"name":"keep that ` + pad + `"}]`
@@ -215,7 +223,11 @@ func TestDeterministicExtractCollapsesRepeats(t *testing.T) {
 // extract_llm with no model available is a clean no-op (deterministic collapse is a
 // separate component now — extract_llm never silently falls back to it).
 func TestExtractLLMNilModelSkips(t *testing.T) {
-	off := newComp(t, "extract_llm", "strategy: code\nmin_tokens: 1\nmodel:\n  source: config\n")
+	// economic_gate: false — this is a MECHANISM test (does the model-written filter
+	// run and reduce?), and its small fixture output is genuinely uneconomic, so the
+	// #28 gate would correctly suppress the call. Gate economics are tested in
+	// components/offload/extract_econ_test.go against the dollar figures directly.
+	off := newComp(t, "extract_llm", "strategy: code\nmin_tokens: 1\neconomic_gate: false\nmodel:\n  source: config\n")
 	st := store.NewMemory(store.Options{})
 	body := strings.Repeat("some log line\n", 40)
 	req := &bschemas.BifrostChatRequest{Input: []bschemas.ChatMessage{

@@ -12,7 +12,9 @@ import (
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/components"
 	"github.com/rossoctl/context-guru/expand"
+	"github.com/rossoctl/context-guru/internal/cheapmodel"
 	"github.com/rossoctl/context-guru/internal/extract"
+	"github.com/rossoctl/context-guru/metrics"
 	"github.com/rossoctl/context-guru/schema"
 	"gopkg.in/yaml.v3"
 )
@@ -60,6 +62,26 @@ type ExtractLLM struct {
 	skipFileReads *bool // nil = auto (skip when cache-aware); true/false = force
 	mu            sync.Mutex
 	llmSeen       map[string]int // session -> count of qualifying (LLM-eligible) requests
+
+	// minTokensSet records whether the operator pinned min_tokens / trigger explicitly.
+	// When they did, their threshold governs (backward compatibility). When they did not,
+	// the derived pressure-based trigger is the default — no per-workload tuning (#28 E).
+	minTokensSet bool
+	// gate enables the economic gate (#28 D). Default on; `economic_gate: false` restores
+	// the old spend-on-size behavior for anyone who needs to reproduce old numbers.
+	gate bool
+	// allowCached permits extraction on prompt-caching backends. Default FALSE — see
+	// extractLLMConfig.AllowOnCachingBackend for why the default ships disabled there.
+	allowCached bool
+	// pricing prices the extraction model's tokens for the gate's cost side (#28 D).
+	pricing cheapmodel.Pricing
+	// ratios learns this workload's real compression ratio instead of assuming one.
+	ratios ratioTracker
+	// prevTokens tracks per-session request size so growth rate is measurable (#28 E).
+	prevTokens map[string]int
+	// modelName identifies the extraction model in the global cache key, so switching
+	// models misses rather than serving another model's extraction (#28 C).
+	modelName string
 }
 
 type extractLLMConfig struct {
@@ -75,6 +97,19 @@ type extractLLMConfig struct {
 	// required verbatim by the sanity check. Default true (the powerful mode) — set
 	// false to force verified deletion-only.
 	Rewrite *bool `yaml:"rewrite"`
+	// AllowOnCachingBackend re-enables extraction on prompt-caching backends. Unset =
+	// FALSE: the component is disabled by default there, because every caching workload
+	// measured in #28 came out net-negative even with the gate working correctly
+	// (break-even ~30,500 tokens/output against a largest-observed 2,053). Shipping a
+	// component our own numbers say loses money, guarded only by a doc note, is not a
+	// defensible default. Set true if your outputs are genuinely huge; the gate's
+	// economics then decide each call as normal.
+	AllowOnCachingBackend *bool `yaml:"allow_on_caching_backend"`
+	// EconomicGate opts out of the expected-value gate (#28 D). Unset = ON (the default):
+	// only call the LLM when the expected saving exceeds the expected call cost, priced
+	// from real model rates and the cache-awareness of the traffic. Set false to restore
+	// the pre-#28 spend-on-size behavior — needed only to reproduce old benchmark numbers.
+	EconomicGate *bool `yaml:"economic_gate"`
 	// SkipFileReads controls whether line-numbered source-file dumps are left verbatim.
 	// Tri-state: unset = AUTO (skip when the request is prompt-cached, reduce otherwise);
 	// true = always skip; false = always reduce. Rationale (measured, SWE-bench 50):
@@ -88,7 +123,23 @@ type extractLLMConfig struct {
 
 func newExtractLLM(raw []byte) (components.Component, error) {
 	cfg := extractLLMConfig{MinTokens: 300, Strategy: "code"}
+	// Detect whether the operator pinned a threshold BEFORE defaults are applied: the
+	// distinction between "unset" and "set to the default value" is what decides whether
+	// the smart trigger or their number governs, so it must be read from the raw YAML.
+	explicit := false
 	if len(raw) > 0 {
+		var probe struct {
+			MinTokens *int `yaml:"min_tokens"`
+			Trigger   *struct {
+				MinRequestTokens *int `yaml:"min_request_tokens"`
+				MinOutputTokens  *int `yaml:"min_output_tokens"`
+			} `yaml:"trigger"`
+		}
+		if err := yaml.Unmarshal(raw, &probe); err == nil {
+			explicit = probe.MinTokens != nil ||
+				(probe.Trigger != nil &&
+					(probe.Trigger.MinRequestTokens != nil || probe.Trigger.MinOutputTokens != nil))
+		}
 		if err := yaml.Unmarshal(raw, &cfg); err != nil {
 			return nil, err
 		}
@@ -100,13 +151,37 @@ func newExtractLLM(raw []byte) (components.Component, error) {
 	if cfg.Strategy == "" {
 		cfg.Strategy = "code"
 	}
+	gate := true // economic gate on by default (#28 D)
+	if cfg.EconomicGate != nil {
+		gate = *cfg.EconomicGate
+	}
+	// Off by default on caching backends (see AllowOnCachingBackend). Disabling the gate
+	// entirely is an explicit request for pre-#28 behavior, so honor it here too — otherwise
+	// `economic_gate: false` would still be silently blocked on caching traffic.
+	allowCached := !gate
+	if cfg.AllowOnCachingBackend != nil {
+		allowCached = *cfg.AllowOnCachingBackend
+	}
 	return &ExtractLLM{
 		minTokens: cfg.MinTokens, strategy: cfg.Strategy,
 		modelSource: cfg.Model.Source, modelClient: cfg.Model.Client(),
 		trigger: cfg.Trigger, mode: parseMarkerMode(cfg.MarkerMode), rewrite: rewrite,
 		llmEveryN: cfg.LLMEveryN, llmMaxPerReq: cfg.LLMMaxPerReq,
 		skipFileReads: cfg.SkipFileReads, llmSeen: map[string]int{},
+		minTokensSet: explicit, gate: gate, allowCached: allowCached,
+		pricing:    cheapmodel.PricingFromEnv(),
+		prevTokens: map[string]int{}, modelName: cfg.Model.Model,
 	}, nil
+}
+
+// noteRequestSize records this request's size for the session and returns the previous
+// one, so the trigger can measure context growth rate (#28 E).
+func (e *ExtractLLM) noteRequestSize(session string, tokens int) int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	prev := e.prevTokens[session]
+	e.prevTokens[session] = tokens
+	return prev
 }
 
 func (*ExtractLLM) Name() string                 { return "extract_llm" }
@@ -166,7 +241,38 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 	if model != nil && fires && !e.llmAllowedThisRequest(c.Session) {
 		model = nil
 	}
+	// Derived trigger (#28 E): context pressure + growth rate replace a hand-tuned
+	// threshold. When min_tokens/trigger is set explicitly the operator's value governs.
+	reqTokens := schema.MessagesTokens(req)
+	prevTokens := e.noteRequestSize(c.Session, reqTokens)
+	pressure := contextPressure(reqTokens, c.CtxWindow)
+	growth := growthRate(reqTokens, prevTokens)
+	pressureFires, triggerReason := shouldFire(pressure, growth, e.minTokensSet)
+	// An unknown context window (0) makes pressure meaningless; fall back to the
+	// configured Trigger alone, the same fail-open convention Trigger itself uses.
+	if c.CtxWindow <= 0 {
+		pressureFires, triggerReason = fires, "context window unknown; absolute trigger only"
+	}
+	if model != nil && !pressureFires {
+		model = nil // no model call this request; frozen reapplications still run below
+	}
+	metrics.RecordExtractionReason(triggerReason)
+
 	floor := e.outputFloor(c.CtxWindow)
+	// Without an explicit min_tokens, derive the per-output floor from context pressure so
+	// there is no per-workload number to pick (#28 E).
+	if !e.minTokensSet {
+		if pf := pressureFloor(c.CtxWindow, pressure); pf > 0 {
+			floor = pf
+		}
+	}
+	// Gate inputs shared by every candidate this request.
+	val := savedTokenValue(c)
+	ratio := e.ratios.ratio()
+	turnsSoFar := len(req.Input)
+	extCfg := extract.DefaultCfg()
+	extCfg.Mode, extCfg.Floor, extCfg.Rewrite = e.strategy, floor, e.rewrite
+
 	keepIDs := extract.HarvestIdentifiers(goal, 40)
 	tools := toolIndices(req)
 	var keys []string
@@ -209,7 +315,7 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 	if e.skipFileReads != nil {
 		skipFR = *e.skipFileReads
 	}
-	var dbgTail, dbgFloor, dbgPlace, dbgReapply, dbgBigTailBlocked int
+	var dbgTail, dbgFloor, dbgPlace, dbgReapply, dbgBigTailBlocked, dbgMaxSz int
 	for _, i := range tools {
 		msg := &req.Input[i]
 		if !schema.Rewritable(*msg) {
@@ -226,7 +332,16 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 		if isKeptVerbatim(c, id) {
 			continue
 		}
+		// SAME-SESSION replay first. This session already sent these compacted bytes on an
+		// earlier turn, so the provider's cached prefix holds the COMPACTED form and replaying
+		// it is byte-identical — which is why it is safe at any depth, cached prefix included.
+		//
+		// One key per decision, not two. #40 unified the projected text and its summary into
+		// a single JSON value precisely because the split `cg:res:` + `cg:sum1:` keys had
+		// independent TTLs and pin slots, so a replay could hit one and miss the other and
+		// emit HALF a decision — projected text with the summary segment silently gone.
 		if cached, hit := getResult(c, id); hit {
+			metrics.RecordExtractionCacheLookup(true)
 			apply(i, content, cached.Projected, cached.Summary)
 			dbgReapply++
 			continue
@@ -244,6 +359,9 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 		// suffix is cache-written either way, so re-deriving would buy a model call for
 		// nothing. The model may also not run at all (throttle, timeout, floor), which would
 		// leave the output verbatim at depth after the gate had already been lifted.
+		if sz > dbgMaxSz {
+			dbgMaxSz = sz
+		}
 		if c.CacheAware && !c.TailOnly(i) {
 			dbgTail++
 			if sz >= floor {
@@ -251,6 +369,48 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 			}
 			continue
 		}
+		// CROSS-SESSION reuse (#28 C), deliberately placed AFTER the tail gate — the
+		// invariant TestGlobalCacheHitIsNotSplicedAtDepth exists to protect. An extraction is
+		// a context-free derived result, so a global content-hash key lets a different session
+		// skip re-deriving it (measured: 82 of 103 unique contents recurred across sessions).
+		// But cache-safety differs from the same-session replay above: THIS session never sent
+		// these compacted bytes, so the provider's cached prefix holds the ORIGINAL. Splicing
+		// a global hit at depth would mutate already-cached content and force a suffix re-write
+		// at 11.5x the read price — the same churn the tail gate exists to prevent, just
+		// sourced from a cache instead of a model call, and exactly the harm #40 removed
+		// repairLostResult to avoid. So a global hit is treated exactly like a new decision:
+		// tail-only, then frozen and replayed from the same-session path at any depth. Do NOT
+		// flatten this ordering: only getResult may bypass the tail gate.
+		//
+		// It cannot become a re-derive path (#40's stance): on a MISS this falls through to the
+		// normal candidate flow, which is already tail-gated and floor-gated; nothing here
+		// lifts a depth restriction the way the removed repairLostResult did.
+		//
+		// Reuse is gated on RECOVERABILITY, not verification. The result was derived toward
+		// the goal of whichever session produced it, and in the default rewrite mode the
+		// containment proof is deliberately skipped — so a reused result can be a lossy rewrite
+		// steered by an unrelated task. That is acceptable only while the agent can get the
+		// original back: with a full (reversible) marker the stash is refreshed and `expand`
+		// recovers it. Without one (marker_mode summary/off, or a non-persisting store) the
+		// drop is permanent, so fall back to same-session reuse only.
+		//
+		// One key per decision here too: the global namespace stores the projected text and
+		// its summary in the SAME value, for the same reason #40 unified the session-scoped
+		// pair. Splitting them across two global keys would re-create the half-a-decision bug
+		// cross-session, where independent TTLs let a hit on one and a miss on the other emit
+		// projected text with the summary segment silently gone.
+		if !e.rewrite || effectiveMode(c, e.mode) == markerFull {
+			if cached, hit := getResultGlobal(c, extract.ResultKey(id, e.modelName, extCfg)); hit {
+				metrics.RecordExtractionCacheLookup(true)
+				// Freeze into this session so later turns replay it byte-for-byte from the
+				// same-session path above, at any depth.
+				putResult(c, id, cached.Projected, cached.Summary)
+				apply(i, content, cached.Projected, cached.Summary)
+				dbgReapply++
+				continue
+			}
+		}
+		metrics.RecordExtractionCacheLookup(false)
 		if sz < floor {
 			dbgFloor++
 			continue // only medium/large outputs are worth a model call
@@ -264,12 +424,42 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 		if skipFR && looksLikeFileRead(content) {
 			continue
 		}
+		// The economic gate (#28 D). This is the check the component never had: is one
+		// LLM call worth it for THIS output, given that a saved token in a cached region
+		// is worth 10x less? Where caching makes extraction pointless, suppress it; on a
+		// non-caching backend or for recurring content, allow it.
+		// Record the sighting BEFORE the gate reads it, and read the PRIOR value. The flag
+		// means "seen on an earlier turn/session", so marking it after the gate allowed a
+		// call made first sight reclassify itself as recurring and collect a 50% valuation
+		// bump (6 expected reuses vs 4) it had not earned — the gate over-firing in the
+		// opposite direction from the two pessimistic priors fixed earlier. Marking on
+		// OBSERVATION also means a suppressed candidate still counts as seen, which is
+		// correct: recurrence is a property of the content, not of what we decided to spend.
+		seenBefore := markSeenContent(c, id)
+		if e.gate {
+			// Stop exploring once calls are observed to be slow: exploration spends wall
+			// clock as well as money, and an agent on a task deadline feels the former more.
+			explore := !tooSlowToExplore(metrics.ExtractionAvgLatencyMs()) &&
+				e.ratios.exploring(c.Session)
+			d := evaluateGate(sz, ratio, val, callCost(e.pricing, sz), seenBefore, turnsSoFar,
+				explore, e.allowCached)
+			if !d.allow {
+				metrics.RecordExtractionSuppressed(d.reason)
+				if debugExtractLLM {
+					slog.Info("cg.debug.extract_llm.gate", "decision", "suppress",
+						"reason", d.reason, "size", sz, "exp_saving_usd", d.expSaving,
+						"exp_cost_usd", d.expCost, "cacheAware", c.CacheAware)
+				}
+				continue
+			}
+			metrics.RecordExtractionReason(d.reason)
+		}
 		cands = append(cands, cand{i, content, id})
 	}
 	if debugExtractLLM && len(tools) > 0 {
 		slog.Info("cg.debug.extract_llm", "tools", len(tools), "cands", len(cands),
 			"reapplied", dbgReapply, "skip_placeholder", dbgPlace, "skip_tail", dbgTail,
-			"skip_floor", dbgFloor, "big_but_not_tail", dbgBigTailBlocked,
+			"skip_floor", dbgFloor, "max_output_tokens", dbgMaxSz, "big_but_not_tail", dbgBigTailBlocked,
 			"cacheAware", c.CacheAware, "maxCachedIdx", c.MaxCachedIdx, "floor", floor,
 			"nInput", len(req.Input))
 	}
@@ -294,13 +484,20 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 				defer wg.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
-				cfg := extract.DefaultCfg()
-				cfg.Mode, cfg.Floor, cfg.Rewrite = e.strategy, floor, e.rewrite
 				ctx, cancel := context.WithTimeout(c.Ctx, llmCallTimeout)
 				defer cancel()
-				res, sum, _ := extract.RunExtractionSummary(ctx, cands[k].content, goal, keepIDs, schema.TextTokens(cands[k].content), cfg, model)
+				before := schema.TextTokens(cands[k].content)
+				start := time.Now()
+				res, sum, _ := extract.RunExtractionSummary(ctx, cands[k].content, goal, keepIDs, before, extCfg, model)
+				metrics.RecordExtractionCall(float64(time.Since(start).Milliseconds()))
 				if res != "" && res != cands[k].content {
 					out[k] = outT{res, sum}
+					// Feed the observed ratio so the gate prices future calls on what this
+					// workload actually achieves, not on an assumption.
+					e.ratios.observe(before-schema.TextTokens(res), before)
+					metrics.RecordExtractionSaving(before - schema.TextTokens(res))
+				} else {
+					e.ratios.observe(0, before) // a miss is real evidence: ratio 0
 				}
 			}(k)
 		}
@@ -309,7 +506,20 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 			if out[k].projected == "" {
 				continue
 			}
+			// Publish to the GLOBAL namespace only when the result is recoverable (or verified
+			// deletion-only) — the same condition the read side checks. An unverified, lossy
+			// rewrite with no way back must not become another session's starting point; keep it
+			// session-scoped so this session still benefits across its own turns.
+			// Always write the session-scoped entry: this session's own cross-turn replay is
+			// what keeps its cached prefix byte-stable, and it must not depend on whether the
+			// result also qualified for cross-session sharing. Then publish globally only when
+			// recoverable. One key per decision (#40) — projected text and summary travel
+			// together, so a replay can never emit half a decision.
 			putResult(c, cands[k].id, out[k].projected, out[k].summary)
+			if !e.rewrite || effectiveMode(c, e.mode) == markerFull {
+				putResultGlobal(c, extract.ResultKey(cands[k].id, e.modelName, extCfg),
+					out[k].projected, out[k].summary)
+			}
 			apply(cands[k].i, cands[k].content, out[k].projected, out[k].summary)
 		}
 	}

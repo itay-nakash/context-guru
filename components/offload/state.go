@@ -60,6 +60,77 @@ func putResult(c *components.Ctx, id, projected, summary string) {
 	}
 }
 
+// --- Global (session-independent) extraction result cache (#28 C) -----------
+//
+// The session prefix above was throwing away most of the available reuse: an extraction
+// is a CONTEXT-FREE derived result, so the same content under the same extractor
+// semantics reduces the same way in any session. Measured on Terminal-Bench: 82 of 103
+// unique contents recurred ACROSS sessions, and ~93% of the component's realized value
+// came from cache reuse rather than from new LLM calls.
+//
+// Contrast issue #27's xdedup index, which is session-scoped ON PURPOSE: it mints a
+// conversational reference ("same as step N") that is meaningless outside its session.
+// The distinction is reference vs derived result, and it decides the namespace.
+//
+// The key is built by extract.ResultKey (content + prompt version + model + config
+// fingerprint), so a prompt bump, a model switch, or a config change MISSES rather than
+// silently serving a stale extraction. The store is already bounded (TTL + LRU), which
+// bounds this namespace too.
+
+// getResultGlobal returns a previously cached reduced output for a global key.
+//
+// ONE key holding the whole decision, matching the session-scoped cachedResult above and
+// for the same reason: as two independently-TTL'd, independently-pinned keys, losing only
+// the summary made the replay HIT and emit different bytes (the "[summary] " segment
+// silently vanishing) with nothing reported lost. That failure is if anything worse in the
+// global namespace, where a half-decision can propagate into a session that never produced
+// it.
+func getResultGlobal(c *components.Ctx, gkey string) (cachedResult, bool) {
+	b, ok := c.Store.Get(gkey)
+	if !ok {
+		return cachedResult{}, false
+	}
+	var r cachedResult
+	if json.Unmarshal(b, &r) != nil || r.Projected == "" {
+		return cachedResult{}, false // unreadable => absent, never splice half a decision
+	}
+	return r, true
+}
+
+// putResultGlobal caches a reduced output under its global key.
+func putResultGlobal(c *components.Ctx, gkey, projected, summary string) {
+	if b, err := json.Marshal(cachedResult{Projected: projected, Summary: summary}); err == nil {
+		c.Store.Put(gkey, b)
+	}
+}
+
+// --- Content recurrence (the economic gate's reuse signal) -------------------
+//
+// The gate needs to know whether content is likely to RECUR, because a compaction's
+// saving is collected on every later turn it is replayed on — recurrence is what makes an
+// extraction call pay for itself under caching. Recording each content key we considered
+// (session-independent, like the result cache) turns "have I seen this before anywhere?"
+// into a cheap store lookup.
+
+func seenKey(ck string) string { return "cg:xseen:" + ck }
+
+// markSeenContent records that this content was OBSERVED and reports whether it had
+// ALREADY been seen (on an earlier turn, or in another session).
+//
+// Test-and-set in one call so the gate cannot read a flag that this same sighting just
+// wrote. Marking after the gate allowed a call made first sight reclassify itself as
+// recurring and collect a 50% valuation bump (6 expected reuses vs 4) it had not earned.
+// Marking on observation also means a SUPPRESSED candidate still counts as seen, which is
+// correct: recurrence is a property of the content, not of what we chose to spend on it.
+func markSeenContent(c *components.Ctx, ck string) bool {
+	k := seenKey(ck)
+	_, seen := c.Store.Get(k)
+	if !seen {
+		c.Store.Put(k, []byte{1})
+	}
+	return seen
+}
+
 // --- Freeze + reapply (cache stability) -------------------------------------
 //
 // The cache-safety invariant: once an offloader compacts an output, it must send the

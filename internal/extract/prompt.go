@@ -1,6 +1,8 @@
 package extract
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"strings"
 )
@@ -185,10 +187,61 @@ lines into one indented marker. Kept lines stay byte-identical (line numbers kep
 // the full INPUT at runtime).
 const maxCodeContentChars = 32000
 
+// PromptVersion identifies the extractor's prompt + acceptance semantics. The result cache
+// key includes it, so a change MISSES every stale entry rather than serving an extraction
+// derived under different rules.
+//
+// DERIVED, not hand-maintained. A manual constant only works if every future editor of the
+// prompt remembers to bump it, and the one time someone forgets, the cache serves
+// extractions produced under rules that no longer exist — exactly the failure the issue
+// warned about, and one with no symptom to notice. Hashing the prompt text makes the version
+// a consequence of the prompt instead of a promise about it.
+var PromptVersion = promptFingerprint()
+
+// semanticsVersion covers result-affecting changes OUTSIDE the prompt strings — the
+// validation gate (validateExtraction / extractionIsSane) and the sandbox contract. Bump it
+// when what gets ACCEPTED changes while the prompt text does not.
+const semanticsVersion = "s1"
+
+// promptFingerprint hashes every prompt constant that can change what the model returns.
+// Add new prompt text here as it is introduced: anything omitted is invisible to the key.
+func promptFingerprint() string {
+	h := sha256.New()
+	for _, part := range []string{
+		semanticsVersion,
+		codeContract, codeRules, codeDeletionRules, codeExample,
+		rules, example, sampleMarker,
+	} {
+		h.Write([]byte(part))
+		h.Write([]byte{0})
+	}
+	return "p" + hex.EncodeToString(h.Sum(nil))[:12]
+}
+
+// codeSystemPreamble is the INVARIANT half of the code-strategy prompt: the sandbox
+// contract, the rules, and the worked examples. It is byte-identical on every call, so
+// it is the cacheable prefix — sent as a `system` block with a cache_control breakpoint
+// (see cheapmodel.Anthropic.CompleteSystem). ~1463 tokens as measured.
+//
+// It is split by REWRITE MODE, not per call: two possible values total, so each is a
+// stable prefix that a provider can actually cache across calls. Anything that varies
+// per call (the goal, the keep-list, the tool output) stays in the user message.
+func codeSystemPreamble(rewrite bool) string {
+	rules := codeRules
+	if !rewrite {
+		rules = codeDeletionRules
+	}
+	return "You write a Starlark program that reduces ONE tool output to what the agent needs next.\n\n" +
+		rules + "\n\n" + codeExample
+}
+
 // buildCodePrompt builds the prompt for the Starlark code-writing strategy. It shows
 // the model the FULL output (bounded) so it can write content-specific deletions
 // rather than a blind generic filter. rewrite selects the (lossy, unverified) rewrite
 // contract instead of the default deletion-only one.
+//
+// Deprecated in favor of buildCodePromptSplit; retained so the single-message shape
+// stays testable and any caller without a system-capable client keeps working.
 func buildCodePrompt(bodyText, goal string, keepIDs []string, rewrite bool) string {
 	g := strings.TrimSpace(goal)
 	if g == "" {
@@ -233,6 +286,51 @@ func buildCodePrompt(bodyText, goal string, keepIDs []string, rewrite bool) stri
 	return "You write a Starlark program that reduces ONE tool output to what the agent needs next.\n\n" +
 		"WHAT THE AGENT IS DOING NOW (reduce toward this):\n" + g + "\n\n" +
 		keepBlock + label + "\n" + shown + "\n\n" + rules + "\n\n" + codeExample
+}
+
+// buildCodePromptSplit returns (system, user): the invariant preamble and the per-call
+// variable part. Same total content as buildCodePrompt, reordered so the stable half can
+// be a cacheable prefix. Order matters — the cacheable block must come FIRST on the
+// wire, which is exactly what a `system` block gives us.
+func buildCodePromptSplit(bodyText, goal string, keepIDs []string, rewrite bool) (system, user string) {
+	return codeSystemPreamble(rewrite), buildCodeUserPart(bodyText, goal, keepIDs)
+}
+
+// buildCodeUserPart is the VARIABLE half: the goal, the keep-list, and the tool output.
+func buildCodeUserPart(bodyText, goal string, keepIDs []string) string {
+	g := strings.TrimSpace(goal)
+	if g == "" {
+		g = "(no explicit goal stated)"
+	}
+	if len(g) > 8000 {
+		g = g[:8000]
+	}
+	keep := keepIDs
+	if len(keep) > 60 {
+		keep = keep[:60]
+	}
+	keepBlock := ""
+	if len(keep) > 0 {
+		kb, _ := json.Marshal(keep)
+		keepBlock = "IDENTIFIERS THE AGENT REFERENCED RECENTLY — keep every one verbatim:\n" +
+			string(kb) + "\n\n"
+	}
+	shown := bodyText
+	if isJSONContainer(bodyText) {
+		if v := parseBody(bodyText); !isRawString(v) {
+			if b, err := json.MarshalIndent(v, "", "  "); err == nil {
+				shown = string(b)
+			}
+		}
+	}
+	label := "FULL TOOL OUTPUT (INPUT is exactly this):"
+	if len(shown) > maxCodeContentChars {
+		half := maxCodeContentChars / 2
+		shown = shown[:half] + "\n…[middle elided in this prompt; the real INPUT at runtime is the FULL output]…\n" + shown[len(shown)-half:]
+		label = "TOOL OUTPUT (head+tail; the real INPUT at runtime is the FULL output):"
+	}
+	return "WHAT THE AGENT IS DOING NOW (reduce toward this):\n" + g + "\n\n" +
+		keepBlock + label + "\n" + shown
 }
 
 func isRawString(v any) bool {

@@ -266,11 +266,22 @@ func (h *Handler) compact(w http.ResponseWriter, r *http.Request) {
 	if q := r.URL.Query().Get("cache"); q != "" {
 		cacheMode = q
 	}
+	// Resolve the model's context window here too, exactly as the chat path does. It used
+	// to be hard-coded 0 ("unknown"), which silently disabled every fraction-based Trigger
+	// threshold AND extract_llm's context-pressure triggering on this endpoint — so
+	// /compact did not reflect production, and offline replay/eval measured a different
+	// component than the one that ships.
+	window := 0
+	if h.opts.Windows != nil {
+		if w, ok := h.opts.Windows.Window(r.Context(), gjson.GetBytes(body, "model").String()); ok {
+			window = w
+		}
+	}
 	out, _ := apply.BodyFull(
 		r.Context(), pipe, h.store, provider, body,
 		r.Header.Get("x-context-guru-session"),
 		strings.EqualFold(r.Header.Get("x-context-guru-bypass"), "true"),
-		models, 0, cacheMode,
+		models, window, cacheMode,
 	)
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(out)
@@ -665,8 +676,42 @@ func (h *Handler) stats(w http.ResponseWriter, _ *http.Request) {
 			Processed: q.Processed, Dropped: q.Dropped, Errors: q.Errors,
 		}
 	}
+	// extract_llm economics (#28 part F). Net-after-cost is the honest headline: the three
+	// LLM* fields above report what the component SPENT, and until now nothing anywhere
+	// compared that against what its savings were WORTH — which is how an 82x loss stayed
+	// invisible. Computed here, the layer that knows the model pricing and the cache mode.
+	// Purely additive: every pre-existing field keeps its name for deploy/harbor/*.py.
+	cacheWrite, cacheRead := cheapmodel.CacheUsage()
+	pricing := cheapmodel.PricingFromEnv()
+	cost := pricing.Cost(snap.LLMInputTokens, snap.LLMOutputTokens, cacheWrite, cacheRead)
+	// Value a saved token at the rate it would actually have been billed. On a caching
+	// backend a removed token saves the cache-READ rate (~10x cheaper), which is exactly
+	// why the component can be underwater while its token count looks impressive.
+	//
+	// Pass the RATE, not a pre-multiplied total: ExtractSnapshot applies it to
+	// extract_llm's OWN gross_saved_tokens. Multiplying snap.SavedTokens here would price
+	// the WHOLE pipeline's savings (format, dedup, cmdfilter, extract, …) against
+	// extract_llm's cost alone and display the component as comfortably POSITIVE on a
+	// preset like codesmart — inverting its own arithmetic in the one field an operator
+	// reads. The rate-based signature makes that mistake unrepresentable.
+	perSavedTok := agentCacheReadPerMTok / 1e6
+	if h.opts.CacheMode == "off" {
+		perSavedTok = agentFreshPerMTok / 1e6
+	}
+	xs := metrics.ExtractSnapshot(cost, perSavedTok, cacheWrite, cacheRead)
+	snap.Extract = &xs
 	json.NewEncoder(w).Encode(snap)
 }
+
+// Agent-model token rates used to VALUE saved tokens at /stats (claude-sonnet-5 class,
+// $3/MTok fresh, 0.1x cache read). Mirrors components/offload/extract_econ.go, which
+// applies the same rates inside the gate; kept as local constants rather than a shared
+// export because the two layers may legitimately be priced differently (the gate prices
+// the traffic it sees; /stats prices the aggregate).
+const (
+	agentFreshPerMTok     = 3.00
+	agentCacheReadPerMTok = 0.30
+)
 
 // expand resolves a stashed original by id — the HTTP side of reversibility (the
 // model-callable tool loop is a separate concern, added with response handling).

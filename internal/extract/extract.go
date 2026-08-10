@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -23,6 +25,25 @@ const sampleChars = 4000
 // injects a concrete implementation; the extractor core stays transport-free.
 type Model interface {
 	Complete(ctx context.Context, prompt string) (string, error)
+}
+
+// SystemModel is the optional capability a Model may also implement: send the invariant
+// instructions as a separately-cacheable stable prefix. cheapmodel's Anthropic (a
+// `system` block + cache_control) and OpenAI (a leading system message) both do. A Model
+// that does NOT implement it still works — the extractor falls back to the single-message
+// prompt — so this is additive, not a breaking interface change.
+type SystemModel interface {
+	CompleteSystem(ctx context.Context, system, prompt string) (string, error)
+}
+
+// completeSplit sends (system, user) via SystemModel when the client supports it, else
+// concatenates them into one user message. Callers get preamble caching where it exists
+// and identical content where it does not.
+func completeSplit(ctx context.Context, model Model, system, user string) (string, error) {
+	if sm, ok := model.(SystemModel); ok {
+		return sm.CompleteSystem(ctx, system, user)
+	}
+	return model.Complete(ctx, system+"\n\n"+user)
 }
 
 // Cfg configures extraction.
@@ -56,6 +77,73 @@ func ContentKey(text string) string {
 	s = strings.TrimSpace(s)
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])[:24]
+}
+
+// ResultKey is the GLOBAL cache key for a derived extraction result. Unlike a
+// conversational reference (issue #27's xdedup index, which is deliberately
+// session-scoped because "same as step N" only means anything in-session), an extraction
+// is a CONTEXT-FREE derived result: the same bytes under the same extractor semantics
+// yield the same reduction in any session. Measured on Terminal-Bench, 82 of 103 unique
+// contents recurred ACROSS sessions, so a session prefix threw away ~80% of the reuse.
+//
+// The key must include everything that materially changes the result, or a stale entry is
+// served silently — which is worse than a miss, because nothing surfaces it:
+//   - contentKey: the content itself (marker/whitespace-insensitive)
+//   - PromptVersion: prompt + acceptance semantics
+//   - model: a different extractor model writes a different program
+//   - cfgFingerprint: the config fields that steer the result (mode, rewrite, floor)
+//
+// A change to ANY of these misses rather than mis-serves. Changing the key schema
+// invalidates existing entries exactly once — acceptable, and noted in the docs.
+func ResultKey(contentKey, model string, cfg Cfg) string {
+	return resultKeyWithVersion(contentKey, model, cfg, PromptVersion)
+}
+
+// resultKeyWithVersion is ResultKey with the prompt version injected, so a test can prove
+// the version genuinely participates in the hash (a version that is documented but not
+// hashed is the exact bug that serves stale extractions forever).
+func resultKeyWithVersion(contentKey, model string, cfg Cfg, version string) string {
+	h := sha256.New()
+	for _, part := range []string{
+		"cg:xres", keySchema, version, model, contentKey, cfgFingerprint(cfg),
+	} {
+		h.Write([]byte(part))
+		// Length-prefixed separator: no concatenation of two parts can be mistaken for
+		// another pair (e.g. ("ab","c") must not collide with ("a","bc")).
+		h.Write([]byte{0})
+	}
+	return "cg:xres:" + hex.EncodeToString(h.Sum(nil))[:32]
+}
+
+// keySchema versions the KEY LAYOUT itself (as distinct from the prompt). Bump it if the
+// set or order of key components changes.
+const keySchema = "k1"
+
+// cfgFingerprint captures the Cfg fields that can change an accepted result. Fields that
+// only affect WHICH strategies are attempted but not what a given result means are still
+// included — a result derived under a different strategy order is a different result.
+func cfgFingerprint(cfg Cfg) string {
+	allowed := append([]string(nil), cfg.AllowedStrategies...)
+	sort.Strings(allowed) // order-insensitive: the same set must fingerprint the same
+	// Floor is included ONLY in "auto" mode. It is now derived from context pressure, so it
+	// changes as the window fills; including it unconditionally would rotate the cache key
+	// mid-session and throw away most of the cross-session reuse this key exists to capture.
+	// And it cannot change the result elsewhere: strategyOrder reads Floor only on the
+	// "auto" branch (max(Floor*4, 8000), deciding whether "rlm" precedes "code"); in
+	// code/single/rlm/deterministic modes it is unread. Include it exactly where it matters.
+	floor := "-"
+	if cfg.Mode == "auto" {
+		floor = strconv.Itoa(cfg.Floor)
+	}
+	return strings.Join([]string{
+		cfg.Mode,
+		floor,
+		strconv.FormatBool(cfg.Rewrite),
+		strconv.FormatBool(cfg.AllowDeterministic),
+		strconv.FormatFloat(cfg.MinKeepRatio, 'f', 4, 64),
+		strconv.Itoa(cfg.MaxChars),
+		strings.Join(allowed, ","),
+	}, "|")
 }
 
 var identRe = regexp.MustCompile(`[A-Za-z_][\w./-]{3,}|\b\d{3,}\b`)
