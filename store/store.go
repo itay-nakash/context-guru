@@ -46,15 +46,34 @@ type FrozenLoser interface {
 	FrozenLost(key string) bool
 }
 
-// FrozenPrefix namespaces a component's FROZEN decision — the exact replacement
-// bytes it must replay on every later turn to keep an already-cached message
-// byte-identical (see components/offload/state.go). Entries under this prefix are
-// PINNED: exempt from LRU eviction, because losing one is not a cache miss, it is a
-// cache-DESTRUCTIVE event (the message flips representation inside the provider's
-// cached prefix and the whole suffix is re-written at 11.5x the read price). They are
-// small (a marker line), still honor the sliding TTL, and the exemption is capped at
-// half the entry cap so a pathological session can never pin the whole cache.
-const FrozenPrefix = "cg:frz:"
+// Key namespaces whose entries are a component's FROZEN decision — the replacement
+// text it must replay on every later turn to keep an already-cached message
+// byte-identical (see components/offload/state.go). Two components' worth, because the
+// freeze-replay mechanism was implemented twice under different names:
+//
+//	cg:frz:  — mask / failed_run (freeze + reapplyFrozen)
+//	cg:res:  — extract_llm's result cache, plus cg:sum1: for the summary line it
+//	           re-emits alongside it. Functionally the same replay contract.
+//
+// Entries under these prefixes are PINNED: exempt from LRU eviction, because losing one
+// is not a cache miss, it is a cache-DESTRUCTIVE event — the message flips representation
+// inside the provider's cached prefix and the whole suffix is re-written at 11.5x the
+// read price. They are small (a marker line / a compacted projection), still honor the
+// sliding TTL, and the exemption is capped at half the entry cap so a pathological
+// session can never pin the whole cache. The rewind stashes (bare content hashes, the
+// large payloads the expand loop resolves) stay fully evictable.
+const (
+	FrozenPrefix  = "cg:frz:"
+	ResultPrefix  = "cg:res:"
+	SummaryPrefix = "cg:sum1:"
+)
+
+// frozenNamespace reports whether key holds a replay decision (see FrozenPrefix).
+func frozenNamespace(key string) bool {
+	return strings.HasPrefix(key, FrozenPrefix) ||
+		strings.HasPrefix(key, ResultPrefix) ||
+		strings.HasPrefix(key, SummaryPrefix)
+}
 
 type entry struct {
 	key     string
@@ -163,7 +182,7 @@ func (m *Memory) Put(key string, payload []byte) {
 	e := &entry{key: key, payload: payload, expires: m.now().Add(m.ttl)}
 	// Pin frozen decisions, but never more than half the cache: past that the marginal
 	// pin protects one message while starving the rewind stashes the expand loop needs.
-	if strings.HasPrefix(key, FrozenPrefix) {
+	if frozenNamespace(key) {
 		if m.pinnedN < m.max/2 {
 			e.pinned = true
 			m.pinnedN++

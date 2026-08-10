@@ -238,7 +238,14 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 		// caching is off, any message is fair game. File reads included (largest mass);
 		// safe because we never touch already-cached content and freeze+reapply the result.
 		sz := schema.TextTokens(content)
-		if c.CacheAware && !c.TailOnly(i) {
+		// Exception to the tail gate: a result-cache entry this session established and the
+		// store then LOST. The provider already holds the compacted bytes for this message,
+		// so re-deriving them restores the cached representation, whereas leaving the output
+		// verbatim is what flips it and re-writes the suffix. (Unlike the deterministic
+		// offloaders this costs a model call and the LLM may not reproduce the bytes
+		// exactly — but the alternative is a GUARANTEED full-suffix cache-write, the more
+		// expensive of the two by a wide margin.)
+		if c.CacheAware && !c.TailOnly(i) && !repairLostResult(c, id) {
 			dbgTail++
 			if sz >= floor {
 				dbgBigTailBlocked++ // a large output we skipped ONLY because it's not in the tail

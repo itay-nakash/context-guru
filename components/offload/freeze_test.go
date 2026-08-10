@@ -151,3 +151,37 @@ func TestFrozenCountersMove(t *testing.T) {
 		t.Fatalf("hits/misses must both advance: %d->%d, %d->%d", h0, h1, m0, m1)
 	}
 }
+
+// The result cache (cg:res:) is the OTHER replay namespace — extract_llm's — and it is
+// the one that carries the load in the shipped coding config (no mask; failed_run
+// self-skips on a cached agent). It must get the same protection: pinned against
+// eviction, and its loss reported so the compaction can be re-derived at depth.
+func TestResultCachePinnedAndRepairable(t *testing.T) {
+	now := time.Unix(0, 0)
+	st := store.NewMemory(store.Options{TTLSeconds: 10, MaxEntries: 4})
+	st.SetClock(func() time.Time { return now })
+	c := &components.Ctx{Session: "s", Store: st}
+
+	putResult(c, "id1", []byte("compacted"))
+	// Ordinary rewind stashes churn through the cache; the replay decision must survive.
+	for i := 0; i < 20; i++ {
+		st.Put("rewindhash"+string(rune('a'+i)), []byte("big original payload"))
+	}
+	if _, ok := getResult(c, "id1"); !ok {
+		t.Fatal("a result-cache decision must be pinned against LRU eviction")
+	}
+	if repairLostResult(c, "id1") {
+		t.Fatal("a live decision is not lost")
+	}
+	// Expire it: nothing reads it for longer than the TTL.
+	now = now.Add(11 * time.Second)
+	if _, ok := getResult(c, "id1"); ok {
+		t.Fatal("expired entry must miss")
+	}
+	if !repairLostResult(c, "id1") {
+		t.Fatal("a LOST result-cache decision must be distinguishable from never-cached")
+	}
+	if repairLostResult(c, "never-seen") {
+		t.Fatal("content that was never compacted must not authorize depth mutation")
+	}
+}
