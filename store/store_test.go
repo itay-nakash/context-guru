@@ -246,3 +246,103 @@ func TestUnpinnedFrozenLossIsStillReported(t *testing.T) {
 		t.Fatal("an unpinned frozen decision that expired must still report as lost")
 	}
 }
+
+// Pinned entries must not be immortal. The TTL is only enforced in Get, and a dead
+// session's decisions are never read again, so without expiry-aware eviction pinnedN
+// ratchets to max/2 and stays there: half the cache leaks AND pinning silently stops
+// working for every later session.
+func TestExpiredPinnedEntriesAreReclaimed(t *testing.T) {
+	now := time.Unix(0, 0)
+	m := NewMemory(Options{TTLSeconds: 10, MaxEntries: 20}) // pin cap = 10
+	m.SetClock(func() time.Time { return now })
+	for i := 0; i < 10; i++ { // fill every pin slot from a "dead" session
+		m.Put(FrozenPrefix+"dead:mask:"+string(rune('a'+i)), []byte("f"))
+	}
+	if m.pinnedN != 10 {
+		t.Fatalf("expected 10 pinned, got %d", m.pinnedN)
+	}
+	now = now.Add(11 * time.Second) // the dead session's decisions are all past their TTL
+	for i := 0; i < 30; i++ {       // a new session's traffic drives eviction
+		m.Put("rewind"+string(rune('a'+i)), []byte("payload"))
+	}
+	if m.pinnedN >= 10 {
+		t.Fatalf("expired pinned entries must be reclaimed, pinnedN=%d", m.pinnedN)
+	}
+	if m.ll.Len() > 20 {
+		t.Fatalf("entry cap breached, len=%d", m.ll.Len())
+	}
+	// A fresh session can pin again, because slots actually freed.
+	m.Put(FrozenPrefix+"live:mask:x", []byte("f"))
+	if el := m.items[FrozenPrefix+"live:mask:x"]; el == nil || !el.Value.(*entry).pinned {
+		t.Fatal("a new session must be able to pin after old decisions expired")
+	}
+}
+
+// cg:len: is apply's prev-turn message count — the MaxCachedIdx boundary. Losing it makes
+// TailOnly return true for EVERY index (fail-open, mutating the cached prefix), so it must
+// be pinned too. It is 2-4 bytes.
+func TestLenTrackerIsPinned(t *testing.T) {
+	m := NewMemory(Options{MaxEntries: 20})
+	m.Put(LenPrefix+"sess", []byte("42"))
+	for i := 0; i < 10; i++ {
+		m.Put(FrozenPrefix+"s:mask:"+string(rune('a'+i)), []byte("f"))
+	}
+	for i := 0; i < 40; i++ {
+		m.Put("rewind"+string(rune('a'+i)), []byte("payload"))
+	}
+	if got, ok := m.Get(LenPrefix + "sess"); !ok || string(got) != "42" {
+		t.Fatal("the cache-boundary tracker must survive eviction pressure (else TailOnly fails open)")
+	}
+}
+
+// An entry that is present and readable is not "dropped". Counting it at write time (when
+// it merely missed the pin cap) inflated the drop count with live entries and made the
+// next ordinary re-freeze look like a repair — flips reading 0 while nothing was wrong.
+func TestOverCapEntryIsNotCountedAsDropped(t *testing.T) {
+	m := NewMemory(Options{MaxEntries: 4}) // pin cap = 2
+	for i := 0; i < 6; i++ {
+		m.Put(FrozenPrefix+"s:mask:"+string(rune('a'+i)), []byte("f"))
+	}
+	dropped, repaired := m.FrozenLossStats()
+	// Whatever was evicted is a real drop; nothing was re-frozen, so repaired must be 0.
+	if repaired != 0 {
+		t.Fatalf("no key was re-frozen, so repaired must be 0, got %d (dropped=%d)", repaired, dropped)
+	}
+	// Re-freezing the same over-cap key twice must not manufacture a drop/repair pair.
+	before, _ := m.FrozenLossStats()
+	k := FrozenPrefix + "s:mask:f"
+	m.Put(k, []byte("f2"))
+	m.Put(k, []byte("f3"))
+	after, rep2 := m.FrozenLossStats()
+	if after != before || rep2 != 0 {
+		t.Fatalf("re-freezing a LIVE over-cap key must not count drops/repairs: %d->%d rep=%d",
+			before, after, rep2)
+	}
+}
+
+// The loss marks are one shared budget, so eviction must not let a busy session delete
+// another session's fresh mark — that session's next turn would see a plain miss and flip
+// its message unrepaired. Oldest-first keeps the newest marks.
+func TestLossMarkEvictionKeepsNewest(t *testing.T) {
+	now := time.Unix(0, 0)
+	m := NewMemory(Options{TTLSeconds: 10, MaxEntries: 2})
+	m.SetClock(func() time.Time { return now })
+	old := FrozenPrefix + "A:mask:old"
+	m.Put(old, []byte("f"))
+	now = now.Add(11 * time.Second)
+	m.Get(old) // expire -> mark A's loss
+	if !m.FrozenLost(old) {
+		t.Fatal("A's loss must be marked")
+	}
+	// Session B churns enough losses to overflow the mark budget (max=2).
+	for i := 0; i < 5; i++ {
+		k := FrozenPrefix + "B:mask:" + string(rune('a'+i))
+		m.Put(k, []byte("f"))
+		now = now.Add(11 * time.Second)
+		m.Get(k)
+	}
+	newest := FrozenPrefix + "B:mask:e"
+	if !m.FrozenLost(newest) {
+		t.Fatal("the NEWEST loss mark must survive the budget (oldest is evicted first)")
+	}
+}

@@ -152,37 +152,48 @@ func TestFrozenCountersMove(t *testing.T) {
 	}
 }
 
-// The result cache (cg:res:) is the OTHER replay namespace — extract_llm's — and it is
-// the one that carries the load in the shipped coding config (no mask; failed_run
-// self-skips on a cached agent). It must get the same protection: pinned against
-// eviction, and its loss reported so the compaction can be re-derived at depth.
-func TestResultCachePinnedAndRepairable(t *testing.T) {
-	now := time.Unix(0, 0)
-	st := store.NewMemory(store.Options{TTLSeconds: 10, MaxEntries: 4})
-	st.SetClock(func() time.Time { return now })
+// The result cache (cg:res:) is extract_llm's replay namespace. It IS pinned against
+// eviction — losing it un-compacts an already-cached message like any other replay
+// decision — but it deliberately gets NO depth repair, because re-deriving it means a
+// sampled model call (see repairLostFreeze).
+func TestResultCachePinnedAgainstEviction(t *testing.T) {
+	st := store.NewMemory(store.Options{MaxEntries: 4})
 	c := &components.Ctx{Session: "s", Store: st}
 
-	putResult(c, "id1", []byte("compacted"))
+	putResult(c, "id1", "compacted", "one-line summary")
 	// Ordinary rewind stashes churn through the cache; the replay decision must survive.
 	for i := 0; i < 20; i++ {
 		st.Put("rewindhash"+string(rune('a'+i)), []byte("big original payload"))
 	}
-	if _, ok := getResult(c, "id1"); !ok {
+	got, ok := getResult(c, "id1")
+	if !ok {
 		t.Fatal("a result-cache decision must be pinned against LRU eviction")
 	}
-	if repairLostResult(c, "id1") {
-		t.Fatal("a live decision is not lost")
+	if got.Projected != "compacted" || got.Summary != "one-line summary" {
+		t.Fatalf("projection and summary must survive together, got %+v", got)
 	}
-	// Expire it: nothing reads it for longer than the TTL.
+}
+
+// The projection and its summary line must live and die as ONE key. As two independently
+// TTL'd/pinned keys, losing only the summary made the replay HIT and silently emit
+// different bytes (the "[summary] " segment vanishing) inside the cached prefix.
+func TestResultAndSummaryShareOneKey(t *testing.T) {
+	now := time.Unix(0, 0)
+	st := store.NewMemory(store.Options{TTLSeconds: 10})
+	st.SetClock(func() time.Time { return now })
+	c := &components.Ctx{Session: "s", Store: st}
+	putResult(c, "id1", "compacted", "summary")
+
+	// Whatever the store drops, a replay either returns BOTH parts or misses entirely —
+	// it can never return a projection with the summary silently missing.
 	now = now.Add(11 * time.Second)
-	if _, ok := getResult(c, "id1"); ok {
-		t.Fatal("expired entry must miss")
+	if got, ok := getResult(c, "id1"); ok {
+		t.Fatalf("expired decision must miss outright, got %+v", got)
 	}
-	if !repairLostResult(c, "id1") {
-		t.Fatal("a LOST result-cache decision must be distinguishable from never-cached")
-	}
-	if repairLostResult(c, "never-seen") {
-		t.Fatal("content that was never compacted must not authorize depth mutation")
+	// A half-written / unreadable payload is also treated as absent, never spliced.
+	st.Put(resultKey("s", "id2"), []byte("{not json"))
+	if got, ok := getResult(c, "id2"); ok {
+		t.Fatalf("unreadable decision must miss, got %+v", got)
 	}
 }
 
@@ -196,7 +207,7 @@ func TestResultCacheFeedsCounters(t *testing.T) {
 	if _, ok := getResult(c, "idz"); ok {
 		t.Fatal("nothing cached yet")
 	}
-	putResult(c, "idz", []byte("compacted"))
+	putResult(c, "idz", "compacted", "")
 	if _, ok := getResult(c, "idz"); !ok {
 		t.Fatal("expected a replay hit")
 	}

@@ -48,31 +48,38 @@ type FrozenLoser interface {
 
 // Key namespaces whose entries are a component's FROZEN decision — the replacement
 // text it must replay on every later turn to keep an already-cached message
-// byte-identical (see components/offload/state.go). Two components' worth, because the
-// freeze-replay mechanism was implemented twice under different names:
-//
-//	cg:frz:  — mask / failed_run (freeze + reapplyFrozen)
-//	cg:res:  — extract_llm's result cache, plus cg:sum1: for the summary line it
-//	           re-emits alongside it. Functionally the same replay contract.
+// byte-identical (see components/offload/state.go), plus the small per-session trackers
+// the cache-safety machinery itself depends on.
 //
 // Entries under these prefixes are PINNED: exempt from LRU eviction, because losing one
 // is not a cache miss, it is a cache-DESTRUCTIVE event — the message flips representation
 // inside the provider's cached prefix and the whole suffix is re-written at 11.5x the
-// read price. They are small (a marker line / a compacted projection), still honor the
-// sliding TTL, and the exemption is capped at half the entry cap so a pathological
-// session can never pin the whole cache. The rewind stashes (bare content hashes, the
-// large payloads the expand loop resolves) stay fully evictable.
+// read price. They are small (a marker line, a compacted projection, an integer), still
+// honor the sliding TTL, and the exemption is capped at half the entry cap so a
+// pathological session can never pin the whole cache. The rewind stashes (bare content
+// hashes, the large payloads the expand loop resolves) stay fully evictable.
+//
+// The prefixes are declared by their OWNERS (components/offload, apply) and passed in via
+// Options.PinPrefixes — the store must not know what a component names its keys.
 const (
-	FrozenPrefix  = "cg:frz:"
-	ResultPrefix  = "cg:res:"
-	SummaryPrefix = "cg:sum1:"
+	FrozenPrefix = "cg:frz:" // mask / failed_run freeze decisions
+	ResultPrefix = "cg:res:" // extract_llm's replayed result (projection + summary, one key)
+	LenPrefix    = "cg:len:" // apply's prev-turn message count (the MaxCachedIdx boundary)
 )
 
-// frozenNamespace reports whether key holds a replay decision (see FrozenPrefix).
-func frozenNamespace(key string) bool {
-	return strings.HasPrefix(key, FrozenPrefix) ||
-		strings.HasPrefix(key, ResultPrefix) ||
-		strings.HasPrefix(key, SummaryPrefix)
+// DefaultPinPrefixes is the shipped set of key namespaces whose loss is cache-destructive.
+// Callers that build their own Store may pass a different set; the zero value means "none",
+// so a host that opts out simply gets plain TTL+LRU.
+var DefaultPinPrefixes = []string{FrozenPrefix, ResultPrefix, LenPrefix}
+
+// pinned reports whether key belongs to one of the configured pin namespaces.
+func (m *Memory) isPinPrefix(key string) bool {
+	for _, p := range m.pinPrefixes {
+		if strings.HasPrefix(key, p) {
+			return true
+		}
+	}
+	return false
 }
 
 type entry struct {
@@ -88,19 +95,21 @@ type entry struct {
 // mirroring headroom's 1800s CCR store: a frozen compaction that dies mid-task is
 // a cache-destructive event, not a saving.
 type Memory struct {
-	mu       sync.Mutex
-	ttl      time.Duration
-	max      int
-	ll       *list.List               // LRU, front = most recent
-	items    map[string]*list.Element // key -> element(*entry)
-	sticky   map[string]map[string]struct{}
-	maxStick int
-	now      func() time.Time // injectable for tests
-	pinnedN  int              // live pinned (frozen) entries, capped at max/2
+	mu          sync.Mutex
+	ttl         time.Duration
+	max         int
+	ll          *list.List               // LRU, front = most recent
+	items       map[string]*list.Element // key -> element(*entry)
+	sticky      map[string]map[string]struct{}
+	maxStick    int
+	pinPrefixes []string
+	now         func() time.Time // injectable for tests
+	pinnedN     int              // live pinned (frozen) entries, capped at max/2
 	// lostFrozen remembers keys whose FROZEN entry was dropped anyway (TTL expiry, or
 	// the pin cap). It is the "was frozen, now LOST" signal a caller cannot otherwise
 	// distinguish from "never frozen" — see FrozenLost. Bounded like sticky.
 	lostFrozen map[string]struct{}
+	lostOrder  []string // insertion order, so the OLDEST mark is evicted first
 	lostN      int64
 	repairedN  int64
 	noSlide    bool // tests only: restore the old write-only expiry (see DisableSlidingTTLForTest)
@@ -112,10 +121,15 @@ type Options struct {
 	// Enabled toggles the state store. nil/absent => on (backward-compatible).
 	// false => no store: reversibility is off, so offload components must run
 	// marker_mode: off (a full-marker offload would leave dangling markers).
-	Enabled     *bool `yaml:"enabled"`
-	TTLSeconds  int   `yaml:"ttl_seconds"`
-	MaxEntries  int   `yaml:"max_entries"`
-	MaxSessions int   `yaml:"max_sessions"`
+	Enabled    *bool `yaml:"enabled"`
+	TTLSeconds int   `yaml:"ttl_seconds"`
+	// PinPrefixes are key namespaces whose entries are exempt from LRU eviction because
+	// losing one is cache-destructive rather than merely a miss (see FrozenPrefix). nil =>
+	// DefaultPinPrefixes. Not a yaml knob: it is a code-level property of the key layout,
+	// not something an operator should be tuning.
+	PinPrefixes []string `yaml:"-"`
+	MaxEntries  int      `yaml:"max_entries"`
+	MaxSessions int      `yaml:"max_sessions"`
 }
 
 // Nop is a Store that persists nothing: Put discards, Get/Sticky always miss.
@@ -150,8 +164,12 @@ func NewMemory(o Options) *Memory {
 	if stick <= 0 {
 		stick = 100
 	}
+	pins := o.PinPrefixes
+	if pins == nil {
+		pins = DefaultPinPrefixes
+	}
 	return &Memory{
-		ttl: ttl, max: max, maxStick: stick,
+		ttl: ttl, max: max, maxStick: stick, pinPrefixes: pins,
 		ll: list.New(), items: map[string]*list.Element{},
 		sticky:     map[string]map[string]struct{}{},
 		lostFrozen: map[string]struct{}{},
@@ -188,25 +206,38 @@ func (m *Memory) Put(key string, payload []byte) {
 	// exceed dropped, or frozen_flips reads 0 while messages are in fact flipping.
 	if _, wasLost := m.lostFrozen[key]; wasLost {
 		delete(m.lostFrozen, key)
+		for i, k := range m.lostOrder {
+			if k == key {
+				m.lostOrder = append(m.lostOrder[:i], m.lostOrder[i+1:]...)
+				break
+			}
+		}
 		m.repairedN++
 	}
 	if el, ok := m.items[key]; ok {
 		e := el.Value.(*entry)
 		e.payload = payload
 		e.expires = m.now().Add(m.ttl)
+		// Claim a pin slot if one has since freed (an earlier session's decisions expired):
+		// the cap is a live-entry budget, not a lifetime quota, so re-freezing every turn
+		// eventually protects this decision instead of leaving it permanently second-class.
+		if !e.pinned && m.isPinPrefix(key) && !m.noSlide && m.pinnedN < m.max/2 {
+			e.pinned = true
+			m.pinnedN++
+		}
 		m.ll.MoveToFront(el)
 		return
 	}
 	e := &entry{key: key, payload: payload, expires: m.now().Add(m.ttl)}
 	// Pin frozen decisions, but never more than half the cache: past that the marginal
 	// pin protects one message while starving the rewind stashes the expand loop needs.
-	if frozenNamespace(key) && !m.noSlide {
-		if m.pinnedN < m.max/2 {
-			e.pinned = true
-			m.pinnedN++
-		} else {
-			m.noteLost(key) // pin cap reached: evictable, and its loss stays visible
-		}
+	// Over the cap the entry is simply evictable — NOT recorded as lost: it is present and
+	// readable right now, and calling it "dropped" at write time both inflates the drop
+	// count with live entries and makes the very next re-freeze look like a repair. Its
+	// loss, if it comes, is recorded where losses actually happen (remove).
+	if m.isPinPrefix(key) && !m.noSlide && m.pinnedN < m.max/2 {
+		e.pinned = true
+		m.pinnedN++
 	}
 	m.items[key] = m.ll.PushFront(e)
 	for m.ll.Len() > m.max {
@@ -217,15 +248,23 @@ func (m *Memory) Put(key string, payload []byte) {
 }
 
 // noteLost records that a frozen decision under key is gone, so a later Get miss is
-// distinguishable from "never frozen". Bounded by the entry cap.
+// distinguishable from "never frozen". Bounded by the entry cap, evicting the OLDEST mark
+// first: dropping an arbitrary one let a busy session delete another session's fresh mark,
+// so that session's next turn saw a plain miss and flipped its message unrepaired.
+// ponytail: FIFO over one shared budget, not a per-session quota — the marks are
+// session-scoped keys and short-lived (cleared by the next re-freeze), so age is a good
+// enough proxy. Revisit if one session's churn is ever shown to starve another's.
 func (m *Memory) noteLost(key string) {
-	if len(m.lostFrozen) >= m.max {
-		for k := range m.lostFrozen {
-			delete(m.lostFrozen, k)
-			break
-		}
+	if _, dup := m.lostFrozen[key]; dup {
+		return // already marked; don't double-count or re-queue
+	}
+	for len(m.lostFrozen) >= m.max && len(m.lostOrder) > 0 {
+		oldest := m.lostOrder[0]
+		m.lostOrder = m.lostOrder[1:]
+		delete(m.lostFrozen, oldest)
 	}
 	m.lostFrozen[key] = struct{}{}
+	m.lostOrder = append(m.lostOrder, key)
 	m.lostN++
 }
 
@@ -239,10 +278,14 @@ func (m *Memory) FrozenLost(key string) bool {
 }
 
 // FrozenLossStats returns how many frozen decisions this store has DROPPED since start
-// (TTL expiry / pin cap) and how many of those were later re-Put — repaired to the same
-// bytes, so no representation flip reached the provider. dropped−repaired is the count of
-// flips that actually cost a suffix cache-write. Both count each key once, however many
-// turns observe it.
+// (TTL expiry, or eviction) and how many of those were later re-Put — restored to the
+// store, so a replay can land again instead of the message flipping.
+//
+// Counted per DROP EVENT, not per distinct key: one key that expires, is re-frozen, and
+// expires again contributes 2 drops and 1 repair. That is the intended reading — each
+// event is a separate opportunity for a flip — but it means dropped−repaired is a running
+// balance (marks still outstanding), not a total of distinct broken keys. A repeat drop of
+// an already-marked key is not double-counted while its mark is outstanding.
 func (m *Memory) FrozenLossStats() (dropped, repaired int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -306,6 +349,20 @@ func (m *Memory) MarkSticky(session, id string) {
 // evictOldest drops the least-recently-used UNPINNED entry, walking back over pinned
 // (frozen) ones. Reports false when nothing is evictable.
 func (m *Memory) evictOldest() bool {
+	now := m.now()
+	// Pass 1: reclaim anything already EXPIRED, pinned included. Without this a pinned
+	// entry is immortal — the TTL is only enforced in Get, and a dead session is never
+	// read again — so pinnedN would ratchet to max/2 and stay there, leaking half the
+	// cache and silently disabling pinning for every later session.
+	for el := m.ll.Back(); el != nil; {
+		prev := el.Prev()
+		if e := el.Value.(*entry); now.After(e.expires) {
+			m.remove(el)
+			return true
+		}
+		el = prev
+	}
+	// Pass 2: nothing expired, so take the LRU entry that is not pinned.
 	for el := m.ll.Back(); el != nil; el = el.Prev() {
 		if !el.Value.(*entry).pinned {
 			m.remove(el)
@@ -324,7 +381,7 @@ func (m *Memory) remove(el *list.Element) {
 	// the pin flag. An entry that missed the pin cap is exactly the one most likely to be
 	// dropped, and gating this on e.pinned would let it vanish silently: unreported, and so
 	// never repaired. (noSlide reproduces the OLD store, which had no loss signal at all.)
-	if frozenNamespace(e.key) && !m.noSlide {
+	if m.isPinPrefix(e.key) && !m.noSlide {
 		m.noteLost(e.key)
 	}
 	m.ll.Remove(el)

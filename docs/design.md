@@ -240,9 +240,14 @@ flip representation inside the provider's cached prefix, and the whole suffix is
   turn never ages out; one nobody reads still expires on its original deadline.
 - **Default 10000s** — Terminal-Bench tasks average ~1975s of wall clock and run to 4h, so the
   old 1800s default expired live decisions mid-task. Still `store.ttl_seconds`.
-- **Frozen decisions are pinned** against LRU eviction (they are a marker line each), capped at
-  half the entry cap so one pathological session cannot pin the whole cache and starve the rewind
-  stashes the expand loop needs.
+- **Replay decisions are pinned** against LRU eviction — `cg:frz:` (mask/failed_run), `cg:res:`
+  (extract_llm's projection *and* its summary line, one key so they cannot half-survive) and
+  `cg:len:` (apply's cache-boundary counter, whose loss makes `TailOnly` fail open). All are tiny;
+  the pin is capped at half the entry cap so one session cannot starve the rewind stashes the
+  expand loop needs. Eviction reclaims **expired** entries first, pinned included — otherwise a
+  finished session's decisions are never read again, never expire, and permanently occupy the pin
+  budget. The prefixes are supplied by their owners via `store.Options.PinPrefixes`; the store
+  does not know component key layouts.
 
 **The fail direction inverts for an established compaction.** Fail-open normally means "forward the
 original", and for a *new* compaction that is right. But once the provider has cached the compacted
@@ -251,18 +256,31 @@ apart, so the store keeps the *fact* of a dropped freeze (`FrozenLoser.FrozenLos
 set — the payload need not survive, only the knowledge that it existed):
 
 - **never frozen** → obey the tail gate; a new compaction stays in the uncached tail.
-- **frozen, then lost** → re-derive it even at depth. An offloader's replacement text is a pure
-  function of `(content, component config)` and the marker key is `sha256(original)`, so
-  re-deriving reproduces the *same* bytes the provider cached and re-establishes the freeze. The
-  component's own never-worse and kept-verbatim guards still apply, so this only ever lifts the
+- **frozen, then lost** → re-derive it even at depth, but **only where re-derivation is
+  reproducible**. `mask` and `failed_run` qualify: their replacement is
+  `prefix + headPeek(content) + Marker(sha256(content))`, a pure function of
+  `(content, config)` and independent of position, so re-deriving reproduces the *same* bytes the
+  provider cached and re-establishes the freeze. Their windows (`keep_recent`, `runs[:len-1]`) gate
+  *whether* a message is considered, never *what bytes* are emitted, and config cannot drift
+  mid-session. The never-worse and kept-verbatim guards still apply, so the repair only lifts the
   depth restriction — it never authorizes new content loss.
+- **`extract_llm` is deliberately excluded.** Its replacement is a *sampled* model output (the
+  cheap-model client sends no temperature and no seed), so re-deriving could splice **different**
+  bytes into the cached prefix — the exact corruption the repair exists to prevent. And the trade
+  does not pay even ignoring that: if the bytes differ, the suffix is cache-written either way, so
+  the repair branch would buy a model call for nothing. There is no upside, so a lost `extract_llm`
+  decision simply declines and the message is forwarded verbatim. (Its entry is still pinned, so
+  the common case is that it is never lost at all.) Re-enabling it would need deterministic
+  decoding *plus* a check that the re-derived bytes match the stored hash before splicing.
 
 `/stats` reports `frozen_hits`, `frozen_misses`, `frozen_dropped`, `frozen_repaired`, and
-`frozen_flips` (= dropped − repaired, the drops that actually cost a cache-write; it should be 0).
+`frozen_flips` (= dropped − repaired; should be 0). `frozen_misses` is a *lookup* counter dominated
+by the ordinary "not compacted yet" case — `frozen_dropped` is the one that measures harm. See
+[Routes](reference/routes.md#stats-freeze-replay-fields).
 
 The related fail-*open* on `MaxCachedIdx`: `prevLen` returning 0 on a store miss yields
 `MaxCachedIdx = -1`, and `Ctx.TailOnly` then permits mutating any index (measured on 11.2% of
-Terminal-Bench requests). The sliding TTL shrinks that window — `cg:len:` is read every turn, so it
+Terminal-Bench requests). `cg:len:` is now pinned and the sliding TTL keeps it alive, so it
 no longer expires mid-session — but inverting `TailOnly` to fail *closed* is a separate change.
 
 ## Session keying

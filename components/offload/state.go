@@ -23,24 +23,41 @@ import (
 // resultKey namespaces a per-content reduced output (extract) by session.
 func resultKey(session, id string) string { return store.ResultPrefix + session + ":" + id }
 
+// cachedResult is the whole replayed decision for one content id: the compacted
+// projection AND the one-line summary re-emitted beside it. They live under ONE key
+// because they must live and die together — as two independently-TTL'd, independently-
+// pinned keys, losing only the summary made the replay HIT and emit different bytes (the
+// "[summary] " segment silently vanishing) with nothing reported lost.
+type cachedResult struct {
+	Projected string `json:"p"`
+	Summary   string `json:"s,omitempty"`
+}
+
 // getResult returns a previously cached reduced output for content id, if any. This is
 // extract_llm's replay lookup, so it feeds the same hit/miss counters as reapplyFrozen —
 // otherwise the shipped coding config (no mask, failed_run self-skipping) would report
 // zero freeze activity while doing all of its replay through here.
-func getResult(c *components.Ctx, id string) ([]byte, bool) {
-	v, ok := c.Store.Get(resultKey(c.Session, id))
-	if ok {
-		frozenHits.Add(1)
-	} else {
+func getResult(c *components.Ctx, id string) (cachedResult, bool) {
+	b, ok := c.Store.Get(resultKey(c.Session, id))
+	if !ok {
 		frozenMisses.Add(1)
+		return cachedResult{}, false
 	}
-	return v, ok
+	var r cachedResult
+	if json.Unmarshal(b, &r) != nil || r.Projected == "" {
+		frozenMisses.Add(1) // unreadable => treat as absent, never splice half a decision
+		return cachedResult{}, false
+	}
+	frozenHits.Add(1)
+	return r, true
 }
 
 // putResult caches a reduced output so a later turn re-sending the same content
 // reuses it (no LLM call, byte-identical result).
-func putResult(c *components.Ctx, id string, v []byte) {
-	c.Store.Put(resultKey(c.Session, id), v)
+func putResult(c *components.Ctx, id, projected, summary string) {
+	if b, err := json.Marshal(cachedResult{Projected: projected, Summary: summary}); err == nil {
+		c.Store.Put(resultKey(c.Session, id), b)
+	}
 }
 
 // --- Freeze + reapply (cache stability) -------------------------------------
@@ -119,17 +136,20 @@ func reapplyFrozen(c *components.Ctx, comp string, m *bschemas.ChatMessage) ([]s
 // Re-deriving reproduces the bytes the provider already cached; NOT re-deriving is what
 // flips the representation and re-writes the suffix. The caller's own never-worse and
 // skipReduce guards still apply, so this only ever LIFTS the depth restriction.
+//
+// ONLY safe for offloaders whose replacement is a pure function of (content, config):
+// mask and failed_run build `prefix + headPeek(content) + Marker(sha256(content))`, which
+// is position-independent — their windows (keep_recent, runs[:len-1]) gate WHETHER the
+// component considers a message, never WHAT bytes it emits, and config cannot drift
+// mid-session (no hot reload; a restart wipes the store with it).
+//
+// It is deliberately NOT offered to extract_llm. That replacement is a SAMPLED model
+// output (cheapmodel sends no temperature/seed), so re-deriving may emit different bytes
+// at depth — and the trade does not work even ignoring that: if the bytes differ, the
+// suffix is cache-written either way, so the repair branch pays a model call for nothing.
+// A lost extract_llm decision therefore just declines, like any other tail-gated miss.
 func repairLostFreeze(c *components.Ctx, comp, content string) bool {
 	return frozenLost(c, frozenKey(c.Session, comp, contentKey(content)))
-}
-
-// repairLostResult is repairLostFreeze for the OTHER replay namespace: extract_llm's
-// per-content result cache (cg:res:), which is the same replay contract under a different
-// name — and the one that actually carries the load in the shipped coding config, where
-// mask is absent and failed_run self-skips on a cached agent. A lost result cache entry
-// un-compacts an already-cached message exactly the same way, so it gets the same repair.
-func repairLostResult(c *components.Ctx, id string) bool {
-	return frozenLost(c, resultKey(c.Session, id))
 }
 
 // Freeze-replay counters: how often a replay landed vs found nothing. Cache-write is the
@@ -208,20 +228,6 @@ func OwnsKey(st store.Store, session, key string) bool {
 	}
 	_, ok := st.Get(ownerKey(session, key))
 	return ok
-}
-
-// summaryKey namespaces the one-line SUMMARY the LLM extract emitted for a content
-// id, so a later turn reusing the cached reduction also re-emits the same marker
-// digest (byte-stable) without re-calling the model.
-func summaryKey(session, id string) string { return store.SummaryPrefix + session + ":" + id }
-
-func getSummary(c *components.Ctx, id string) (string, bool) {
-	b, ok := c.Store.Get(summaryKey(c.Session, id))
-	return string(b), ok
-}
-
-func putSummary(c *components.Ctx, id, s string) {
-	c.Store.Put(summaryKey(c.Session, id), []byte(s))
 }
 
 // sumCheckpoint is the per-session summarize state: the exact summary message
