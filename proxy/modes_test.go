@@ -541,3 +541,37 @@ func settleGoroutines() {
 		time.Sleep(5 * time.Millisecond)
 	}
 }
+
+// The observe-mode docs tell operators to watch `dropped` and `errors`, and make a point
+// of contrasting that against a dashboard which reports only queue depth. The pool tracked
+// all five counters correctly and NOTHING SERVED THEM: metrics.Snapshot had no field and
+// the /stats handler never called Stats(), so the documented counter was unreachable. This
+// asserts the wiring, not the pool.
+func TestObserveQueueCountersReachStats(t *testing.T) {
+	up, _ := captureUpstream(t)
+	h, agg := modeHandler(t, modePipeline, up.URL, components.ModeObserve)
+	srv := httptest.NewServer(h.Mux())
+	defer srv.Close()
+
+	for i := 0; i < 3; i++ {
+		post(t, srv, dupBody())
+	}
+	awaitSnapshot(t, agg, func(s metrics.Snapshot) bool { return s.ObserveRequests > 0 })
+
+	var got metrics.Snapshot
+	res, err := http.Get(srv.URL + "/stats")
+	if err != nil {
+		t.Fatalf("GET /stats: %v", err)
+	}
+	defer res.Body.Close()
+	if err := json.NewDecoder(res.Body).Decode(&got); err != nil {
+		t.Fatalf("decode /stats: %v", err)
+	}
+	if got.ObserveQueue == nil {
+		t.Fatal("observe_queue absent from /stats: the pool's counters are still unreachable, " +
+			"so the documented `dropped` cannot be read by any consumer")
+	}
+	if got.ObserveQueue.Processed == 0 && got.ObserveQueue.Queued == 0 && got.ObserveQueue.Pending == 0 {
+		t.Fatalf("observe_queue served but empty after 3 observed requests: %+v", got.ObserveQueue)
+	}
+}

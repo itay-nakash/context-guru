@@ -654,6 +654,17 @@ func (h *Handler) stats(w http.ResponseWriter, _ *http.Request) {
 		snap.FrozenDropped, snap.FrozenRepaired = fl.FrozenLossStats()
 		snap.FrozenFlips = snap.FrozenDropped - snap.FrozenRepaired
 	}
+	// Off-path pool counters, same layering: the pool lives in `modes`, so `metrics` cannot
+	// read it and the host merges it here. Without this the observe-mode docs describe a
+	// `dropped` counter no consumer can reach — the pool tracked it correctly and nothing
+	// served it.
+	if h.pool != nil {
+		q := h.pool.Stats()
+		snap.ObserveQueue = &metrics.QueueStats{
+			Queued: q.Queued, Pending: q.Pending,
+			Processed: q.Processed, Dropped: q.Dropped, Errors: q.Errors,
+		}
+	}
 	json.NewEncoder(w).Encode(snap)
 }
 

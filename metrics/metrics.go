@@ -491,6 +491,26 @@ type Snapshot struct {
 	// mode it correctly reads ~0 because that path does no pipeline work. Zeroing either
 	// would hide a true number rather than protect anyone.
 	ObserveLLMNotice string `json:"observe_llm_notice,omitempty"`
+
+	// ObserveQueue is the off-path worker pool's counter tuple, filled by the host at
+	// serve time (the pool lives in `modes`, which sits above this package). All five
+	// counters are exposed rather than just `queued` because `dropped` is the one that
+	// changes a reader's conclusion: a drop is an observation silently given up, so a
+	// rising `dropped` means the potential_*/projected_* figures UNDERSTATE what
+	// compaction would have saved. Reporting the queue depth while hiding the drops is
+	// exactly the gap noted in headroom's dashboard. Omitted when no pool is running, so
+	// a sync-only deployment shows no phantom queue.
+	ObserveQueue *QueueStats `json:"observe_queue,omitempty"`
+}
+
+// QueueStats mirrors modes.Stats. Declared here as a plain struct rather than importing
+// modes because the dependency runs the other way (modes uses metrics, not vice versa).
+type QueueStats struct {
+	Queued    int64 `json:"queued"`
+	Pending   int64 `json:"pending"`
+	Processed int64 `json:"processed"`
+	Dropped   int64 `json:"dropped"`
+	Errors    int64 `json:"errors"`
 }
 
 // SelectorMiss is one output shape that matched no filter, with how often it appeared.
