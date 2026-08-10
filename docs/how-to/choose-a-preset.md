@@ -32,16 +32,19 @@ per-component behavior is in [Components](../components.md).
 No components. Passthrough. Use it as the A/B control when you measure savings — the baseline in
 [Benchmarks](../RESULTS.md) is this preset.
 
-### `safe` — `[format, cacheinject]`
+### `safe` — `[format, cachesplit]`
 Two lossless [Reformat](../components.md#reformat-lossless) components only: compact JSON
-(`format`) and an Anthropic cache breakpoint (`cacheinject`). Nothing is ever dropped, so there is
-nothing to expand.
+(`format`) and the Anthropic volatile-tail split (`cachesplit`). Nothing is ever dropped, so there
+is nothing to expand.
 
 - **Fits:** any traffic where you want a zero-risk win and no reversibility surface.
-- **Caveat:** `cacheinject`'s savings are provider-side cache hits, invisible to `/stats` token
+- **Caveat:** `cachesplit`'s savings are provider-side cache hits, invisible to `/stats` token
   counts — it will show up under `top_passthrough`. That's expected, not dead weight.
+- **Note:** breakpoint *placement* (`cacheinject`) is deliberately **not** here — it is unmeasured
+  and opt-in since [#32](https://github.com/rossoctl/context-guru/issues/32). `cachesplit` carries
+  the part with measured savings.
 
-### `balanced` — `[format, dedup, failed_run, cmdfilter, cacheinject]`
+### `balanced` — `[format, dedup, failed_run, cmdfilter, cachesplit]`
 The default. Adds three cheap, high-precision offloaders: exact-dup removal (`dedup`), superseded
 test/build runs (`failed_run`), and DSL command-log filtering (`cmdfilter`).
 
@@ -50,7 +53,7 @@ test/build runs (`failed_run`), and DSL command-log filtering (`cmdfilter`).
   one. Its builtins cover pytest / npm-install / make; author more with a
   [custom DSL filter](custom-dsl-filter.md).
 
-### `aggressive` — `[format, dedup, failed_run, cmdfilter, smartcrush, extract, cacheinject]`
+### `aggressive` — `[format, dedup, failed_run, cmdfilter, smartcrush, extract, cachesplit]`
 `balanced` plus JSON-array crushing (`smartcrush`) and query-relevance projection (`extract`).
 
 - **Fits:** you want more savings and accept structural/LLM offload with expand recovery.
@@ -58,7 +61,7 @@ test/build runs (`failed_run`), and DSL command-log filtering (`cmdfilter`).
   the default `deterministic` strategy is free. Keep the [store](recover-context.md) on so the
   extra offloads stay recoverable.
 
-### `coding` — `[format, skeleton, cmdfilter, cacheinject]`
+### `coding` — `[format, skeleton, cmdfilter, cachesplit]`
 Swaps in `skeleton`, which tree-sitter-parses fenced code blocks and replaces function bodies with
 `{ … }`, keeping signatures/imports/types.
 
@@ -66,14 +69,14 @@ Swaps in `skeleton`, which tree-sitter-parses fenced code blocks and replaces fu
 - **Caveat:** `skeleton` is inert on unfenced file reads, unknown languages, or when the skeleton
   isn't smaller than the body.
 
-### `mcp` — `[format, smartcrush, cacheinject]`
+### `mcp` — `[format, smartcrush, cachesplit]`
 Targets homogeneous JSON arrays (list endpoints, search hits): keep `keep_first` + `keep_last`
 items plus any item carrying an error signal, drop the middle.
 
 - **Fits:** MCP tools and REST list endpoints returning long uniform arrays.
 - **Caveat:** inert on non-array output or arrays below `min_items`.
 
-### `agent` — `[format, dedup, failed_run, mask, extract, cacheinject]`
+### `agent` — `[format, dedup, failed_run, mask, extract, cachesplit]`
 Tuned for long agentic sessions (e.g. Claude Code on SWE-bench) where the dominant cost is the
 transcript of old tool outputs re-sent every turn.
 

@@ -11,7 +11,8 @@ messages (`role:"tool"`; for Anthropic, `tool_result` blocks normalized to that 
 |---|---|---|---|---|---|
 | `format` | Reformat | nothing (compacts JSON) | n/a (lossless) | pretty-printed JSON tool output | `min_tokens` (50) |
 | `toon` | Reformat | nothing (re-encodes JSON arrays as TOON) | n/a (lossless) | uniform flat JSON object-arrays | `min_tokens` (50) |
-| `cacheinject` | Reformat | nothing (adds `cache_control`) | n/a (lossless) | Anthropic-family requests | — |
+| `cacheinject` | Reformat | nothing (adds `cache_control`) | n/a (lossless) | Anthropic-family requests; **opt-in, in no preset** — placement is unmeasured (#32) | `ttl` (5m) |
+| `cachesplit` | Reformat | nothing (splits a `system` block) | n/a (lossless) | Anthropic-family requests; **in the default presets** — enables the measured volatile-tail split | — |
 | `skeleton` | Offload | function/method bodies | via expand | fenced ` ```lang ` code blocks | `min_tokens` (80) |
 | `dedup` | Offload | later byte-identical tool outputs | via expand | repeated identical outputs | `min_tokens` (100) |
 | `collapse` | Offload | middle of an oversized output | via expand | any large tool output (fallback) | `max_tokens` (2000), `head_lines` (20), `tail_lines` (20) |
@@ -23,12 +24,12 @@ messages (`role:"tool"`; for Anthropic, `tool_result` blocks normalized to that 
 | `mask` | Offload | older tool outputs (age-based) | via expand | more than `keep_recent` outputs | `keep_recent` (3), `min_tokens` (100), `keep_head_chars` (96) |
 | `summarize` | Offload (LLM) | the middle of the transcript → one summary | via expand | long trajectories | `summary_level` (regular), `keep_last` (3), `min_tokens` (500), `resummarize_tokens` (6000), `model.source`, `trigger` |
 
-Presets (`config`): `off` `[]` · `safe` `[format, cacheinject]` · `balanced`
-`[format, dedup, failed_run, cmdfilter, cacheinject]` · `aggressive` adds `smartcrush, extract` ·
-`coding` `[format, skeleton, cmdfilter, cacheinject]` · `mcp` `[format, smartcrush, cacheinject]` ·
-**`agent`** `[format, dedup, failed_run, mask, extract, cacheinject]` — for long agentic sessions;
+Presets (`config`): `off` `[]` · `safe` `[format, cachesplit]` · `balanced`
+`[format, dedup, failed_run, cmdfilter, cachesplit]` · `aggressive` adds `smartcrush, extract` ·
+`coding` `[format, skeleton, cmdfilter, cachesplit]` · `mcp` `[format, smartcrush, cachesplit]` ·
+**`agent`** `[format, dedup, failed_run, mask, extract, cachesplit]` — for long agentic sessions;
 `mask` is the biggest lever there (~27–30% content-token savings, no reward loss — see [RESULTS.md](RESULTS.md)) ·
-**`general`** `[format, toon, dedup, failed_run, cmdfilter, mask, extract, collapse, cacheinject]` — the
+**`general`** `[format, toon, dedup, failed_run, cmdfilter, mask, extract, collapse, cachesplit]` — the
 recommended all-round pipeline: the reward-neutral levers of `agent` plus the situational shrinkers
 (`toon`/`cmdfilter`/`collapse`) that cost nothing when they don't fire. `balanced` is **not** recommended
 for agentic traffic — it omits `mask`, so it barely helps (6% vs 31% in the Terminal-Bench replay) ·
@@ -96,9 +97,14 @@ after:   [2]{id,name}:
   output, or not smaller.
 
 ### `cacheinject`
-Places an Anthropic `cache_control: {type: ephemeral}` breakpoint on the last content block of
-the message just **before** the newest turn (a stable prefix boundary), so the provider KV cache
-hits across turns. Adds a control directive, changes no model-visible content.
+Places Anthropic `cache_control: {type: ephemeral}` breakpoints at the positions that minimise
+billed input cost, so the provider KV cache is read rather than re-processed. Adds control
+directives, changes no model-visible content.
+
+**In no preset — opt in explicitly.** Until [#32](https://github.com/rossoctl/context-guru/issues/32)
+its breakpoints never reached the provider on Claude Code traffic, so the placement policy has
+never been measured. The presets carry `cachesplit` instead, which enables the volatile-tail split
+(measured) without the placement (not).
 
 - **Lossiness:** none. **Shines:** Anthropic/Bedrock/Vertex agents that don't self-cache (the
   savings lever is provider-side cache hits, invisible to `/stats` token counts). **Inert:**

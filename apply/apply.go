@@ -132,11 +132,18 @@ func BodyFull(ctx context.Context, pipe *components.Pipeline, st store.Store, pr
 	// Volatile-tail split, before anything else touches the body. This is a
 	// body-level concern rather than a component one: the pipeline operates on
 	// `messages`, but the block that needs splitting lives in the top-level `system`
-	// array, which components never see. Gated on cacheinject being configured, so it
-	// is opt-in via the same pipeline entry and adds no new config surface. See
-	// prefixsplit.go for what it splits and why.
+	// array, which components never see. See prefixsplit.go for what it splits and why.
+	//
+	// Gated on `cachesplit` OR `cacheinject`. The two were coupled only because the split
+	// had to hang off some existing config entry, but they are independent mechanisms
+	// with very different evidence: the split is measured (−34.1% cost, 0% → 96.7% hit in
+	// an isolated A/B), while breakpoint PLACEMENT has never been measured — so #32 drops
+	// cacheinject from the default presets and puts `cachesplit` there instead. Without
+	// its own gate the split would have gone down with cacheinject, turning "disable an
+	// unproven component" into a real cost regression. It stays opt-in rather than
+	// unconditional so `off` remains a true passthrough control for A/B runs.
 	systemSplit := false
-	if !bypass && pipe != nil && pipe.Has("cacheinject") {
+	if !bypass && pipe != nil && (pipe.Has("cachesplit") || pipe.Has("cacheinject")) {
 		body, systemSplit = splitVolatileTail(body, provider)
 	}
 
@@ -170,6 +177,10 @@ func BodyFull(ctx context.Context, pipe *components.Pipeline, st store.Store, pr
 		CtxWindow:    window,
 		CacheAware:   cacheAware,
 		MaxCachedIdx: maxCachedIdx,
+		// Every breakpoint already on the wire — including the ones no component can
+		// see (`system`, `tools`, and the marks our own normalize drops). The
+		// provider's cap of four counts them all (issue #32, defect 2).
+		ExistingBreakpoints: wireBreakpoints(body),
 	}
 
 	// Canonical form of each normalized message BEFORE the pipeline, so a
@@ -179,7 +190,7 @@ func BodyFull(ctx context.Context, pipe *components.Pipeline, st store.Store, pr
 		normPre[i], _ = json.Marshal(norm[i])
 	}
 
-	pipe.Run(chat, c)
+	rr := pipe.Run(chat, c)
 
 	// A component changed the message count (summarize restructures the transcript
 	// to [msg0, <summary>, last-K]). Rebuild the messages array preserving each
@@ -198,6 +209,9 @@ func BodyFull(ctx context.Context, pipe *components.Pipeline, st store.Store, pr
 	// if no component changes a message.
 	changed := systemSplit
 	var changes []change
+	// Per-message count of changes this writeback threw away, attributed back to the
+	// components that made them once the loop is done.
+	discarded := map[int]int{}
 	for i := range chat.Input {
 		s := slots[i]
 		switch s.kind {
@@ -222,8 +236,20 @@ func BodyFull(ctx context.Context, pipe *components.Pipeline, st store.Store, pr
 			}
 			if !s.lossless {
 				// bifrost can't round-trip this message; splicing our re-marshal would
-				// drop provider fields it doesn't model. Discard the change, keep the
-				// original bytes. ponytail: correctness over the marginal saving here.
+				// drop provider fields it doesn't model. But if the ONLY change is added
+				// `cache_control` — metadata, not content — write those keys at their exact
+				// paths on the original raw bytes: nothing else is read or rewritten, so no
+				// provider field can be dropped. See metawrite.go (issue #32).
+				if w, ok := metadataOnlyWrites(s.pre, post); ok {
+					if nb, ok := applyMetaWrites(out, s.path, len(chat.Input[i].Content.ContentBlocks), w); ok {
+						out = nb
+						changed = true
+						continue
+					}
+				}
+				// Anything else: discard the change, keep the original bytes.
+				// ponytail: correctness over the marginal saving here.
+				discarded[i]++
 				continue
 			}
 			if out, err = sjson.SetRawBytes(out, s.path, post); err != nil {
@@ -235,8 +261,18 @@ func BodyFull(ctx context.Context, pipe *components.Pipeline, st store.Store, pr
 			changes = append(changes, mkChange(s.path, schema.MessageText(pm), schema.MessageText(chat.Input[i])))
 		}
 	}
+	pipe.RecordDiscards(rr, discarded)
 	if changed && dumpPath != "" {
 		dumpChanges(c.Session, changes)
+	}
+	// A cap breach WE caused is a bug and must be loud. A request that arrived already
+	// over the cap is the client's to fix — we forward it as-is (fail open), and an ERROR
+	// blaming context-guru for it would be a false alarm. So compare against the inbound
+	// count and only shout when we added to an over-cap total.
+	if n := wireBreakpoints(out); n > maxWireBreakpoints && n > c.ExistingBreakpoints {
+		slog.Error("context-guru: cache breakpoint count exceeds the provider cap",
+			"breakpoints", n, "inbound", c.ExistingBreakpoints,
+			"cap", maxWireBreakpoints, "session", c.Session)
 	}
 	return out, changed
 }

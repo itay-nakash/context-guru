@@ -196,13 +196,32 @@ func TestSplitAppliedThroughBodyFull(t *testing.T) {
 	}
 }
 
-// Gated on cacheinject: a pipeline without it must leave the body byte-identical.
-func TestSplitGatedOnCacheinject(t *testing.T) {
+// Gated: a pipeline with neither cachesplit nor cacheinject must leave the body
+// byte-identical, so `off` stays a true passthrough control for A/B runs.
+func TestSplitGatedOnConfig(t *testing.T) {
 	full, _, _ := blockWithGitTail(6000)
 	in := sysBody(textBlock(full, true))
 	got, changed := runBody(t, pipeWith(t, "pipeline: [format]\n"), in, false)
 	if changed || string(got) != string(in) {
-		t.Fatal("split fired without cacheinject configured")
+		t.Fatal("split fired with neither cachesplit nor cacheinject configured")
+	}
+}
+
+// `cachesplit` alone enables the split. This is what keeps #32's preset change (dropping
+// the unmeasured cacheinject) from silently disabling the measured split along with it.
+func TestSplitEnabledByCachesplitAlone(t *testing.T) {
+	full, _, _ := blockWithGitTail(6000)
+	in := sysBody(textBlock(full, true))
+	got, changed := runBody(t, pipeWith(t, "pipeline: [cachesplit]\n"), in, false)
+	if !changed {
+		t.Fatal("cachesplit did not enable the volatile-tail split")
+	}
+	if n := gjson.GetBytes(got, "system.#").Int(); n != 2 {
+		t.Fatalf("expected the system block to split into 2, got %d", n)
+	}
+	// cachesplit must add NO breakpoint of its own — it is not a placement policy.
+	if before, after := wireBreakpoints(in), wireBreakpoints(got); after != before {
+		t.Fatalf("cachesplit changed the breakpoint count %d -> %d", before, after)
 	}
 }
 

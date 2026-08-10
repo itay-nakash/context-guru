@@ -46,7 +46,7 @@ func TestRichPresetCarriesComponentConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"format", "dedup", "failed_run", "cmdfilter", "extract_llm", "extract", "cacheinject"}
+	want := []string{"format", "dedup", "failed_run", "cmdfilter", "extract_llm", "extract", "cachesplit"}
 	if strings.Join(c.Pipeline, ",") != strings.Join(want, ",") {
 		t.Fatalf("codesmart pipeline = %v, want %v", c.Pipeline, want)
 	}
@@ -106,5 +106,34 @@ func TestStoreOptionsParse(t *testing.T) {
 	}
 	if c.Store.TTLSeconds != 60 || c.Store.MaxEntries != 5 {
 		t.Fatalf("store options not parsed: %+v", c.Store)
+	}
+}
+
+// cacheinject is deliberately absent from every default preset (#32). Its breakpoints
+// only started reaching the provider with that fix, and placement has never been shown
+// to help — so it must not be on by default. `cachesplit` carries the volatile-tail
+// split, which IS measured, so disabling placement does not disable the split with it.
+func TestNoPresetEnablesCacheinjectByDefault(t *testing.T) {
+	for name := range presets {
+		p, _ := PresetPipeline(name)
+		for _, c := range p {
+			if c == "cacheinject" {
+				t.Errorf("preset %q enables cacheinject; placement is unmeasured and must be opt-in", name)
+			}
+		}
+	}
+	// The split must still be on in the recommended presets, or dropping cacheinject
+	// would be a cost regression rather than a neutral default change.
+	for _, name := range []string{"general", "codesmart", "codesafe", "balanced"} {
+		p, _ := PresetPipeline(name)
+		found := false
+		for _, c := range p {
+			if c == "cachesplit" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("preset %q lost the volatile-tail split", name)
+		}
 	}
 }

@@ -3,6 +3,8 @@ package apply_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -11,8 +13,10 @@ import (
 	"github.com/rossoctl/context-guru/components"
 	_ "github.com/rossoctl/context-guru/components/all"
 	"github.com/rossoctl/context-guru/config"
+	"github.com/rossoctl/context-guru/metrics"
 	"github.com/rossoctl/context-guru/store"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 func pipe(t *testing.T, yaml string) *config.Config {
@@ -265,4 +269,292 @@ func TestNoMessagesForwardsUnchanged(t *testing.T) {
 	if changed || string(out) != string(body) {
 		t.Fatalf("no messages array => forward unchanged; got changed=%v %s", changed, out)
 	}
+}
+
+// TestCacheinjectReachesTheWire is the #32 regression: cacheinject's only possible
+// targets on Claude Code traffic are assistant messages carrying `tool_use`, which
+// bifrost cannot round-trip — so every mark used to be discarded by the writeback
+// loop (46 applied, 0 forwarded, measured over 40 real requests). cache_control is
+// metadata, so it is written onto the ORIGINAL raw bytes and the unmodellable
+// provider fields must survive verbatim.
+func TestCacheinjectReachesTheWire(t *testing.T) {
+	cfg := pipe(t, "pipeline: [cacheinject]\n")
+	p, _ := cfg.Build(nil)
+	st := store.NewMemory(store.Options{})
+
+	body := []byte(`{"model":"claude-x","messages":[
+		{"role":"user","content":"run the tool"},
+		{"role":"assistant","content":[{"type":"text","text":"on it"},{"type":"tool_use","id":"toolu_abc","name":"Bash","input":{"command":"ls -la"}}]}
+	]}`)
+
+	out, changed := apply.Body(context.Background(), p, st, bschemas.Anthropic, body, "", false)
+	if !changed {
+		t.Fatal("expected cacheinject's breakpoint to change the body")
+	}
+	cc := gjson.GetBytes(out, "messages.1.content.1.cache_control")
+	if !cc.Exists() || cc.Get("type").String() != "ephemeral" {
+		t.Fatalf("breakpoint never reached the wire: %s", out)
+	}
+	// Provider fields bifrost drops on unmarshal must be intact.
+	blk := gjson.GetBytes(out, "messages.1.content.1")
+	if blk.Get("id").String() != "toolu_abc" || blk.Get("name").String() != "Bash" ||
+		blk.Get("input.command").String() != "ls -la" {
+		t.Fatalf("tool_use provider fields corrupted: %s", blk.Raw)
+	}
+	if gjson.GetBytes(out, "messages.1.content.0.text").String() != "on it" {
+		t.Fatalf("sibling text block corrupted: %s", out)
+	}
+	// Everything except the added cache_control is byte-identical.
+	stripped, err := sjson.DeleteBytes(out, "messages.1.content.1.cache_control")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !jsonEq(t, stripped, body) {
+		t.Fatalf("body changed beyond the metadata write:\n old=%s\n new=%s", body, stripped)
+	}
+}
+
+func jsonEq(t *testing.T, a, b []byte) bool {
+	t.Helper()
+	var av, bv any
+	if err := json.Unmarshal(a, &av); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(b, &bv); err != nil {
+		t.Fatal(err)
+	}
+	return reflect.DeepEqual(av, bv)
+}
+
+// TestWireBreakpointCapRealTrafficShape uses the exact shape 1,771 of 1,794
+// captured Claude Code requests carry — system=2, tools=0, messages=1 — on a long
+// conversation, and asserts the total the PROVIDER sees never exceeds 4. Before #32
+// the component counted only the messages array, saw 1 existing breakpoint, and
+// budgeted 3 more: 6 on the wire, which the provider rejects with a 400.
+func TestWireBreakpointCapRealTrafficShape(t *testing.T) {
+	cfg := pipe(t, "pipeline: [cacheinject]\n")
+	p, _ := cfg.Build(nil)
+
+	msgs := make([]any, 0, 60)
+	for i := 0; i < 60; i++ {
+		role, blk := "user", map[string]any{"type": "text", "text": strings.Repeat("turn ", i%7+1)}
+		if i%2 == 1 {
+			role = "assistant"
+		}
+		m := map[string]any{"role": role, "content": []any{blk}}
+		if i == 59 { // the caller's own trailing breakpoint
+			blk["cache_control"] = map[string]any{"type": "ephemeral"}
+		}
+		msgs = append(msgs, m)
+	}
+	body, _ := json.Marshal(map[string]any{
+		"model": "claude-x",
+		"system": []any{
+			map[string]any{"type": "text", "text": "tools preamble", "cache_control": map[string]any{"type": "ephemeral"}},
+			map[string]any{"type": "text", "text": "main system prompt", "cache_control": map[string]any{"type": "ephemeral"}},
+		},
+		"messages": msgs,
+	})
+
+	out, _ := apply.Body(context.Background(), p, store.NewMemory(store.Options{}), bschemas.Anthropic, body, "", false)
+	if n := countWireBreakpoints(t, out); n > 4 {
+		t.Fatalf("%d breakpoints on the wire — the provider caps at 4 and 400s above it", n)
+	}
+}
+
+// countWireBreakpoints counts cache_control across system, tools and messages the
+// way the provider does — deliberately re-derived in the test rather than reusing
+// the implementation's counter, so a bug in that counter cannot hide the cap breach.
+func countWireBreakpoints(t *testing.T, body []byte) int {
+	t.Helper()
+	var req struct {
+		System []map[string]json.RawMessage `json:"system"`
+		Tools  []map[string]json.RawMessage `json:"tools"`
+		Msgs   []struct {
+			CacheControl json.RawMessage              `json:"cache_control"`
+			Content      []map[string]json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		t.Fatalf("output is not valid JSON: %v", err)
+	}
+	n := 0
+	count := func(blocks []map[string]json.RawMessage) {
+		for _, b := range blocks {
+			if _, ok := b["cache_control"]; ok {
+				n++
+			}
+		}
+	}
+	count(req.System)
+	count(req.Tools)
+	for _, m := range req.Msgs {
+		if len(m.CacheControl) > 0 {
+			n++
+		}
+		count(m.Content)
+	}
+	return n
+}
+
+// contentRewriter is a test-only component that rewrites an assistant message's
+// text — a CONTENT change on a message bifrost cannot round-trip, so the writeback
+// layer must discard it. No shipped component targets assistant turns, so the
+// discard path needs one to exercise it.
+type contentRewriter struct{}
+
+func (contentRewriter) Name() string                 { return "testrewrite" }
+func (contentRewriter) Enabled(*components.Ctx) bool { return true }
+func (contentRewriter) Reformat(req *bschemas.BifrostChatRequest, _ *components.Report, _ *components.Ctx) error {
+	for i := range req.Input {
+		if req.Input[i].Role != bschemas.ChatMessageRoleAssistant || req.Input[i].Content == nil {
+			continue
+		}
+		for b := range req.Input[i].Content.ContentBlocks {
+			if t := req.Input[i].Content.ContentBlocks[b].Text; t != nil {
+				short := "shortened"
+				req.Input[i].Content.ContentBlocks[b].Text = &short
+			}
+		}
+	}
+	return nil
+}
+
+func init() {
+	components.Register("testrewrite", func([]byte) (components.Component, error) {
+		return contentRewriter{}, nil
+	})
+}
+
+// TestDiscardedChangeIsCounted: a change the writeback layer throws away must be
+// attributed to the component that made it, not silently vanish. A component that
+// mutates and is then discarded used to look exactly like one that works — which is
+// how #32 survived two benchmark studies.
+func TestDiscardedChangeIsCounted(t *testing.T) {
+	cfg := pipe(t, "pipeline: [testrewrite]\n")
+	agg := metrics.NewAggregator()
+	p, _ := cfg.Build(agg)
+
+	body := []byte(`{"model":"claude-x","messages":[
+		{"role":"user","content":"go"},
+		{"role":"assistant","content":[{"type":"text","text":"a long narration that the component will rewrite"},{"type":"tool_use","id":"toolu_z","name":"Bash","input":{"command":"ls"}}]}
+	]}`)
+
+	out, _ := apply.Body(context.Background(), p, store.NewMemory(store.Options{}), bschemas.Anthropic, body, "", false)
+	if gjson.GetBytes(out, "messages.1").Raw != gjson.GetBytes(body, "messages.1").Raw {
+		t.Fatalf("the unmodellable message must be kept verbatim:\n old=%s\n new=%s",
+			gjson.GetBytes(body, "messages.1").Raw, gjson.GetBytes(out, "messages.1").Raw)
+	}
+	snap := agg.Snapshot()
+	if got := snap.Components["testrewrite"].Discarded; got == 0 {
+		t.Fatalf("discarded change not counted: %+v", snap.Components["testrewrite"])
+	}
+	if len(snap.TopDiscarded) == 0 || snap.TopDiscarded[0] != "testrewrite" {
+		t.Fatalf("top_discarded should name the component, got %v", snap.TopDiscarded)
+	}
+	// A Discarded report must not inflate Runs (it is attribution, not a second run).
+	if r := snap.Components["testrewrite"].Runs; r != 1 {
+		t.Fatalf("Runs should stay 1, got %d", r)
+	}
+}
+
+// reverter always errors, so the pipeline rolls its change back. A reverted component
+// must NOT be charged a discard: its change never reached the writeback layer at all.
+type reverter struct{}
+
+func (reverter) Name() string                 { return "testrevert" }
+func (reverter) Enabled(*components.Ctx) bool { return true }
+func (reverter) Reformat(req *bschemas.BifrostChatRequest, _ *components.Report, _ *components.Ctx) error {
+	for i := range req.Input {
+		if req.Input[i].Role == bschemas.ChatMessageRoleAssistant && req.Input[i].Content != nil {
+			for b := range req.Input[i].Content.ContentBlocks {
+				if req.Input[i].Content.ContentBlocks[b].Text != nil {
+					s := "mutated then reverted"
+					req.Input[i].Content.ContentBlocks[b].Text = &s
+				}
+			}
+		}
+	}
+	return errors.New("deliberate failure so the pipeline reverts")
+}
+
+func init() {
+	components.Register("testrevert", func([]byte) (components.Component, error) { return reverter{}, nil })
+}
+
+// A rolled-back component must not appear as a discard. Otherwise the counter meant to
+// catch #32-class bugs becomes a false-positive generator.
+func TestRevertedComponentNotChargedDiscard(t *testing.T) {
+	// testrewrite runs AFTER and produces the discard, so the writeback layer really does
+	// throw a change away at that index. Pre-fix, testrevert's ChangedIdx was recorded
+	// before the rollback, so it got charged for a discard caused by the other component.
+	cfg := pipe(t, "pipeline: [testrewrite, testrevert]\n")
+	agg := metrics.NewAggregator()
+	p, _ := cfg.Build(agg)
+
+	body := []byte(`{"model":"claude-x","messages":[
+		{"role":"user","content":"go"},
+		{"role":"assistant","content":[{"type":"text","text":"narration"},{"type":"tool_use","id":"toolu_r","name":"Bash","input":{}}]}
+	]}`)
+	apply.Body(context.Background(), p, store.NewMemory(store.Options{}), bschemas.Anthropic, body, "", false)
+
+	cs := agg.Snapshot().Components["testrevert"]
+	if cs.Reverted != 1 {
+		t.Fatalf("expected the component to be reverted, got %+v", cs)
+	}
+	if cs.Discarded != 0 {
+		t.Fatalf("reverted component charged %d discards — its change never reached writeback", cs.Discarded)
+	}
+}
+
+// One discarded message is charged to exactly ONE component, not to every component
+// that touched it. Two components rewrite the same unmodellable message; only the last
+// one's change is what the writeback layer actually threw away.
+func TestDiscardChargedOnceNotPerToucher(t *testing.T) {
+	cfg := pipe(t, "pipeline: [testrewrite, testrewrite2]\n")
+	agg := metrics.NewAggregator()
+	p, _ := cfg.Build(agg)
+
+	body := []byte(`{"model":"claude-x","messages":[
+		{"role":"user","content":"go"},
+		{"role":"assistant","content":[{"type":"text","text":"a long narration both components rewrite"},{"type":"tool_use","id":"toolu_d","name":"Bash","input":{}}]}
+	]}`)
+	apply.Body(context.Background(), p, store.NewMemory(store.Options{}), bschemas.Anthropic, body, "", false)
+
+	snap := agg.Snapshot()
+	total := snap.Components["testrewrite"].Discarded + snap.Components["testrewrite2"].Discarded
+	if total != 1 {
+		t.Fatalf("one discarded message charged %d times (testrewrite=%d testrewrite2=%d)",
+			total, snap.Components["testrewrite"].Discarded, snap.Components["testrewrite2"].Discarded)
+	}
+	// It must land on the LAST toucher — its change is the discarded state.
+	if snap.Components["testrewrite2"].Discarded != 1 {
+		t.Fatalf("discard should be charged to the last component to change the message, got %v", snap.TopDiscarded)
+	}
+}
+
+// contentRewriter2 is a second rewriter so two components touch one message.
+type contentRewriter2 struct{}
+
+func (contentRewriter2) Name() string                 { return "testrewrite2" }
+func (contentRewriter2) Enabled(*components.Ctx) bool { return true }
+func (contentRewriter2) Reformat(req *bschemas.BifrostChatRequest, _ *components.Report, _ *components.Ctx) error {
+	for i := range req.Input {
+		if req.Input[i].Role != bschemas.ChatMessageRoleAssistant || req.Input[i].Content == nil {
+			continue
+		}
+		for b := range req.Input[i].Content.ContentBlocks {
+			if req.Input[i].Content.ContentBlocks[b].Text != nil {
+				s := "even shorter"
+				req.Input[i].Content.ContentBlocks[b].Text = &s
+			}
+		}
+	}
+	return nil
+}
+
+func init() {
+	components.Register("testrewrite2", func([]byte) (components.Component, error) {
+		return contentRewriter2{}, nil
+	})
 }

@@ -100,31 +100,31 @@ func (c *Config) applyPreset() error {
 // Build time as a clear error.
 var presets = map[string][]string{
 	"off":        {}, // passthrough: no components (baseline / A-B control)
-	"safe":       {"format", "cacheinject"},
-	"balanced":   {"format", "dedup", "failed_run", "cmdfilter", "cacheinject"},
-	"aggressive": {"format", "dedup", "failed_run", "cmdfilter", "smartcrush", "extract", "extract_llm", "cacheinject"},
-	"coding":     {"format", "skeleton", "cmdfilter", "cacheinject"},
-	"mcp":        {"format", "smartcrush", "cacheinject"},
+	"safe":       {"format", "cachesplit"},
+	"balanced":   {"format", "dedup", "failed_run", "cmdfilter", "cachesplit"},
+	"aggressive": {"format", "dedup", "failed_run", "cmdfilter", "smartcrush", "extract", "extract_llm", "cachesplit"},
+	"coding":     {"format", "skeleton", "cmdfilter", "cachesplit"},
+	"mcp":        {"format", "smartcrush", "cachesplit"},
 	// agent: tuned for long agentic sessions (e.g. Claude Code on SWE-bench),
 	// where the dominant cost is the transcript of tool outputs (file reads)
 	// re-sent every turn. mask (drop old tool outputs) is the biggest lever
 	// there — ~27% content-token savings with no task-reward loss in the
 	// eval-containers SWE-bench sweep (see docs/RESULTS.md); extract + failed_run
-	// + dedup add relevance/supersession/dup wins; cacheinject keeps the prefix
-	// cacheable. Order: lossless first, then offload old-then-large, cache last.
-	"agent": {"format", "dedup", "failed_run", "mask", "extract", "extract_llm", "cacheinject"},
+	// + dedup add relevance/supersession/dup wins; cachesplit keeps the shared system
+	// prefix cacheable. Order: lossless first, then offload old-then-large, cache last.
+	"agent": {"format", "dedup", "failed_run", "mask", "extract", "extract_llm", "cachesplit"},
 	// general: the recommended all-round pipeline, safe+effective for any agent/
 	// benchmark. Ordered by pipeline semantics: lossless repack first (format, toon)
 	// so downstream token counts are honest; cheap structural offloaders next (dedup,
 	// failed_run, cmdfilter); age-based mask; relevance-based extract; the blind
 	// head/tail collapse as the last-resort catch-all for anything still oversized;
-	// cacheinject last so the cache breakpoint sits on the final bytes. Every offloader
+	// cachesplit last (it edits `system`, not `messages`). Every offloader
 	// defaults to marker_mode:full (reversible via the injected expand tool) and skips
 	// content already carrying a placeholder, so they never double-reduce. Combines the
 	// levers that proved reward-neutral in the benchmark sweeps without stacking the
 	// two overlapping old-context reducers (mask is the one kept; summarize
 	// is its own preset — see docs/components.md redundancy notes).
-	"general": {"format", "toon", "dedup", "failed_run", "cmdfilter", "mask", "extract", "extract_llm", "collapse", "cacheinject"},
+	"general": {"format", "toon", "dedup", "failed_run", "cmdfilter", "mask", "extract", "extract_llm", "collapse", "cachesplit"},
 	// summarize restructures the whole transcript (changes the message count) — run
 	// it alone so no other component's in-place edits race apply's rebuild.
 	"summarize": {"summarize"},
@@ -132,8 +132,8 @@ var presets = map[string][]string{
 	// recommended defaults (codesmart is the proxy default). Their tuned per-component
 	// settings live in presetConfigs; the name-lists here keep PresetPipeline (used by
 	// /compact?preset=) resolving them.
-	"codesmart": {"format", "dedup", "failed_run", "cmdfilter", "extract_llm", "extract", "cacheinject"},
-	"codesafe":  {"format", "dedup", "failed_run", "cmdfilter", "extract", "collapse", "cacheinject"},
+	"codesmart": {"format", "dedup", "failed_run", "cmdfilter", "extract_llm", "extract", "cachesplit"},
+	"codesafe":  {"format", "dedup", "failed_run", "cmdfilter", "extract", "collapse", "cachesplit"},
 }
 
 // presetConfigs carries FULL config docs for presets whose behavior depends on tuned
@@ -143,13 +143,13 @@ var presets = map[string][]string{
 //     relevance-trimmer extract_llm routed to the CHEAP model (model.source: config,
 //     nil-when-unset ⇒ it silently no-ops to deterministic — see docs), gated at 3000
 //     tok so most turns make no model call, ≤4 calls/req; the free deterministic extract
-//     catches smaller noise; cacheinject keeps the prefix warm.
+//     catches smaller noise; cachesplit keeps the shared system prefix warm.
 //   - codesafe: the deterministic-only variant (NO LLM, by policy) — same structural
 //     offloaders plus a blind collapse fallback, zero model calls.
 //
 // Component defaults are left untouched, so general/agent/aggressive are unaffected.
 var presetConfigs = map[string]string{
-	"codesmart": `pipeline: [format, dedup, failed_run, cmdfilter, extract_llm, extract, cacheinject]
+	"codesmart": `pipeline: [format, dedup, failed_run, cmdfilter, extract_llm, extract, cachesplit]
 components:
   extract:
     min_tokens: 400
@@ -162,7 +162,7 @@ components:
       min_request_tokens: 3000
     llm_every_n_requests: 1
     llm_max_per_request: 4`,
-	"codesafe": `pipeline: [format, dedup, failed_run, cmdfilter, extract, collapse, cacheinject]
+	"codesafe": `pipeline: [format, dedup, failed_run, cmdfilter, extract, collapse, cachesplit]
 components:
   collapse:
     max_tokens: 3000`,
