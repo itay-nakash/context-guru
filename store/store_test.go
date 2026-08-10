@@ -228,3 +228,21 @@ func TestPinCapDoesNotFakeRepair(t *testing.T) {
 		t.Fatalf("repaired (%d) must never exceed dropped (%d)", r2, d2)
 	}
 }
+
+// A replay decision that is dropped while UNPINNED (it missed the pin cap) must still be
+// reported lost. Gating loss detection on the pin flag would let exactly the most
+// at-risk entries vanish silently — unreported, and therefore never repaired.
+func TestUnpinnedFrozenLossIsStillReported(t *testing.T) {
+	now := time.Unix(0, 0)
+	m := NewMemory(Options{TTLSeconds: 10, MaxEntries: 2}) // pin cap = 1
+	m.SetClock(func() time.Time { return now })
+	pinned := FrozenPrefix + "s:mask:pinned"
+	overCap := FrozenPrefix + "s:mask:overcap"
+	m.Put(pinned, []byte("a"))
+	m.Put(overCap, []byte("b")) // past the cap -> unpinned
+	now = now.Add(11 * time.Second)
+	m.Get(overCap) // expires it
+	if !m.FrozenLost(overCap) {
+		t.Fatal("an unpinned frozen decision that expired must still report as lost")
+	}
+}

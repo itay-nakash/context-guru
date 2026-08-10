@@ -319,7 +319,13 @@ func (m *Memory) remove(el *list.Element) {
 	e := el.Value.(*entry)
 	if e.pinned {
 		m.pinnedN--
-		m.noteLost(e.key) // a frozen decision is disappearing — make it detectable
+	}
+	// Any replay decision disappearing must be detectable — keyed on the NAMESPACE, not on
+	// the pin flag. An entry that missed the pin cap is exactly the one most likely to be
+	// dropped, and gating this on e.pinned would let it vanish silently: unreported, and so
+	// never repaired. (noSlide reproduces the OLD store, which had no loss signal at all.)
+	if frozenNamespace(e.key) && !m.noSlide {
+		m.noteLost(e.key)
 	}
 	m.ll.Remove(el)
 	delete(m.items, e.key)
