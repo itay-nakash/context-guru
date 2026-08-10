@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>context-guru dashboard</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="topbar">
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 18 L10 6 L14 14 L20 9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <span>context-guru</span>
+  </div>
+  <nav class="tabs" role="tablist" aria-label="Views">
+    <button role="tab" class="tab" data-view="overview" data-testid="tab-overview" aria-selected="true">Overview</button>
+    <button role="tab" class="tab" data-view="components" data-testid="tab-components">Components</button>
+    <button role="tab" class="tab" data-view="sessions" data-testid="tab-sessions">Sessions</button>
+    <button role="tab" class="tab" data-view="requests" data-testid="tab-requests">Requests</button>
+    <button role="tab" class="tab" data-view="benchmarks" data-testid="tab-benchmarks">Benchmarks</button>
+    <button role="tab" class="tab" data-view="config" data-testid="tab-config">Config</button>
+  </nav>
+  <div class="topbar-right">
+    <span class="live" data-testid="live-indicator" title="Live event stream"><i class="dot"></i><span id="live-label">connecting…</span></span>
+    <button id="theme" class="ghost" data-testid="theme-toggle" title="Toggle colour theme" aria-label="Toggle colour theme">◐</button>
+  </div>
+</header>
+
+<section class="filters" aria-label="Filters">
+  <input id="f-q" type="search" placeholder="Search session, model, agent…" data-testid="filter-q" aria-label="Search">
+  <select id="f-range" data-testid="filter-range" aria-label="Time range">
+    <option value="0">All time</option>
+    <option value="3600000">Last hour</option>
+    <option value="21600000">Last 6 hours</option>
+    <option value="86400000">Last 24 hours</option>
+    <option value="604800000">Last 7 days</option>
+  </select>
+  <select id="f-model" data-testid="filter-model" aria-label="Model"><option value="">All models</option></select>
+  <select id="f-provider" data-testid="filter-provider" aria-label="Provider"><option value="">All providers</option></select>
+  <select id="f-agent" data-testid="filter-agent" aria-label="Agent"><option value="">All agents</option></select>
+  <select id="f-preset" data-testid="filter-preset" aria-label="Preset"><option value="">All presets</option></select>
+  <select id="f-mode" data-testid="filter-mode" aria-label="Mode"><option value="">All modes</option></select>
+  <select id="f-component" data-testid="filter-component" aria-label="Component"><option value="">All components</option></select>
+  <select id="f-reason" data-testid="filter-reason" aria-label="Compaction outcome">
+    <option value="">Compacted or not</option>
+    <option value="compacted">Compacted</option>
+    <option value="bypassed">Not: bypassed</option>
+    <option value="below_trigger">Not: below trigger</option>
+    <option value="cache_frozen">Not: frozen for cache safety</option>
+    <option value="found_nothing">Not: found nothing</option>
+    <option value="reverted">Not: reverted</option>
+    <option value="no_messages">Not: no messages</option>
+  </select>
+  <select id="f-accounting" data-testid="filter-accounting" aria-label="Token accounting">
+    <option value="">Any accounting</option>
+    <option value="complete">Exact (complete)</option>
+    <option value="partial">Estimated (partial)</option>
+    <option value="missing">Unmeasured (missing)</option>
+  </select>
+  <button id="f-clear" class="ghost" data-testid="filter-clear">Clear</button>
+</section>
+
+<div id="capture-warning" class="banner warn" hidden data-testid="capture-warning"></div>
+<!-- Observe mode: above the fold, before any number, because in that mode every figure
+     below is a projection rather than an achieved saving. Filled by checkCapture(). -->
+<div id="observe-banner" class="banner warn" hidden data-testid="observe-banner" role="status"></div>
+
+<main id="main">
+
+<!-- ── Overview ───────────────────────────────────────────────────────────── -->
+<section class="view" id="view-overview">
+  <div class="tiles" id="tiles"></div>
+
+  <div class="panel">
+    <h2>Savings percentage — four denominators, four questions</h2>
+    <p class="note">A single savings figure would be a lie of omission. Each bar below divides
+      the same savings by a different denominator, and says which. Where the inputs are
+      missing the bar reads <em>n/a</em> rather than inventing a number.</p>
+    <div id="denominators" data-testid="denominators"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Cumulative cost: without context-guru vs with</h2>
+    <p class="note">The shaded area between the lines is money saved. Baseline prices the
+      <strong>unique</strong> tokens we removed at the cache-write rate they would have entered
+      as (~11.5&times; a cache read on a prompt-caching backend), and the re-sent remainder at
+      the cache-read rate the provider would have served it from. Pricing gross savings as
+      writes is how a dashboard overstates itself by its own overcount ratio — which is why
+      dollar savings and token savings diverge so sharply on this workload.</p>
+    <div id="chart-cost" class="chart" data-testid="chart-cost"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Honest savings waterfall</h2>
+    <p class="note">Baseline, every reduction, every penalty we owe back, and the net. If
+      context-guru cost more than it saved, this chart says so.</p>
+    <div id="waterfall" data-testid="waterfall"></div>
+  </div>
+
+  <div class="grid-2">
+    <div class="panel">
+      <h2>Tokens over time</h2>
+      <div id="chart-tokens" class="chart" data-testid="chart-tokens"></div>
+    </div>
+    <div class="panel">
+      <h2>Cache reads vs writes</h2>
+      <div id="chart-cache" class="chart" data-testid="chart-cache"></div>
+    </div>
+    <div class="panel">
+      <h2>Latency: context-guru vs upstream</h2>
+      <div id="chart-latency" class="chart" data-testid="chart-latency"></div>
+    </div>
+    <div class="panel">
+      <h2>Request volume &amp; restorations</h2>
+      <div id="chart-volume" class="chart" data-testid="chart-volume"></div>
+    </div>
+  </div>
+
+  <div class="grid-2">
+    <div class="panel">
+      <h2>What our own safety mechanisms cost</h2>
+      <p class="note" id="safety-note"></p>
+      <div id="safety" data-testid="safety-cost"></div>
+    </div>
+    <div class="panel">
+      <h2>Cache-miss attribution</h2>
+      <p class="note">A cold start is not a failure — the first request of a session, or the
+        first for a model, has nothing to hit. TTL expiry wins ties over a changed prefix.</p>
+      <div id="cachemiss" data-testid="cache-miss"></div>
+    </div>
+    <div class="panel">
+      <h2>Why we didn't compact</h2>
+      <p class="note">A first-class reason bucket, not an absence of data.</p>
+      <div id="reasons" data-testid="uncompressed-reasons"></div>
+    </div>
+    <div class="panel">
+      <h2>Token-accounting confidence</h2>
+      <p class="note">Only <code>complete</code> rows have all four billed token tiers. Anything
+        else is an estimate and is never rendered as exact.</p>
+      <div id="accounting" data-testid="accounting"></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Live feed</h2>
+    <p class="note">Summary rows only, streamed over SSE. Content is never pushed to a live
+      client; open a request to inspect it.</p>
+    <div class="tblwrap">
+      <table class="tbl compact" data-testid="live-table">
+        <thead><tr><th>Time</th><th>Session</th><th>Model</th><th class="num">Before</th><th class="num">After</th><th class="num">Saved</th><th class="num">CG ms</th><th>Accounting</th></tr></thead>
+        <tbody id="live-body"></tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- ── Components ─────────────────────────────────────────────────────────── -->
+<section class="view" id="view-components" hidden>
+  <div class="panel">
+    <h2>Per-component economics</h2>
+    <p class="note">Which components earn their place. <strong>Unique</strong> counts each
+      distinct compaction once; <strong>gross</strong> re-counts it every turn the agent
+      re-sends the transcript, so <strong>overcount</strong> is how inflated the gross figure
+      is. <strong>Own latency</strong> is the wall time the component spent on the hot path,
+      and <strong>value</strong> prices its unique savings against that cost.</p>
+    <div class="tblwrap">
+      <table class="tbl" data-testid="components-table">
+        <thead><tr>
+          <th>Component</th><th>Kind</th><th class="num">Runs</th><th class="num">Acted</th>
+          <th class="num">Act rate</th><th class="num">Reverted</th>
+          <th class="num">Unique saved</th><th class="num">Gross saved</th><th class="num">Overcount</th>
+          <th class="num">Own latency</th><th class="num">Avg ms</th><th class="num">Errors</th><th>Verdict</th>
+        </tr></thead>
+        <tbody id="components-body"></tbody>
+      </table>
+    </div>
+  </div>
+  <div class="panel">
+    <h2>Unique savings by component</h2>
+    <div id="chart-comp" class="chart" data-testid="chart-components"></div>
+  </div>
+</section>
+
+<!-- ── Sessions ───────────────────────────────────────────────────────────── -->
+<section class="view" id="view-sessions" hidden>
+  <div class="panel">
+    <h2>Sessions</h2>
+    <div class="tblwrap">
+      <table class="tbl" data-testid="sessions-table">
+        <thead><tr>
+          <th>Session</th><th>Model</th><th>Agent</th><th>Preset</th>
+          <th class="num">Turns</th><th class="num">Before</th><th class="num">Saved</th>
+          <th class="num">Saved $</th><th class="num">Cache r/w</th><th class="num">Expands</th>
+          <th class="num">CG ms</th><th>Started</th>
+        </tr></thead>
+        <tbody id="sessions-body"></tbody>
+      </table>
+    </div>
+    <div class="pager"><button id="sess-prev" class="ghost">Previous</button><span id="sess-page"></span><button id="sess-next" class="ghost">Next</button></div>
+  </div>
+</section>
+
+<!-- ── Requests ───────────────────────────────────────────────────────────── -->
+<section class="view" id="view-requests" hidden>
+  <div class="panel">
+    <h2>Requests</h2>
+    <div class="tblwrap">
+      <table class="tbl" data-testid="requests-table">
+        <thead><tr>
+          <th>ID</th><th>Time</th><th>Session</th><th>Model</th><th>Mode</th>
+          <th class="num">Before</th><th class="num">After</th><th class="num">Saved</th>
+          <th class="num">Cache r/w</th><th class="num">$</th><th class="num">CG ms</th>
+          <th>Cache</th><th>Accounting</th>
+        </tr></thead>
+        <tbody id="requests-body"></tbody>
+      </table>
+    </div>
+    <div class="pager">
+      <button id="req-prev" class="ghost" data-testid="requests-prev">Previous</button>
+      <span id="req-page" data-testid="requests-page"></span>
+      <button id="req-next" class="ghost" data-testid="requests-next">Next</button>
+    </div>
+  </div>
+</section>
+
+<!-- ── Benchmarks ─────────────────────────────────────────────────────────── -->
+<section class="view" id="view-benchmarks" hidden>
+  <div class="panel">
+    <h2>Benchmark runs</h2>
+    <p class="note">Ingested from the harness artifacts (<code>summary.json</code> +
+      <code>rows-&lt;arm&gt;.json</code>). Reward sits beside cost on purpose: an arm that
+      saves money by failing tasks is not saving money.</p>
+    <button id="bench-refresh" class="ghost" data-testid="bench-refresh">Re-scan run directories</button>
+    <div id="bench-list" data-testid="bench-list"></div>
+  </div>
+</section>
+
+<!-- ── Config ─────────────────────────────────────────────────────────────── -->
+<section class="view" id="view-config" hidden>
+  <div class="panel">
+    <h2>Effective configuration</h2>
+    <p class="note">The <strong>resolved</strong> configuration — preset expanded, defaults
+      filled, overrides applied — not what was typed. Visible from loopback or a trusted CIDR
+      only, and key-allowlisted even then.</p>
+    <div id="config-body" data-testid="config-body"></div>
+  </div>
+  <div class="panel">
+    <h2>Capture pipeline health</h2>
+    <div id="capture-body" data-testid="capture-body"></div>
+  </div>
+</section>
+
+</main>
+
+<!-- ── Request detail drawer ──────────────────────────────────────────────── -->
+<div id="drawer" class="drawer" hidden aria-modal="true" role="dialog" aria-label="Request detail">
+  <div class="drawer-head">
+    <h2 id="drawer-title">Request</h2>
+    <button id="drawer-close" class="ghost" data-testid="drawer-close" aria-label="Close">✕</button>
+  </div>
+  <div id="drawer-body" class="drawer-body" data-testid="drawer-body"></div>
+</div>
+<div id="scrim" class="scrim" hidden></div>
+
+<script src="app.js"></script>
+</body>
+</html>

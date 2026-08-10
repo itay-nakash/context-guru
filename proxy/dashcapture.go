@@ -1,0 +1,171 @@
+package proxy
+
+import (
+	"context"
+	"net/http"
+	"time"
+
+	"github.com/rossoctl/context-guru/apply"
+	"github.com/rossoctl/context-guru/dash"
+	"github.com/rossoctl/context-guru/internal/cheapmodel"
+	"github.com/rossoctl/context-guru/internal/modelinfo"
+)
+
+// The dashboard's capture point. It is a plain struct built from values the
+// request path has already computed, handed to a channel with a `default:` branch.
+// No I/O, no lock held across a call, no token re-counting: the entire cost on the
+// request goroutine is a few field copies and one non-blocking send, which is why
+// enabling the dashboard does not show up in request latency (see docs/dashboard.md
+// for the measurement).
+//
+// Everything expensive — redaction of captured content, gzip, the insert, the SSE
+// fan-out — happens on the writer goroutine, after the response has been sent.
+
+// capture is the per-request scratchpad the chat handler fills as it goes.
+type capture struct {
+	rec       *dash.Recorder
+	pricer    modelinfo.Pricer
+	preset    string
+	route     string
+	provider  string
+	model     string
+	agent     string
+	start     time.Time
+	cgMs      float64
+	upstream  float64
+	status    int
+	expands   int
+	expandTok int
+	trace     apply.Trace
+	// llmCallsAtStart / llmCostAtStart snapshot context-guru's own cheap-model usage
+	// before the pipeline runs, so this request is charged only its own share of it.
+	llmInAtStart  int64
+	llmOutAtStart int64
+	unique        map[string]int
+}
+
+// newCapture starts a capture for one request, or returns nil when the dashboard
+// is off — every call site is nil-safe, so the disabled path costs one nil check.
+func (h *Handler) newCapture(r *http.Request, provider, route string) *capture {
+	if h.rec == nil {
+		return nil
+	}
+	_, in, out := cheapmodel.Usage()
+	return &capture{
+		rec: h.rec, pricer: h.opts.Prices, preset: h.opts.Preset,
+		route: route, provider: provider,
+		agent: r.UserAgent(), start: time.Now(),
+		llmInAtStart: in, llmOutAtStart: out,
+		unique: map[string]int{},
+	}
+}
+
+// noteTrace records the pipeline's outcome and computes each component's
+// unique-savings share. The dedup map lives in the recorder (process-wide), which
+// is what makes "unique" mean the same thing here and in /stats.
+func (c *capture) noteTrace(tr apply.Trace) {
+	if c == nil {
+		return
+	}
+	c.trace = tr
+	if tr.Run == nil {
+		return
+	}
+	for _, rep := range tr.Run.Components {
+		if saved := rep.Saved(); saved > 0 && !rep.Reverted && !rep.Skipped {
+			c.unique[rep.Component] = c.rec.MarkUnique(rep.Component, rep.CacheKeys, saved)
+		}
+	}
+}
+
+func (c *capture) noteCG(ms float64) {
+	if c != nil {
+		c.cgMs = ms
+	}
+}
+func (c *capture) noteUpstream(ms float64, status int) {
+	if c != nil {
+		c.upstream, c.status = ms, status
+	}
+}
+func (c *capture) noteModel(model string) {
+	if c != nil {
+		c.model = model
+	}
+}
+func (c *capture) noteExpand(tokens int) {
+	if c != nil {
+		c.expands++
+		c.expandTok += tokens
+	}
+}
+
+// finish builds the event and hands it off. Called once, after the response has
+// been written, so nothing here is on the client's critical path. usage may be
+// zero-valued with ok=false, in which case the row is marked partial and left
+// unpriced rather than priced as free.
+func (c *capture) finish(usage Usage, usageOK bool, captureContent bool, contentCap, contentMax int) {
+	if c == nil {
+		return
+	}
+	e := &dash.Event{
+		TS:       c.start.UnixMilli(),
+		Model:    c.model,
+		Provider: c.provider,
+		Route:    c.route,
+		Preset:   c.preset,
+		Status:   c.status,
+	}
+	e.Agent = dash.AgentFor(c.agent)
+	e.FromTrace(c.trace, c.unique)
+	e.CGLatencyMs, e.UpstreamMs = c.cgMs, c.upstream
+	e.Expands, e.ExpandTokens = c.expands, c.expandTok
+	e.FreshInput, e.CacheRead = usage.FreshInput, usage.CacheRead
+	e.CacheWrite, e.OutputTokens = usage.CacheWrite, usage.Output
+
+	// context-guru's own model spend attributable to THIS request: the delta of the
+	// process-wide cheap-model counters across the request. Priced with the same
+	// model rates; a cheap model configured to a different id is close enough here
+	// that over-reporting our own cost is the safe direction.
+	_, inNow, outNow := cheapmodel.Usage()
+	cgIn, cgOut := inNow-c.llmInAtStart, outNow-c.llmOutAtStart
+
+	var price modelinfo.Price
+	priced := false
+	if c.pricer != nil && c.model != "" {
+		price, priced = c.pricer.Price(context.Background(), c.model)
+	}
+	e.Price(price, usageOK && priced)
+	if priced && (cgIn > 0 || cgOut > 0) {
+		e.CGLLMCostUSD = price.Cost(cgIn, 0, 0, cgOut)
+	}
+
+	// Cache attribution, with a cold start treated as the non-failure it is.
+	seenSession, seenModel, sinceMs := c.rec.Observe(e.SessionID, e.Model, e.TS)
+	// Anthropic's prompt cache has a 5-minute TTL; a gap wider than that explains a
+	// miss without blaming a prefix change (TTL wins ties).
+	e.AttributeCache(seenSession, seenModel, sinceMs, 5*60*1000, e.CacheWrite > 0)
+
+	if !captureContent {
+		e.Content = nil
+	} else {
+		// Truncate here (a slice reslice, free), but do NOT redact here.
+		//
+		// finish is called from serve's defer, which runs before the handler RETURNS —
+		// not merely after the response body is written. So anything expensive on this
+		// line is paid by the next request on a keep-alive connection, i.e. by every real
+		// agent. Redaction is nine regexes over up to contentMax x 2 blobs, measured at
+		// ~53 ms/request (~25% of a request), against the ~175 ns the channel send costs.
+		// It therefore belongs on the writer goroutine, which already owns the event and
+		// is already off the hot path.
+		//
+		// Secrets still never reach disk: the writer redacts BEFORE the INSERT (see
+		// Event.Redact, called from Recorder.run). What changed is which goroutine pays,
+		// not whether redaction happens.
+		if len(e.Content) > contentMax {
+			e.Content = e.Content[:contentMax]
+		}
+		e.ContentCap = contentCap
+	}
+	c.rec.Record(e)
+}

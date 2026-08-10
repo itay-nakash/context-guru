@@ -127,6 +127,18 @@ type Aggregator struct {
 	filterFam  map[string]*filterStat
 	filterName map[string]*filterStat
 	filterMiss map[string]int64
+	// Provider-billed usage, summed from response bodies (W8). These are the tiers
+	// that actually cost money — on a prompt-caching backend a cache write bills
+	// ~11.5x a read, so content-token savings alone cannot express the economics.
+	freshInput int64
+	cacheRead  int64
+	cacheWrite int64
+	outputTok  int64
+	// attempted is the tokens compaction was ALLOWED to touch (the uncached tail
+	// when cache-aware); frozen is what cache safety made us leave alone. Together
+	// they give /stats an honest denominator and the cost of its own safety.
+	attempted int64
+	frozen    int64
 }
 
 // filterStat is one cmdfilter family's or filter's ledger. SavedUnique dedups by
@@ -333,6 +345,28 @@ func (a *Aggregator) RecordExpand(tokens int) {
 	a.mu.Unlock()
 }
 
+// RecordUsage adds one response's provider-billed token tiers. Called with what
+// the provider reported; a response that reports nothing contributes nothing
+// (never a zero-filled row that would read as "free").
+func (a *Aggregator) RecordUsage(fresh, cacheRead, cacheWrite, output int64) {
+	a.mu.Lock()
+	a.freshInput += fresh
+	a.cacheRead += cacheRead
+	a.cacheWrite += cacheWrite
+	a.outputTok += output
+	a.mu.Unlock()
+}
+
+// RecordEligibility notes how many tokens this request's offloaders were allowed
+// to touch, and how many cache-awareness froze — the numerator's honest
+// denominator, and the cost of our own safety mechanism.
+func (a *Aggregator) RecordEligibility(attempted, frozen int) {
+	a.mu.Lock()
+	a.attempted += int64(attempted)
+	a.frozen += int64(frozen)
+	a.mu.Unlock()
+}
+
 // RecordAddedLatency notes the wall time (ms) context-guru added to one request
 // (normalize + pipeline + writeback). Only meaningful on the active path.
 func (a *Aggregator) RecordAddedLatency(ms float64) {
@@ -506,6 +540,26 @@ type Snapshot struct {
 	// exactly the gap noted in headroom's dashboard. Omitted when no pool is running, so
 	// a sync-only deployment shows no phantom queue.
 	ObserveQueue *QueueStats `json:"observe_queue,omitempty"`
+
+	// Provider-billed token tiers (W8), summed from response usage. ADDITIVE: the
+	// benchmark harnesses parse this payload, so fields are only ever added here,
+	// never renamed or removed (see the golden shape test).
+	FreshInputTokens int64 `json:"fresh_input_tokens"`
+	CacheReadTokens  int64 `json:"cache_read_tokens"`
+	CacheWriteTokens int64 `json:"cache_write_tokens"`
+	OutputTokens     int64 `json:"output_tokens"`
+	// AttemptedTokens is what compaction was ALLOWED to touch; FrozenTokens is what
+	// cache-awareness deliberately left alone. SavingsPctAttempted divides savings
+	// by the former — the honest ratio, since SavingsPct's whole-request denominator
+	// recounts the transcript every turn and trends to ~0% on a long session.
+	AttemptedTokens int64 `json:"attempted_tokens"`
+	FrozenTokens    int64 `json:"frozen_tokens"`
+	// SavingsPctAttempted = saved / attempted. 0 when nothing was attempted.
+	SavingsPctAttempted float64 `json:"savings_pct_attempted"`
+	// SavingsPctNewInput = saved / (fresh + cache_write + saved): savings as a
+	// fraction of what would have newly entered the provider. 0 (not 100) when the
+	// provider reported no usage — savings must never be divided by themselves.
+	SavingsPctNewInput float64 `json:"savings_pct_new_input"`
 }
 
 // QueueStats mirrors modes.Stats. Declared here as a plain struct rather than importing
@@ -590,6 +644,16 @@ func (a *Aggregator) Snapshot() Snapshot {
 	if mode == "" {
 		mode = components.ModeSync
 	}
+	attemptedPct := 0.0
+	if a.attempted > 0 {
+		attemptedPct = float64(saved) / float64(a.attempted) * 100
+	}
+	// Guard on the BILLED figure, not the sum: with no usage data the denominator
+	// would be `saved` alone and the ratio would read ~100%. No data => report 0.
+	newInputPct := 0.0
+	if a.freshInput+a.cacheWrite > 0 {
+		newInputPct = float64(saved) / float64(a.freshInput+a.cacheWrite+saved) * 100
+	}
 	snap := Snapshot{
 		Requests: a.requests, TokensBefore: a.before, TokensAfter: a.after,
 		SavedTokens: saved, SavingsPct: pct,
@@ -603,6 +667,10 @@ func (a *Aggregator) Snapshot() Snapshot {
 		CmdfilterMisses:   topMisses(a.filterMiss, 20),
 		Mode:              string(mode),
 		SyncEnforced:      a.syncRequests,
+		FreshInputTokens:  a.freshInput, CacheReadTokens: a.cacheRead,
+		CacheWriteTokens: a.cacheWrite, OutputTokens: a.outputTok,
+		AttemptedTokens: a.attempted, FrozenTokens: a.frozen,
+		SavingsPctAttempted: attemptedPct, SavingsPctNewInput: newInputPct,
 	}
 	if a.potentialRuns > 0 || mode == components.ModeObserve {
 		snap.ObserveNotice = observeNotice

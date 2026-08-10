@@ -26,8 +26,10 @@ import (
 	"github.com/rossoctl/context-guru/apply"
 	"github.com/rossoctl/context-guru/components"
 	"github.com/rossoctl/context-guru/components/offload"
+	"github.com/rossoctl/context-guru/dash"
 	"github.com/rossoctl/context-guru/expand"
 	"github.com/rossoctl/context-guru/internal/cheapmodel"
+	"github.com/rossoctl/context-guru/internal/modelinfo"
 	"github.com/rossoctl/context-guru/metrics"
 	"github.com/rossoctl/context-guru/modes"
 	"github.com/rossoctl/context-guru/schema"
@@ -76,6 +78,19 @@ type Options struct {
 	// auto/on keep offloaders from mutating already-cached content on prompt-caching
 	// backends; off restores legacy compact-everything (for confirmed non-caching backends).
 	CacheMode string
+	// Prices resolves a model's per-token rates so the dashboard can price each
+	// request AT WRITE TIME (so history does not reprice when a rate changes). nil =
+	// no pricing, and every captured row is marked partially accounted rather than
+	// being priced as free. Built in main from internal/modelinfo.
+	Prices modelinfo.Pricer
+	// Preset labels captured rows with the configuration in effect, so the dashboard
+	// can filter and compare by preset.
+	Preset string
+	// Dashboard, when non-nil, enables the persistent observability layer: each
+	// request is captured off the hot path into a durable store and the dashboard UI
+	// + API are mounted. nil = the proxy behaves exactly as before.
+	Dashboard *dash.Recorder
+
 	// PipelineFor builds a pipeline for a per-request override on /compact
 	// (?preset=… or x-context-guru-pipeline: a,b,c). nil = overrides ignored, the
 	// handler always uses the configured pipeline. Supplied by main (which holds
@@ -133,6 +148,10 @@ type Handler struct {
 	// So observe gets a store of its own: as persistent as the live one, and completely
 	// disjoint from it.
 	shadow store.Store
+	// rec is the dashboard's capture pipeline (nil when the dashboard is off). Every
+	// use is nil-guarded, so the disabled path costs one nil check per request.
+	rec *dash.Recorder
+	api *dash.API
 }
 
 // New builds the proxy handler. agg may be nil (no /stats rollups).
@@ -141,13 +160,29 @@ func New(pipe *components.Pipeline, st store.Store, agg *metrics.Aggregator, opt
 	if c == nil {
 		c = &http.Client{Timeout: 5 * time.Minute}
 	}
-	h := &Handler{pipe: pipe, store: st, agg: agg, opts: opts, client: c, tracker: modes.NewTracker(0)}
+	h := &Handler{pipe: pipe, store: st, agg: agg, opts: opts, client: c,
+		tracker: modes.NewTracker(0), rec: opts.Dashboard}
 	if h.mode() == components.ModeObserve {
 		h.pool = modes.NewPool(opts.Observe.MaxQueue, opts.Observe.Workers)
 		h.shadow = store.NewMemory(store.Options{})
 	}
 	if agg != nil {
 		agg.SetMode(h.mode())
+	}
+	if h.rec != nil {
+		h.api = dash.NewAPI(h.rec)
+		// Publish the off-path pool's counters to the dashboard, the same layering /stats
+		// uses: the pool lives in `modes`, which sits above both `metrics` and `dash`, so
+		// the host is the only place that can join them. Read at serve time, not captured
+		// now, and left unset in sync mode so the UI shows no phantom queue.
+		if h.pool != nil {
+			pool := h.pool
+			h.rec.SetObserveQueue(func() dash.QueueStats {
+				q := pool.Stats()
+				return dash.QueueStats{Queued: q.Queued, Pending: q.Pending,
+					Processed: q.Processed, Dropped: q.Dropped, Errors: q.Errors}
+			})
+		}
 	}
 	return h
 }
@@ -174,6 +209,11 @@ func (h *Handler) Mux() *http.ServeMux {
 	m.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
 	m.HandleFunc("GET /stats", h.stats)
 	m.HandleFunc("GET /expand", h.expand)
+	// The dashboard mounts /dashboard/ (embedded UI) and /api/* (JSON + SSE) only
+	// when enabled, so an unconfigured proxy's route table is byte-identical to before.
+	if h.api != nil {
+		h.api.Mount(m)
+	}
 	// Bob (BobShell) gateway. Bob is OpenAI-compatible but calls Bob-specific
 	// paths: its model call is POST /inference/v1/chat/completions (reduced like
 	// any OpenAI chat), and its control-plane calls (/admin/v1/profile,
@@ -288,6 +328,9 @@ func (h *Handler) compact(w http.ResponseWriter, r *http.Request) {
 	// eval measures a different component than the one that ships. That is the same class of
 	// divergence as the window this handler used to hard-code as unknown, a few lines above —
 	// and it went unnoticed for the same reason, because both are silent.
+	cp := h.newCapture(r, string(provider), "/compact")
+	cp.noteModel(gjson.GetBytes(body, "model").String())
+	start := time.Now()
 	res := apply.BodyOpts(r.Context(), pipe, h.store, apply.Opts{
 		Provider:  provider,
 		Body:      body,
@@ -298,9 +341,13 @@ func (h *Handler) compact(w http.ResponseWriter, r *http.Request) {
 		CacheMode: cacheMode,
 		Tracker:   h.tracker,
 	})
-	out := res.Body
+	cp.noteCG(float64(time.Since(start).Microseconds()) / 1000.0)
+	cp.noteTrace(res.Trace)
 	w.Header().Set("Content-Type", "application/json")
-	w.Write(out)
+	w.Write(res.Body)
+	// After the response: /compact never calls a provider, so there is no usage to
+	// report and the row is honestly marked partially accounted.
+	cp.finish(Usage{}, false, h.captureContent(), h.contentCap(), h.contentMax())
 }
 
 // splitComma splits a comma-separated header value into trimmed, non-empty names.
@@ -426,6 +473,10 @@ func (h *Handler) chat(provider bschemas.ModelProvider, up upstream) http.Handle
 			}
 		}
 		bypassed := strings.EqualFold(r.Header.Get("x-context-guru-bypass"), "true")
+		// Start the dashboard capture (nil when the dashboard is off). It only holds
+		// values the request path already computed; nothing here does I/O.
+		cp := h.newCapture(r, string(provider), up.path)
+		cp.noteModel(gjson.GetBytes(body, "model").String())
 		// Fail open around the whole pre-forward rewrite (pipeline + expand injection): a
 		// panic anywhere here must forward the PRISTINE inbound body, never 500 the client.
 		// apply.BodyFull has its own recover; this backstops expand.Inject and anything else.
@@ -438,7 +489,8 @@ func (h *Handler) chat(provider bschemas.ModelProvider, up upstream) http.Handle
 				}
 			}()
 			var added time.Duration
-			body, added = h.applyMode(&reqInfo{
+			var tr apply.Trace
+			body, added, tr = h.applyMode(&reqInfo{
 				ctx:      r.Context(),
 				provider: provider,
 				body:     body,
@@ -447,8 +499,12 @@ func (h *Handler) chat(provider bschemas.ModelProvider, up upstream) http.Handle
 				models:   models,
 				window:   window,
 			})
+			addedMs := float64(added.Microseconds()) / 1000.0
+			cp.noteCG(addedMs)
+			cp.noteTrace(tr)
 			if h.agg != nil && !bypassed {
-				h.agg.RecordAddedLatency(float64(added.Microseconds()) / 1000.0)
+				h.agg.RecordAddedLatency(addedMs)
+				h.agg.RecordEligibility(tr.AttemptedTokens, tr.FrozenTokens)
 			}
 			// Advertise the expand tool so the model can recover any offloaded content
 			// (closes the reversibility loop h.serve drives). Sticky/idempotent + appended
@@ -464,7 +520,7 @@ func (h *Handler) chat(provider bschemas.ModelProvider, up upstream) http.Handle
 				body, _ = expand.Inject(string(provider), im, body, h.store.Persists())
 			}
 		}()
-		h.serve(w, r, provider, up, body, bypassed)
+		h.serve(w, r, provider, up, body, bypassed, cp)
 	}
 }
 
@@ -500,7 +556,7 @@ var errNoUpstream = errors.New("no upstream configured")
 // → /stats sse_streamed / sse_buffered). It previously matched the expand tool
 // description this proxy injects itself, so it was unconditionally true and the
 // zero-added-latency promise above never held for any request (issue #26).
-func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschemas.ModelProvider, up upstream, body []byte, bypassed bool) {
+func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschemas.ModelProvider, up upstream, body []byte, bypassed bool, cp *capture) {
 	injectOn := h.opts.InjectExpand != expand.InjectNever
 	// For SSE we must buffer to inspect (a latency cost), so only do it when the request
 	// actually carries expandable markers (offload happened → the model might expand).
@@ -518,10 +574,19 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 	reqStart := time.Now()
 	sse, sseBuffered := false, false
 	var sseFirstByte time.Time // zero on buffered paths: the client's first byte is the write itself
+	// The response's billed token tiers, harvested out of band (see sniffer) and
+	// handed to the dashboard AFTER the client's response is complete, so capture
+	// can never delay or fail a request.
+	var usage Usage
+	var usageOK bool
 	defer func() {
 		if sse && h.agg != nil {
 			h.agg.RecordSSE(msSince(reqStart, sseFirstByte), sseBuffered)
 		}
+		if h.agg != nil && usageOK {
+			h.agg.RecordUsage(usage.FreshInput, usage.CacheRead, usage.CacheWrite, usage.Output)
+		}
+		cp.finish(usage, usageOK, h.captureContent(), h.contentCap(), h.contentMax())
 	}()
 	for round := 0; ; round++ {
 		upStart := time.Now()
@@ -530,8 +595,10 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 			http.Error(w, "upstream: "+err.Error(), http.StatusBadGateway)
 			return
 		}
+		upMs := float64(time.Since(upStart).Microseconds()) / 1000.0
+		cp.noteUpstream(upMs, resp.StatusCode)
 		if h.agg != nil {
-			h.agg.RecordUpstreamLatency(float64(time.Since(upStart).Microseconds())/1000.0, bypassed)
+			h.agg.RecordUpstreamLatency(upMs, bypassed)
 		}
 		isSSE := strings.Contains(resp.Header.Get("Content-Type"), "event-stream")
 		// Inspect for a lone expand call when injection is on and we haven't hit the round
@@ -542,8 +609,14 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 			// sseBuffered is sticky: if an earlier round was buffered the client already
 			// lost its stream, so this request counts as buffered however it ends.
 			sse = sse || isSSE
-			if first := h.stream(w, resp); !sseBuffered {
+			// Stream straight through, sniffing usage from a bounded head+tail window as
+			// the bytes go by (no buffering of the whole response, no added latency).
+			first, u, ok := h.stream(w, resp)
+			if !sseBuffered {
 				sseFirstByte = first
+			}
+			if ok {
+				usage, usageOK = u, true
 			}
 			return
 		}
@@ -553,6 +626,9 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 			// Buffered: the client sees nothing until the whole stream has arrived, so its
 			// first byte lands no earlier than the write on whichever path we return from.
 			sse, sseBuffered, sseFirstByte = true, true, time.Time{}
+		}
+		if u, ok := responseUsage(resp.Header.Get("Content-Type"), respBody); ok {
+			usage, usageOK = u, true
 		}
 
 		// Reconstruct the message the loop reasons over. For SSE, aggregate the events;
@@ -629,13 +705,24 @@ func (h *Handler) doUpstream(r *http.Request, up upstream, body []byte) (*http.R
 	return h.client.Do(req)
 }
 
-// stream copies an upstream response through with flushing (SSE-friendly) and
-// returns the instant the client got its first byte (zero if the body was empty).
-func (h *Handler) stream(w http.ResponseWriter, resp *http.Response) (firstByte time.Time) {
+// stream copies an upstream response through with flushing (SSE-friendly), while
+// keeping a BOUNDED head+tail window of the bytes so the response's billed token
+// tiers can be read afterwards. The window is why observability costs nothing
+// here: no whole-response buffering, no extra pass, and the client sees each chunk
+// as soon as it arrives.
+//
+// head+tail rather than tail alone because Anthropic reports the input tiers in
+// the FIRST SSE event (message_start) and the output count in the last, while
+// OpenAI reports everything in a final chunk.
+//
+// It also returns the instant the client got its first byte (zero if the body was
+// empty), which is the SSE TTFB accounting in serve.
+func (h *Handler) stream(w http.ResponseWriter, resp *http.Response) (firstByte time.Time, u Usage, ok bool) {
 	defer resp.Body.Close()
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	flush, _ := w.(http.Flusher)
+	sn := newSniffer(h.rec != nil || h.agg != nil)
 	buf := make([]byte, 16*1024)
 	for {
 		n, rerr := resp.Body.Read(buf)
@@ -644,6 +731,7 @@ func (h *Handler) stream(w http.ResponseWriter, resp *http.Response) (firstByte 
 				firstByte = time.Now()
 			}
 			w.Write(buf[:n])
+			sn.write(buf[:n])
 			if flush != nil {
 				flush.Flush()
 			}
@@ -652,7 +740,8 @@ func (h *Handler) stream(w http.ResponseWriter, resp *http.Response) (firstByte 
 			break
 		}
 	}
-	return firstByte
+	u, ok = responseUsage(resp.Header.Get("Content-Type"), sn.bytes())
+	return firstByte, u, ok
 }
 
 // msSince returns milliseconds from start to at (falling back to now if the
@@ -662,6 +751,24 @@ func msSince(start, at time.Time) float64 {
 		at = time.Now()
 	}
 	return float64(at.Sub(start).Microseconds()) / 1000.0
+}
+
+// captureContent / contentCap / contentMax read the dashboard's content-capture
+// settings, with safe zero values when the dashboard is off.
+func (h *Handler) captureContent() bool {
+	return h.rec != nil && h.rec.Opts().CaptureContent
+}
+func (h *Handler) contentCap() int {
+	if h.rec == nil {
+		return 0
+	}
+	return h.rec.Opts().ContentCap
+}
+func (h *Handler) contentMax() int {
+	if h.rec == nil {
+		return 0
+	}
+	return h.rec.Opts().ContentMaxPerRequest
 }
 
 func (h *Handler) stats(w http.ResponseWriter, _ *http.Request) {

@@ -27,6 +27,33 @@ type Resolver interface {
 	Window(ctx context.Context, model string) (tokens int, ok bool)
 }
 
+// Price is a model's per-token USD rates, in the four tiers a prompt-caching
+// provider bills. Zero rates mean "unknown" — a caller must treat a Price it did
+// not get an ok=true for as "no pricing", never as free.
+type Price struct {
+	Input      float64 `json:"input"`       // fresh (uncached) input per token
+	Output     float64 `json:"output"`      // completion per token
+	CacheRead  float64 `json:"cache_read"`  // cache-hit input per token
+	CacheWrite float64 `json:"cache_write"` // cache-creation input per token
+}
+
+// Cost prices one request's four token tiers in USD.
+func (p Price) Cost(fresh, cacheRead, cacheWrite, output int64) float64 {
+	return float64(fresh)*p.Input + float64(cacheRead)*p.CacheRead +
+		float64(cacheWrite)*p.CacheWrite + float64(output)*p.Output
+}
+
+// Zero reports whether no rate at all is known (so a cost figure would be a lie).
+func (p Price) Zero() bool {
+	return p.Input == 0 && p.Output == 0 && p.CacheRead == 0 && p.CacheWrite == 0
+}
+
+// Pricer resolves a model's per-token rates. ok=false means "unknown"; callers
+// must then report cost as unavailable rather than zero.
+type Pricer interface {
+	Price(ctx context.Context, model string) (Price, bool)
+}
+
 // LiteLLMPricesURL is the community-maintained map of model -> {max_input_tokens,…}.
 // Overridable (air-gapped mirrors) via NewLiteLLM.
 const LiteLLMPricesURL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
@@ -50,9 +77,10 @@ type LiteLLM struct {
 	TTL    time.Duration
 
 	mu       sync.Mutex
-	byKey    map[string]int // normalized key -> max_input_tokens
-	fetched  time.Time      // last fetch ATTEMPT (success or failure)
-	fetching bool           // a background fetch is in flight (single-flight guard)
+	byKey    map[string]int   // normalized key -> max_input_tokens
+	priceBy  map[string]Price // normalized key -> per-token USD rates
+	fetched  time.Time        // last fetch ATTEMPT (success or failure)
+	fetching bool             // a background fetch is in flight (single-flight guard)
 }
 
 // negTTL is how long to wait before retrying after a failed/empty fetch when no map
@@ -96,76 +124,90 @@ func (l *LiteLLM) refreshIfStale(context.Context) {
 	go func() {
 		// Detached context: the fetch outlives the triggering request; its own Client
 		// timeout bounds it. Record the attempt time regardless of outcome (negative cache).
-		m, err := l.fetch(context.Background())
+		m, pm, err := l.fetch(context.Background())
 		l.mu.Lock()
 		l.fetching = false
 		l.fetched = time.Now()
 		if err == nil && len(m) > 0 {
-			l.byKey = m // on failure keep any prior map (fail open)
+			l.byKey, l.priceBy = m, pm // on failure keep any prior map (fail open)
 		}
 		l.mu.Unlock()
 	}()
 }
 
-func (l *LiteLLM) fetch(ctx context.Context) (map[string]int, error) {
+func (l *LiteLLM) fetch(ctx context.Context) (map[string]int, map[string]Price, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, l.URL, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	resp, err := l.Client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer resp.Body.Close()
 	b, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	// Decode PER ENTRY, not into one typed map[string]struct{…}. The upstream
-	// document is community-maintained and not schema-clean: it carries a
-	// `sample_spec` documentation entry whose numeric fields hold prose
-	// ("deprecation_date": "date when the model becomes deprecated…"), and a
-	// handful of models spell an integer field as a float. encoding/json aborts the
-	// WHOLE map on the first type error, so a strict decode returned (nil, err)
-	// after successfully parsing ~2,900 good rows — which is why every context
-	// window resolved to "unknown" in production and no fraction-based trigger has
-	// ever fired. Skip the bad entries; keep the good ones; say so out loud.
+	// Per-entry decode (see the package note): the upstream document is not
+	// schema-clean, so one typed whole-map unmarshal yields nothing. This loop also
+	// collects the per-token PRICES the dashboard needs, from the same pass.
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(b, &raw); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	m := make(map[string]int, len(raw)*2)
+	pm := make(map[string]Price, len(raw)*2)
 	var skipped []string
 	for k, rv := range raw {
 		if k == sampleSpecKey {
 			continue // the document's own schema documentation, not a model
 		}
 		var v struct {
-			// float64, not int: a few entries spell an integer window as 128000.0,
+			// float64, not int: a few entries spell an integer field as 128000.0,
 			// which an int field rejects.
-			MaxInputTokens float64 `json:"max_input_tokens"`
-			MaxTokens      float64 `json:"max_tokens"`
+			MaxInputTokens  float64 `json:"max_input_tokens"`
+			MaxTokens       float64 `json:"max_tokens"`
+			InputCost       float64 `json:"input_cost_per_token"`
+			OutputCost      float64 `json:"output_cost_per_token"`
+			CacheReadCost   float64 `json:"cache_read_input_token_cost"`
+			CacheCreateCost float64 `json:"cache_creation_input_token_cost"`
 		}
 		if err := json.Unmarshal(rv, &v); err != nil {
 			skipped = append(skipped, k)
 			continue
 		}
-		w := int(v.MaxInputTokens)
-		if w == 0 {
-			w = int(v.MaxTokens)
+		full, tail := normalize(k)
+		if w := int(v.MaxInputTokens); w != 0 || v.MaxTokens != 0 {
+			if w == 0 {
+				w = int(v.MaxTokens)
+			}
+			m[full] = w
+			if _, ok := m[tail]; !ok { // don't clobber a more-specific full key
+				m[tail] = w
+			}
 		}
-		if w == 0 {
+		p := Price{Input: v.InputCost, Output: v.OutputCost, CacheRead: v.CacheReadCost, CacheWrite: v.CacheCreateCost}
+		if p.Zero() {
 			continue
 		}
-		full, tail := normalize(k)
-		m[full] = w
-		if _, ok := m[tail]; !ok { // don't clobber a more-specific full key
-			m[tail] = w
+		// LiteLLM omits cache rates for models that do not cache; fall back to the
+		// provider-standard Anthropic multiples ONLY when a cache tier is missing but
+		// input pricing is known, so a cached request is never priced as free.
+		if p.CacheRead == 0 {
+			p.CacheRead = p.Input * 0.1
+		}
+		if p.CacheWrite == 0 {
+			p.CacheWrite = p.Input * 1.25
+		}
+		pm[full] = p
+		if _, ok := pm[tail]; !ok {
+			pm[tail] = p
 		}
 	}
-	// Degrading silently here is what hid this bug for the life of the package: an
-	// empty map is indistinguishable from "no model has a window" at every call
-	// site, because every lookup fails open. Both outcomes get a log line.
+	// Degrading silently here is what hid the whole-map decode bug for the life of
+	// the package: an empty map is indistinguishable from "no model has a window" at
+	// every call site, because every lookup fails open. Both outcomes get a log line.
 	if len(m) == 0 {
 		slog.Warn("modelinfo: the model-window document decoded to nothing; every context window will read as unknown and fraction-based triggers will not fire",
 			"url", l.URL, "entries", len(raw), "skipped", len(skipped))
@@ -173,7 +215,31 @@ func (l *LiteLLM) fetch(ctx context.Context) (map[string]int, error) {
 		slog.Info("modelinfo: skipped malformed model entries", "skipped", len(skipped),
 			"kept", len(m), "examples", skipped[:min(3, len(skipped))])
 	}
-	return m, nil
+	return m, pm, nil
+}
+
+// Price returns the model's per-token rates from the cached LiteLLM map, matched
+// the same way Window matches (full id, then bare tail, then a contains scan).
+func (l *LiteLLM) Price(ctx context.Context, model string) (Price, bool) {
+	l.refreshIfStale(ctx)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.priceBy == nil {
+		return Price{}, false
+	}
+	full, tail := normalize(model)
+	if p, ok := l.priceBy[full]; ok {
+		return p, true
+	}
+	if p, ok := l.priceBy[tail]; ok {
+		return p, true
+	}
+	for k, p := range l.priceBy {
+		if strings.Contains(k, tail) {
+			return p, true
+		}
+	}
+	return Price{}, false
 }
 
 // sampleSpecKey is the LiteLLM document's self-documenting entry: its fields are
@@ -245,4 +311,18 @@ func (c Chain) Window(ctx context.Context, model string) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+// Price tries each element that can price a model; the first ok wins. Elements
+// that only resolve windows are skipped, so a Chain{LiteLLM, Static} prices from
+// LiteLLM and reports unknown when it has not loaded.
+func (c Chain) Price(ctx context.Context, model string) (Price, bool) {
+	for _, r := range c {
+		if p, ok := r.(Pricer); ok {
+			if pr, found := p.Price(ctx, model); found {
+				return pr, true
+			}
+		}
+	}
+	return Price{}, false
 }

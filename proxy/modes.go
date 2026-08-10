@@ -22,9 +22,14 @@ import (
 // is nothing for a failure to damage, because the forwarded body is the input.
 
 // applyMode rewrites body for forwarding according to the handler's mode, and returns the
-// body to forward plus the wall time to charge to the request path. Never returns a nil
-// body.
-func (h *Handler) applyMode(r *reqInfo) ([]byte, time.Duration) {
+// body to forward, the wall time to charge to the request path, and the observational
+// trace the dashboard's capture reads. Never returns a nil body.
+//
+// In observe mode the returned trace is the ZERO value, and deliberately so: the enforced
+// path ran nothing, so there is nothing about this request to observe. Reporting the
+// off-path projection here would credit a hypothetical saving to a request that was
+// forwarded untouched — the exact confusion the potential_* namespace exists to prevent.
+func (h *Handler) applyMode(r *reqInfo) ([]byte, time.Duration, apply.Trace) {
 	mode := h.mode()
 	start := time.Now()
 
@@ -33,7 +38,7 @@ func (h *Handler) applyMode(r *reqInfo) ([]byte, time.Duration) {
 	// happens off-path, on a copy, and the request pays only the enqueue.
 	if mode == components.ModeObserve && !r.bypassed {
 		h.observe(r)
-		return r.body, time.Since(start)
+		return r.body, time.Since(start), apply.Trace{}
 	}
 
 	res := apply.BodyOpts(r.ctx, h.pipe, h.store, apply.Opts{
@@ -43,9 +48,9 @@ func (h *Handler) applyMode(r *reqInfo) ([]byte, time.Duration) {
 	})
 	added := time.Since(start)
 	if res.Body == nil {
-		return r.body, added
+		return r.body, added, res.Trace
 	}
-	return res.Body, added
+	return res.Body, added, res.Trace
 }
 
 // reqInfo is the per-request input both the inline pass and an off-path observation need.
