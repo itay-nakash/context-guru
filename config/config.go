@@ -42,6 +42,12 @@ type AsyncConfig struct {
 	// 11.5x the cost — which makes async strictly worse than sync. The escape hatch
 	// exists because a backend that genuinely does not cache needs no protection.
 	CacheUncompactedTail bool `yaml:"cache_uncompacted_tail"`
+	// StripCallerBreakpoints lets async's tail protection remove a cache breakpoint the
+	// agent itself placed inside the protected span. Required for the protection to do
+	// anything on an agent that sets its own (claude-code does); without it async
+	// declines to defer on those turns instead of pretending. Default false because it
+	// changes a directive in someone else's request.
+	StripCallerBreakpoints bool `yaml:"strip_caller_breakpoints"`
 	// MaxQueue bounds the off-path job queue (0 = 256). A full queue drops, counted,
 	// and never blocks the request path.
 	MaxQueue int `yaml:"max_queue"`

@@ -3,6 +3,7 @@ package modes
 import (
 	"context"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,12 +13,20 @@ import (
 // --- Tracker ----------------------------------------------------------------
 
 func TestTurnReturnsPreviousLengthAndAdvances(t *testing.T) {
+	// Generation VALUES are not per-session counters — they are drawn from a global
+	// high-water mark so a session recreated after eviction cannot reuse one an in-flight
+	// job still holds. Only the ordering is contractual: strictly increasing per turn.
 	tr := NewTracker(0)
-	if pl, gen := tr.Turn("s", 5); pl != 0 || gen != 0 {
-		t.Fatalf("first turn: got (%d,%d), want (0,0)", pl, gen)
+	pl0, g0 := tr.Turn("s", 5)
+	if pl0 != 0 {
+		t.Fatalf("first turn prevLen: got %d, want 0", pl0)
 	}
-	if pl, gen := tr.Turn("s", 9); pl != 5 || gen != 0 {
-		t.Fatalf("second turn: got (%d,%d), want (5,0)", pl, gen)
+	pl1, g1 := tr.Turn("s", 9)
+	if pl1 != 5 {
+		t.Fatalf("second turn prevLen: got %d, want 5", pl1)
+	}
+	if g1 <= g0 {
+		t.Fatalf("generation did not advance on a turn: %d then %d", g0, g1)
 	}
 	// A shorter turn must not shrink the boundary: content the provider already
 	// cached would otherwise fall back into the mutable tail.
@@ -35,9 +44,12 @@ func TestSessionsAreIsolated(t *testing.T) {
 	if pl, _ := tr.Turn("b", 2); pl != 0 {
 		t.Fatalf("session b saw session a's length: %d", pl)
 	}
-	tr.CommitIfCurrent("a", 0, nil)
-	if g := tr.Gen("b"); g != 0 {
-		t.Fatalf("session b's generation moved with a's: %d", g)
+	// A commit on one session must not move another's generation (which would make
+	// b's in-flight jobs spuriously stale).
+	_, gb := tr.Turn("b", 4)
+	tr.CommitIfCurrent("a", 1, nil)
+	if g := tr.Gen("b"); g != gb {
+		t.Fatalf("session b's generation moved with a's: %d, want %d", g, gb)
 	}
 }
 
@@ -54,15 +66,52 @@ func TestStaleResultIsDiscarded(t *testing.T) {
 	if applied != 1 {
 		t.Fatalf("commit did not run: %d", applied)
 	}
-	// A second job built from the SAME (now superseded) generation.
+	// A LATER TURN ships. That, not a previous commit, is what makes a job stale in
+	// practice — and it is exactly the case an earlier version got wrong: the
+	// generation only moved on commit, so a job from turn 1 stayed "current" through
+	// any number of later turns and committed against a transcript long since replaced.
+	tr.Turn("s", 9)
 	if tr.CommitIfCurrent("s", gen, func() { applied++ }) {
-		t.Fatal("stale generation was accepted")
+		t.Fatal("a job superseded by a later TURN was accepted")
 	}
 	if applied != 1 {
 		t.Fatalf("stale commit ran anyway: applied=%d", applied)
 	}
-	if g := tr.Gen("s"); g != gen+1 {
-		t.Fatalf("generation did not advance exactly once: %d", g)
+}
+
+// TestGenerationAdvancesPerTurn pins the invariant directly: every turn supersedes the
+// jobs of every earlier turn. Without this the stale guard can only ever catch a dedup
+// collision, never actual staleness — the guard exists but never fires.
+func TestGenerationAdvancesPerTurn(t *testing.T) {
+	tr := NewTracker(0)
+	_, first := tr.Turn("s", 4)
+	for n := 5; n <= 12; n++ {
+		tr.Turn("s", n)
+	}
+	if g := tr.Gen("s"); g == first {
+		t.Fatal("the generation did not move across eight turns")
+	}
+	if tr.CommitIfCurrent("s", first, func() {}) {
+		t.Fatal("a job from the first turn committed after eight later turns")
+	}
+}
+
+// TestLandedGatesRealizedSavings: before any deferred compaction commits, a session has
+// realized nothing from deferral — whatever the inline pass saved, it saved on the
+// request path. Crediting that to the deferral would make the "realized" counter a
+// tautology (it reported exactly the inline saving on turn 1 of a model-free pipeline).
+func TestLandedGatesRealizedSavings(t *testing.T) {
+	tr := NewTracker(0)
+	_, gen := tr.Turn("s", 4)
+	if tr.Landed("s") {
+		t.Fatal("a session with no committed compaction reports one")
+	}
+	tr.CommitIfCurrent("s", gen, func() {})
+	if !tr.Landed("s") {
+		t.Fatal("a committed compaction was not recorded")
+	}
+	if tr.Landed("other") {
+		t.Fatal("Landed leaked across sessions")
 	}
 }
 
@@ -287,5 +336,75 @@ func settle() {
 	for i := 0; i < 20; i++ {
 		runtime.Gosched()
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestEvictionDoesNotResurrectAnInFlightJob: a session recreated after eviction must not
+// restart at a generation an in-flight job could still match, or that job commits over a
+// session that has moved several turns on.
+func TestEvictionDoesNotResurrectAnInFlightJob(t *testing.T) {
+	tr := NewTracker(2)
+	_, gen := tr.Turn("victim", 4) // a job is now in flight holding `gen`
+
+	// Churn other sessions until "victim" is evicted.
+	for i := 0; i < 10; i++ {
+		tr.Turn("filler"+strconv.Itoa(i), 3)
+	}
+	// "victim" comes back as a fresh session.
+	tr.Turn("victim", 5)
+
+	if tr.CommitIfCurrent("victim", gen, func() {}) {
+		t.Fatalf("a pre-eviction job (gen %d) committed over the recreated session", gen)
+	}
+}
+
+// TestStopDoesNotWaitForASlowJob: cancelling asks a job to stop, but one blocked in an
+// HTTP call to the cheap model only notices when that call returns — and its client
+// timeout is minutes. Shutdown must not inherit that: the job's result is pure savings
+// nobody is waiting for. main.go defers Close(), so a blocking Stop would hang exit.
+func TestStopDoesNotWaitForASlowJob(t *testing.T) {
+	p := NewPool(0, 1)
+	release := make(chan struct{})
+	defer close(release)
+
+	started := make(chan struct{})
+	p.Enqueue("slow", func(context.Context) {
+		close(started)
+		<-release // ignores cancellation, like an in-flight HTTP call
+	})
+	<-started
+
+	done := make(chan bool, 1)
+	go func() { done <- p.Stop() }()
+	select {
+	case clean := <-done:
+		if clean {
+			t.Fatal("Stop reported a clean exit while a job was still running")
+		}
+	case <-time.After(stopGrace + 3*time.Second):
+		t.Fatal("Stop blocked past its grace period on an uncancellable job")
+	}
+}
+
+// TestBarrenSessionStopsPayingForCompaction: each deferred job is a real cheap-model
+// call, so traffic that simply does not compact must stop buying attempts.
+func TestBarrenSessionStopsPayingForCompaction(t *testing.T) {
+	tr := NewTracker(0)
+	for i := 0; i < barrenLimit; i++ {
+		if tr.Barren("s") {
+			t.Fatalf("gave up after only %d unproductive jobs", i)
+		}
+		tr.RecordJobOutcome("s", false)
+	}
+	if !tr.Barren("s") {
+		t.Fatalf("still deferring after %d unproductive jobs", barrenLimit)
+	}
+	// One productive job proves the traffic does compact after all; resume.
+	tr.RecordJobOutcome("s", true)
+	if tr.Barren("s") {
+		t.Fatal("a productive job did not reset the budget")
+	}
+	if tr.Barren("untouched") {
+		t.Fatal("the barren budget leaked across sessions")
 	}
 }

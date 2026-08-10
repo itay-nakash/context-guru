@@ -296,6 +296,7 @@ func TestNoBreakpointAtOrBeyondUncompactedTail(t *testing.T) {
 	c.MaxCachedIdx = boundary - 1
 	c.TailCachePending = true
 	c.NoCacheAtOrAfter = boundary
+	c.StripCallerBreakpoints = true
 
 	idxs, rep := run(t, c, convo(n))
 	if rep.Skipped {
@@ -317,18 +318,24 @@ func TestNoBreakpointAtOrBeyondUncompactedTail(t *testing.T) {
 
 // A boundary of 0 means the whole request is doomed tail. Nothing may be written —
 // there is no stable prefix to protect and a breakpoint anywhere would be rewritten.
-func TestWholeRequestPendingPlacesNothing(t *testing.T) {
+// A session's FIRST turn must still write the prefix. It has no pending compaction (no
+// earlier turn enqueued one) and nothing to protect, so apply never turns the protection
+// on there — a previous version derived the boundary from prevLen=0, blocked every index,
+// and wrote zero breakpoints on precisely the turn whose job is to establish the cache.
+// An earlier test asserted that as correct; it encoded the bug.
+func TestFirstTurnStillWritesThePrefix(t *testing.T) {
 	c := ctx()
 	c.Mode = components.ModeAsync
-	c.TailCachePending = true
-	c.NoCacheAtOrAfter = 0
+	c.CacheAware = true
+	c.MaxCachedIdx = -1 // first turn
+	// apply leaves TailCachePending false here: PendingFrom is 0 (nothing queued).
 
-	idxs, rep := run(t, c, convo(10))
-	if len(idxs) != 0 {
-		t.Fatalf("wrote breakpoints over a fully-pending request: %v", idxs)
+	idxs, rep := run(t, c, convo(30))
+	if len(idxs) == 0 || rep.Skipped {
+		t.Fatalf("first turn wrote no breakpoint: %v skipped=%v", idxs, rep.Skipped)
 	}
-	if !rep.Skipped {
-		t.Fatal("placing nothing should report skipped")
+	if top := idxs[len(idxs)-1]; top != 29 {
+		t.Fatalf("first turn did not anchor the newest message: %v", idxs)
 	}
 }
 
@@ -381,5 +388,59 @@ func TestSkippedOnDeferredRun(t *testing.T) {
 		if !(Cacheinject{}).Enabled(on) {
 			t.Fatalf("cacheinject disabled on the %s request path", m)
 		}
+	}
+}
+
+// The protection must cover breakpoints the CALLER set, not only the ones cacheinject
+// wanted. claude-code marks its own newest message, so an earlier version that pruned
+// only `want` left the doomed tail cache-written — the protection was a silent no-op on
+// the primary workload, and async then paid the rewrite AND lost a slot.
+func TestCallerBreakpointInProtectedTailIsStripped(t *testing.T) {
+	msgs := convo(30)
+	if !mark(&msgs[29], nil) {
+		t.Fatal("could not place the caller's breakpoint")
+	}
+	c := ctx()
+	c.Mode = components.ModeAsync
+	c.CacheAware = true
+	c.MaxCachedIdx = 21
+	c.TailCachePending = true
+	c.NoCacheAtOrAfter = 22
+	c.StripCallerBreakpoints = true
+
+	idxs, _ := run(t, c, msgs)
+	for _, i := range idxs {
+		if i >= 22 {
+			t.Fatalf("breakpoint at %d survived inside the protected tail: %v", i, idxs)
+		}
+	}
+	if len(idxs) == 0 {
+		t.Fatal("stripped everything; the stable prefix must still be written")
+	}
+}
+
+// Without permission to strip, cacheinject must DECLINE rather than report success it
+// did not deliver — and say so, so the host can skip deferring a turn it cannot protect.
+func TestCallerBreakpointDeclinesWhenStrippingIsNotAllowed(t *testing.T) {
+	msgs := convo(30)
+	mark(&msgs[29], nil)
+	c := ctx()
+	c.Mode = components.ModeAsync
+	c.CacheAware = true
+	c.MaxCachedIdx = 21
+	c.TailCachePending = true
+	c.NoCacheAtOrAfter = 22
+	c.StripCallerBreakpoints = false
+
+	idxs, rep := run(t, c, msgs)
+	if !c.TailUnprotected() {
+		t.Fatal("declined the protection without telling the host")
+	}
+	if !rep.Skipped {
+		t.Fatal("declining should report skipped")
+	}
+	// The caller's request is left exactly as it came.
+	if len(idxs) != 1 || idxs[0] != 29 {
+		t.Fatalf("modified the request while declining: %v", idxs)
 	}
 }

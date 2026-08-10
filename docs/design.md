@@ -192,8 +192,14 @@ Mode is a dimension. `Report`/`RunReport` carry `Mode`, stamped by the pipeline 
 
 - enforced requests split into `sync_enforced` / `async_enforced`;
 - async adds the whole queue tuple (`queued`, `pending`, `processed`, `dropped`,
-  `errors`, `stale_discarded`) plus `async_realized_saved_tokens`, the savings a turn
-  got by replaying an earlier turn's deferred work;
+  `errors`, `stale_discarded`), `async_tail_unprotected_turns`, and
+  `async_realized_saved_tokens` — the savings a turn got by replaying an earlier turn's
+  deferred work. That last one is gated on the session having had a compaction actually
+  land (`Tracker.Landed`): recording it on every async turn that saved anything made it a
+  tautology that re-reported the inline saving, so it read equal to total savings even on
+  turn 1 with no deferred work in existence;
+- off-path (`Deferred`) runs are excluded from the enforced rollups entirely — their
+  savings are counted where they are realized, on the request path;
 - observe results land in **physically separate** accumulators serialized under
   `potential_*` / `projected_*`, which share no key with an enforced metric. In observe
   mode every enforced aggregate is zero by construction. Getting this wrong would
@@ -233,10 +239,22 @@ So `modes.Tracker` keeps, per session under one lock:
   lock is held, so two jobs cannot both observe `gen` as current. A stale result is
   **discarded**, not applied.
 
-The generation advances only when a compaction actually lands. That is what makes the
-scheme non-starving: dedup on `(session, generation)` keeps at most one useful job in
-flight per session, a commit moves the session forward, and the next turn enqueues
-fresh work against the longer transcript.
+**The generation advances on every TURN.** That is what makes "stale" mean what it says:
+a job built from turn N is stale the moment turn N+1 ships. An earlier version advanced it
+only on commit, which looked equivalent and was not — a job from turn 1 still read its own
+generation as current after eight later turns and committed happily. The guard existed but
+could only ever fire on a dedup collision, never on actual staleness.
+
+The honest consequence: at agent turn rates (seconds) a compaction taking tens of seconds
+is usually superseded before it lands, so async discards a lot of work it paid for.
+`stale_discarded` is how you see that, and it is the number to watch when deciding whether
+async suits a workload. Dedup on `(session, generation)` still keeps at most one job in
+flight per session, and the deferral is not starving — a job that finishes inside one turn
+commits — but "computed" and "applied" are genuinely different counts here.
+
+A session that produces several unproductive jobs in a row stops enqueueing them
+(`Tracker.Barren`): each one is a real cheap-model call, and traffic that does not compact
+would otherwise buy an attempt every turn forever.
 
 `store.Buffer` is what makes "discard" possible at all. A deferred run writes frozen
 decisions, stashes and sticky ids as it goes, so throwing the result away after the
@@ -269,9 +287,29 @@ A cache-write costs 11.5x a cache-read, so letting the un-compacted tail be cach
 then replacing it converts a read into a write and makes async strictly worse than
 sync — the failure that tripled headroom's cache-write on Terminal-Bench.
 
-`apply` therefore sets `Ctx.TailCachePending` + `Ctx.NoCacheAtOrAfter` in async mode,
-and `cacheinject` drops every wanted breakpoint position at or beyond that index,
-anchoring at the highest safe one instead so the stable prefix is still written.
+`apply` therefore sets `Ctx.TailCachePending` + `Ctx.NoCacheAtOrAfter`, and `cacheinject`
+drops every breakpoint at or beyond that index, anchoring at the highest safe one instead
+so the stable prefix is still written.
+
+Four conditions gate it, each one a bug caught in review:
+
+- **The protected span is the PREVIOUS turn's tail** (`Opts.PendingFrom`), not this
+  turn's. The pending job was built from that turn's body, so that is what it will
+  replace. Deriving the span from the current boundary protected messages no pending job
+  would touch — off by one turn, and guarding the wrong bytes.
+- **Only when something is actually pending.** A session's first turn has no queued job
+  and nothing to protect; blocking there wrote zero breakpoints on precisely the turn whose
+  job is to establish the cache.
+- **Only when cache-aware.** With `cache_mode: off` there is no cached prefix to protect,
+  so blocking suppressed caching forever for nothing.
+- **Caller breakpoints too, or not at all.** `cacheinject` originally pruned only the
+  positions it wanted, leaving breakpoints the *agent* set. claude-code marks its own
+  newest message, so on the primary workload the doomed tail was cache-written anyway and
+  the protection was a silent no-op — async paid the rewrite *and* lost a slot. It now
+  either strips those (`async.strip_caller_breakpoints`) or declines the turn entirely via
+  `Ctx.DeclineTailProtection`, and the host then does not defer
+  (`async_tail_unprotected_turns`). Declining is the default because removing a directive
+  an agent deliberately placed is a change to someone else's request.
 
 The protection needs a separate bool rather than a sentinel index, because index 0 is
 a legitimate value ("no breakpoint anywhere") — no integer is free to mean "off". The

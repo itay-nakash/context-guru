@@ -121,10 +121,11 @@ func TestStaleAsyncResultIsDiscardedEndToEnd(t *testing.T) {
 		Mode: components.ModeAsync, Tracker: tr,
 	})
 
-	// A newer turn's compaction lands first, advancing the generation.
-	if !tr.CommitIfCurrent("s", inline.Generation, func() {}) {
-		t.Fatal("could not advance the generation")
-	}
+	// A newer TURN ships, superseding the job's snapshot. This is the realistic path and
+	// the one that used to be broken: the generation advanced only on commit, so a job
+	// from turn 1 read its own generation as current no matter how many turns had
+	// shipped, and committed against a transcript long since replaced.
+	tr.Turn("s", 99)
 
 	// Now the older job finishes.
 	buf := store.NewBuffer(base)

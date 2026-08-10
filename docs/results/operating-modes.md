@@ -30,7 +30,7 @@ cite for savings. What is measured here is whether each mode does what it says.
 | context-guru's own LLM cost | $0.0122 (1 call) | $0.0435 (4 calls) | $0.0779 (7 calls) |
 | off-path compaction time | — | 80.8 s | 75.0 s |
 | deferred compactions committed | — | 1 | 0 (never commits) |
-| `async_realized_saved_tokens` | — | 15,962 | — |
+| `async_realized_saved_tokens` | — | 15,962 *(retracted — circular, see below)* | — |
 | queue `{dropped, stale_discarded}` | — | `{0, 0}` | `{0, 0}` |
 
 ## The four questions
@@ -43,36 +43,53 @@ path and 71.3 ms cumulative across 42 requests on async's, with `acted=0` inline
 model call is genuinely gone from the hot path. 80.8 s of compaction ran off-path,
 charged to nobody's request.
 
-**Cache-write: it went DOWN, which is the result the policy was designed for.** Absolute
-cache-write 52,287 → 42,980 (**−17.8%**) on ~49% *more* cache-read traffic. Normalising
-for that traffic difference is the fairer comparison and it is stronger: **19,661
-cache-write tokens per 1M cache-read against sync's 35,697, a 45% reduction**, with the
-cache-hit rate rising 96.55% → 98.07%.
+**Cache-write: it was lower, but this measurement does NOT establish that the policy
+caused it.** Absolute cache-write 52,287 → 42,980 (−17.8%) on ~49% more cache-read
+traffic; normalised, 19,661 per 1M cache-read against sync's 35,697. Terminal-Bench showed
+the same direction (13,185 vs 21,689).
 
-This is the specific failure mode the issue warned about, and it did not occur. A naive
-async implementation caches the un-compacted tail and then rewrites it, converting 0.1x
-reads into 1.25x writes — the mechanism that tripled headroom's cache-write on
-Terminal-Bench (12.37M vs a 4.01M baseline). Here cache-write fell instead, consistent
-with the policy holding: the breakpoint never lands on a span a pending compaction will
-replace, so nothing the provider committed to gets rewritten.
+Those numbers stand as measurements. The causal claim does not, and it was withdrawn after
+review found the mechanism was not doing what the arms were credited to:
 
-Caveat: n=1 across 2 tasks with differing trajectories, so treat the magnitude as
-indicative. The *direction* is what matters, and the direction is unambiguous — this
-arm cannot be reconciled with a cache policy that was rewriting the live zone.
+- On this workload the protection was **inert**. claude-code sets its own breakpoint on the
+  newest message, and the policy only pruned positions `cacheinject` itself wanted — so the
+  doomed tail was cache-written anyway. Whatever moved cache-write here, it was not the
+  tail protection.
+- Two other defects pushed cache-write down for uninteresting reasons: a session's first
+  turn placed **zero** breakpoints, and with `cache_mode: off` breakpoints were suppressed
+  entirely. Writing fewer breakpoints lowers cache-write; that is arithmetic, not a policy
+  win.
+- The arms are not paired: cache-read differs by 49%, trajectories by 6 mean steps, and
+  the async arm was re-run separately after a port collision.
+
+All four defects are now fixed, and the policy is proven **structurally** — unit tests
+assert no breakpoint survives at or beyond the protected span, including one the caller
+placed, and that the protection declines rather than pretends when it may not strip. The
+*measured* confirmation needs a re-run on a 50-task paired arm with
+`strip_caller_breakpoints: true`. Until then: mechanism verified by test, effect
+unmeasured.
 
 ### 2. Does async reach the same steady-state savings as sync, just later?
 
 **On this evidence it reached more, not less** — 4.17% enforced against sync's 0.82% —
 but do not read that as async being better at compaction. Both numbers are small and
 noisy at n=1, and the arms took different trajectories (different step counts, so
-different traffic). The load-bearing observation is narrower and does hold:
-`async_realized_saved_tokens` = 15,962 = the entire enforced saving, from 1 committed
-deferred compaction. Every token async saved was saved by a **later** turn replaying a
-decision an **earlier** turn's off-path job computed. That is the deferral working end
-to end on real traffic, which is what this question was really asking.
+different traffic). **The `async_realized_saved_tokens` = 15,962 figure I originally cited as "the entire
+enforced saving" was circular and is retracted.** The counter was recorded on every async
+turn that saved anything, with no check that the saving came from deferred work — so it
+re-reported the inline saving and necessarily equalled the total. Review demonstrated it
+reading `saved=396, realized=396` on the first turn of a model-free pipeline, where no
+deferred compaction existed at all.
 
-Note also what async spent to get there: 80.8 s of compaction ran off-path against 25.3
-ms/req on-path. The work did not disappear, it moved.
+It is now gated on the session having had a compaction actually land, and a test asserts it
+is a **strict** subset of `saved_tokens` (equality is the signature of the old bug). Under
+the corrected counter a controlled five-turn session reports `realized=4125` of
+`saved=4948` with 1 legitimate `stale_discarded` — deferral demonstrably contributing part
+of the saving, which is the honest form of the claim.
+
+So this question is **not** answered by the arms above; the deferral mechanism is verified
+by test, and its steady-state contribution on real traffic is unmeasured. What the arms do
+show is where the work went: 80.8 s of compaction ran off-path against 25.3 ms/req on-path.
 
 ### 3. Does observe add measurable latency to the enforced path?
 

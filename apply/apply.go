@@ -177,6 +177,14 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 	sys, firstUser := systemAndFirstUser(norm)
 	sessionID := session.Resolve(o.Session, sys, firstUser)
 	cacheAware := resolveCacheAware(o.CacheMode, provider, body)
+	// Turn accounting is independent of cache mode: the generation counts TURNS, and a
+	// turn happens whether or not the backend caches. Deriving it inside the cache-aware
+	// branch left every generation at 0 with cache_mode: off, which both disabled the
+	// stale guard and collided with 0's use as "nothing pending".
+	if o.Tracker != nil && !o.Deferred {
+		pl, gen := o.Tracker.Turn(sessionID, len(norm))
+		res.PrevLen, res.Generation = pl, gen
+	}
 	maxCachedIdx := -1
 	if cacheAware && !bypass {
 		// Messages present on the previous turn of this session are already committed
@@ -193,42 +201,52 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 		case o.PrevLen != nil:
 			maxCachedIdx = *o.PrevLen - 1
 		case o.Tracker != nil:
-			pl, gen := o.Tracker.Turn(sessionID, len(norm))
-			maxCachedIdx = pl - 1
-			res.PrevLen = pl
-			res.Generation = gen
+			maxCachedIdx = res.PrevLen - 1 // recorded above, in one locked call
 		default:
 			maxCachedIdx = prevLen(st, sessionID) - 1
 			defer putLen(st, sessionID, len(norm))
 		}
-	} else if o.Tracker != nil {
-		res.Generation = o.Tracker.Gen(sessionID)
 	}
 	// Async cache policy: while a compaction for this session is queued but not landed,
 	// the un-compacted tail is about to be REPLACED, so no breakpoint may be committed
 	// at or beyond it (see components.Ctx.NoCacheAtOrAfter). CacheUncompactedTail=true
 	// is the escape hatch for a confirmed non-caching backend, where the protection buys
 	// nothing.
+	//
+	// Three conditions beyond "async", each one a bug found in review:
+	//
+	//   - cacheAware. With cache_mode: off there is no cached prefix to protect and no
+	//     boundary to protect it at, so blocking breakpoints would suppress caching
+	//     forever for nothing (the two knobs interacted backwards).
+	//   - a boundary that exists. On a session's FIRST turn prevLen is 0, so the whole
+	//     request is "tail" and blocking it wrote zero breakpoints — on precisely the
+	//     turn whose job is to write the prefix. There is also nothing to protect yet:
+	//     no compaction is pending, because no earlier turn enqueued one.
+	//   - the tail a pending job will actually replace. The job enqueued by the PREVIOUS
+	//     turn targets that turn's tail, which by now sits at or below the boundary.
+	//     Blocking from the boundary up protected this turn's new messages, which no
+	//     pending job is going to touch — off by one turn, and it protected the wrong
+	//     span. The doomed span starts where the previous turn's own tail started.
 	tailPending, noCacheAt := false, 0
-	if mode == components.ModeAsync && !o.Deferred && !bypass && !o.CacheUncompactedTail {
+	if mode == components.ModeAsync && !o.Deferred && !bypass && !o.CacheUncompactedTail &&
+		cacheAware && o.PendingFrom > 0 {
 		tailPending = true
-		if noCacheAt = maxCachedIdx + 1; noCacheAt < 0 {
-			noCacheAt = 0
-		}
+		noCacheAt = o.PendingFrom
 	}
 	c := &components.Ctx{
-		Ctx:              ctx,
-		Session:          sessionID,
-		Store:            st,
-		Model:            models,
-		Bypass:           bypass,
-		CtxWindow:        o.Window,
-		CacheAware:       cacheAware,
-		MaxCachedIdx:     maxCachedIdx,
-		Mode:             mode,
-		Deferred:         o.Deferred,
-		TailCachePending: tailPending,
-		NoCacheAtOrAfter: noCacheAt,
+		Ctx:                    ctx,
+		Session:                sessionID,
+		Store:                  st,
+		Model:                  models,
+		Bypass:                 bypass,
+		CtxWindow:              o.Window,
+		CacheAware:             cacheAware,
+		MaxCachedIdx:           maxCachedIdx,
+		Mode:                   mode,
+		Deferred:               o.Deferred,
+		TailCachePending:       tailPending,
+		NoCacheAtOrAfter:       noCacheAt,
+		StripCallerBreakpoints: o.StripCallerBreakpoints,
 	}
 	res.Session = sessionID
 
@@ -240,6 +258,7 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 	}
 
 	res.Run = pipe.Run(chat, c)
+	res.TailUnprotected = c.TailUnprotected()
 
 	// A component changed the message count (summarize restructures the transcript
 	// to [msg0, <summary>, last-K]). Rebuild the messages array preserving each

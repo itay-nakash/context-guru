@@ -7,6 +7,7 @@ behavior that existed before modes did, byte for byte.
 mode: sync            # sync | async | observe
 async:
   cache_uncompacted_tail: false   # safe default: protect cache-write economics
+  strip_caller_breakpoints: false # true is REQUIRED for async to do anything with claude-code
   max_queue: 256
   workers: 1
 ```
@@ -66,6 +67,19 @@ tail a pending compaction is going to replace. `cacheinject` drops those positio
 and anchors at the highest index below them instead, so the whole stable prefix is
 still written and nothing the provider commits to is later rewritten.
 
+!!! warning "With claude-code you must choose: `strip_caller_breakpoints`, or async does nothing"
+    The protection only works if it controls the breakpoints. claude-code sets its **own**
+    breakpoint on the newest message — inside exactly the span a pending compaction will
+    replace. context-guru will not silently override a directive the agent placed, so by
+    default it **declines to defer that turn at all**, counted as
+    `async_tail_unprotected_turns`. On such a workload async is inert and `sync` is what
+    you are effectively running.
+
+    Set `async.strip_caller_breakpoints: true` to let context-guru take that breakpoint
+    back and actually get async's benefit. The trade is explicit: you override the agent's
+    caching choice on the newest message, in exchange for not paying an 11.5x rewrite of
+    it.
+
 The cost of the protection is one breakpoint position: the newest messages are not
 cached until their compaction lands. On an append-only agent transcript that is a
 small, bounded loss, and it is bounded by construction — the protection only covers
@@ -79,14 +93,24 @@ is the difference between async being cheaper than sync and being worse than it.
 ### What async guarantees
 
 - **One useful job per session per generation.** A session carries a compaction
-  generation; a job records the generation it was built from. Enqueue dedups on
-  `(session, generation)`, with the pending slot claimed before the job is observable
-  in the queue, so a concurrent enqueue of the same key cannot slip past.
+  generation that advances on **every turn**; a job records the generation it was built
+  from. Enqueue dedups on `(session, generation)`, with the pending slot claimed before
+  the job is observable in the queue, so a concurrent enqueue of the same key cannot slip
+  past.
 - **Stale results are discarded, never applied.** The job writes into a buffered
-  overlay of the store and that buffer is committed only if the session is still at
-  the generation the job was built from — checked under the same lock that advances
-  it. A result computed from a superseded snapshot is thrown away and counted as
-  `stale_discarded`.
+  overlay of the store and that buffer is committed only if the session is still on the
+  turn the job was built from — checked under the same lock that advances it. A result
+  computed from a superseded snapshot is thrown away and counted as `stale_discarded`.
+
+    Expect this to happen often. At agent turn rates (seconds) a compaction taking tens
+    of seconds is usually superseded before it lands, so async pays for work it then
+    discards. That is the deliberate trade: never apply a decision computed against a
+    transcript the session has moved past. If `stale_discarded` dominates `processed`,
+    your turns are too tight for deferral and `sync` is the honest choice.
+
+- **Unproductive sessions stop paying.** After a few deferred jobs in a row that produce
+  nothing, a session stops enqueueing them. Each job is a real cheap-model call, and
+  traffic that simply does not compact would otherwise buy an attempt every turn forever.
 - **The request path never waits and never blocks.** A full queue drops, counted as
   `dropped`. The request has already been forwarded, so a drop costs savings only.
 - **Bounded, owned workers.** One queue and a fixed worker count owned by the proxy,
@@ -105,9 +129,16 @@ is the difference between async being cheaper than sync and being worse than it.
 - `dropped` and `stale_discarded` are the counters that say *we silently gave up
   savings*. They are surfaced deliberately. (headroom's dashboard shows only
   `queued`, which hides precisely this.)
-- A rising `stale_discarded` means turns arrive faster than compaction finishes. That
-  is a tuning signal, not a fault — raise `workers`, or use `sync` if the workload's
-  turns are too tight for deferral to ever land.
+- A high `stale_discarded` relative to `processed` means turns arrive faster than
+  compaction finishes, so most deferred work is computed and then thrown away. Expect
+  this at agent turn rates. Raise `workers`, or use `sync` — deferral cannot pay off if
+  nothing ever lands.
+- `async_tail_unprotected_turns` counts turns async **refused** to defer because the
+  agent had cache-written the span a compaction would replace. Non-zero and climbing
+  means async is inert on this workload; see `strip_caller_breakpoints` above.
+- `async_realized_saved_tokens` counts savings a turn got by replaying deferred work, and
+  counts at all only once a compaction has actually landed for that session. It is a
+  strict subset of `saved_tokens`; if it ever equals it, the counter is lying.
 - A rising `dropped` means `max_queue` is too small for your concurrency.
 - `errors` counts jobs that ran and failed. Non-zero with zero `processed` means the
   compaction path itself is broken — check the cheap model's credentials.
@@ -139,10 +170,21 @@ enforced metric**:
 | `potential_components` | Per-component hypothetical contributions. |
 | `potential_overhead_ms_avg` | What compaction *would* have added per request — measured off-path, so it is what `sync` would cost you, not what `observe` costs you. |
 
-In observe mode every **enforced** aggregate is zero by construction:
+In observe mode every enforced **savings** aggregate is zero by construction:
 `requests`, `tokens_before`, `tokens_after`, `saved_tokens`, `sync_enforced`,
 `async_enforced` and the `components` map. That zero is the machine-readable form of
 "context-guru did not modify any request".
+
+Two enforced-namespace fields are deliberately **not** zero, because they are real
+measurements rather than hypotheticals:
+
+- `cg_added_ms_avg` — the actual latency added to the enforced path, which in observe mode
+  is ~0 precisely because that path does no pipeline work. Zeroing it would hide the mode's
+  headline result.
+- `llm_calls` / `llm_input_tokens` / `llm_output_tokens` — context-guru's own model spend.
+  Observe measures off-path, and that measuring costs real money. The spend is not
+  hypothetical, so it stays where cost tooling already reads it, labelled by
+  `observe_llm_notice` as the cost of measuring rather than of enforcing.
 
 A mislabelled hypothetical is worse than no number at all, because it silently
 inflates a savings claim. The separation is therefore structural — two physically

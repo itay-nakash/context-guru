@@ -97,6 +97,14 @@ type AsyncOptions struct {
 	// 11.5x the cost, making async strictly WORSE than sync. Set true only for a
 	// backend confirmed not to cache, where the protection buys nothing.
 	CacheUncompactedTail bool `yaml:"cache_uncompacted_tail"`
+	// StripCallerBreakpoints lets the tail protection remove a cache breakpoint the
+	// AGENT placed inside the span a pending compaction will replace. Without it the
+	// protection cannot cover an agent that sets its own breakpoints — claude-code does,
+	// so on that workload async declines to defer at all rather than pretend to protect
+	// (counted as async_tail_unprotected_turns). Default false: removing a directive the
+	// agent deliberately placed is a behavior change in someone else's request, so it is
+	// opt-in. Turn it on to actually get async's benefit with claude-code.
+	StripCallerBreakpoints bool `yaml:"strip_caller_breakpoints"`
 	// MaxQueue bounds the off-path job queue; a full queue DROPS (counted) rather than
 	// blocking the request path. 0 = modes.DefaultMaxQueue.
 	MaxQueue int `yaml:"max_queue"`

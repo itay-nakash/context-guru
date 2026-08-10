@@ -94,6 +94,7 @@ type Aggregator struct {
 	deferredRuns    int64   // off-path async compactions that produced a committed result
 	deferredMs      float64 // wall time spent off the request path
 	realizedSaved   int64   // tokens saved on-path by replaying a previously deferred compaction
+	tailUnprotected int64   // turns where deferral was declined to protect the cache
 	potentialRuns   int64
 	potentialBefore int64
 	potentialAfter  int64
@@ -131,9 +132,20 @@ func (a *Aggregator) RecordDeferred(ms float64, committed bool) {
 	a.mu.Unlock()
 }
 
+// RecordTailUnprotected notes a turn where async declined to defer because the caller
+// had cache-written the tail a compaction would have replaced and stripping its
+// breakpoint was not permitted. Deferring anyway would cost a 1.25x rewrite of a span
+// the provider committed to. A high count means async is doing nothing on this workload
+// and async.strip_caller_breakpoints is the knob to consider.
+func (a *Aggregator) RecordTailUnprotected() {
+	a.mu.Lock()
+	a.tailUnprotected++
+	a.mu.Unlock()
+}
+
 // RecordRealized notes tokens saved on the request path by replaying a compaction an
-// EARLIER turn computed off-path. This is async's "savings realized on turn N+k"
-// figure: without it the deferred value looks like it never arrived.
+// EARLIER turn computed off-path. Gated by the caller on the session having had a
+// compaction actually land — otherwise it would just re-report the inline saving.
 func (a *Aggregator) RecordRealized(tokens int) {
 	if tokens <= 0 {
 		return
@@ -367,6 +379,15 @@ type Snapshot struct {
 	SyncEnforced  int64 `json:"sync_enforced"`
 	AsyncEnforced int64 `json:"async_enforced"`
 
+	// ObserveLLMNotice warns that context-guru's own model spend (llm_calls /
+	// llm_input_tokens / llm_output_tokens, which feed cg_llm_cost in the harnesses) is
+	// OFF-PATH measurement cost in observe mode, not the cost of an enforced compaction.
+	// The tokens were really spent — the number is not hypothetical and must not be moved
+	// into the potential_* namespace — but attributing it to enforcement would be wrong.
+	// cg_added_ms_avg is likewise a real measurement of the enforced path, and in observe
+	// mode it correctly reads ~0 because that path does no pipeline work.
+	ObserveLLMNotice string `json:"observe_llm_notice,omitempty"`
+
 	// Async: the full queue counter tuple (queued/pending/processed/dropped/errors/
 	// stale_discarded) plus the deferred-work accounting. `dropped` and
 	// `stale_discarded` are the "we silently gave up savings" counters and are
@@ -375,6 +396,10 @@ type Snapshot struct {
 	DeferredRuns        int64   `json:"async_deferred_runs"`
 	DeferredMsTotal     float64 `json:"async_deferred_ms_total"`
 	RealizedSavedTokens int64   `json:"async_realized_saved_tokens"`
+	// TailUnprotectedTurns counts turns async declined to defer because the caller had
+	// already cache-written the span a compaction would replace. Non-zero means async is
+	// largely inert here; see async.strip_caller_breakpoints.
+	TailUnprotectedTurns int64 `json:"async_tail_unprotected_turns"`
 
 	// Observe mode: HYPOTHETICALS. Distinct keys (potential_* / projected_*) that
 	// never share a name with an enforced metric, so a consumer cannot sum a
@@ -396,6 +421,13 @@ type Snapshot struct {
 // was applied, and every number prefixed potential_/projected_ is a hypothetical.
 const observeNotice = "OBSERVE MODE: context-guru did not modify any request. " +
 	"Every potential_*/projected_* field is a hypothetical, not a realized saving."
+
+// observeLLMNotice covers the one place observe legitimately writes an enforced-namespace
+// key: its own model spend is real money, so it stays where cost tooling already reads
+// it, labelled for what it is.
+const observeLLMNotice = "In observe mode llm_calls/llm_input_tokens/llm_output_tokens " +
+	"are the cost of MEASURING off-path, not of enforcing a compaction. The spend is real " +
+	"(not hypothetical); it simply bought a projection rather than a saving."
 
 // Snapshot returns a point-in-time copy of the rollups.
 func (a *Aggregator) Snapshot() Snapshot {
@@ -447,13 +479,17 @@ func (a *Aggregator) Snapshot() Snapshot {
 		SyncEnforced:  a.syncRequests,
 		AsyncEnforced: a.asyncRequests,
 		DeferredRuns:  a.deferredRuns, DeferredMsTotal: a.deferredMs,
-		RealizedSavedTokens: a.realizedSaved,
+		RealizedSavedTokens:  a.realizedSaved,
+		TailUnprotectedTurns: a.tailUnprotected,
 	}
 	if a.asyncStats != nil {
 		snap.AsyncQueue = a.asyncStats()
 	}
 	if a.potentialRuns > 0 || mode == components.ModeObserve {
 		snap.ObserveNotice = observeNotice
+		if snap.LLMCalls > 0 || mode == components.ModeObserve {
+			snap.ObserveLLMNotice = observeLLMNotice
+		}
 		snap.ObserveRequests = a.potentialRuns
 		snap.ActualBaselineTokens = a.potentialBefore
 		snap.ProjectedOptimizedTokens = a.potentialAfter

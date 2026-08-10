@@ -151,14 +151,35 @@ func (ci Cacheinject) Reformat(req *schemas.BifrostChatRequest, rep *components.
 	// tail it is going to REPLACE must not be committed to the provider cache: a
 	// breakpoint at or beyond it turns what would have been a 0.1x read next turn into
 	// a 1.25x write of that same span — 11.5x the cost. That is exactly the failure
-	// that tripled headroom's cache-write on Terminal-Bench. So drop every wanted
-	// position inside the doomed tail and put one at the highest index below it, which
-	// still writes the whole stable prefix.
+	// that tripled headroom's cache-write on Terminal-Bench.
+	//
+	// This has to cover breakpoints the CALLER set, not just the ones we wanted. An
+	// earlier version only pruned `want`, which made the whole protection a no-op on the
+	// primary workload: claude-code sets its own breakpoint on the newest message, so
+	// the doomed tail was cache-written anyway — async then paid the rewrite AND lost a
+	// slot, strictly worse than sync. Whether we may strip that breakpoint is the
+	// caller's call (StripCallerBreakpoints), because removing one an agent deliberately
+	// placed changes behavior we do not own.
 	if c.TailCachePending {
 		for i := range want {
 			if c.CacheBlocked(i) {
 				delete(want, i)
 			}
+		}
+		for i := range req.Input {
+			if !c.CacheBlocked(i) || !hasBreakpoint(&req.Input[i]) {
+				continue
+			}
+			if !c.StripCallerBreakpoints {
+				// Cannot protect this turn without overriding the caller, so do not
+				// pretend to: leave the request exactly as it came and tell the host,
+				// which then declines to defer (see proxy.applyMode). Reporting success
+				// here is what made the protection a silent no-op before.
+				c.DeclineTailProtection()
+				rep.Skipped = true
+				return nil
+			}
+			unmark(&req.Input[i])
 		}
 		if last := c.NoCacheAtOrAfter - 1; last >= 0 && last < len(req.Input) {
 			want[last] = struct{}{}
@@ -226,6 +247,18 @@ func mark(m *schemas.ChatMessage, ttl *string) bool {
 	}
 	last.CacheControl = &schemas.CacheControl{Type: schemas.CacheControlTypeEphemeral, TTL: ttl}
 	return true
+}
+
+// unmark removes every cache_control directive from a message. Used only by async's
+// tail protection, to take back a breakpoint that sits on content a pending compaction
+// is about to replace.
+func unmark(m *schemas.ChatMessage) {
+	if m.Content == nil {
+		return
+	}
+	for i := range m.Content.ContentBlocks {
+		m.Content.ContentBlocks[i].CacheControl = nil
+	}
 }
 
 func hasBreakpoint(m *schemas.ChatMessage) bool {

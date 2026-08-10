@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"time"
 )
 
 // Pool is the bounded off-path worker pool for async and observe mode: one queue,
@@ -183,20 +184,38 @@ func (p *Pool) Stats() Stats {
 	}
 }
 
-// Stop cancels the pool's context and waits for its workers to exit. Queued jobs are
-// abandoned — they were pure savings, and the requests they belonged to went out long
-// ago. Idempotent.
-func (p *Pool) Stop() {
+// stopGrace bounds how long Stop waits for an in-flight job. Cancelling the context asks
+// the job to stop, but a compaction sitting in an HTTP call to the cheap model only
+// notices when that call returns, and its client timeout is minutes. Since the job's
+// result is pure savings that nobody is waiting for, a shutdown must not inherit that
+// timeout — it gives up and lets the goroutine die with the process.
+const stopGrace = 2 * time.Second
+
+// Stop cancels the pool's context and waits briefly for its workers to exit. Queued jobs
+// are abandoned — they were pure savings, and the requests they belonged to went out long
+// ago. Returns false if a worker was still running at the grace deadline (its goroutine
+// is left to exit on its own; nothing depends on its result). Idempotent.
+func (p *Pool) Stop() bool {
 	if p == nil {
-		return
+		return true
 	}
 	p.mu.Lock()
 	if !p.started {
 		p.mu.Unlock()
-		return
+		return true
 	}
 	p.started = false
 	p.mu.Unlock()
 	p.cancel()
-	p.wg.Wait()
+
+	done := make(chan struct{})
+	go func() { p.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+		return true
+	case <-time.After(stopGrace):
+		slog.Warn("context-guru: async worker still busy at shutdown; abandoning its result",
+			"grace", stopGrace)
+		return false
+	}
 }

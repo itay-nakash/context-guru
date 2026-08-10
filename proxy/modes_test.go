@@ -200,6 +200,14 @@ func TestObserveMetricsCannotBeSummedIntoEnforcedTotals(t *testing.T) {
 	if snap.SyncEnforced != 0 || snap.AsyncEnforced != 0 {
 		t.Fatalf("observe counted as enforced: sync=%d async=%d", snap.SyncEnforced, snap.AsyncEnforced)
 	}
+	// Two enforced-namespace fields are deliberately NOT zeroed, because they are real
+	// measurements rather than hypotheticals — cg_added_ms_avg (the actual enforced-path
+	// latency, ~0 here, which IS the headline) and context-guru's own model spend (observe
+	// measures off-path, and that costs real money). The notice labels the latter so it is
+	// not read as the cost of enforcing.
+	if snap.ObserveLLMNotice == "" {
+		t.Fatal("observe did not label its own off-path model spend")
+	}
 	if len(snap.Components) != 0 {
 		t.Fatalf("observe results leaked into the enforced per-component map: %v", snap.Components)
 	}

@@ -46,21 +46,44 @@ func (h *Handler) applyMode(r *httpReqInfo) ([]byte, time.Duration) {
 		return r.body, time.Since(start)
 	}
 
+	// The span a pending job may rewrite, resolved before the pipeline runs so
+	// cacheinject can keep a breakpoint off it. Session id is not known yet when the
+	// host supplied none (apply derives it), so this covers the explicit-session case
+	// and degrades to "no protection" otherwise — the same direction as no pending job.
+	pendingFrom := 0
+	if mode == components.ModeAsync && r.session != "" {
+		pendingFrom = h.tracker.Pending(r.session)
+	}
 	res := apply.BodyOpts(r.ctx, h.pipe, h.store, apply.Opts{
 		Provider: r.provider, Body: r.body, Session: r.session, Bypass: r.bypassed,
 		Models: r.models, Window: r.window, CacheMode: h.opts.CacheMode,
 		Mode: mode, Tracker: h.tracker,
-		CacheUncompactedTail: h.opts.Async.CacheUncompactedTail,
+		CacheUncompactedTail:   h.opts.Async.CacheUncompactedTail,
+		PendingFrom:            pendingFrom,
+		StripCallerBreakpoints: h.opts.Async.StripCallerBreakpoints,
 	})
 	added := time.Since(start)
 
 	if mode == components.ModeAsync && !r.bypassed {
-		// The savings this turn came from replaying an EARLIER turn's off-path work.
-		// Attributing them is the only way deferred value stops looking invisible.
-		if h.agg != nil && res.Run != nil && res.Run.Saved() > 0 {
+		// Savings realized from DEFERRED work only. Gated on the session having had a
+		// compaction land, because before that whatever the inline pass saved was saved by
+		// deterministic components on the request path — crediting it to the deferral made
+		// this counter a tautology (it reported the inline saving verbatim on turn 1 of a
+		// model-free pipeline, so "realized == total saved" was true by construction).
+		if h.agg != nil && res.Run != nil && res.Run.Saved() > 0 &&
+			res.Session != "" && h.tracker.Landed(res.Session) {
 			h.agg.RecordRealized(res.Run.Saved())
 		}
-		h.enqueueAsync(r, res)
+		if res.TailUnprotected {
+			// The tail is being cache-written and we were not allowed to prevent it, so
+			// deferring would buy a 1.25x rewrite of a span the provider has committed to
+			// — strictly worse than staying synchronous for this turn. Skip the job.
+			if h.agg != nil {
+				h.agg.RecordTailUnprotected()
+			}
+		} else {
+			h.enqueueAsync(r, res)
+		}
 	}
 	if res.Body == nil {
 		return r.body, added
@@ -119,9 +142,20 @@ func (h *Handler) enqueueAsync(r *httpReqInfo, inline apply.Result) {
 	if sess == "" {
 		return // the pipeline never ran (no messages array) — nothing to defer
 	}
+	// A session whose traffic simply does not compact must stop paying for off-path
+	// compaction attempts: each one is a real cheap-model call, and without this an
+	// unproductive session runs one every turn indefinitely.
+	if h.tracker.Barren(sess) {
+		return
+	}
 	key := jobKey(sess, gen)
 
-	h.pool.Enqueue(key, func(ctx context.Context) {
+	// The span this job may rewrite: the tail of the turn it was built from. Recorded
+	// BEFORE the enqueue so a turn arriving while the job is queued already sees the
+	// protection — recording it after would leave a window where the tail gets cached
+	// and then rewritten, which is the whole failure this policy exists to prevent.
+	h.tracker.SetPending(sess, prevLen)
+	if !h.pool.Enqueue(key, func(ctx context.Context) {
 		start := time.Now()
 		buf := store.NewBuffer(h.store)
 		info.ctx = ctx
@@ -139,7 +173,9 @@ func (h *Handler) enqueueAsync(r *httpReqInfo, inline apply.Result) {
 			PrevLen: &prevLen,
 		})
 		committed := false
-		if res.Changed && buf.Writes() > 0 {
+		productive := res.Changed && buf.Writes() > 0
+		h.tracker.RecordJobOutcome(sess, productive)
+		if productive {
 			committed = h.tracker.CommitIfCurrent(sess, gen, buf.Commit)
 			if !committed {
 				h.pool.RecordStale()
@@ -150,7 +186,13 @@ func (h *Handler) enqueueAsync(r *httpReqInfo, inline apply.Result) {
 		if h.agg != nil {
 			h.agg.RecordDeferred(float64(time.Since(start).Microseconds())/1000.0, committed)
 		}
-	})
+		// Every terminal path clears the protection, including "ran and produced
+		// nothing": leaving it set would latch the block on forever and permanently
+		// cost a breakpoint slot for a rewrite that is never coming.
+		h.tracker.ClearPending(sess)
+	}) {
+		h.tracker.ClearPending(sess) // dropped or deduped: nothing is pending from THIS turn
+	}
 }
 
 // enqueueObserve runs the pipeline off-path on a COPY of the request, against observe's

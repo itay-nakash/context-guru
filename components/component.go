@@ -179,7 +179,30 @@ type Ctx struct {
 	// fails the other way — see #25.)
 	TailCachePending bool
 	NoCacheAtOrAfter int
+	// StripCallerBreakpoints permits taking back a cache breakpoint the CALLER set
+	// inside the protected tail. Without it the protection cannot cover an agent that
+	// places its own breakpoints (claude-code does), which made it a no-op on the
+	// primary workload. Removing a directive an agent deliberately placed is a behavior
+	// change we do not own, so it is the host's decision; the host's other option is to
+	// not defer that turn at all.
+	StripCallerBreakpoints bool
+	// tailUnprotected is set by cacheinject when it had to decline the tail protection
+	// (a caller breakpoint sat inside the protected span and stripping was not allowed).
+	// The host reads it to avoid deferring a compaction it cannot protect. Written from
+	// the single pipeline goroutine that owns this Ctx, read after Run returns.
+	tailUnprotected bool
 }
+
+// DeclineTailProtection records that async's tail protection could not be honored on
+// this request. Called by cacheinject; read by the host via TailUnprotected.
+func (c *Ctx) DeclineTailProtection() {
+	if c != nil {
+		c.tailUnprotected = true
+	}
+}
+
+// TailUnprotected reports whether DeclineTailProtection was called during this run.
+func (c *Ctx) TailUnprotected() bool { return c != nil && c.tailUnprotected }
 
 // effMode is Ctx.Mode with the zero value normalized to sync, so a Ctx built by
 // older code (or a test) reports the default rather than an empty mode string.

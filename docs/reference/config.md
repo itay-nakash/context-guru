@@ -33,6 +33,7 @@ Always explicit — nothing infers it from the rest of the configuration.
 | Field | Default | Purpose |
 |---|---|---|
 | `cache_uncompacted_tail` | `false` | When false (the safe default), no prompt-cache breakpoint is placed at or beyond the tail a pending compaction will replace. A cache-write costs **11.5x** a cache-read, so caching that tail and then replacing it makes async strictly worse than `sync`. Set true only for a backend confirmed **not** to cache prompts. |
+| `strip_caller_breakpoints` | `false` | Let the tail protection remove a cache breakpoint the **agent** placed inside the protected span. Required for the protection to do anything on an agent that sets its own — claude-code does — otherwise async declines to defer those turns (`async_tail_unprotected_turns`) and is effectively inert. Default false because it overrides a directive in someone else's request. |
 | `max_queue` | `256` | Bound on the off-path job queue. A full queue **drops** (counted as `dropped`) and never blocks the request path. |
 | `workers` | `1` | Drain goroutines. One keeps a single compaction LLM call in flight per process, which keeps cheap-model spend and gateway rate limits predictable. |
 
@@ -50,7 +51,7 @@ components:
   smartcrush: { min_items: 5, keep_first: 3, keep_last: 2 }
 store: { ttl_seconds: 1800, max_entries: 1000 }
 mode: sync                          # sync | async | observe
-async: { cache_uncompacted_tail: false, max_queue: 256, workers: 1 }
+async: { cache_uncompacted_tail: false, strip_caller_breakpoints: false, max_queue: 256, workers: 1 }
 ```
 
 A component registers its constructor + config type via `init()`, so adding one

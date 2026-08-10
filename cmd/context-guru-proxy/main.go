@@ -77,9 +77,10 @@ func main() {
 		Windows:      modelWindows(),             // dynamic context-window resolver (fraction triggers)
 		Mode:         mode,                       // sync (default) | async | observe — explicit, never inferred
 		Async: proxy.AsyncOptions{
-			CacheUncompactedTail: cfg.Async.CacheUncompactedTail,
-			MaxQueue:             cfg.Async.MaxQueue,
-			Workers:              cfg.Async.Workers,
+			CacheUncompactedTail:   cfg.Async.CacheUncompactedTail,
+			StripCallerBreakpoints: cfg.Async.StripCallerBreakpoints,
+			MaxQueue:               cfg.Async.MaxQueue,
+			Workers:                cfg.Async.Workers,
 		},
 
 		// Per-request /compact override: swap the pipeline (?preset / header) while

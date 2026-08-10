@@ -103,3 +103,25 @@ func (b *Buffer) Writes() int {
 	defer b.mu.Unlock()
 	return len(b.writes)
 }
+
+// FrozenLost forwards the optional FrozenLoser capability (#40) to the base store, so
+// wrapping a store in a Buffer does not silently disable it. A key the buffer itself
+// holds is present, not lost, whatever the base thinks.
+//
+// Type-asserting on the wrapper is why this is needed: a component checks
+// `c.Store.(store.FrozenLoser)`, and without this method an off-path async run — which
+// always sees a Buffer — would take the degraded path and re-derive nothing, exactly the
+// case #40 added the signal for.
+func (b *Buffer) FrozenLost(key string) bool {
+	b.mu.Lock()
+	_, held := b.writes[key]
+	b.mu.Unlock()
+	if held {
+		return false
+	}
+	// Asserted on a locally-declared shape rather than store.FrozenLoser, because that
+	// type arrives with #40 and this branch must compile before it. Structural matching
+	// means it binds to the real interface the moment #40 lands, with no edit here.
+	fl, ok := b.Base.(interface{ FrozenLost(string) bool })
+	return ok && fl.FrozenLost(key)
+}
