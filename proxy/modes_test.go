@@ -640,3 +640,33 @@ func TestAsyncDoesNotSpinOnAnUnproductiveTurn(t *testing.T) {
 		t.Fatalf("async enforced count is %d, want 12", s.AsyncEnforced)
 	}
 }
+
+// TestCompactEndpointIgnoresMode: /compact is the "compact a context, hand it back"
+// endpoint used by offline replay and the llm-d-router. Its contract is synchronous by
+// nature — the caller wants the compacted body in the response — so the handler's mode
+// must not change it. In particular observe mode must not turn /compact into a no-op.
+func TestCompactEndpointIgnoresMode(t *testing.T) {
+	body := dupBody()
+	var outs [][]byte
+	for _, mode := range []components.Mode{components.ModeSync, components.ModeAsync, components.ModeObserve} {
+		up, _ := captureUpstream(t)
+		h, _ := modeHandler(t, "pipeline: [dedup]\n", up.URL, mode)
+		srv := httptest.NewServer(h.Mux())
+		resp, err := http.Post(srv.URL+"/compact", "application/json", bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		srv.Close()
+		if bytes.Equal(out, body) {
+			t.Fatalf("/compact returned the original unchanged under mode %s", mode)
+		}
+		outs = append(outs, out)
+	}
+	for i := 1; i < len(outs); i++ {
+		if !bytes.Equal(outs[0], outs[i]) {
+			t.Fatalf("/compact output depends on the operating mode:\n %s\n %s", outs[0], outs[i])
+		}
+	}
+}
