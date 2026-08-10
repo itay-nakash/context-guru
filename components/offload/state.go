@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"sync/atomic"
 
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/components"
@@ -44,12 +45,36 @@ func putResult(c *components.Ctx, id string, v []byte) {
 // REAPPLIES it on every turn, regardless of the tail boundary. New decisions are still
 // gated to the tail; frozen ones are replayed everywhere.
 
-func frozenKey(session, comp, ck string) string { return "cg:frz:" + session + ":" + comp + ":" + ck }
+func frozenKey(session, comp, ck string) string {
+	return store.FrozenPrefix + session + ":" + comp + ":" + ck
+}
 
 // freeze records the replacement text a component produced for an original content, so
 // later turns replay it byte-for-byte.
 func freeze(c *components.Ctx, comp, original, replacement string) {
 	c.Store.Put(frozenKey(c.Session, comp, contentKey(original)), []byte(replacement))
+}
+
+// frozenLost reports that this component DID freeze a decision for this content and the
+// store has since dropped it (TTL expiry / pin cap). It is the counterpart to a plain
+// reapplyFrozen miss, which is indistinguishable from "never frozen" — and the two call
+// for OPPOSITE behavior:
+//
+//   - never frozen: obey the tail gate. Compacting content the provider already cached
+//     flips it and forces a suffix cache-write, so NEW decisions stay in the tail.
+//   - frozen, then lost: the provider ALREADY holds the compacted bytes for this message,
+//     so leaving it verbatim is itself the cache-destructive move. Re-derive the decision
+//     even at depth. This is not a fail-open exception — an offloader's replacement text
+//     is a pure function of (content, component config), and the marker key is
+//     sha256(original), so re-deriving reproduces the SAME bytes the provider cached and
+//     re-establishes the freeze. For an ESTABLISHED compaction the safe direction is the
+//     opposite of the usual "forward the original" (see docs/design.md).
+//
+// Only the FACT of the freeze has to survive, not its payload — one key in a bounded set,
+// which is why the signal lives in the store instead of a second content index.
+func frozenLost(c *components.Ctx, comp, content string) bool {
+	fl, ok := c.Store.(store.FrozenLoser)
+	return ok && fl.FrozenLost(frozenKey(c.Session, comp, contentKey(content)))
 }
 
 // reapplyFrozen replays a component's frozen decision for the message at m, if one
@@ -63,8 +88,10 @@ func reapplyFrozen(c *components.Ctx, comp string, m *bschemas.ChatMessage) ([]s
 	}
 	repl, ok := c.Store.Get(frozenKey(c.Session, comp, contentKey(content)))
 	if !ok {
+		frozenMisses.Add(1)
 		return nil, 0, false
 	}
+	frozenHits.Add(1)
 	rs := string(repl)
 	saved := schema.TextTokens(content) - schema.TextTokens(rs)
 	if saved <= 0 {
@@ -77,6 +104,29 @@ func reapplyFrozen(c *components.Ctx, comp string, m *bschemas.ChatMessage) ([]s
 	schema.SetMessageText(m, rs)
 	return keys, saved, true
 }
+
+// repairLostFreeze reports whether an offloader may compact this message even though the
+// cache-tail gate would forbid it, because a freeze for it was established and then lost.
+// Re-deriving reproduces the bytes the provider already cached; NOT re-deriving is what
+// flips the representation and re-writes the suffix. The caller's own never-worse and
+// skipReduce guards still apply, so this only ever LIFTS the depth restriction.
+func repairLostFreeze(c *components.Ctx, comp, content string) bool {
+	return frozenLost(c, comp, content)
+}
+
+// Freeze-replay counters: how often a replay landed vs found nothing. Cache-write is the
+// largest cost line on long-horizon traffic and a lost freeze is the mechanism that
+// produces it, so the store counts the drops and the repairs (a re-Put of a dropped
+// frozen key) itself — exactly once each, regardless of how many turns observe them —
+// while these two count the replay path. /stats reports all of them together.
+var (
+	frozenHits   atomic.Int64
+	frozenMisses atomic.Int64
+)
+
+// FrozenStats returns the cumulative freeze-replay hits and misses since process start.
+// Exported for the host's /stats, which pairs them with the store's drop/repair counts.
+func FrozenStats() (hits, misses int64) { return frozenHits.Load(), frozenMisses.Load() }
 
 // contentKey is a marker/whitespace-insensitive content hash (shared with extract's
 // result cache), so the same output re-sent across turns maps to one frozen decision.

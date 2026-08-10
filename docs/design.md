@@ -190,7 +190,8 @@ sequenceDiagram
 
 An expired/evicted original resolves to an explicit placeholder rather than being omitted (the
 provider requires one `tool_result` per `tool_call_id`). A miss silently turns a lossless offload
-lossy — the known TTL edge.
+lossy — the known TTL edge, much narrower now the TTL slides on every read (see
+[Freeze lifetime](#freeze-lifetime-and-which-way-to-fail)).
 
 ### The loop on a streaming response
 
@@ -218,7 +219,7 @@ bytes* (`expand.rawMarkerRe`, used by the host's streaming decision) must accept
 
 ## State: the Store
 
-One `Store` interface, in-memory TTL+LRU default (both hosts share it). Defaults: **1800s TTL,
+One `Store` interface, in-memory TTL+LRU default (both hosts share it). Defaults: **10000s TTL,
 1000 entries, 100 sticky sessions**. It carries, keyed per session:
 
 - **Rewind** — `cache_key → original bytes` (what the expand loop resolves).
@@ -226,6 +227,43 @@ One `Store` interface, in-memory TTL+LRU default (both hosts share it). Defaults
   across turns; scaffolding for cache stability).
 
 SQLite/Redis slot in behind the same interface when a durable/multi-replica deployment is real.
+
+### Freeze lifetime, and which way to fail
+
+The TTL exists to reclaim state for **finished** sessions. Applying it to a *live* one is a bug
+with a price tag: a frozen compaction (`cg:frz:…`, the exact replacement bytes an offloader must
+replay so an already-cached message stays byte-identical) that dies mid-task makes that message
+flip representation inside the provider's cached prefix, and the whole suffix is re-written at
+**11.5x** the cache-read price. So the store treats a *read* as proof of life:
+
+- **Sliding TTL** — `Get` refreshes `expires`, not just LRU recency. An entry being replayed every
+  turn never ages out; one nobody reads still expires on its original deadline.
+- **Default 10000s** — Terminal-Bench tasks average ~1975s of wall clock and run to 4h, so the
+  old 1800s default expired live decisions mid-task. Still `store.ttl_seconds`.
+- **Frozen decisions are pinned** against LRU eviction (they are a marker line each), capped at
+  half the entry cap so one pathological session cannot pin the whole cache and starve the rewind
+  stashes the expand loop needs.
+
+**The fail direction inverts for an established compaction.** Fail-open normally means "forward the
+original", and for a *new* compaction that is right. But once the provider has cached the compacted
+bytes, forwarding the original **is** the destructive act. A plain `Get` miss can't tell those cases
+apart, so the store keeps the *fact* of a dropped freeze (`FrozenLoser.FrozenLost`, a bounded key
+set — the payload need not survive, only the knowledge that it existed):
+
+- **never frozen** → obey the tail gate; a new compaction stays in the uncached tail.
+- **frozen, then lost** → re-derive it even at depth. An offloader's replacement text is a pure
+  function of `(content, component config)` and the marker key is `sha256(original)`, so
+  re-deriving reproduces the *same* bytes the provider cached and re-establishes the freeze. The
+  component's own never-worse and kept-verbatim guards still apply, so this only ever lifts the
+  depth restriction — it never authorizes new content loss.
+
+`/stats` reports `frozen_hits`, `frozen_misses`, `frozen_dropped`, `frozen_repaired`, and
+`frozen_flips` (= dropped − repaired, the drops that actually cost a cache-write; it should be 0).
+
+The related fail-*open* on `MaxCachedIdx`: `prevLen` returning 0 on a store miss yields
+`MaxCachedIdx = -1`, and `Ctx.TailOnly` then permits mutating any index (measured on 11.2% of
+Terminal-Bench requests). The sliding TTL shrinks that window — `cg:len:` is read every turn, so it
+no longer expires mid-session — but inverting `TailOnly` to fail *closed* is a separate change.
 
 ## Session keying
 
@@ -265,7 +303,7 @@ pipeline: [format, dedup, failed_run, cmdfilter, cacheinject]   # order + enable
 components:
   collapse:   { max_tokens: 2000, head_lines: 20, tail_lines: 20 }
   smartcrush: { min_items: 5, keep_first: 3, keep_last: 2 }
-store: { ttl_seconds: 1800, max_entries: 1000 }
+store: { ttl_seconds: 10000, max_entries: 1000 }
 ```
 
 A component registers its constructor + config type via `init()`; adding one makes it

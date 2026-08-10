@@ -277,6 +277,20 @@ type Snapshot struct {
 	// requests", not as a latency to compare against sse_ttfb_ms_avg.
 	SSETTFBMsAvgBuf float64 `json:"sse_ttfb_ms_avg_buffered"`
 	SSEBufferedPct  float64 `json:"sse_buffered_pct"`
+	// Freeze-replay health — the cache-WRITE cost line. A frozen decision replayed
+	// (frozen_hits) keeps an already-cached message byte-identical. A decision the store
+	// DROPS (frozen_dropped: TTL expiry / pin cap) would flip that message's
+	// representation and force the provider to re-write the whole suffix at 11.5x the
+	// read price — unless it is re-derived (frozen_repaired). frozen_flips =
+	// dropped − repaired is the count that actually cost cache-writes; it should be 0.
+	// frozen_misses counts every replay lookup that found nothing, which is dominated by
+	// the normal "never frozen yet" case — read it beside frozen_dropped, not instead.
+	// Filled by the host at serve time (offload + store live below metrics).
+	FrozenHits     int64 `json:"frozen_hits"`
+	FrozenMisses   int64 `json:"frozen_misses"`
+	FrozenDropped  int64 `json:"frozen_dropped"`
+	FrozenRepaired int64 `json:"frozen_repaired"`
+	FrozenFlips    int64 `json:"frozen_flips"`
 }
 
 // Snapshot returns a point-in-time copy of the rollups.

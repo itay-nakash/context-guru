@@ -14,7 +14,7 @@ The document has four top-level fields (from the `Config` struct in
 | `preset` | string | Named default pipeline (see [Presets](presets.md)). |
 | `pipeline` | `[]string` | Ordered component names — controls **order + enablement**. Overrides the preset's pipeline when present. |
 | `components:<name>` | map | Each component's typed config block, handed to its constructor verbatim. |
-| `store` | object | State store options (`enabled`, `ttl_seconds`, `max_entries`, …). |
+| `store` | object | State store options (`enabled`, `ttl_seconds` (default **10000**, sliding), `max_entries`, …). |
 
 !!! warning "Strict: unknown keys are rejected"
     The YAML loader runs with `KnownFields(true)`, so a typo'd key fails loudly
@@ -28,7 +28,7 @@ pipeline: [format, dedup, failed_run, cmdfilter, cacheinject]   # order + enable
 components:
   collapse:   { max_tokens: 2000, head_lines: 20, tail_lines: 20 }
   smartcrush: { min_items: 5, keep_first: 3, keep_last: 2 }
-store: { ttl_seconds: 1800, max_entries: 1000 }
+store: { ttl_seconds: 10000, max_entries: 1000 }
 ```
 
 A component registers its constructor + config type via `init()`, so adding one

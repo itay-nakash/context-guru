@@ -110,8 +110,12 @@ func (fr *FailedRun) Offload(req *schemas.BifrostChatRequest, rep *components.Re
 		// transitions on SWE-50). On a cached agent the superseded run already bills at
 		// the cheap cache-read rate, so collapsing it doesn't pay: skip NEW collapses
 		// entirely (frozen ones are still reapplied above for stability). With caching
-		// OFF, collapse freely — there the content cut is a direct saving.
-		if c.CacheAware {
+		// OFF, collapse freely — there the content cut is a direct saving. The one
+		// exception is a freeze this session established and the store then LOST: the
+		// provider already holds the collapsed bytes for this run, so re-deriving them
+		// (deterministic) preserves its cache, while leaving the run verbatim is what
+		// forces the suffix re-write.
+		if c.CacheAware && !repairLostFreeze(c, fr.Name(), content) {
 			continue
 		}
 		newText, key, eff, ok := tryMark(c, fr.mode, content, " [full output: call "+expand.ToolName+"]",

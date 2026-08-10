@@ -71,3 +71,128 @@ func TestStickyBoundedAndCopied(t *testing.T) {
 		t.Fatal("Sticky must return a defensive copy")
 	}
 }
+
+// A frozen decision that is still being replayed every turn must not die of old age:
+// the TTL reclaims state for FINISHED sessions, and expiring a live decision flips an
+// already-cached message's representation (a suffix cache-write at 11.5x the read price).
+func TestMemorySlidingTTLOnGet(t *testing.T) {
+	now := time.Unix(0, 0)
+	m := NewMemory(Options{TTLSeconds: 10})
+	m.now = func() time.Time { return now }
+	m.Put("k", []byte("v"))
+	// Read just before each expiry, 100 times = 900s ≫ the 10s TTL.
+	for i := 0; i < 100; i++ {
+		now = now.Add(9 * time.Second)
+		if _, ok := m.Get("k"); !ok {
+			t.Fatalf("a continuously-read entry expired at iteration %d", i)
+		}
+	}
+	// ... but stopping the reads still expires it (the TTL is not disabled).
+	now = now.Add(11 * time.Second)
+	if _, ok := m.Get("k"); ok {
+		t.Fatal("an unread entry must still expire")
+	}
+}
+
+// The sliding refresh must not keep an entry nobody reads alive just because OTHER
+// entries are being read.
+func TestMemoryUnreadEntryStillExpires(t *testing.T) {
+	now := time.Unix(0, 0)
+	m := NewMemory(Options{TTLSeconds: 10})
+	m.now = func() time.Time { return now }
+	m.Put("hot", []byte("1"))
+	m.Put("cold", []byte("2"))
+	for i := 0; i < 5; i++ {
+		now = now.Add(9 * time.Second)
+		m.Get("hot")
+	}
+	if _, ok := m.Get("cold"); ok {
+		t.Fatal("an entry that was never read must expire on its original deadline")
+	}
+	if _, ok := m.Get("hot"); !ok {
+		t.Fatal("the continuously-read entry must survive")
+	}
+}
+
+// The default TTL must outlast a long-horizon agent task (TB averaged 1975s, up to 4h)
+// — the old 1800s default expired live frozen decisions mid-task.
+func TestDefaultTTLCoversLongTask(t *testing.T) {
+	if DefaultTTL < 2*time.Hour {
+		t.Fatalf("default TTL %v is too short for a long-horizon task", DefaultTTL)
+	}
+	m := NewMemory(Options{})
+	if m.ttl != DefaultTTL {
+		t.Fatalf("zero TTLSeconds should yield DefaultTTL, got %v", m.ttl)
+	}
+	if m2 := NewMemory(Options{TTLSeconds: 42}); m2.ttl != 42*time.Second {
+		t.Fatalf("ttl_seconds must stay configurable, got %v", m2.ttl)
+	}
+}
+
+// Frozen decisions are pinned against LRU eviction: losing one is not a cache miss but
+// a cache-DESTRUCTIVE event. Ordinary entries still evict normally.
+func TestFrozenEntriesExemptFromLRU(t *testing.T) {
+	m := NewMemory(Options{MaxEntries: 4}) // pin cap = max/2 = 2
+	m.Put(FrozenPrefix+"s:mask:aaa", []byte("frozen"))
+	for i := 0; i < 20; i++ {
+		m.Put(string(rune('a'+i)), []byte("x"))
+	}
+	if _, ok := m.Get(FrozenPrefix + "s:mask:aaa"); !ok {
+		t.Fatal("a frozen decision must survive LRU pressure")
+	}
+	if m.ll.Len() > 4 {
+		t.Fatalf("cache still has to respect the entry cap, len=%d", m.ll.Len())
+	}
+}
+
+// The eviction exemption must be capped so a pathological session cannot pin the whole
+// cache and starve the rewind stashes the expand loop needs.
+func TestFrozenPinCapped(t *testing.T) {
+	m := NewMemory(Options{MaxEntries: 10}) // pin cap = 5
+	for i := 0; i < 20; i++ {
+		m.Put(FrozenPrefix+"s:mask:"+string(rune('a'+i)), []byte("f"))
+	}
+	if m.pinnedN > 5 {
+		t.Fatalf("pinned entries %d exceed the max/2 cap", m.pinnedN)
+	}
+	if m.ll.Len() > 10 {
+		t.Fatalf("entry cap breached, len=%d", m.ll.Len())
+	}
+	// Beyond the cap the decisions are evictable — but their loss stays VISIBLE, which
+	// is the whole point of the signal.
+	if dropped, _ := m.FrozenLossStats(); dropped == 0 {
+		t.Fatal("frozen decisions dropped past the pin cap must be counted")
+	}
+}
+
+// A dropped frozen decision must be distinguishable from one that never existed: the two
+// call for opposite behavior (re-derive at depth vs obey the tail gate).
+func TestFrozenLostIsDistinguishable(t *testing.T) {
+	now := time.Unix(0, 0)
+	m := NewMemory(Options{TTLSeconds: 10})
+	m.now = func() time.Time { return now }
+	k := FrozenPrefix + "s:mask:aaa"
+	if m.FrozenLost(k) {
+		t.Fatal("a key that was never frozen must not report as lost")
+	}
+	m.Put(k, []byte("masked"))
+	now = now.Add(11 * time.Second)
+	if _, ok := m.Get(k); ok {
+		t.Fatal("expired entry must miss")
+	}
+	if !m.FrozenLost(k) {
+		t.Fatal("an EXPIRED frozen decision must report as lost, not as never-frozen")
+	}
+	dropped, repaired := m.FrozenLossStats()
+	if dropped != 1 || repaired != 0 {
+		t.Fatalf("want dropped=1 repaired=0, got %d/%d", dropped, repaired)
+	}
+	// Re-freezing the same key repairs it: no flip reached the provider.
+	m.Put(k, []byte("masked"))
+	if m.FrozenLost(k) {
+		t.Fatal("a re-frozen decision is no longer lost")
+	}
+	if dropped, repaired = m.FrozenLossStats(); dropped != 1 || repaired != 1 {
+		t.Fatalf("want dropped=1 repaired=1, got %d/%d", dropped, repaired)
+	}
+}

@@ -13,6 +13,7 @@ package store
 
 import (
 	"container/list"
+	"strings"
 	"sync"
 	"time"
 )
@@ -34,15 +35,39 @@ type Store interface {
 	Persists() bool
 }
 
+// FrozenLoser is an OPTIONAL Store capability: reporting that a frozen decision
+// under key was dropped (TTL expiry / pin cap) rather than never taken. A bare Get
+// miss cannot tell those apart, and they call for opposite behavior — "never frozen"
+// means obey the tail gate, "was frozen, now lost" means re-derive the same bytes so
+// the cached prefix does not flip. Stores that don't implement it degrade to the
+// legacy indistinguishable behavior.
+type FrozenLoser interface {
+	// FrozenLost reports whether a frozen entry under key existed and was dropped.
+	FrozenLost(key string) bool
+}
+
+// FrozenPrefix namespaces a component's FROZEN decision — the exact replacement
+// bytes it must replay on every later turn to keep an already-cached message
+// byte-identical (see components/offload/state.go). Entries under this prefix are
+// PINNED: exempt from LRU eviction, because losing one is not a cache miss, it is a
+// cache-DESTRUCTIVE event (the message flips representation inside the provider's
+// cached prefix and the whole suffix is re-written at 11.5x the read price). They are
+// small (a marker line), still honor the sliding TTL, and the exemption is capped at
+// half the entry cap so a pathological session can never pin the whole cache.
+const FrozenPrefix = "cg:frz:"
+
 type entry struct {
 	key     string
 	payload []byte
 	expires time.Time
+	pinned  bool // exempt from LRU eviction (frozen decision); TTL still applies
 }
 
 // Memory is an in-memory Store: a TTL+LRU cache for rewind payloads plus a
-// bounded per-session sticky-id set. Defaults mirror headroom's CCR store
-// (1800s TTL, 1000 entries).
+// bounded per-session sticky-id set. The TTL is SLIDING (refreshed on Get), and
+// the default (DefaultTTL) is sized past a long-horizon agent task rather than
+// mirroring headroom's 1800s CCR store: a frozen compaction that dies mid-task is
+// a cache-destructive event, not a saving.
 type Memory struct {
 	mu       sync.Mutex
 	ttl      time.Duration
@@ -52,6 +77,13 @@ type Memory struct {
 	sticky   map[string]map[string]struct{}
 	maxStick int
 	now      func() time.Time // injectable for tests
+	pinnedN  int              // live pinned (frozen) entries, capped at max/2
+	// lostFrozen remembers keys whose FROZEN entry was dropped anyway (TTL expiry, or
+	// the pin cap). It is the "was frozen, now LOST" signal a caller cannot otherwise
+	// distinguish from "never frozen" — see FrozenLost. Bounded like sticky.
+	lostFrozen map[string]struct{}
+	lostN      int64
+	repairedN  int64
 }
 
 // Options configures a Memory store; the zero value yields sane defaults.
@@ -77,12 +109,18 @@ func (Nop) Sticky(string) map[string]struct{} { return nil }
 func (Nop) MarkSticky(string, string)         {}
 func (Nop) Persists() bool                    { return false }
 
+// DefaultTTL is the store's default (sliding) entry lifetime. Terminal-Bench tasks
+// averaged 1975s of wall clock and run up to 4h, so the old 1800s default expired
+// live frozen decisions mid-task; ~2.8h covers a long-horizon task's idle gaps
+// (test suites, training runs) with the sliding refresh doing the rest.
+const DefaultTTL = 10000 * time.Second
+
 // NewMemory builds an in-memory store. Zero/negative option fields fall back to
-// defaults (1800s TTL, 1000 entries, 100 sessions of sticky sets).
+// defaults (DefaultTTL, 1000 entries, 100 sessions of sticky sets).
 func NewMemory(o Options) *Memory {
 	ttl := time.Duration(o.TTLSeconds) * time.Second
 	if o.TTLSeconds <= 0 {
-		ttl = 1800 * time.Second
+		ttl = DefaultTTL
 	}
 	max := o.MaxEntries
 	if max <= 0 {
@@ -95,12 +133,22 @@ func NewMemory(o Options) *Memory {
 	return &Memory{
 		ttl: ttl, max: max, maxStick: stick,
 		ll: list.New(), items: map[string]*list.Element{},
-		sticky: map[string]map[string]struct{}{},
-		now:    time.Now,
+		sticky:     map[string]map[string]struct{}{},
+		lostFrozen: map[string]struct{}{},
+		now:        time.Now,
 	}
 }
 
 func (*Memory) Persists() bool { return true }
+
+// SetClock replaces the store's time source. For TESTS only — TTL behavior over a
+// multi-hour agent session is not testable in real time, and the freeze lifetime is
+// exactly what this store gets wrong when it's wrong.
+func (m *Memory) SetClock(now func() time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.now = now
+}
 
 func (m *Memory) Put(key string, payload []byte) {
 	m.mu.Lock()
@@ -113,10 +161,59 @@ func (m *Memory) Put(key string, payload []byte) {
 		return
 	}
 	e := &entry{key: key, payload: payload, expires: m.now().Add(m.ttl)}
+	// Pin frozen decisions, but never more than half the cache: past that the marginal
+	// pin protects one message while starving the rewind stashes the expand loop needs.
+	if strings.HasPrefix(key, FrozenPrefix) {
+		if m.pinnedN < m.max/2 {
+			e.pinned = true
+			m.pinnedN++
+		} else {
+			m.noteLost(key) // pin cap reached: this decision is evictable, and losing it is visible
+		}
+	}
+	if _, wasLost := m.lostFrozen[key]; wasLost {
+		delete(m.lostFrozen, key) // re-frozen: the dropped decision was repaired
+		m.repairedN++
+	}
 	m.items[key] = m.ll.PushFront(e)
 	for m.ll.Len() > m.max {
-		m.evictOldest()
+		if !m.evictOldest() {
+			break // everything left is pinned
+		}
 	}
+}
+
+// noteLost records that a frozen decision under key is gone, so a later Get miss is
+// distinguishable from "never frozen". Bounded by the entry cap.
+func (m *Memory) noteLost(key string) {
+	if len(m.lostFrozen) >= m.max {
+		for k := range m.lostFrozen {
+			delete(m.lostFrozen, k)
+			break
+		}
+	}
+	m.lostFrozen[key] = struct{}{}
+	m.lostN++
+}
+
+// FrozenLost reports whether a frozen entry under key existed and was dropped (TTL
+// expiry or the pin cap) — the "was frozen, now lost" signal. See FrozenLoser.
+func (m *Memory) FrozenLost(key string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.lostFrozen[key]
+	return ok
+}
+
+// FrozenLossStats returns how many frozen decisions this store has DROPPED since start
+// (TTL expiry / pin cap) and how many of those were later re-Put — repaired to the same
+// bytes, so no representation flip reached the provider. dropped−repaired is the count of
+// flips that actually cost a suffix cache-write. Both count each key once, however many
+// turns observe it.
+func (m *Memory) FrozenLossStats() (dropped, repaired int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lostN, m.repairedN
 }
 
 func (m *Memory) Get(key string) ([]byte, bool) {
@@ -131,6 +228,12 @@ func (m *Memory) Get(key string) ([]byte, bool) {
 		m.remove(el)
 		return nil, false
 	}
+	// Sliding TTL: an entry still being read is still live. The TTL exists to reclaim
+	// state for FINISHED sessions, not to kill a decision an ongoing session replays
+	// every turn — expiring a frozen compaction mid-task flips an already-cached
+	// message's representation and forces the provider to re-write the whole suffix
+	// (one cache-write costs 11.5 cache-reads). Recency and lifetime refresh together.
+	e.expires = m.now().Add(m.ttl)
 	m.ll.MoveToFront(el)
 	return e.payload, true
 }
@@ -165,13 +268,24 @@ func (m *Memory) MarkSticky(session, id string) {
 	s[id] = struct{}{}
 }
 
-func (m *Memory) evictOldest() {
-	if el := m.ll.Back(); el != nil {
-		m.remove(el)
+// evictOldest drops the least-recently-used UNPINNED entry, walking back over pinned
+// (frozen) ones. Reports false when nothing is evictable.
+func (m *Memory) evictOldest() bool {
+	for el := m.ll.Back(); el != nil; el = el.Prev() {
+		if !el.Value.(*entry).pinned {
+			m.remove(el)
+			return true
+		}
 	}
+	return false
 }
 
 func (m *Memory) remove(el *list.Element) {
+	e := el.Value.(*entry)
+	if e.pinned {
+		m.pinnedN--
+		m.noteLost(e.key) // a frozen decision is disappearing — make it detectable
+	}
 	m.ll.Remove(el)
-	delete(m.items, el.Value.(*entry).key)
+	delete(m.items, e.key)
 }
