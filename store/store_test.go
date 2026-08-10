@@ -196,3 +196,35 @@ func TestFrozenLostIsDistinguishable(t *testing.T) {
 		t.Fatalf("want dropped=1 repaired=1, got %d/%d", dropped, repaired)
 	}
 }
+
+// repaired must never exceed dropped. At the pin cap a decision is recorded lost and
+// stays unprotected, so it must NOT also be scored as repaired — otherwise frozen_flips
+// reads 0 while messages are in fact flipping, and the metric lies in the safe direction.
+func TestPinCapDoesNotFakeRepair(t *testing.T) {
+	m := NewMemory(Options{MaxEntries: 4}) // pin cap = 2
+	for i := 0; i < 6; i++ {
+		m.Put(FrozenPrefix+"s:mask:"+string(rune('a'+i)), []byte("f"))
+	}
+	dropped, repaired := m.FrozenLossStats()
+	if dropped == 0 {
+		t.Fatal("over-cap frozen decisions must be counted as dropped")
+	}
+	if repaired != 0 {
+		t.Fatalf("nothing was re-frozen, so repaired must be 0, got %d", repaired)
+	}
+	// Re-freezing a key that WAS lost counts exactly one repair. (The first two keys are
+	// pinned and were never lost, so pick one the cap actually pushed out.)
+	var lost string
+	for k := range m.lostFrozen {
+		lost = k
+		break
+	}
+	m.Put(lost, []byte("f2"))
+	d2, r2 := m.FrozenLossStats()
+	if r2 != 1 {
+		t.Fatalf("re-freezing a lost decision must count one repair, got %d", r2)
+	}
+	if r2 > d2 {
+		t.Fatalf("repaired (%d) must never exceed dropped (%d)", r2, d2)
+	}
+}

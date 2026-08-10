@@ -172,6 +172,15 @@ func (m *Memory) SetClock(now func() time.Time) {
 func (m *Memory) Put(key string, payload []byte) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Writing a key previously recorded as lost IS the repair — the decision is present
+	// again. Counted here, before either branch, so it is not missed when the entry still
+	// exists (over the pin cap it stays in the map, unpinned) and so a decision that is
+	// immediately unprotected again is not ALSO scored as repaired: repaired must never
+	// exceed dropped, or frozen_flips reads 0 while messages are in fact flipping.
+	if _, wasLost := m.lostFrozen[key]; wasLost {
+		delete(m.lostFrozen, key)
+		m.repairedN++
+	}
 	if el, ok := m.items[key]; ok {
 		e := el.Value.(*entry)
 		e.payload = payload
@@ -187,12 +196,8 @@ func (m *Memory) Put(key string, payload []byte) {
 			e.pinned = true
 			m.pinnedN++
 		} else {
-			m.noteLost(key) // pin cap reached: this decision is evictable, and losing it is visible
+			m.noteLost(key) // pin cap reached: evictable, and its loss stays visible
 		}
-	}
-	if _, wasLost := m.lostFrozen[key]; wasLost {
-		delete(m.lostFrozen, key) // re-frozen: the dropped decision was repaired
-		m.repairedN++
 	}
 	m.items[key] = m.ll.PushFront(e)
 	for m.ll.Len() > m.max {
