@@ -170,6 +170,10 @@ func BodyFull(ctx context.Context, pipe *components.Pipeline, st store.Store, pr
 		CtxWindow:    window,
 		CacheAware:   cacheAware,
 		MaxCachedIdx: maxCachedIdx,
+		// Every breakpoint already on the wire — including the ones no component can
+		// see (`system`, `tools`, and cache_control on blocks bifrost drops). The
+		// provider's cap of four counts them all (issue #32, defect 2).
+		ExistingBreakpoints: wireBreakpoints(body),
 	}
 
 	// Canonical form of each normalized message BEFORE the pipeline, so a
@@ -179,7 +183,7 @@ func BodyFull(ctx context.Context, pipe *components.Pipeline, st store.Store, pr
 		normPre[i], _ = json.Marshal(norm[i])
 	}
 
-	pipe.Run(chat, c)
+	rr := pipe.Run(chat, c)
 
 	// A component changed the message count (summarize restructures the transcript
 	// to [msg0, <summary>, last-K]). Rebuild the messages array preserving each
@@ -198,6 +202,9 @@ func BodyFull(ctx context.Context, pipe *components.Pipeline, st store.Store, pr
 	// if no component changes a message.
 	changed := systemSplit
 	var changes []change
+	// Per-message count of changes this writeback threw away, attributed back to the
+	// components that made them once the loop is done.
+	discarded := map[int]int{}
 	for i := range chat.Input {
 		s := slots[i]
 		switch s.kind {
@@ -222,8 +229,20 @@ func BodyFull(ctx context.Context, pipe *components.Pipeline, st store.Store, pr
 			}
 			if !s.lossless {
 				// bifrost can't round-trip this message; splicing our re-marshal would
-				// drop provider fields it doesn't model. Discard the change, keep the
-				// original bytes. ponytail: correctness over the marginal saving here.
+				// drop provider fields it doesn't model. But if the ONLY change is added
+				// `cache_control` — metadata, not content — write those keys at their exact
+				// paths on the original raw bytes: nothing else is read or rewritten, so no
+				// provider field can be dropped. See metawrite.go (issue #32).
+				if w, ok := metadataOnlyWrites(s.pre, post); ok {
+					if nb, ok := applyMetaWrites(out, s.path, len(chat.Input[i].Content.ContentBlocks), w); ok {
+						out = nb
+						changed = true
+						continue
+					}
+				}
+				// Anything else: discard the change, keep the original bytes.
+				// ponytail: correctness over the marginal saving here.
+				discarded[i]++
 				continue
 			}
 			if out, err = sjson.SetRawBytes(out, s.path, post); err != nil {
@@ -235,8 +254,15 @@ func BodyFull(ctx context.Context, pipe *components.Pipeline, st store.Store, pr
 			changes = append(changes, mkChange(s.path, schema.MessageText(pm), schema.MessageText(chat.Input[i])))
 		}
 	}
+	pipe.RecordDiscards(rr, discarded)
 	if changed && dumpPath != "" {
 		dumpChanges(c.Session, changes)
+	}
+	if n := wireBreakpoints(out); n > maxWireBreakpoints {
+		// Should be unreachable: the component budgets against OuterBreakpoints. Loud
+		// rather than a 400 from the provider, and it names the request shape.
+		slog.Error("context-guru: cache breakpoint count exceeds the provider cap",
+			"breakpoints", n, "cap", maxWireBreakpoints, "session", c.Session)
 	}
 	return out, changed
 }

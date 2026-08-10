@@ -141,14 +141,24 @@ func (ci Cacheinject) Reformat(req *schemas.BifrostChatRequest, rep *components.
 	}
 
 	applied := 0
-	// Count breakpoints the caller already set: they occupy provider slots, and an
-	// agent that sets its own (claude-code does) is already at the optimum.
-	existing := 0
+	// Breakpoints the caller already set occupy provider slots, and an agent that sets
+	// its own (claude-code does) is already at the optimum. Two separate things must
+	// happen with them: the positions we can SEE are dropped from `want` (never mark
+	// twice), and the BUDGET is computed from the host's raw-body count, which also
+	// sees the ones we cannot — the `system` array components never receive, and
+	// `tool_result` blocks whose cache_control bifrost drops on unmarshal. On real
+	// Claude Code traffic that is all 3 of them, so counting only Input gave a budget
+	// of 3 free slots when 1 was free: 6 on the wire, and a 400 (issue #32).
+	visible := 0
 	for i := range req.Input {
 		if hasBreakpoint(&req.Input[i]) {
-			existing++
+			visible++
 			delete(want, i)
 		}
+	}
+	existing := visible
+	if c != nil && c.ExistingBreakpoints > visible {
+		existing = c.ExistingBreakpoints
 	}
 	budget := maxBreakpoints - existing
 	if budget <= 0 {

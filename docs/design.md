@@ -111,7 +111,7 @@ sequenceDiagram
   apply->>apply: normalize → []ChatMessage + write-back slots
   apply->>Pipe: Run(chat, ctx)
   Pipe-->>apply: mutated messages
-  apply->>apply: per message: unchanged → keep bytes,<br/>changed & lossless round-trip → sjson splice
+  apply->>apply: per message: unchanged → keep bytes,<br/>changed & lossless round-trip → sjson splice,<br/>changed & metadata-only → sjson key write on raw bytes,<br/>else discard + count
   apply-->>Host: rewritten body (or original, fail open)
 ```
 
@@ -123,6 +123,35 @@ pipeline, then splices each rewritten output back into its exact source block vi
 Non-string tool_result content is skipped (never lose non-text). A whole-message change is only
 spliced back if bifrost round-trips that message losslessly (`jsonEqual`); otherwise the change
 is discarded — correctness over the marginal saving.
+
+**The metadata exception.** That guard has one deliberate hole, and it exists because the guard
+alone made `cacheinject` a no-op. bifrost drops `tool_use.id/name/input` on unmarshal, so every
+Anthropic assistant turn carrying a `tool_use` is non-round-trippable — and those are exactly the
+only messages `cacheinject` can mark. Measured on 40 captured Claude Code requests: **46
+breakpoints applied at the component level, 0 in the output body** (issue #32).
+
+So `apply/metawrite.go` adds a narrow path: when a component's *only* change to a message is an
+added `cache_control` key, that key is written at its exact path (`messages.<i>.content.<b>.cache_control`)
+on the **original raw bytes** via `sjson`. `cache_control` is metadata, not content — it changes
+nothing the model reads, so it needs no message model to express, and a targeted `sjson` write
+provably cannot drop a field it never reads. The `metadataOnlyWrites` diff enforces "only that":
+a text edit, a removed key, a changed block count, anything else at all, and the change is still
+discarded. `applyMetaWrites` additionally refuses if the raw body's block layout disagrees with
+the normalized view, so a key can never land on the wrong block, and never overwrites a
+breakpoint the caller set.
+
+**Discards are now loud.** `Pipeline.RecordDiscards` attributes each thrown-away change back to
+the component that made it (via `Report.ChangedIdx`), surfacing as `discarded_changes` per
+component and `top_discarded` in `/stats`. Before this, a mutated-then-discarded component looked
+byte-identical to a working Reformat — which is how #32 survived two full benchmark studies.
+
+**Breakpoint budgeting is a host job.** The provider caps `cache_control` at 4 across `system` +
+`tools` + `messages` together, and a component sees none of the first two — nor cache_control on
+blocks bifrost drops. On real Claude Code traffic that hides all three of the agent's own
+breakpoints, so a component counting only what it saw computed 3 free slots when 1 was free.
+`apply` counts them from the raw body (`wireBreakpoints`) and passes the total as
+`Ctx.ExistingBreakpoints`; exceeding the cap on output logs an error rather than waiting for the
+provider's 400.
 
 If a component changes the message *count* (none of the v1 set does), the slot map no longer
 aligns, so `apply` forwards the original untouched.

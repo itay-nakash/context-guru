@@ -49,6 +49,7 @@ func (s Slog) Component(r components.Report) {
 		"context_engineering.tokens.after", r.TokensAfter,
 		"context_engineering.tokens.saved", r.Saved(),
 		"context_engineering.reverted", r.Reverted,
+		"context_engineering.discarded_changes", r.Discarded,
 		"context_engineering.duration_ms", r.DurationMs,
 	)
 }
@@ -96,9 +97,15 @@ type compStat struct {
 	// OvercountRatio = Saved / SavedUnique — how many times, on average, each distinct
 	// compaction was re-counted (the agent re-sends history verbatim every turn). ~1.0
 	// is honest; large values mean the cumulative figure is inflated by re-sends.
-	OvercountRatio float64             `json:"overcount_ratio"`
-	DurationMs     float64             `json:"duration_ms"` // cumulative wall time this component spent (its own latency cost on the hot path)
-	seenKeys       map[string]struct{} // content keys already counted toward SavedUnique (not serialized)
+	OvercountRatio float64 `json:"overcount_ratio"`
+	DurationMs     float64 `json:"duration_ms"` // cumulative wall time this component spent (its own latency cost on the hot path)
+	// Discarded counts changes this component made that the WRITEBACK layer then threw
+	// away (bifrost could not round-trip the message, so splicing would have dropped
+	// provider fields). Nonzero means the component ran, mutated, and had no effect on
+	// the wire — which for two whole benchmark studies looked exactly like a working
+	// Reformat (issue #32).
+	Discarded int64               `json:"discarded_changes"`
+	seenKeys  map[string]struct{} // content keys already counted toward SavedUnique (not serialized)
 }
 
 // NewAggregator returns an empty aggregator.
@@ -111,6 +118,13 @@ func (a *Aggregator) Component(r components.Report) {
 	if cs == nil {
 		cs = &compStat{}
 		a.perComp[r.Component] = cs
+	}
+	// A Discarded report is a follow-up from the writeback layer attributing thrown-away
+	// changes to the component that made them — not a fresh run. Count it and stop, or
+	// Runs would double per request.
+	if r.Discarded > 0 {
+		cs.Discarded += int64(r.Discarded)
+		return
 	}
 	cs.Runs++
 	cs.Saved += int64(r.Saved())
@@ -207,6 +221,11 @@ type Snapshot struct {
 	// TopPassthrough names components that ran but never saved a token — dead
 	// weight in the pipeline, candidates to drop from the config.
 	TopPassthrough []string `json:"top_passthrough"`
+	// TopDiscarded names components whose changes the writeback layer threw away at
+	// least once — they mutated the request but (for those changes) never reached the
+	// wire. Any entry here needs investigating; see the per-component
+	// `discarded_changes` for the count.
+	TopDiscarded []string `json:"top_discarded"`
 	// LLM* report the cheap (config-source) model usage the CONTEXT-GURU components
 	// themselves incurred (e.g. extract:code's Starlark-writer calls) — the CG
 	// components' OWN cost, separate from the agent. Priced externally.
@@ -231,8 +250,11 @@ func (a *Aggregator) Snapshot() Snapshot {
 		pct = float64(saved) / float64(a.before) * 100
 	}
 	comps := make(map[string]compStat, len(a.perComp))
-	var passthrough []string
+	var passthrough, discarded []string
 	for k, v := range a.perComp {
+		if v.Discarded > 0 {
+			discarded = append(discarded, k)
+		}
 		cs := *v
 		if cs.SavedUnique > 0 {
 			cs.OvercountRatio = float64(cs.Saved) / float64(cs.SavedUnique)
@@ -247,6 +269,7 @@ func (a *Aggregator) Snapshot() Snapshot {
 		}
 	}
 	sort.Strings(passthrough)
+	sort.Strings(discarded)
 	addedAvg, upAvg, upAvgByp := 0.0, 0.0, 0.0
 	if a.addedSamples > 0 {
 		addedAvg = a.addedMs / float64(a.addedSamples)
@@ -261,7 +284,7 @@ func (a *Aggregator) Snapshot() Snapshot {
 		Requests: a.requests, TokensBefore: a.before, TokensAfter: a.after,
 		SavedTokens: saved, SavingsPct: pct,
 		WastedTokens: a.wasted, Bounces: a.bounces, AdjustedSaved: saved - a.wasted,
-		Components: comps, TopPassthrough: passthrough,
+		Components: comps, TopPassthrough: passthrough, TopDiscarded: discarded,
 		AddedLatencyMsAvg: addedAvg, UpstreamMsAvg: upAvg, UpstreamMsAvgBypassed: upAvgByp,
 	}
 }

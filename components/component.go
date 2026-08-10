@@ -123,6 +123,17 @@ type Ctx struct {
 	// -1 = unknown/first turn/cache off ⇒ no tail restriction. Only meaningful when
 	// CacheAware is true.
 	MaxCachedIdx int
+	// ExistingBreakpoints is how many prompt-cache breakpoints the RAW request already
+	// carries, counted across `system`, `tools` and `messages` — which is what the
+	// provider's cap of four applies to. A component that spends breakpoint slots must
+	// budget against this number rather than what it can see in Input, for two reasons
+	// measured on real Claude Code traffic: 2 of its 3 breakpoints live in the
+	// top-level `system` array, which components never see at all, and the third sits
+	// on a `tool_result` block whose cache_control bifrost drops on unmarshal. Both
+	// were invisible, so the budget came out as 3 free slots when only 1 was free —
+	// enough to put 6 on the wire and take a 400 (issue #32). The host fills it from
+	// the raw body; 0 means "unknown, fall back to what you can see".
+	ExistingBreakpoints int
 }
 
 // TailOnly reports whether a supersession/age-based offloader may mutate the message
@@ -150,6 +161,17 @@ type Report struct {
 	Reverted     bool     // pipeline reverted it (error/panic/never-worse)
 	Irreversible bool     // Offload dropped content on purpose without stashing (marker_mode summary/off)
 	Err          error
+	// ChangedIdx are the req.Input indices this component modified, filled by the
+	// pipeline. The writeback layer uses them to attribute a discarded change back to
+	// the component that made it (see Pipeline.RecordDiscards).
+	ChangedIdx []int
+	// Discarded counts changes this component made that the WRITEBACK layer then threw
+	// away (bifrost could not round-trip the message, so splicing would have dropped
+	// provider fields). A report carrying Discarded > 0 is a follow-up attribution, not
+	// a fresh run — emitters must not count it as one. A component that mutates and is
+	// then silently discarded looked identical to one that works, which is how issue
+	// #32 survived two benchmark studies.
+	Discarded int
 }
 
 // Saved returns non-negative tokens saved by this component.

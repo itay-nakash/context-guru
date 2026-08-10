@@ -1,6 +1,8 @@
 package components
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 
 	"github.com/maximhq/bifrost/core/schemas"
@@ -93,6 +95,7 @@ func (p *Pipeline) runOne(comp Component, req *schemas.BifrostChatRequest, c *Ct
 		return rep
 	}
 
+	rep.ChangedIdx = changedIdx(before, req.Input)
 	after := tokensOf(req.Input)
 	switch {
 	case err != nil:
@@ -122,6 +125,47 @@ func (p *Pipeline) runOne(comp Component, req *schemas.BifrostChatRequest, c *Ct
 
 func tokensOf(msgs []schemas.ChatMessage) int {
 	return schema.MessagesTokens(&schemas.BifrostChatRequest{Input: msgs})
+}
+
+// changedIdx returns the indices at which a component's output differs from its
+// input, so the writeback layer can attribute a discarded change to the component
+// that made it. Compared on the canonical marshal, the same form the writeback loop
+// uses to decide "changed". Count changes (summarize) yield nil — those go down the
+// rebuild path, which never discards per-message.
+func changedIdx(before, after []schemas.ChatMessage) []int {
+	if len(before) != len(after) {
+		return nil
+	}
+	var out []int
+	for i := range after {
+		a, err1 := json.Marshal(before[i])
+		b, err2 := json.Marshal(after[i])
+		if err1 != nil || err2 != nil || !bytes.Equal(a, b) {
+			out = append(out, i)
+		}
+	}
+	return out
+}
+
+// RecordDiscards emits one follow-up Report per component whose changes the
+// writeback layer threw away, so a silently-suppressed component is visible in
+// telemetry instead of looking like a working one. discarded maps req.Input index ->
+// number of discarded changes at that index; hosts call this after the splice.
+func (p *Pipeline) RecordDiscards(rr *RunReport, discarded map[int]int) {
+	if p == nil || rr == nil || len(discarded) == 0 {
+		return
+	}
+	for _, rep := range rr.Components {
+		n := 0
+		for _, i := range rep.ChangedIdx {
+			n += discarded[i]
+		}
+		if n == 0 {
+			continue
+		}
+		d := Report{Component: rep.Component, Kind: rep.Kind, Discarded: n}
+		safeEmit(func() { p.emitter.Component(d) })
+	}
 }
 
 // Has reports whether a component with this name is configured in the pipeline.

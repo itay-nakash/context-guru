@@ -281,3 +281,51 @@ func TestTTLConfig(t *testing.T) {
 		t.Fatal("an unsupported ttl must be rejected, not silently accepted")
 	}
 }
+
+// The provider's cap counts breakpoints this component cannot see: `system` and
+// `tools` never reach it, and bifrost drops cache_control on block types it does not
+// model. Real Claude Code traffic carries (system=2, tools=0, messages=1), so the
+// true remaining budget is 1, not 3 (issue #32, defect 2). The synthetic 60-message
+// shape below is exactly the probe that produced 4 message marks — 6 on the wire.
+func TestBudgetCountsInvisibleBreakpoints(t *testing.T) {
+	msgs := convo(60)
+	mark(&msgs[59], nil) // the caller's own message breakpoint
+
+	c := ctx()
+	c.ExistingBreakpoints = 3 // (system=2, tools=0, messages=1) — the real shape
+	req := &schemas.BifrostChatRequest{Provider: schemas.Anthropic, Input: msgs}
+	rep := &components.Report{}
+	if err := (Cacheinject{}).Reformat(req, rep, c); err != nil {
+		t.Fatalf("Reformat: %v", err)
+	}
+	got := marked(req.Input)
+	// The caller's own message breakpoint is one of the 3 counted, so the wire total is
+	// c.ExistingBreakpoints plus whatever we added on top.
+	added := 0
+	for _, i := range got {
+		if i != 59 {
+			added++
+		}
+	}
+	if wire := c.ExistingBreakpoints + added; wire > maxBreakpoints {
+		t.Fatalf("wire breakpoints %d > cap %d (marked %v, existing %d)",
+			wire, maxBreakpoints, got, c.ExistingBreakpoints)
+	}
+}
+
+// Four breakpoints already on the wire leave no budget at all: adding any would be a 400.
+func TestExistingBreakpointsCanExhaustTheBudget(t *testing.T) {
+	c := ctx()
+	c.ExistingBreakpoints = maxBreakpoints
+	req := &schemas.BifrostChatRequest{Provider: schemas.Anthropic, Input: convo(30)}
+	rep := &components.Report{}
+	if err := (Cacheinject{}).Reformat(req, rep, c); err != nil {
+		t.Fatalf("Reformat: %v", err)
+	}
+	if !rep.Skipped {
+		t.Fatal("expected a skip: the caller's own breakpoints already fill the cap")
+	}
+	if got := marked(req.Input); len(got) != 0 {
+		t.Fatalf("marked %v over a full budget", got)
+	}
+}
