@@ -29,7 +29,7 @@ All optional except `match`.
 
 | Field | Purpose |
 |---|---|
-| `match` | regex tested against the **selector** (the output's first non-empty line) — decides if this filter applies |
+| `match` | regex tested against the **selector** (the output's first few non-empty lines; `(?m)` is applied, so `^`/`$` anchor per line) — decides if this filter applies |
 | `family` | command family for the per-family `/stats` ledger: `builds` / `tests` / `iac` / `pkg` / `net` / … |
 | `priority` | match order — higher first, then by name. Use it to put a specific filter ahead of a generic one. |
 | `strip_ansi` | strip ANSI escape codes |
@@ -85,10 +85,20 @@ run collapses to the `on_empty` message — if a future edit breaks that, the lo
 
 ### Write the selector against a real sample
 
-This is the step that most often goes wrong. `match` is tested against the output's **first
-non-empty line**, not against a command. An `rtk`-style command regex (`^terraform\s+plan`) compiles
-fine and never fires. Paste a real sample of the output, take its first non-empty line, and write the
-regex against *that* (`^Refreshing state`, `^> Task :`, `^==> Downloading`).
+This is the step that most often goes wrong. `match` is tested against the output's **first few
+non-empty lines**, not against a command. An `rtk`-style command regex (`^terraform\s+plan`) compiles
+fine and never fires. Paste a real sample of the output and write the regex against a line that
+actually appears near its top (`^Refreshing state`, `^> Task :`, `^==> Downloading`).
+
+Two traps, both found by measuring real traffic rather than by reasoning:
+
+- **Don't assume your signature is line 1.** Agent harnesses prepend their own preamble
+  (`Exit code 1`, `Internet access disabled`), so the selector deliberately spans several lines. Do
+  not write a filter that only works when its banner leads.
+- **Key on tool identity, not a generic verb.** `^Compiling ` looks like a Swift signature and is
+  also what Cython and cargo print — a filter anchored on it will strip other tools' output. Prefer a
+  signature no other tool emits (`^Compiling \S+ \S+\.swift`), and give a filter whose selector is
+  unavoidably generic a **negative** `priority` so it only catches leftovers.
 
 Selectors that match nothing are logged: `/stats` exposes `cmdfilter_selector_misses`, the frequency-
 ranked list of output shapes no filter claimed. That is the backlog of filters worth writing — the

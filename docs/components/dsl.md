@@ -22,7 +22,8 @@ flowchart LR
 
 All optional except `match`:
 
-- `match` — regex vs the selector (= first non-empty line)
+- `match` — regex vs the selector (= the first few non-empty lines, `(?m)` applied so `^`/`$`
+  anchor per line)
 - `family` — command family for per-family metrics (`builds` / `tests` / `iac` / `pkg` / `net` / …)
 - `priority` — match order; higher first, then by name. Absent (`0`) is today's name ordering.
 - `strip_ansi`
@@ -37,10 +38,15 @@ All optional except `match`:
 
 ### `priority`, and why order matters more here
 
-`cmdfilter` matches on the *shape of the output*, not on a command, so a generic pattern can shadow a
-specific one in a way rtk's command matching never had to deal with. `priority` makes
-specific-before-generic explicit instead of dependent on alphabetical luck. Absent, ordering is by
-name — exactly the previous behavior.
+`cmdfilter` matches on the *shape of the output*, not on a command, and against several leading lines
+rather than one — so a generic pattern can shadow a specific one in a way rtk's command matching
+never had to deal with. This is not hypothetical: widening the selector made `gcc` start claiming
+`make`, `swift-build` and `dotnet-build` output, because a bare `file:line: error:` line appears
+inside all of them. `priority` makes specific-before-generic explicit instead of dependent on
+alphabetical luck. Absent, ordering is by name — exactly the previous behavior.
+
+Rule of thumb: a filter whose selector is a *tool banner* can be high priority; one whose selector is
+a *generic diagnostic shape* must be low, so it only catches what nothing else claimed.
 
 ### Line budgets: `cap` classes
 

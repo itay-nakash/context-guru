@@ -18,9 +18,19 @@ the newest tool output, in the mutable tail.
 The shipped filters are adapted from [rtk](https://github.com/rtk-ai/rtk) (Apache-2.0 — see
 `THIRD-PARTY-NOTICES`), with one systematic rewrite. rtk is a shell hook: it matches a **command
 string** (`^terraform\s+plan`). A proxy never sees the command — it sees the *result*. So every
-filter here matches an **output-shape signature** against the output's first non-empty line
+filter here matches an **output-shape signature** against the output's first few non-empty lines
 (`^Refreshing state`, `^> Task :`, `^==> Downloading`). rtk's command regexes are not portable as
 written; copied over they would compile fine and never fire.
+
+The selector spans the first **6** non-empty lines, not one, and that detail is load-bearing.
+Measured on real agent traffic, a one-line selector missed 112 pytest runs (311 KB) outright: the
+harness prepends its own preamble (`Exit code 1`, `Internet access disabled`) or the report opens
+with a bare `ERROR path::test`, so pytest's session banner is never line 1. A one-line selector ties
+a filter's reach to the agent's *output framing* rather than to the tool that produced the output.
+Widening it took claimed output from 13 to 124 of 520 eligible outputs (2.5% → **23.8%**). It stays
+at 6 lines on purpose: a whole-blob scan would let a generic pattern match some incidental line deep
+inside unrelated output, which is the opposite failure. Match regexes compile with `(?m)`, so `^`
+and `$` anchor per line.
 
 That is also the structural advantage: rtk's hook only sees Bash calls, so an agent's built-in
 `Read`/`Grep`/`Glob` tools are invisible to it. A proxy sees every tool result regardless of origin.
@@ -105,6 +115,27 @@ collapse. `TestEveryMatchOutputRuleIsGuarded` fails the build if one is added wi
 `dotnet-build`'s guard is worth noting: dotnet prints `0 Error(s)` on success, so a guard on the
 word "error" would never let it collapse. It guards on the diagnostic *form* instead
 (`error CS1002` / `warning CS0168`).
+
+### Ordering: `priority`, because a wider selector shadows
+
+A multi-line selector lets a generic filter claim output a specific one should own. That is a real
+hazard, and `TestEveryBuiltinFilterHasTestsAndRoutes` catches it: it asserts every filter's own test
+input routes to *that* filter. Resolved with explicit `priority`:
+
+- **20** — tool-identity banners (`make`, `apt`, `terraform-*`, `pulumi`, the package managers …).
+  Unambiguous, so they win.
+- **10** — `pytest`, matched on its report shapes.
+- **-10** — `gcc`. Its selector is the *generic* `file:line:col: error:` diagnostic shape, which also
+  occurs inside make, swift and dotnet output. It is the deliberate last resort for "some compiler
+  said something" when no tool-specific filter claimed the output.
+
+### A selector must key on tool IDENTITY, not a generic verb
+
+Found in a live run: `swift-build`'s `^Compiling ` claimed **Cython** output and stripped its
+`Compiling x.pyx because it changed` lines. Cython, cargo and others all print `Compiling`. The
+selector now requires Swift identity (a `.swift` file or a Swift build phase), and
+`TestSelectorsDoNotClaimForeignOutput` asserts Cython and cargo output are not claimed. Prefer a
+signature no other tool emits over a verb that many do.
 
 ### Line budgets: shared `cap` classes
 
