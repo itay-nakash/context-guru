@@ -103,6 +103,7 @@ type Memory struct {
 	lostFrozen map[string]struct{}
 	lostN      int64
 	repairedN  int64
+	noSlide    bool // tests only: restore the old write-only expiry (see DisableSlidingTTLForTest)
 }
 
 // Options configures a Memory store; the zero value yields sane defaults.
@@ -169,6 +170,14 @@ func (m *Memory) SetClock(now func() time.Time) {
 	m.now = now
 }
 
+// DisableSlidingTTLForTest restores the old write-only expiry (and un-pins frozen
+// entries) so a test can measure what the previous behavior cost. For TESTS only.
+func (m *Memory) DisableSlidingTTLForTest() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.noSlide = true
+}
+
 func (m *Memory) Put(key string, payload []byte) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -191,7 +200,7 @@ func (m *Memory) Put(key string, payload []byte) {
 	e := &entry{key: key, payload: payload, expires: m.now().Add(m.ttl)}
 	// Pin frozen decisions, but never more than half the cache: past that the marginal
 	// pin protects one message while starving the rewind stashes the expand loop needs.
-	if frozenNamespace(key) {
+	if frozenNamespace(key) && !m.noSlide {
 		if m.pinnedN < m.max/2 {
 			e.pinned = true
 			m.pinnedN++
@@ -257,7 +266,9 @@ func (m *Memory) Get(key string) ([]byte, bool) {
 	// every turn — expiring a frozen compaction mid-task flips an already-cached
 	// message's representation and forces the provider to re-write the whole suffix
 	// (one cache-write costs 11.5 cache-reads). Recency and lifetime refresh together.
-	e.expires = m.now().Add(m.ttl)
+	if !m.noSlide {
+		e.expires = m.now().Add(m.ttl)
+	}
 	m.ll.MoveToFront(el)
 	return e.payload, true
 }
