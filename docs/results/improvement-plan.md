@@ -359,11 +359,43 @@ ratio (which overcounts 22–42×).
 
 ### F. Hygiene / methodology
 
+!!! danger "F-1. The rule this whole document was written the hard way to learn"
+    **An aggregate moving in the predicted direction is not evidence that the predicted mechanism
+    operated.** Verify the mechanism fired *before* believing the outcome.
+
+    Four premises in this plan were wrong, and every one failed the same way — a derived artifact
+    was trusted over the raw request stream:
+
+    | premise | what was believed | what was true |
+    |---|---|---|
+    | §C1 `xdedup` | a 39.8× re-send factor meant tokens re-sent as new bytes | 232/232 large outputs sit at **one stable index**; the agent *appends*. Those tokens are cached-prefix reads, already cheap. Component would have had **zero** legal opportunity to act |
+    | §B2 expand tool | "never registered on the streaming path", 4.8M tokens stranded | tool IS registered, loop IS armed, a live agent restored 3,372 tokens. 4.8M was a **cumulative re-count**; unique is 234k (21× smaller). Real bug was a latency tautology |
+    | `prefixpin` | early messages mutate in place, worth ~31% of input cost | **0 mutations in ~6,500 comparisons** on claude-code. The 52% churn first measured was concurrent sessions sharing a first message, diffed against each other |
+    | §31 async cache-write | −45%/−39% cache-write proved the tail-protection worked | the protection **only stripped context-guru's own breakpoints**, never the agent's — so it did nothing on the primary workload. Lower cache-write came from writing *fewer breakpoints*, not from protecting the tail |
+
+    Three of the four produced a number that pointed the *right* way for the *wrong* reason, which is
+    why they survived review. The countermeasures, in order of value:
+
+    1. **Group request lineages by append-only prefix match**, never by a hash of `messages[0]` — a
+       benchmark harness runs concurrent sessions whose first message is byte-identical.
+    2. **Distinguish cumulative from unique on every token figure.** The overcount is 8–42×, so a
+       cumulative number is off by an order of magnitude, not a rounding error.
+    3. **Instrument "did this component act?" separately from "did the metric improve?"** and require
+       both before claiming a mechanism. `acted=0` beside a favourable delta is the tell.
+    4. **A trial where the baseline aborts is not a measurement** — exclude it, don't average it. Six
+       such trials inverted the sign of the entire TB cost conclusion (§1a).
+    5. **Read the raw wire bytes.** The change-log dumps only record messages a component *already
+       acted on*, so they structurally cannot answer "was this ever sent?"
+
 - **F0. Re-run the 6 degenerate TB baselines** and regenerate the comparison/baseline docs (§1a).
 - **F1. Report `saved_tokens_unique` and cache-aware $, never raw cumulative byte ratio** (overcounts
   22–42×; unusable for tuning).
-- **F2. Kill dead components:** `cacheinject` (0 acts, inert), `failed_run` (0 acts, burns 28.8 s
-  scanning) — hoist the `CacheAware` check so the regexes never run.
+- **F2. Kill dead components** — *revised*: `failed_run` (0 acts, burns 28.8 s scanning) — hoist the
+  `CacheAware` check so the regexes never run. **`cacheinject` is no longer in this list**: it read as
+  "0 acts, inert" because it is a Reformat that removes no tokens *and* because its breakpoints were
+  being **discarded by the writeback layer before reaching the wire** (46 applied, 0 forwarded).
+  Once forwarded, first measurement shows placement is mildly *harmful* (+61.9% cache-write per step,
+  n=1) — so the open question is whether it belongs in the default preset, not whether it is dead.
 - **F3. Tune per regime:** SWE = cache-read regime (optimise steps; note cross-turn dedup is refuted, §C); TB = output
   regime (optimise trajectory length). Same knobs, different settings, selected by measured context
   size.
