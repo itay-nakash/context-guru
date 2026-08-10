@@ -23,9 +23,18 @@ import (
 // resultKey namespaces a per-content reduced output (extract) by session.
 func resultKey(session, id string) string { return store.ResultPrefix + session + ":" + id }
 
-// getResult returns a previously cached reduced output for content id, if any.
+// getResult returns a previously cached reduced output for content id, if any. This is
+// extract_llm's replay lookup, so it feeds the same hit/miss counters as reapplyFrozen —
+// otherwise the shipped coding config (no mask, failed_run self-skipping) would report
+// zero freeze activity while doing all of its replay through here.
 func getResult(c *components.Ctx, id string) ([]byte, bool) {
-	return c.Store.Get(resultKey(c.Session, id))
+	v, ok := c.Store.Get(resultKey(c.Session, id))
+	if ok {
+		frozenHits.Add(1)
+	} else {
+		frozenMisses.Add(1)
+	}
+	return v, ok
 }
 
 // putResult caches a reduced output so a later turn re-sending the same content

@@ -185,3 +185,23 @@ func TestResultCachePinnedAndRepairable(t *testing.T) {
 		t.Fatal("content that was never compacted must not authorize depth mutation")
 	}
 }
+
+// The counters must also move on extract_llm's replay path (getResult), not just
+// reapplyFrozen — the shipped coding config does ALL of its replay through the result
+// cache, so counting only reapplyFrozen would report zero freeze activity on exactly the
+// traffic this fix targets.
+func TestResultCacheFeedsCounters(t *testing.T) {
+	h0, m0 := FrozenStats()
+	c := &components.Ctx{Session: "sRC", Store: store.NewMemory(store.Options{})}
+	if _, ok := getResult(c, "idz"); ok {
+		t.Fatal("nothing cached yet")
+	}
+	putResult(c, "idz", []byte("compacted"))
+	if _, ok := getResult(c, "idz"); !ok {
+		t.Fatal("expected a replay hit")
+	}
+	h1, m1 := FrozenStats()
+	if h1 <= h0 || m1 <= m0 {
+		t.Fatalf("result-cache replay must feed hits/misses: %d->%d, %d->%d", h0, h1, m0, m1)
+	}
+}
