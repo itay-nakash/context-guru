@@ -14,46 +14,64 @@ cite for savings. What is measured here is whether each mode does what it says.
 
 | | `sync` | `async` | `observe` |
 |---|---|---|---|
-| solved | 2/2 | see below | 2/2 |
-| mean steps | 15.5 | — | 22.5 |
-| **added latency / req** | **1,599.4 ms** | **28.8 ms** | **0.062 ms** |
-| content savings (enforced) | 0.82% | 4.78% | — (0 by construction) |
+| solved | 2/2 | 2/2 | 2/2 |
+| mean steps | 15.5 | 21.5 | 22.5 |
+| **added latency / req** | **1,599.4 ms** | **25.3 ms** | **0.062 ms** |
+| content savings (enforced) | 0.82% | 4.17% | — (0 by construction) |
 | projected savings | — | — | 6.40% |
-| cache-read | 1,464,729 | — | 2,300,699 |
-| cache-write | 52,287 | — | 127,589 |
-| fresh input | 54 | — | 86 |
-| output | 10,249 | — | 11,522 |
-| billed cost | $0.5263 | — | $0.8945 |
-| context-guru's own LLM cost | $0.0122 (1 call) | — | $0.0779 (7 calls) |
-| off-path compaction time | — | 54.0 s | 75.0 s |
+| cache-read | 1,464,729 | 2,186,100 | 2,300,699 |
+| **cache-write** | **52,287** | **42,980** | 127,589 |
+| cache-write per 1M cache-read | 35,697 | **19,661** | 55,458 (not enforcing) |
+| cache-hit rate | 96.55% | **98.07%** | 94.74% |
+| fresh input | 54 | 78 | 86 |
+| output | 10,249 | 10,711 | 11,522 |
+| billed cost | $0.5263 | $0.6519 | $0.8945 |
+| context-guru's own LLM cost | $0.0122 (1 call) | $0.0435 (4 calls) | $0.0779 (7 calls) |
+| off-path compaction time | — | 80.8 s | 75.0 s |
+| deferred compactions committed | — | 1 | 0 (never commits) |
+| `async_realized_saved_tokens` | — | 15,962 | — |
 | queue `{dropped, stale_discarded}` | — | `{0, 0}` | `{0, 0}` |
 
 ## The four questions
 
 ### 1. Does async reduce added latency without increasing cache-write?
 
-**Latency: yes, decisively.** 1,599.4 ms → 28.8 ms per request, a **55x reduction**.
+**Latency: yes, decisively.** 1,599.4 ms → 25.3 ms per request, a **63x reduction**.
 The mechanism is visible per component: `extract_llm` costs 15,014 ms on sync's request
-path and 63.6 ms on async's, with `acted=0` inline — the model call is genuinely gone
-from the hot path. 54.0 s of compaction ran off-path, charged to nobody's request.
+path and 71.3 ms cumulative across 42 requests on async's, with `acted=0` inline — the
+model call is genuinely gone from the hot path. 80.8 s of compaction ran off-path,
+charged to nobody's request.
 
-**Cache-write: not measurable at this scale, and the honest answer is "unproven".** The
-async arm's paired token tiers are not usable (see below), so the cache-write comparison
-that would confirm the policy is missing. What *is* established is that the policy is
-active and does what it claims structurally: a unit test asserts no breakpoint lands at
-or beyond the un-compacted tail under the default, and that the escape hatch restores
-normal placement. The measured confirmation needs a 50-task paired run.
+**Cache-write: it went DOWN, which is the result the policy was designed for.** Absolute
+cache-write 52,287 → 42,980 (**−17.8%**) on ~49% *more* cache-read traffic. Normalising
+for that traffic difference is the fairer comparison and it is stronger: **19,661
+cache-write tokens per 1M cache-read against sync's 35,697, a 45% reduction**, with the
+cache-hit rate rising 96.55% → 98.07%.
+
+This is the specific failure mode the issue warned about, and it did not occur. A naive
+async implementation caches the un-compacted tail and then rewrites it, converting 0.1x
+reads into 1.25x writes — the mechanism that tripled headroom's cache-write on
+Terminal-Bench (12.37M vs a 4.01M baseline). Here cache-write fell instead, consistent
+with the policy holding: the breakpoint never lands on a span a pending compaction will
+replace, so nothing the provider committed to gets rewritten.
+
+Caveat: n=1 across 2 tasks with differing trajectories, so treat the magnitude as
+indicative. The *direction* is what matters, and the direction is unambiguous — this
+arm cannot be reconciled with a cache policy that was rewriting the live zone.
 
 ### 2. Does async reach the same steady-state savings as sync, just later?
 
-**On this evidence it reached more, not less** — 4.78% enforced against sync's 0.82% —
+**On this evidence it reached more, not less** — 4.17% enforced against sync's 0.82% —
 but do not read that as async being better at compaction. Both numbers are small and
 noisy at n=1, and the arms took different trajectories (different step counts, so
 different traffic). The load-bearing observation is narrower and does hold:
-`async_realized_saved_tokens` = 15,962 = the entire enforced saving. Every token async
-saved was saved by a **later** turn replaying a decision an **earlier** turn's off-path
-job computed. That is the deferral working end to end on real traffic, which is what
-this question was really asking.
+`async_realized_saved_tokens` = 15,962 = the entire enforced saving, from 1 committed
+deferred compaction. Every token async saved was saved by a **later** turn replaying a
+decision an **earlier** turn's off-path job computed. That is the deferral working end
+to end on real traffic, which is what this question was really asking.
+
+Note also what async spent to get there: 80.8 s of compaction ran off-path against 25.3
+ms/req on-path. The work did not disappear, it moved.
 
 ### 3. Does observe add measurable latency to the enforced path?
 
@@ -155,9 +173,10 @@ Each is now covered by a test that fails without its fix.
 
 ## What is not established here
 
-- Cache-write parity between `sync` and `async` on real traffic — the policy is proven
-  structurally by unit test, not yet measured on a paired arm.
-- Any cost or solve-rate claim per mode. 2 tasks, n=1.
+- Any cost or solve-rate claim per mode. 2 tasks, n=1. The billed-cost column tracks
+  trajectory length more than it tracks mode.
+- The cache-write result's *magnitude*. Its direction (down, not up) is solid; the 45%
+  normalised figure needs a 50-task paired run to be quotable.
 - Async under concurrency pressure: `dropped` and `stale_discarded` were 0 on every
   arm, so the drop and stale-discard paths are exercised only by tests, never yet by
   production load.
