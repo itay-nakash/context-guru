@@ -47,8 +47,8 @@ test/build runs (`failed_run`), and DSL command-log filtering (`cmdfilter`).
 
 - **Fits:** general agent traffic; the safe everyday choice.
 - **Caveat:** `cmdfilter` only fires when ≥1 filter is loaded and the output's first line matches
-  one. Its builtins cover pytest / npm-install / make; author more with a
-  [custom DSL filter](custom-dsl-filter.md).
+  one. It ships 23 filters covering test runners, build tools, package managers, IaC plans and
+  verbose network clients; author more with a [custom DSL filter](custom-dsl-filter.md).
 
 ### `aggressive` — `[format, dedup, failed_run, cmdfilter, smartcrush, extract, cacheinject]`
 `balanced` plus JSON-array crushing (`smartcrush`) and query-relevance projection (`extract`).

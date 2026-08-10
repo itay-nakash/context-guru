@@ -123,6 +123,22 @@ type Ctx struct {
 	// -1 = unknown/first turn/cache off ⇒ no tail restriction. Only meaningful when
 	// CacheAware is true.
 	MaxCachedIdx int
+	// FilterStats receives cmdfilter's per-filter ledger (which command families pay
+	// off, and which output shapes matched nothing). nil = not recording.
+	FilterStats FilterStatsSink
+}
+
+// FilterStatsSink records cmdfilter's per-filter/per-family ledger. metrics.Aggregator
+// implements it; the pipeline depends only on this interface. Implementations must be
+// safe for concurrent use.
+type FilterStatsSink interface {
+	// FilterAct notes one applied filter: its family (builds/tests/iac/pkg/net/...),
+	// its name, the content key (so a compaction re-sent verbatim next turn is counted
+	// once), and the tokens saved.
+	FilterAct(family, filter, contentKey string, saved int)
+	// FilterMiss notes a selector that matched no filter — the ledger that says which
+	// filter is worth writing next (after rtk's parse_failures table).
+	FilterMiss(selector string)
 }
 
 // TailOnly reports whether a supersession/age-based offloader may mutate the message

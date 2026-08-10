@@ -6,6 +6,7 @@ package offload
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"strconv"
 	"strings"
 
 	"github.com/maximhq/bifrost/core/schemas"
@@ -23,15 +24,23 @@ func init() { components.Register("cmdfilter", newCmdfilter) }
 // recover it. Filters match on the tool output's first non-empty line (the
 // proxy-world stand-in for rtk's shell command).
 type Cmdfilter struct {
-	reg  *dsl.Registry
-	mode markerMode
+	reg     *dsl.Registry
+	mode    markerMode
+	minSize int
 }
 
 type cmdfilterConfig struct {
 	Filters         []string `yaml:"filters"`          // inline filter YAML documents
 	DisableBuiltins bool     `yaml:"disable_builtins"` // skip the bundled starter filters
 	MarkerMode      string   `yaml:"marker_mode"`      // full (default) | summary | off
+	MinSize         *int     `yaml:"min_size"`         // byte floor below which filtering isn't worth a marker
 }
+
+// defaultMinSize is rtk's MIN_TEE_SIZE: below it the recovery marker routinely
+// costs more tokens than the filter saves, so we don't bother. The
+// marker-inclusive never-worse check would catch those anyway; this just skips the
+// work (and the stash) instead of doing it and throwing it away.
+const defaultMinSize = 500
 
 func newCmdfilter(raw []byte) (components.Component, error) {
 	var cfg cmdfilterConfig
@@ -51,7 +60,11 @@ func newCmdfilter(raw []byte) (components.Component, error) {
 			return nil, err
 		}
 	}
-	return &Cmdfilter{reg: reg, mode: parseMarkerMode(cfg.MarkerMode)}, nil
+	minSize := defaultMinSize
+	if cfg.MinSize != nil {
+		minSize = *cfg.MinSize
+	}
+	return &Cmdfilter{reg: reg, mode: parseMarkerMode(cfg.MarkerMode), minSize: minSize}, nil
 }
 
 func (Cmdfilter) Name() string { return "cmdfilter" }
@@ -77,8 +90,17 @@ func (f *Cmdfilter) Offload(req *schemas.BifrostChatRequest, rep *components.Rep
 			continue // marker-bearing (a filter rule could drop the marker line and orphan
 			// the stash) or expanded by the agent — leave it verbatim
 		}
-		filt := f.reg.Match(selectorKey(content))
+		if len(content) < f.minSize {
+			continue // below the size floor the marker often costs more than the saving
+		}
+		key := selectorKey(content)
+		filt := f.reg.Match(key)
 		if filt == nil {
+			if c.FilterStats != nil {
+				// The miss ledger: it turns "which filter to write next" into data
+				// instead of guesswork (after rtk's parse_failures table).
+				c.FilterStats.FilterMiss(key)
+			}
 			continue
 		}
 		out, loss := dsl.Apply(filt, content)
@@ -90,13 +112,13 @@ func (f *Cmdfilter) Offload(req *schemas.BifrostChatRequest, rep *components.Rep
 		// still bail. Compare the FULL rewritten text (token included) against the
 		// original — the marker costs tokens too, so filtering that barely wins can
 		// still make the message larger (rtk never_worse, at the message level).
-		key := hashKey(content)
+		stashKey := hashKey(content)
 		// degrade full→off when the store can't persist (no unresolvable marker).
 		mode := effectiveMode(c, f.mode)
 		var token string
 		switch mode {
 		case markerFull:
-			token = expand.Marker(key) + recoveryHint(loss)
+			token = expand.Marker(stashKey) + recoveryHint(loss, len(strings.Split(out, "\n")))
 		case markerSummary:
 			token = expand.SummaryMarker
 		} // off: no token
@@ -104,17 +126,21 @@ func (f *Cmdfilter) Offload(req *schemas.BifrostChatRequest, rep *components.Rep
 		if token != "" {
 			newText += "\n" + token
 		}
-		if schema.TextTokens(newText) >= schema.TextTokens(content) {
+		before, after := schema.TextTokens(content), schema.TextTokens(newText)
+		if after >= before {
 			continue
 		}
 		if mode == markerFull {
-			c.Store.Put(key, []byte(content))
-			recordOwner(c, key) // scope GET /expand retrieval to this session
-			keys = append(keys, key)
+			c.Store.Put(stashKey, []byte(content))
+			recordOwner(c, stashKey) // scope GET /expand retrieval to this session
+			keys = append(keys, stashKey)
 		} else {
 			rep.Irreversible = true
 		}
 		schema.SetMessageText(m, newText)
+		if c.FilterStats != nil {
+			c.FilterStats.FilterAct(filt.Family(), filt.Name, stashKey, before-after)
+		}
 		changed++
 	}
 	if changed == 0 {
@@ -134,46 +160,23 @@ func selectorKey(content string) string {
 	return ""
 }
 
-func recoveryHint(loss dsl.Lossiness) string {
-	if loss == dsl.LossNone {
+// recoveryHint types the hint by WHAT was lost. A clean contiguous tail cut is
+// cheaply recoverable — the agent can re-read from the cut point instead of pulling
+// the whole blob back — so it says so (rtk emits a partial-recovery hint for the
+// same case). Collapsing both kinds into one hint made every loss look like a
+// whole-blob loss and pushed the agent toward the expensive recovery.
+func recoveryHint(loss dsl.Lossiness, kept int) string {
+	switch loss {
+	case dsl.LossTail:
+		return " [truncated after line " + strconv.Itoa(kept) + "; rest via " + expand.ToolName + "]"
+	case dsl.LossWhole:
+		return " [full output: call " + expand.ToolName + "]"
+	default:
 		return ""
 	}
-	return " [full output: call " + expand.ToolName + "]"
 }
 
 func hashKey(s string) string {
 	h := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(h[:])[:16]
 }
-
-// builtinFilters is a small starter set adapted from rtk built-ins. Users add
-// more via the cmdfilter `filters:` config with no recompile.
-const builtinFilters = `
-schema_version: 1
-filters:
-  pytest:
-    description: keep failures + summary, drop passing noise
-    match: "(pytest|=+ test session starts)"
-    strip_lines_matching:
-      - "^\\s*$"
-      - " PASSED"
-      - "^\\.+$"
-    max_lines: 80
-    on_empty: "pytest: all passed"
-  npm-install:
-    description: collapse npm/yarn install chatter
-    match: "^(npm|yarn|added|removed) "
-    strip_lines_matching:
-      - "^npm warn"
-      - "^\\s*$"
-    max_lines: 40
-    on_empty: "install: ok"
-  make:
-    description: drop make directory chatter
-    match: "^(make|gcc|cc|clang) "
-    strip_lines_matching:
-      - "^make\\[\\d+\\]:"
-      - "^\\s*$"
-    max_lines: 60
-    on_empty: "make: ok"
-`

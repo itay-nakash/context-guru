@@ -179,8 +179,8 @@ after:   [superseded by a later run] <<cg:7d1c…>> [full output: …]   [run 2]
 ### `cmdfilter`
 Shrinks tool output with **declarative DSL filters** (see below). Matches a filter on the output's
 first non-empty line, applies its 8-stage pipeline, stashes the original, and appends a recovery
-hint only when the filter was actually lossy. Ships builtin `pytest` / `npm-install` / `make`
-filters.
+hint only when the filter was actually lossy. Ships 23 filters (test runners, build tools, package
+managers, IaC plans, verbose network clients) — see [cmdfilter](components/cmdfilter.md).
 
 ```
 before:  pytest … 100 lines of PASSED + warnings + 1 failure
