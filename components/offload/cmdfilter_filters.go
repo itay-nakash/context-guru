@@ -31,7 +31,7 @@ filters:
     description: keep failures + summary, drop passing noise
     family: tests
     priority: 10
-    match: '(pytest|=+ test session starts)'
+    match: '(^=+ test session starts|^=+ (FAILURES|ERRORS|short test summary info)|^(FAILED|ERROR) \S+::|^\d+ (passed|failed|error)|^collected \d+ items)'
     strip_lines_matching:
       - '^\s*$'
       - ' PASSED'
@@ -47,6 +47,7 @@ filters:
   npm-install:
     description: collapse npm/yarn/pnpm install chatter
     family: pkg
+    priority: 20
     match: '^(npm |yarn |pnpm |added \d|removed \d|up to date)'
     strip_lines_matching:
       - '^npm warn'
@@ -62,6 +63,7 @@ filters:
   make:
     description: drop make directory chatter and no-op notices
     family: builds
+    priority: 20
     match: '^(make(\[\d+\])?:|(gcc|g\+\+|cc|clang) )'
     strip_lines_matching:
       - '^make(\[\d+\])?: (Entering|Leaving) directory'
@@ -74,6 +76,7 @@ filters:
   gradle:
     description: strip Gradle progress and no-op tasks, keep tasks and errors
     family: builds
+    priority: 20
     match: '^(> (Task|Configuring project|Resolving dependencies|Transform )|Starting a Gradle Daemon|BUILD (SUCCESSFUL|FAILED))'
     strip_ansi: true
     strip_lines_matching:
@@ -95,6 +98,7 @@ filters:
   xcodebuild:
     description: strip xcodebuild build phases and tool invocations, keep diagnostics
     family: builds
+    priority: 20
     match: '^(note: Using new build system|CompileC |CompileSwift |Ld |CodeSign |PhaseScriptExecution |\*\* BUILD)'
     strip_ansi: true
     strip_lines_matching:
@@ -135,6 +139,10 @@ filters:
   gcc:
     description: strip include traces and diagnostic counters, keep every error and warning
     family: builds
+    # Lowest priority ON PURPOSE: this selector is a generic compiler-diagnostic shape
+    # that also occurs inside make / swift / dotnet output. It is the fallback for
+    # "some compiler said something" when no tool-specific filter claimed the output.
+    priority: -10
     match: '^(In file included from|/usr/bin/ld:|collect2: error:|\S+: In function|\S+:\d+:(\d+:)? (error|warning|note):)'
     strip_ansi: true
     strip_lines_matching:
@@ -150,12 +158,13 @@ filters:
   swift-build:
     description: strip Compiling/Linking noise, collapse a clean build
     family: builds
-    match: '^(Compiling |Linking |Building for |Build complete!)'
+    priority: 20
+    match: '^(Compiling \S+ \S+\.swift|Building for (debugging|production)|Build complete!|\S+\.swift:\d+:\d+: (error|warning):)'
     strip_ansi: true
     strip_lines_matching:
       - '^\s*$'
-      - '^Compiling '
-      - '^Linking '
+      - '^Compiling \S+ \S+\.swift'
+      - '^Linking \S+$'
     match_output:
       - pattern: 'Build complete!'
         message: 'ok (build complete)'
@@ -165,6 +174,7 @@ filters:
   dotnet-build:
     description: strip MSBuild banners, collapse a clean build
     family: builds
+    priority: 20
     match: '^(Microsoft \(R\) Build Engine|MSBuild version)'
     strip_ansi: true
     strip_lines_matching:
@@ -183,6 +193,7 @@ filters:
   turbo:
     description: strip Turborepo cache status noise, keep task results
     family: builds
+    priority: 20
     match: '^(cache (hit|miss|bypass)|\d+ packages in scope|> [^ ]+:[^ ]+$)'
     strip_ansi: true
     strip_lines_matching:
@@ -199,6 +210,7 @@ filters:
   nx:
     description: strip Nx task-graph banners, keep task output
     family: builds
+    priority: 20
     match: '^(> +NX +|Nx \(powered by)'
     strip_ansi: true
     strip_lines_matching:
@@ -214,6 +226,7 @@ filters:
   terraform-plan:
     description: strip state-refresh and unchanged-resource noise from a terraform/tofu plan
     family: iac
+    priority: 20
     match: '^(Acquiring state lock|Releasing state lock|Refreshing state|(Terraform|OpenTofu) (will perform|used the selected providers)|No changes\.)'
     strip_ansi: true
     strip_lines_matching:
@@ -228,6 +241,7 @@ filters:
   terraform-init:
     description: strip provider download spam from a terraform/tofu init
     family: iac
+    priority: 20
     match: '^Initializing (the backend|provider plugins|modules)'
     strip_ansi: true
     strip_lines_matching:
@@ -244,6 +258,7 @@ filters:
   pulumi:
     description: strip pulumi banners, permalinks and per-resource progress rows
     family: iac
+    priority: 20
     match: '^(Previewing (update|refresh|destroy)|Updating \(|Refreshing \(|Destroying \(|No stacks found|Please choose a stack|Current stack is)'
     strip_ansi: true
     match_output:
@@ -287,6 +302,7 @@ filters:
   liquibase:
     description: strip the ASCII banner, jar inventory and INFO chatter
     family: builds
+    priority: 20
     match: '^(#{10,}$|Starting Liquibase at|Liquibase (Community|Open Source) )'
     strip_ansi: true
     strip_lines_matching:
@@ -308,6 +324,7 @@ filters:
   ssh:
     description: strip ssh connection banners and debug1 flood, keep the remote output
     family: net
+    priority: 20
     match: '^(Warning: Permanently added|debug1:|OpenSSH_|Pseudo-terminal)'
     strip_ansi: true
     strip_lines_matching:
@@ -324,6 +341,7 @@ filters:
   ping:
     description: drop per-packet replies, keep the statistics block
     family: net
+    priority: 20
     match: '^(PING |Pinging )'
     strip_ansi: true
     strip_lines_matching:
@@ -337,6 +355,7 @@ filters:
   rsync:
     description: strip the file list and byte counters, collapse a clean sync
     family: net
+    priority: 20
     match: '^(sending incremental file list|rsync: |rsync error:)'
     strip_ansi: true
     strip_lines_matching:
@@ -352,6 +371,7 @@ filters:
   bundle-install:
     description: strip cached-gem "Using" lines, collapse a complete bundle
     family: pkg
+    priority: 20
     match: '^(Fetching gem metadata|Resolving dependencies\.|Using \S+ \d)'
     strip_ansi: true
     strip_lines_matching:
@@ -371,7 +391,8 @@ filters:
   poetry-install:
     description: strip poetry download/install chatter, collapse an up-to-date lock
     family: pkg
-    match: '^(Installing dependencies from lock file|Creating virtualenv|Using virtualenv|[•-] Installing |[•-] Downloading )'
+    priority: 20
+    match: '^(Installing dependencies from lock file|Creating virtualenv|Using virtualenv|\s*[•-] (Installing|Downloading) \S+ \()'
     strip_ansi: true
     strip_lines_matching:
       - '^\s*$'
@@ -390,6 +411,7 @@ filters:
   composer-install:
     description: strip composer download/install chatter, collapse a no-op install
     family: pkg
+    priority: 20
     match: '^Loading composer repositories'
     strip_ansi: true
     strip_lines_matching:
@@ -407,6 +429,7 @@ filters:
   uv-sync:
     description: strip uv download/cache chatter, collapse an audited-only sync
     family: pkg
+    priority: 20
     match: '^(Resolved \d+ packages|Downloading \S+\.whl|Using cached \S+\.whl|Audited \d+ package)'
     strip_ansi: true
     strip_lines_matching:
@@ -423,6 +446,7 @@ filters:
   apt:
     description: collapse apt/dpkg install boilerplate, keep errors and configuration prompts
     family: pkg
+    priority: 20
     match: '^(Get:\d+ http|Selecting previously unselected package|Preparing to unpack |Unpacking |Setting up |Processing triggers for |Reading package lists|Building dependency tree)'
     strip_ansi: true
     strip_lines_matching:
@@ -453,6 +477,7 @@ filters:
   brew-install:
     description: strip brew download/pour chatter, collapse an already-installed formula
     family: pkg
+    priority: 20
     match: '^(==> (Fetching|Downloading)|Warning: .+ is already installed)'
     strip_ansi: true
     strip_lines_matching:
@@ -471,6 +496,7 @@ filters:
   quarto-render:
     description: strip quarto render progress, collapse a successful render
     family: builds
+    priority: 20
     match: '^processing file: '
     strip_ansi: true
     strip_lines_matching:

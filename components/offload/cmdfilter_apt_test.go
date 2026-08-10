@@ -42,3 +42,22 @@ func TestAptKeepsProblems(t *testing.T) {
 		t.Fatalf("pure boilerplate should collapse, got %q", out)
 	}
 }
+
+// Selectors must key on TOOL IDENTITY, not on a generic verb. Found in production:
+// swift-build's bare '^Compiling ' claimed CYTHON output and stripped its
+// "Compiling x.pyx because it changed" lines. These are real outputs from other tools
+// that a tool-specific filter must not claim.
+func TestSelectorsDoNotClaimForeignOutput(t *testing.T) {
+	var r dsl.Registry
+	if err := r.Load([]byte(builtinFilters)); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ name, out string }{
+		{"cython", "Compiling pkg/mod.pyx because it changed.\n[1/4] Cythonizing pkg/mod.pyx\n[2/4] Cythonizing pkg/other.pyx\nrunning build_ext\n"},
+		{"cargo", "Compiling serde v1.0.197\nCompiling libc v0.2.153\n   Finished dev [unoptimized] target(s) in 4.21s\n"},
+	} {
+		if c := r.Match(selectorKey(tc.out)); c != nil && c.Name == "swift-build" {
+			t.Errorf("%s output must not be claimed by swift-build", tc.name)
+		}
+	}
+}

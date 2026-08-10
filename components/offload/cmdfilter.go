@@ -98,8 +98,11 @@ func (f *Cmdfilter) Offload(req *schemas.BifrostChatRequest, rep *components.Rep
 		if filt == nil {
 			if c.FilterStats != nil {
 				// The miss ledger: it turns "which filter to write next" into data
-				// instead of guesswork (after rtk's parse_failures table).
-				c.FilterStats.FilterMiss(key)
+				// instead of guesswork (after rtk's parse_failures table). Log only the
+				// FIRST line — the selector is multi-line, and keying the bounded ledger
+				// on whole multi-line blobs would make almost every entry unique and
+				// exhaust the cap on noise instead of ranking real shapes.
+				c.FilterStats.FilterMiss(firstLine(key))
 			}
 			continue
 		}
@@ -149,15 +152,39 @@ func (f *Cmdfilter) Offload(req *schemas.BifrostChatRequest, rep *components.Rep
 	return keys, nil
 }
 
-// selectorKey is the string a filter's match regex is tested against: the first
-// non-empty, trimmed line of the tool output.
+// selectorHeadLines is how many leading non-empty lines a filter's match regex is
+// tested against. It is NOT 1, and that matters: measuring real agent traffic showed
+// 112 pytest outputs (311 KB) matching nothing because the harness prepends its own
+// preamble ("Exit code 1", "Internet access disabled") or the run opens with a bare
+// "ERROR path::test" line, so pytest's "=== test session starts ===" banner is never
+// the FIRST line. A one-line selector makes a filter's reach depend on the agent's
+// output framing rather than on the tool that produced it.
+//
+// Kept small on purpose: a whole-blob scan would let a generic pattern match on some
+// incidental line deep inside unrelated output, which is the opposite failure.
+const selectorHeadLines = 6
+
+// firstLine returns the leading line of a (possibly multi-line) selector key.
+func firstLine(key string) string {
+	if i := strings.IndexByte(key, '\n'); i >= 0 {
+		return key[:i]
+	}
+	return key
+}
+
+// selectorKey is the string a filter's match regex is tested against: the first few
+// non-empty, trimmed lines of the tool output, newline-joined.
 func selectorKey(content string) string {
+	var head []string
 	for _, line := range strings.Split(content, "\n") {
 		if s := strings.TrimSpace(line); s != "" {
-			return s
+			head = append(head, s)
+			if len(head) == selectorHeadLines {
+				break
+			}
 		}
 	}
-	return ""
+	return strings.Join(head, "\n")
 }
 
 // recoveryHint types the hint by WHAT was lost. A clean contiguous tail cut is
