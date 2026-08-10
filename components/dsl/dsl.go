@@ -252,7 +252,9 @@ func Apply(c *Compiled, input string) (string, Lossiness) {
 	if c.def.HeadLines != nil || c.def.TailLines != nil {
 		var htLoss Lossiness
 		lines, htLoss = headTail(lines, c.def.HeadLines, c.def.TailLines)
-		loss = worseLoss(loss, htLoss)
+		if htLoss > loss { // keep the more severe of an intra-line cut and a line drop
+			loss = htLoss
+		}
 	}
 	// 7. max_lines (absolute cap, counts the omission marker)
 	if c.def.MaxLines != nil && len(lines) > *c.def.MaxLines {
@@ -285,14 +287,6 @@ func truncateRunes(s string, n int) string {
 		return "..."
 	}
 	return string(r[:n-3]) + "..."
-}
-
-// worseLoss returns the more severe of two loss kinds.
-func worseLoss(a, b Lossiness) Lossiness {
-	if b > a {
-		return b
-	}
-	return a
 }
 
 func filterLines(lines []string, res []*regexp.Regexp, keep bool) []string {
