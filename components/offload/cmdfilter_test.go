@@ -11,6 +11,8 @@ import (
 	"github.com/rossoctl/context-guru/expand"
 	"github.com/rossoctl/context-guru/schema"
 	"github.com/rossoctl/context-guru/store"
+	"regexp"
+
 	"gopkg.in/yaml.v3"
 )
 
@@ -68,14 +70,50 @@ func TestEveryBuiltinFilterHasTestsAndRoutes(t *testing.T) {
 
 // Every success-collapse rule must carry an unless guard: in a proxy the agent
 // cannot re-run the command to find the warning a bare collapse swallowed.
+// Collapsing output to a one-line summary is the dangerous operation in this package: in a
+// proxy the agent cannot re-run the command to find the warning that got swallowed. TWO
+// mechanisms collapse and they are safe for DIFFERENT reasons, so each needs its own
+// assertion — checking only `match_output` (as this test originally did) leaves the 12
+// `on_empty` filters, including the heaviest-firing one, entirely unguarded by any test.
+//
+//   - match_output: guarded. Every rule names the diagnostics that veto the collapse.
+//   - on_empty: structural. It fires only when strip_lines_matching removed EVERYTHING, and
+//     every strip list is an explicit allow-list of known boilerplate with no catch-all — so
+//     an unrecognised diagnostic is not stripped, the output is not empty, and the collapse
+//     never fires. An `unless` guard would be redundant.
+//
+// The on_empty half is why this test exists. Adding `.*` to a strip list would silently void
+// the guarantee and NOTHING else would catch it: the filter's own inline tests would still
+// pass, because they exercise the boilerplate it was written for.
 func TestEveryMatchOutputRuleIsGuarded(t *testing.T) {
+	// Matches a pattern that can consume ANY line: `.*`, `.+`, and the anchored forms.
+	catchAll := regexp.MustCompile(`^\^?\.[*+]\$?$`)
+
+	guarded, structural := 0, 0
 	for name, def := range builtinDoc(t).Filters {
 		for i, rule := range def.MatchOutput {
 			if rule.Unless == "" {
 				t.Errorf("filter %q match_output[%d] (%q) has no unless guard", name, i, rule.Pattern)
 			}
+			guarded++
+		}
+		if def.OnEmpty == nil {
+			continue
+		}
+		structural++
+		for _, pat := range def.StripLinesMatching {
+			if catchAll.MatchString(pat) {
+				t.Errorf("filter %q strips with catch-all %q while on_empty collapses to %q: an "+
+					"unrecognised diagnostic would be stripped, leaving the output empty, and the "+
+					"collapse would then hide it. Strip lists must stay explicit allow-lists",
+					name, pat, *def.OnEmpty)
+			}
 		}
 	}
+	if structural == 0 {
+		t.Fatal("no on_empty filters found; the structural half of the invariant is untested")
+	}
+	t.Logf("collapse rules: %d guarded (match_output), %d structural (on_empty)", guarded, structural)
 }
 
 // Every filter must declare a family, else its savings land in "other" and the
