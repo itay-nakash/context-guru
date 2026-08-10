@@ -96,10 +96,10 @@ tool-schema overhead. That is *"baseline plus free headroom,"* not *"better comp
   replay result-cache, not from the model** — only 0.24% of tool outputs ever reached haiku.
 - **The cache-write tax.** cg's write/read ratio is 2.82% on TB vs baseline 1.86% (+52%), from
   mutating content inside the cached prefix (§2, §3A).
-- **`context_guru_expand` is referenced 1,496× and callable 0×.** The tool is never registered in
-  the streaming path, so **4.8M TB tokens (77% of cg's compaction volume) are deleted behind a
-  placeholder that promises retrieval that does not exist.** This is the most likely driver of any
-  agent re-work.
+- ~~**`context_guru_expand` is referenced 1,496× and callable 0×.**~~ **REFUTED — see §B2.** The
+  tool *is* registered, the SSE loop *is* armed, and a live agent restored 3,372 tokens through the
+  streaming path. The 4.8M was a cumulative re-count; unique is 234,119 tokens (21× smaller). The
+  genuine defect in this area was a latency tautology that buffered every SSE response.
 
 ---
 
@@ -195,12 +195,39 @@ loss (+8% SWE-small, +52% TB-small). A `min_conversation_tokens` / `min_turns` g
 offloader recovers most of the small-task regression at zero reward risk. Above the gate, escalate
 aggressiveness with size.
 
-**B2. Register `context_guru_expand` on the streaming path — or stop promising it. ★ likely the
-biggest reward lever.** Right now 4.8M TB tokens are deleted behind a tool the agent is told to call
-but that is never offered (0 calls across 87 trajectories). Either wire the SSE expand loop so the
-tool actually works (the machinery exists in `expand/`; the streaming short-circuit disables it), or
-change the marker to an honest, non-promising form. A promise the agent can't act on produces a wrong
-world-model → re-work → steps.
+**B2. ~~Register `context_guru_expand` on the streaming path~~ — REFUTED; the real bug was a
+latency tautology.** ([#26](https://github.com/rossoctl/context-guru/issues/26) /
+[PR #33](https://github.com/rossoctl/context-guru/pull/33))
+
+Both halves of the original claim were wrong:
+
+- **The tool IS registered and the SSE loop IS armed.** `expand.Inject` fires on real streaming
+  requests (24 → 25 tools, idempotent on the next turn), and `proxy.serve` buffers + aggregates SSE
+  whenever markers are present. There is no streaming short-circuit.
+- **A real agent DID invoke restoration through the streaming path.** Live SWE run: `bounces=1`,
+  **3,372 tokens restored**. `RecordExpand` has exactly one reachable call site (`proxy.go:488`),
+  inside the continuation loop, only after `expand.ResponseCalls` finds a model-issued expand call
+  *and* `expand.Resolve` succeeds. All traffic was SSE.
+- **The 4.8M figure was cumulative**, re-counting each compaction on every turn history is re-sent.
+  Unique: **234,119 tokens behind 103 distinct markers** (TB) and **15,457 behind 29** (SWE) —
+  **21× and 8× smaller**. Restoration demand is genuinely low (~1 recoverable compaction per 3
+  sessions), not blocked.
+
+**The actual bug, and it is a real one.** `hasMarkers` tested the raw body for `\u003ccg:`, and the
+*injected tool description itself* contains that sequence (`toolDesc` mentions `<<cg:HASH>>`; Go's
+`encoding/json` HTML-escapes `<`). So from the moment `Inject` ran, the check was a **tautology** and
+**every SSE response was fully buffered** — defeating the documented zero-added-latency fast path.
+
+Fixed by scoping the check to `messages` + `system` (`expand.HasMarkersInMessages`). Measured:
+marker-free TTFB **1007 ms → 43 ms (23×)**, marker-bearing correctly unchanged. On live traffic
+buffering fell from an implied **100% → 27.3%**, and the transitions confirm the intended semantics —
+17 requests streamed before the first offload, buffering began exactly as `saved` went non-zero, and
+a fresh session resumed the fast path.
+
+**Lesson for this document:** a "component never fires" finding must be checked against the raw wire
+bytes before it becomes a plan item. Two of this plan's entries (B2 here, C1 in §C) were premise
+errors of exactly this kind, both caused by trusting a derived artifact — the change-log dumps — over
+the request captures.
 
 **B3. Make `extract_llm` cost-aware and get it off the hot path.**
 (a) **Prompt-cache its 852-token fixed preamble** (`cheapmodel/anthropic.go:45` — put the invariant
@@ -337,7 +364,7 @@ ratio (which overcounts 22–42×).
   22–42×; unusable for tuning).
 - **F2. Kill dead components:** `cacheinject` (0 acts, inert), `failed_run` (0 acts, burns 28.8 s
   scanning) — hoist the `CacheAware` check so the regexes never run.
-- **F3. Tune per regime:** SWE = cache-read regime (optimise steps + cross-turn dedup); TB = output
+- **F3. Tune per regime:** SWE = cache-read regime (optimise steps; note cross-turn dedup is refuted, §C); TB = output
   regime (optimise trajectory length). Same knobs, different settings, selected by measured context
   size.
 
@@ -368,4 +395,4 @@ cache-write. context-guru is the only one positioned to hold **all** of the good
 tail-only (−44%) compose to **−57%** in simulation, before adding tool-schema compaction, the
 recurrence-aware floor, and the step-reduction levers — i.e. a path to **substantially beyond headroom's
 −16%**, while being strictly cache-safe and reward-neutral-to-positive. The prerequisites are the
-three cache bugs (A2/A3) and the expand-tool fix (B2); everything else compounds on top.
+three cache bugs (A2/A3) and the SSE buffering fix (B2, shipped); everything else compounds on top.
