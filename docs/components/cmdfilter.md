@@ -36,7 +36,7 @@ check would reject those rewrites anyway; the floor skips the work and the stash
 
 ## The shipped filter set
 
-23 filters. Compression is measured on each filter's own fixtures (its inline tests), summed:
+24 filters. Compression is measured on each filter's own fixtures (its inline tests), summed:
 
 | filter | family | preserves | drops | saved |
 |---|---|---|---|--:|
@@ -45,7 +45,7 @@ check would reject those rewrites anyway; the floor skips the work and the stash
 | `make` | builds | compiler lines, errors | `Entering/Leaving directory`, `Nothing to be done` | 56% |
 | `gradle` | builds | executed tasks, test results, BUILD result | `UP-TO-DATE`/`NO-SOURCE`/`FROM-CACHE` tasks, daemon + download chatter | 49% |
 | `xcodebuild` | builds | errors, warnings, test results, BUILD result | 31 build-phase and tool-invocation patterns | 62% |
-| `gcc` | builds | **every** error and warning, with its source context | include-chain traces, `N warnings generated` counters | 27% |
+| `gcc` | builds | **every** error and warning, with its source context | include-chain traces, `N warnings generated` counters | 21% |
 | `swift-build` | builds | diagnostics; collapses a clean build to `ok` | `Compiling`/`Linking` lines | 29% |
 | `dotnet-build` | builds | diagnostics; collapses a clean build to `ok` | MSBuild banner, restore chatter | 54% |
 | `turbo` | builds | task output, errors | cache hit/miss/bypass, scope + duration lines | 66% |
@@ -61,11 +61,37 @@ check would reject those rewrites anyway; the floor skips the work and the stash
 | `poetry-install` | pkg | lock writes, solver errors; collapses an up-to-date lock | download/install lines, virtualenv chatter | 70% |
 | `composer-install` | pkg | lock writes, warnings; collapses a no-op install | download/install lines | 75% |
 | `uv-sync` | pkg | the installed-package list; collapses an audited-only sync | download/cache lines | 51% |
+| `apt` | pkg | `E:`/`W:`/`N:` lines, dpkg errors, prompts | `Setting up`/`Unpacking`/`Get:`/trigger boilerplate | 76% |
 | `brew-install` | pkg | the install summary; collapses an already-installed formula | download/pour/progress lines | 59% |
 | `quarto-render` | builds | errors, warnings; collapses a successful render | per-file processing and pandoc lines | 54% |
 
 `terraform-plan` and `make` additionally assert a **≥60% floor** on a realistic large fixture
 (`TestCompressionFloors`), matching the floors rtk asserts for its equivalents.
+
+### Two filters came from measurement, not from rtk
+
+`apt` and `gcc`'s widened selector are not ports — they came from replaying the shipped
+selectors over a recorded Terminal-Bench tool-output dump and counting what matched nothing. Two
+shapes dominated the misses:
+
+- **apt/dpkg install boilerplate** — 584 outputs, ~1.0 MB, the single largest reachable family on
+  that benchmark. rtk has no apt filter at all. 76% compression, and pure boilerplate collapses to
+  one line.
+- **`<file>: In function 'main':`** — gcc's diagnostic *header* line, 108 outputs. rtk's `gcc` filter
+  matches the command, so its patterns never had to name this shape; ported as-is, the filter would
+  miss the most common way gcc output starts.
+
+Meanwhile the IaC and mobile-build filters (`pulumi`, `terraform-plan`, `xcodebuild`, `gradle`) fired
+**zero** times on that dump. They are kept — they are correct, tested and cost nothing when inert —
+but the honest reading is that a filter set's value is decided by the workload, not by its size. The
+`cmdfilter_selector_misses` ledger exists so that stays measurable rather than assumed.
+
+### A cautionary note on strip rules
+
+The `apt` filter originally stripped `^debconf: `, which also swallowed
+`debconf: unable to initialize frontend` — a real diagnostic. `TestAptKeepsProblems` catches that
+class of mistake by asserting a list of must-survive lines against a wall of boilerplate. Any new
+strip rule on a high-volume filter should be run past a list like it.
 
 ### Every success-collapse carries an `unless` guard
 
@@ -88,7 +114,8 @@ Filters select a budget by **signal density** (`cap: errors`) rather than each h
 
 ## What is deliberately NOT ported
 
-rtk ships 63 DSL filters and ~50 native Rust ones. 23 filters are ported. The rest is excluded on
+rtk ships 63 DSL filters and ~50 native Rust ones. 22 are ported (plus 2 written from measurement).
+The rest is excluded on
 purpose:
 
 - **The ~24 `truncate_lines_at`-only filters** (`df`, `ps`, `du`, `jq`, `jira`, `markdownlint`,
