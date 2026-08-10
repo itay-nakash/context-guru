@@ -176,6 +176,17 @@ func (h *Handler) enqueueObserve(r *httpReqInfo) {
 			Provider: info.provider, Body: info.body, Session: info.session,
 			Models: info.models, Window: info.window, CacheMode: h.opts.CacheMode,
 			Mode: components.ModeObserve,
+			// The Tracker, so the projection is measured under the SAME cached-prefix
+			// boundary an enforcing mode would use. Without it the boundary is unknown,
+			// MaxCachedIdx is -1, the tail gate never fires, and every message in the
+			// transcript looks compactable — which inflates the projection against what
+			// sync actually achieves. Measured on SWE-bench: 9.5% projected against 0.8%
+			// enforced, because 50 candidates passed the gate instead of 5.
+			//
+			// Safe off-path despite jobs finishing out of order: prevLen only ever grows,
+			// so a late job for a shorter turn cannot move the boundary backwards. And
+			// observe never commits, so the generation stays put and nothing reads it.
+			Tracker: h.tracker,
 		})
 		// The pipeline already emitted mode-stamped reports through the emitter; the
 		// Aggregator routes anything stamped observe into the potential_* namespace. No
