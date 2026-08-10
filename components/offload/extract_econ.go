@@ -86,20 +86,71 @@ func savedTokenValue(c *components.Ctx) tokenValue {
 	return tokenValue{perToken: agentFreshPerMTok / 1_000_000, cached: false}
 }
 
-// priorCallCost is the fallback per-call cost estimate used before this process has
-// observed any extraction call. ~$0.012 was the Terminal-Bench measurement; it is a PRIOR
-// to be replaced by observation, never a constant to compute against — which is why
-// callCost prefers cheapmodel.AvgCallCost as soon as one call has been made.
+// priorCallCost is a last-resort per-call cost estimate (~the Terminal-Bench average).
+// It is only used when neither an observation nor a size is available; see callCost for
+// why a flat prior must never be the primary estimate.
 const priorCallCost = 0.012
 
-// callCost returns the expected dollar cost of one extraction call. Observed-mean first
-// (it reflects this deployment's real prompt sizes, model pricing, and whether the
-// preamble cache is working), prior second.
-func callCost(pricing cheapmodel.Pricing) float64 {
-	if avg, ok := cheapmodel.AvgCallCost(pricing); ok && avg > 0 {
-		return avg
+// Prompt-size constants for the analytic cost estimate, in tokens.
+const (
+	// preambleTokens is the invariant contract + examples sent on every call (measured
+	// 1463 for the code strategy). It is billed as fresh input whenever the provider's
+	// minimum cacheable prefix is above it — which is the case on claude-haiku-4-5.
+	preambleTokens = 1463
+	// promptOverheadTokens covers the goal + keep-list + labels in the variable part.
+	promptOverheadTokens = 200
+	// expectedOutputTokens is a Starlark filter program's typical length (observed ~77
+	// on Terminal-Bench captures; kept a little higher so cost is not under-estimated).
+	expectedOutputTokens = 200
+	// maxShownTokens bounds the content shown to the model (maxCodeContentChars ≈ 32k
+	// chars ≈ 5k tokens), so a huge output does not inflate the estimated prompt without
+	// limit — the real prompt is truncated to head+tail.
+	maxShownTokens = 5000
+)
+
+// callCost returns the expected dollar cost of ONE extraction call for a candidate of
+// sizeTokens.
+//
+// A flat per-call constant is the wrong model and caused a real cold-start deadlock in
+// development: the gate priced every call at the ~$0.012 Terminal-Bench average, which is
+// ~5x the true cost on a workload with small outputs, so it suppressed everything — and
+// because it suppressed everything, no call was ever observed and the estimate never
+// corrected itself. Measured on a real capture: observed cost was $0.0024/call against
+// the $0.012 prior, and the gate wrongly declined calls that were in fact ~2.2x profitable.
+//
+// So the estimate is analytic and size-aware first (prompt = preamble + shown content +
+// overhead, priced at real rates), blended with the observed mean once real calls exist.
+// The observed mean alone is not enough either: it is an average over past candidate
+// sizes, and cost genuinely scales with THIS candidate's size.
+func callCost(pricing cheapmodel.Pricing, sizeTokens int) float64 {
+	shown := sizeTokens
+	if shown > maxShownTokens {
+		shown = maxShownTokens
 	}
-	return priorCallCost
+	inTok := int64(preambleTokens + shown + promptOverheadTokens)
+	analytic := pricing.Cost(inTok, expectedOutputTokens, 0, 0)
+
+	// Reconcile with reality: if observed calls came in cheaper or dearer than the
+	// analytic model predicts (a working preamble cache, a different tokenizer, a
+	// gateway contract), scale by that ratio rather than discarding size-sensitivity.
+	if avg, ok := cheapmodel.AvgCallCost(pricing); ok && avg > 0 {
+		if base := analyticBaseline(pricing); base > 0 {
+			if ratio := avg / base; ratio > 0.1 && ratio < 10 {
+				return analytic * ratio
+			}
+		}
+		return (analytic + avg) / 2 // ratio implausible: hedge between the two
+	}
+	if analytic <= 0 {
+		return priorCallCost
+	}
+	return analytic
+}
+
+// analyticBaseline is the analytic cost of a mid-sized candidate, used as the denominator
+// when scaling the analytic estimate to observed reality.
+func analyticBaseline(pricing cheapmodel.Pricing) float64 {
+	return pricing.Cost(preambleTokens+2000+promptOverheadTokens, expectedOutputTokens, 0, 0)
 }
 
 // gateDecision records why the gate allowed or suppressed a call. The reason string is
@@ -142,7 +193,7 @@ func expectedReuses(seenBefore bool, turnsSoFar int) float64 {
 //
 // Allow only when saving strictly exceeds cost. Every suppression carries a reason.
 func evaluateGate(sizeTokens int, ratio float64, val tokenValue, cost float64,
-	seenBefore bool, turnsSoFar int) gateDecision {
+	seenBefore bool, turnsSoFar int, explore bool) gateDecision {
 
 	expectedRemoved := float64(sizeTokens) * ratio
 	reuses := expectedReuses(seenBefore, turnsSoFar)
@@ -150,6 +201,13 @@ func evaluateGate(sizeTokens int, ratio float64, val tokenValue, cost float64,
 	saving := expectedRemoved * (1 + reuses) * val.perToken
 
 	d := gateDecision{expSaving: saving, expCost: cost}
+	if saving <= cost && explore {
+		// No trustworthy ratio yet — spend a bounded call to find out rather than
+		// letting a pessimistic prior justify itself forever.
+		d.allow = true
+		d.reason = "allow: exploring (learning this workload's compression ratio)"
+		return d
+	}
 	if saving <= cost {
 		// The honest message: on a caching backend a small output CANNOT pay for a call.
 		if val.cached {
@@ -172,9 +230,18 @@ func evaluateGate(sizeTokens int, ratio float64, val tokenValue, cost float64,
 }
 
 // defaultCompressionRatio is the fraction of an output an accepted extraction removes,
-// used before this component has observed its own results. Deliberately CONSERVATIVE:
-// over-estimating the ratio is how the component talked itself into 271 losing calls.
-const defaultCompressionRatio = 0.45
+// used before this component has observed its own results.
+//
+// MEASURED, and much lower than intuition suggests. On real captures an accepted
+// extraction removed only 31-254 tokens per call on outputs of 400-2000 tokens — an actual
+// ratio around 0.10, not the 0.45 originally assumed here. The model mostly declines to cut
+// aggressively (correctly: its contract is recall-first), so most of a "reduction" is small.
+//
+// Note the DIRECTION of conservatism: for a spending gate, conservative means
+// UNDER-estimating the saving, i.e. a LOW ratio. An optimistic ratio is precisely how the
+// component talked itself into 271 losing calls, so this errs low and lets the observed
+// tracker raise it if a workload really does compress well.
+const defaultCompressionRatio = 0.12
 
 // ratioTracker learns this workload's ACTUAL compression ratio from accepted results, so
 // the gate stops guessing after the first few calls. A call that produced nothing counts
@@ -182,9 +249,10 @@ const defaultCompressionRatio = 0.45
 // the estimate down and shut the gate, which is precisely the feedback the old
 // fixed-threshold design lacked.
 type ratioTracker struct {
-	mu      sync.Mutex
-	removed int64
-	total   int64
+	mu       sync.Mutex
+	removed  int64
+	total    int64
+	explored int // calls spent learning the ratio (bounded by maxExploreCalls)
 }
 
 // observe records one attempted extraction: removedTok of totalTok (0 removed on a miss).
@@ -209,9 +277,39 @@ func (r *ratioTracker) ratio() float64 {
 	return float64(r.removed) / float64(r.total)
 }
 
+// exploring reports whether the tracker still lacks the evidence to estimate a ratio, and
+// consumes one exploration slot if so.
+//
+// This closes the SECOND deadlock of the same shape as the flat-cost one (see callCost).
+// The ratio starts at a deliberately pessimistic 0.12; on a workload whose outputs sit
+// below the resulting break-even, the gate suppresses every call — so the tracker never
+// observes anything and the pessimistic default becomes permanent and self-justifying.
+// Measured on a real capture: the gate forwent a genuine +$0.0094 net because of exactly
+// this. A gate that can never revise its own prior is not a gate, it is an off switch.
+//
+// So allow a small, BOUNDED number of calls through before the estimate is trustworthy.
+// The exploration budget is tiny relative to a session (each call is ~$0.003-0.008), and it
+// buys the one thing the gate cannot compute from first principles: whether THIS workload's
+// outputs actually compress.
+func (r *ratioTracker) exploring() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.total >= minRatioSampleTokens || r.explored >= maxExploreCalls {
+		return false
+	}
+	r.explored++
+	return true
+}
+
+// maxExploreCalls bounds the exploration budget. Small on purpose: enough to learn the
+// ratio (a handful of outputs clears minRatioSampleTokens), far too few to reproduce the
+// 271-call loss even if every one of them is wasted.
+const maxExploreCalls = 3
+
 // minRatioSampleTokens is how much observed content the ratio estimate needs before it
-// displaces the default — roughly a couple of medium outputs.
-const minRatioSampleTokens = 4000
+// displaces the default. Kept small so a workload that genuinely compresses well is
+// recognized within a few calls rather than after a whole session.
+const minRatioSampleTokens = 1500
 
 // --- Triggering (issue #28 part E) -----------------------------------------------
 //
