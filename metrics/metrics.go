@@ -246,11 +246,17 @@ type Snapshot struct {
 	// SSE streaming health (#26). SSEBuffered counts streams context-guru had to read
 	// in full before the client saw a byte (to look for an expand tool call); those
 	// requests lose streaming entirely, so their TTFB is reported separately. A high
-	// buffered share on traffic that never expands is the regression to watch.
-	SSEStreamed     int64   `json:"sse_streamed"`
-	SSEBuffered     int64   `json:"sse_buffered"`
-	SSETTFBMsAvg    float64 `json:"sse_ttfb_ms_avg"`          // streamed-through responses
-	SSETTFBMsAvgBuf float64 `json:"sse_ttfb_ms_avg_buffered"` // buffered-for-inspection responses
+	// buffered share on traffic that never expands is the regression to watch. All four
+	// count once per CLIENT REQUEST, not per upstream round: a request that drove
+	// several expand rounds waited for all of them.
+	SSEStreamed  int64   `json:"sse_streamed"`
+	SSEBuffered  int64   `json:"sse_buffered"`
+	SSETTFBMsAvg float64 `json:"sse_ttfb_ms_avg"` // streamed-through requests: a real TTFB
+	// SSETTFBMsAvgBuf is time-to-LAST-byte by construction, not a comparable TTFB: a
+	// buffered response is read in full before the client is written to, so its first
+	// byte cannot precede the buffer completing. Read it as "what buffering cost these
+	// requests", not as a latency to compare against sse_ttfb_ms_avg.
+	SSETTFBMsAvgBuf float64 `json:"sse_ttfb_ms_avg_buffered"`
 	SSEBufferedPct  float64 `json:"sse_buffered_pct"`
 }
 

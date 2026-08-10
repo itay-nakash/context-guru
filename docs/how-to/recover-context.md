@@ -65,15 +65,26 @@ time-to-last-byte), which is why the marker test is narrow. It scans **only** `m
 `context_guru_expand` tool description we inject ourselves ("…replaced by a `<<cg:HASH>>` marker"),
 so it was always true and **every** stream was silently buffered (issue #26).
 
-`/stats` reports this directly: `sse_streamed`, `sse_buffered`, `sse_buffered_pct`,
-`sse_ttfb_ms_avg` and `sse_ttfb_ms_avg_buffered`. On traffic that never offloads, `sse_buffered`
-should be 0.
+`/stats` reports this directly, counted **once per client request** (not per upstream round, so a
+request that drove several expand rounds is one sample): `sse_streamed`, `sse_buffered`,
+`sse_buffered_pct`, `sse_ttfb_ms_avg` and `sse_ttfb_ms_avg_buffered`. On traffic that never offloads,
+`sse_buffered` stays 0; it starts counting from the first turn that carries a marker. Note that
+`sse_ttfb_ms_avg_buffered` is time-to-*last*-byte by construction — a buffered response is read in
+full before the client is written to — so it is not comparable to `sse_ttfb_ms_avg`.
 
-!!! note "Markers arrive HTML-escaped"
-    A marker the model reads as `<<cg:HASH>>` travels on the wire as `<<cg:HASH>>`:
-    Go's `encoding/json` always escapes `<`, and `sjson` escapes it whenever the value contains a
-    newline — and markers are appended after a newline. Any check matching markers against raw
-    request bytes must accept both spellings; `expand.rawMarkerRe` does, deliberately.
+!!! note "Markers usually arrive HTML-escaped"
+    A marker the model reads as `<<cg:HASH>>` normally travels on the wire as
+    `<<cg:HASH>>`: Go's `encoding/json` escapes `<` by default (callers can opt out
+    with `Encoder.SetEscapeHTML(false)`, and some non-Go clients never escape it), and `sjson`
+    escapes it whenever the value contains a newline — which is how every marker is appended. Any
+    check matching markers against raw request bytes must accept both spellings, case-insensitively
+    (`<` is as valid as `<`); `expand.rawMarkerRe` does, deliberately. A miss there is a
+    false negative — a real expand call streamed past uninspected — which is worse than
+    over-buffering.
+
+    Because that matcher accepts the plain form too, a document or message quoting a literal
+    `<<cg:HASH>>` example (like this page) counts as marker-bearing. That is the intended bias:
+    over-inspect rather than miss a real call.
 
 !!! warning "Streaming restoration is Anthropic-only"
     `expand.AggregateSSE` reconstructs the Anthropic Messages event stream only. A marker-bearing

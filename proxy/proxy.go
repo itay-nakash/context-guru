@@ -425,6 +425,20 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 	// silently buffered EVERY stream. Both the plain and HTML-escaped marker spellings
 	// count — see expand.HasMarkersInMessages.
 	hasMarkers := expand.HasMarkersInMessages(body)
+	// SSE accounting is PER CLIENT REQUEST, not per upstream round: one client request
+	// that drives several expand rounds waited for all of them, so timing a single
+	// round would report a healthy TTFB for a client that waited three round-trips.
+	// Recorded in a defer so every terminal return path is covered exactly once —
+	// stream-through, aggregate-failure replay, normal-answer replay, nothing-resolved
+	// replay, and the round-cap exit.
+	reqStart := time.Now()
+	sse, sseBuffered := false, false
+	var sseFirstByte time.Time // zero on buffered paths: the client's first byte is the write itself
+	defer func() {
+		if sse && h.agg != nil {
+			h.agg.RecordSSE(msSince(reqStart, sseFirstByte), sseBuffered)
+		}
+	}()
 	for round := 0; ; round++ {
 		upStart := time.Now()
 		resp, err := h.doUpstream(r, up, body)
@@ -441,18 +455,20 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 		// buffered+inspected when markers are present (else stream through, no added latency).
 		checkExpand := injectOn && round < maxExpandRounds && (!isSSE || hasMarkers)
 		if !checkExpand {
-			first := h.stream(w, resp)
-			if isSSE && h.agg != nil {
-				h.agg.RecordSSE(msSince(upStart, first), false)
+			// sseBuffered is sticky: if an earlier round was buffered the client already
+			// lost its stream, so this request counts as buffered however it ends.
+			sse = sse || isSSE
+			if first := h.stream(w, resp); !sseBuffered {
+				sseFirstByte = first
 			}
 			return
 		}
 		respBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		if isSSE && h.agg != nil {
-			// Buffered: the client sees nothing until the whole stream has arrived, so
-			// its first byte lands no earlier than now.
-			h.agg.RecordSSE(float64(time.Since(upStart).Microseconds())/1000.0, true)
+		if isSSE {
+			// Buffered: the client sees nothing until the whole stream has arrived, so its
+			// first byte lands no earlier than the write on whichever path we return from.
+			sse, sseBuffered, sseFirstByte = true, true, time.Time{}
 		}
 
 		// Reconstruct the message the loop reasons over. For SSE, aggregate the events;

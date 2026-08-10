@@ -1,6 +1,7 @@
 package expand
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -36,13 +37,31 @@ func TestParseMarkersDistinctInOrder(t *testing.T) {
 	}
 }
 
-// escLT / escGT are the JSON \uXXXX escapes Go's encoders emit for "<" and ">".
-// Built from the code points rather than written literally so the test fixtures
-// cannot drift from what encoding/json and sjson actually produce.
-var (
-	escLT = `\u` + "003c"
-	escGT = `\u` + "003e"
-)
+// escLT / escGT are the JSON \uXXXX escapes Go's encoders emit for "<" and ">",
+// obtained by ASKING encoding/json rather than hand-writing them, so a fixture can
+// never claim an escape form the encoder does not actually produce.
+var escLT, escGT = jsonEscape('<'), jsonEscape('>')
+
+// jsonEscape marshals a single rune with HTML escaping on and returns the escape
+// sequence encoding/json chose for it (e.g. "<" for '<').
+func jsonEscape(r rune) string {
+	b, err := json.Marshal(string(r))
+	if err != nil {
+		panic(err)
+	}
+	s := strings.Trim(string(b), `"`)
+	if !strings.HasPrefix(s, `\u`) {
+		panic("encoding/json no longer escapes " + string(r) + " (got " + s + "); " +
+			"the raw-body marker matcher's escaped-form handling needs revisiting")
+	}
+	return s
+}
+
+// upperHex uppercases the hex digits of a \uXXXX escape but not the "u" ("<"
+// -> "<"), matching what a non-Go JSON encoder may legitimately emit.
+func upperHex(esc string) string {
+	return `\u` + strings.ToUpper(strings.TrimPrefix(esc, `\u`))
+}
 
 // TestHasMarkersInMessagesIgnoresOwnInjectedTool is the regression guard for the
 // tautology of issue #26: the injected expand tool's own description quotes the
@@ -78,6 +97,11 @@ func TestHasMarkersInMessagesEscapedForm(t *testing.T) {
 		"summary sentinel":        `{"messages":[{"role":"user","content":"` + SummaryMarker + ` compacted"}]}`,
 		"in the system prompt":    `{"system":"context: ` + escMarker + `","messages":[]}`,
 		"escaped in tool_result":  `{"messages":[{"role":"user","content":[{"type":"tool_result","content":"out\n` + escMarker + `"}]}]}`,
+		// < is as valid an escape as <. Missing it would be a false negative:
+		// a real expand call streamed past uninspected.
+		"uppercase hex escape": `{"messages":[{"role":"user","content":"see ` +
+			upperHex(escLT) + upperHex(escLT) + `cg:ABC` +
+			upperHex(escGT) + upperHex(escGT) + `"}]}`,
 	}
 	for name, body := range cases {
 		if !HasMarkersInMessages([]byte(body)) {

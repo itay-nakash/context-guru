@@ -673,6 +673,63 @@ func TestExpandSSEMultiRoundCapped(t *testing.T) {
 	if !strings.Contains(string(out), "message_stop") {
 		t.Fatalf("client must still receive a complete stream after the cap: %s", out)
 	}
+
+	// SSE stats are per CLIENT REQUEST, not per upstream round. This one request drove
+	// 4 upstream calls; recording per round would report streamed=1/buffered=3 and —
+	// worse — count the terminal round as a healthy "streamed" TTFB timed from that
+	// round alone, hiding the 3 round-trips the client actually waited for.
+	var snap metrics.Snapshot
+	stx, _ := http.Get(srv.URL + "/stats")
+	json.NewDecoder(stx.Body).Decode(&snap)
+	stx.Body.Close()
+	if snap.SSEBuffered != 1 || snap.SSEStreamed != 0 {
+		t.Fatalf("one client request must yield exactly one buffered sample, got %+v", snap)
+	}
+	if snap.SSEBufferedPct != 100 {
+		t.Fatalf("buffered_pct must be a share of requests (want 100), got %v", snap.SSEBufferedPct)
+	}
+}
+
+// TestExpandSSEAggregateFailureReplaysRaw covers the fail-open path INSIDE
+// aggregateAnthropicSSE (expand/sse.go:132): a truncated input_json_delta leaves the
+// tool_use input unparseable, so AggregateSSE returns ok=false even though the
+// provider IS anthropic — a different branch from the provider gate at sse.go:21.
+// The client must still receive the original bytes unchanged.
+func TestExpandSSEAggregateFailureReplaysRaw(t *testing.T) {
+	var calls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "text/event-stream")
+		// partial_json is TRUNCATED — it cannot reconstruct to valid JSON.
+		w.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"role\":\"assistant\"}}\n\n" +
+			"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"context_guru_expand\"}}\n\n" +
+			"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"id\\\":\\\"HA\"}}\n\n" +
+			"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	h, st := buildHandler(t, "pipeline: []\n", upstream.URL)
+	st.Put("HASH", []byte("THE ORIGINAL CONTENT"))
+	srv := httptest.NewServer(h.Mux())
+	defer srv.Close()
+
+	body := anthropicSSEBody(t, "look at <<cg:HASH>>")
+	resp, err := http.Post(srv.URL+"/anthropic/v1/messages", "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if calls != 1 {
+		t.Fatalf("an unreconstructable stream must not drive a continuation: %d calls", calls)
+	}
+	if !strings.Contains(string(out), `\"id\":\"HA`) || !strings.Contains(string(out), "message_stop") {
+		t.Fatalf("client must get the raw stream back verbatim (fail-open): %s", out)
+	}
+	if strings.Contains(string(out), "THE ORIGINAL CONTENT") {
+		t.Fatalf("nothing may be spliced into a stream we could not parse: %s", out)
+	}
 }
 
 // TestExpandOpenAISSEFallsBackToRaw documents (and pins) the OpenAI streaming

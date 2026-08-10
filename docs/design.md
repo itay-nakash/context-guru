@@ -173,9 +173,10 @@ scanning the whole body also matched the expand tool description the host inject
 it unconditionally true (issue #26). `/stats` exposes `sse_streamed` / `sse_buffered` /
 `sse_buffered_pct` and the two TTFB averages so the fast path is measured, not assumed.
 
-**Markers on the wire are HTML-escaped.** `encoding/json` always escapes `<`; `sjson` escapes it
-whenever the value contains a newline, and markers are appended after a newline. So `<<cg:H>>` in the
-model's view is `<<cg:H>>` in the bytes. Marker matching on *decoded* content
+**Markers on the wire are usually HTML-escaped.** `encoding/json` escapes `<` by default — a caller
+can opt out with `Encoder.SetEscapeHTML(false)`, and some non-Go clients never escape it — and `sjson`
+escapes it whenever the value contains a newline, which is how every marker is appended. So `<<cg:H>>`
+in the model's view is normally `<<cg:H>>` in the bytes. Marker matching on *decoded* content
 (`expand.HasPlaceholder`, used by the components) sees the plain form; matching on *raw request
 bytes* (`expand.rawMarkerRe`, used by the host's streaming decision) must accept both, and does.
 
