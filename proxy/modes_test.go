@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -394,5 +395,62 @@ func settleGoroutines() {
 	for i := 0; i < 20; i++ {
 		runtime.Gosched()
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestAsyncSavingsArriveOnALaterTurn is the end-to-end claim of async mode: turn 1
+// forwards without the expensive compaction, the job lands off-path, and a LATER turn
+// gets the saving by replaying the frozen decision. Without this the mode is only
+// "cheaper because it does less".
+func TestAsyncSavingsArriveOnALaterTurn(t *testing.T) {
+	up, got := captureUpstream(t)
+	// mask is a frozen-decision offloader (age-based), deterministic, so no model is
+	// needed to prove the deferred-then-replayed path.
+	h, agg := modeHandler(t, "pipeline: [mask]\ncomponents:\n  mask:\n    keep_last: 1\n", up.URL, components.ModeAsync)
+	srv := httptest.NewServer(h.Mux())
+	defer srv.Close()
+
+	dump := strings.Repeat("a long tool output line that is worth offloading\n", 80)
+	turn := func(n int) {
+		msgs := []map[string]any{{"role": "user", "content": "go"}}
+		for i := 0; i < n; i++ {
+			msgs = append(msgs,
+				map[string]any{"role": "assistant", "content": "step " + strconv.Itoa(i)},
+				map[string]any{"role": "tool", "tool_call_id": "t" + strconv.Itoa(i), "content": dump + strconv.Itoa(i)})
+		}
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/openai/v1/chat/completions",
+			bytes.NewReader(openAIBody(msgs...)))
+		req.Header.Set("x-context-guru-session", "later-turn")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+
+	for n := 2; n <= 6; n++ {
+		turn(n)
+		// Let the off-path job for this turn land before the next one.
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if agg.Snapshot().DeferredRuns > 0 {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
+	snap := agg.Snapshot()
+	t.Logf("async: deferred_runs=%d realized=%d saved=%d queue=%+v",
+		snap.DeferredRuns, snap.RealizedSavedTokens, snap.SavedTokens, snap.AsyncQueue)
+	if snap.DeferredRuns == 0 {
+		t.Fatal("no off-path compaction ever committed")
+	}
+	if snap.RealizedSavedTokens == 0 {
+		t.Fatal("a deferred compaction committed but no later turn ever realized it")
+	}
+	if len(got()) != 5 {
+		t.Fatalf("forwarded %d of 5 turns", len(got()))
 	}
 }
