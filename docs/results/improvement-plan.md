@@ -363,8 +363,9 @@ ratio (which overcounts 22–42×).
     **An aggregate moving in the predicted direction is not evidence that the predicted mechanism
     operated.** Verify the mechanism fired *before* believing the outcome.
 
-    Four premises in this plan were wrong, and every one failed the same way — a derived artifact
-    was trusted over the raw request stream:
+    **Eight** premises in this effort were wrong, and nearly all failed the same way — a derived
+    artifact was trusted over the raw request stream, or an outcome was credited to a mechanism
+    nobody checked had run:
 
     | premise | what was believed | what was true |
     |---|---|---|
@@ -372,9 +373,16 @@ ratio (which overcounts 22–42×).
     | §B2 expand tool | "never registered on the streaming path", 4.8M tokens stranded | tool IS registered, loop IS armed, a live agent restored 3,372 tokens. 4.8M was a **cumulative re-count**; unique is 234k (21× smaller). Real bug was a latency tautology |
     | `prefixpin` | early messages mutate in place, worth ~31% of input cost | **0 mutations in ~6,500 comparisons** on claude-code. The 52% churn first measured was concurrent sessions sharing a first message, diffed against each other |
     | §31 async cache-write | −45%/−39% cache-write proved the tail-protection worked | the protection **only stripped context-guru's own breakpoints**, never the agent's — so it did nothing on the primary workload. Lower cache-write came from writing *fewer breakpoints*, not from protecting the tail |
+    | §A5 `cacheinject` "provably inert" | placement has no headroom; the component does nothing | it applied **46 breakpoints and forwarded 0** — the writeback layer discarded every one. Inert for a reason nobody had checked. Two benchmark studies concluded things about placement while measuring a suppressed component |
+    | §A5 follow-on: placement is *harmful* | +61.9% cache-write/step once the marks reached the wire | **0 of 106 marks land above** the agent's own breakpoint, so the proposed mechanism (shortening the readable prefix) is ruled out. `acted=0` in that arm is a *tautology* of the arm's design, not proof the delta was placement |
+    | `cachesplit` on Terminal-Bench | the volatile-tail split carries a −34.1% win | TB runs the Agent **SDK**, which never appends the git/env snapshot the CLI does. All 73 captured TB requests: 3 system blocks, **zero** volatile-tail markers. **Zero legal opportunity** — the same shape as `xdedup` |
+    | the split on Bedrock Converse | `Changed: true`, `cachesplit` active in `/stats` | `cachePoint` is its own array entry *after* the block, so the split inserts the volatile half **before** it and the breakpoint still covers the churn. It reports success and achieves nothing |
 
-    Three of the four produced a number that pointed the *right* way for the *wrong* reason, which is
-    why they survived review. The countermeasures, in order of value:
+    Most of these produced a number that pointed the *right* way for the *wrong* reason, which is
+    why they survived review. Two were mine as orchestrator, both from accepting a number without
+    checking the mechanism — and one of those was an *unfavourable* number, which is the tell that
+    the bias is not optimism but incuriosity. **Skepticism applied only to good news is not
+    skepticism.** The countermeasures, in order of value:
 
     1. **Group request lineages by append-only prefix match**, never by a hash of `messages[0]` — a
        benchmark harness runs concurrent sessions whose first message is byte-identical.
@@ -386,16 +394,41 @@ ratio (which overcounts 22–42×).
        such trials inverted the sign of the entire TB cost conclusion (§1a).
     5. **Read the raw wire bytes.** The change-log dumps only record messages a component *already
        acted on*, so they structurally cannot answer "was this ever sent?"
+    6. **A component reporting that it acted is not evidence it acted usefully.** `Changed: true` and
+       a non-zero `acted` counter both survive a mechanism that achieves nothing — see the Converse
+       split. Assert the *effect* (did the breakpoint stop covering the churn?), not the activity.
+    7. **Check that a favourable metric had the opportunity to be caused by your change.** Three
+       arms credited components that could not fire on that workload at all. Before attributing, ask
+       what counter would be non-zero if the mechanism ran, and confirm it is.
+    8. **Verify the verifier.** Two "defects" in this effort were bugs in the checking script (a
+       regex scraping the wrong table column; a stale binary one commit behind). A check that
+       over-matches manufactures exactly the findings that waste a review cycle.
+    9. **A sum over heterogeneous tasks can be one task.** An interim TB delta read −40.2%; a single
+       trial carried half of it, and dropping that one task gave −19.2%. Report the **median
+       per-task ratio** and a **leave-one-out** on the top contributors beside any aggregate.
 
 - **F0. Re-run the 6 degenerate TB baselines** and regenerate the comparison/baseline docs (§1a).
 - **F1. Report `saved_tokens_unique` and cache-aware $, never raw cumulative byte ratio** (overcounts
   22–42×; unusable for tuning).
-- **F2. Kill dead components** — *revised*: `failed_run` (0 acts, burns 28.8 s scanning) — hoist the
-  `CacheAware` check so the regexes never run. **`cacheinject` is no longer in this list**: it read as
-  "0 acts, inert" because it is a Reformat that removes no tokens *and* because its breakpoints were
-  being **discarded by the writeback layer before reaching the wire** (46 applied, 0 forwarded).
-  Once forwarded, first measurement shows placement is mildly *harmful* (+61.9% cache-write per step,
-  n=1) — so the open question is whether it belongs in the default preset, not whether it is dead.
+- **F2. Kill dead components** — *revised twice*: `failed_run` (0 acts, burns 28.8 s scanning) — hoist
+  the `CacheAware` check so the regexes never run. **`cacheinject` is no longer in this list**, and the
+  story behind it is the clearest example of F-1 in the whole document:
+    1. It read as "0 acts, inert", which is *expected* for a Reformat that removes no tokens — so the
+       reading was accepted.
+    2. It was in fact discarding **every** breakpoint before the wire (46 applied, 0 forwarded): the
+       writeback layer dropped them because its only targets are `tool_use` messages that bifrost
+       cannot round-trip. Two full benchmark studies drew conclusions about placement while measuring
+       a component whose output never left the process. Fixed in
+       [#36](https://github.com/rossoctl/context-guru/pull/36).
+    3. The first live measurement then looked *harmful* — +61.9% cache-write per step — and that was
+       accepted too, by me, until review showed the proposed mechanism is **ruled out**: 0 of 106
+       marks land above the agent's own breakpoint, and the arm's `acted=0` is a tautology of its
+       design rather than proof the delta was placement.
+  **Net position: `cacheinject` is removed from all nine presets** (#36) — not because it is proven
+  harmful, but because there is a live cost signal with no explanation and no demonstrated benefit,
+  which is not a defensible default. A `cachesplit` marker component now carries the volatile-tail
+  split, which *does* have measured savings on CLI traffic. Whether placement helps at all remains
+  **genuinely unanswered** and needs a properly-powered study, not another n=1.
 - **F3. Tune per regime:** SWE = cache-read regime (optimise steps; note cross-turn dedup is refuted, §C); TB = output
   regime (optimise trajectory length). Same knobs, different settings, selected by measured context
   size.
