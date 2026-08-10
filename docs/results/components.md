@@ -102,8 +102,19 @@ Run: **245 acts, 34,293 cumulative / ~2.9k unique tok**, ~0.6 s total (near-zero
 
 ### 7. `cacheinject` (Reformat)
 Stamps an ephemeral `cache_control` breakpoint on the prefix boundary so the provider KV
-cache hits across turns. No content change. Its payoff is systemic — the 97.8% cache-hit
-rate the whole cache-aware design is tuned around.
+cache hits across turns. No content change.
+
+!!! danger "This row measured a suppressed component"
+    On the run behind this page, `cacheinject`'s breakpoints **never reached the wire** —
+    46 applied at the component level, 0 in the output body across 40 captured requests
+    ([#32](https://github.com/rossoctl/context-guru/issues/32)). Its only possible targets
+    are assistant turns carrying `tool_use`, which bifrost cannot round-trip, so the
+    writeback layer discarded every mark.
+
+    So the **97.8% cache-hit rate is not attributable to this component.** That rate is
+    claude-code's own breakpoints, which it sets on every request and which the proxy
+    forwarded untouched. Fixed in #32; a re-run must re-measure this row rather than carry
+    the number forward.
 
 ---
 
