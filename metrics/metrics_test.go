@@ -73,6 +73,28 @@ func TestLatencyAverages(t *testing.T) {
 	}
 }
 
+// TestSSEBufferingStats: streamed vs buffered SSE responses average separately and
+// the buffered share is reported, so a buffering regression is visible in /stats.
+func TestSSEBufferingStats(t *testing.T) {
+	a := NewAggregator()
+	if s := a.Snapshot(); s.SSEBufferedPct != 0 || s.SSETTFBMsAvg != 0 {
+		t.Fatalf("no SSE traffic should report zeros: %+v", s)
+	}
+	a.RecordSSE(20, false)
+	a.RecordSSE(40, false)
+	a.RecordSSE(900, true)
+	s := a.Snapshot()
+	if s.SSEStreamed != 2 || s.SSEBuffered != 1 {
+		t.Fatalf("counts=%d/%d want 2 streamed / 1 buffered", s.SSEStreamed, s.SSEBuffered)
+	}
+	if s.SSETTFBMsAvg != 30 || s.SSETTFBMsAvgBuf != 900 {
+		t.Fatalf("ttfb=%v buffered=%v want 30/900", s.SSETTFBMsAvg, s.SSETTFBMsAvgBuf)
+	}
+	if got := s.SSEBufferedPct; got < 33.3 || got > 33.4 {
+		t.Fatalf("buffered pct=%v want ~33.33", got)
+	}
+}
+
 // TestMutatedZeroSavingsNotPassthrough locks the fix for cacheinject-style
 // components: they change the request (add cache_control) but save no content
 // tokens, so they must NOT be flagged as dead weight in top_passthrough.

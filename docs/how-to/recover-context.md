@@ -48,6 +48,51 @@ original resolves to an explicit placeholder rather than being omitted — the p
 `tool_result` per `tool_call_id`. A store miss silently turns a lossless offload lossy: the known
 TTL edge.
 
+### Streaming (SSE): what actually happens
+
+The loop reasons over a complete assistant message, but a streaming response arrives as events, so
+on SSE the proxy makes a per-request choice from the request bytes:
+
+- **No marker in `messages`/`system`** → the model has nothing to expand, so the response is
+  streamed straight through, byte for byte, with no added latency.
+- **A marker is present** → the response is read in full, reconstructed with `expand.AggregateSSE`,
+  and inspected. If it is a lone expand call the loop runs; otherwise the buffered bytes are
+  replayed to the client verbatim.
+
+Buffering costs the client its streaming for that request (time-to-first-byte becomes
+time-to-last-byte), which is why the marker test is narrow. It scans **only** `messages` and
+`system` — the model-visible content. It used to scan the whole request body, which also matched the
+`context_guru_expand` tool description we inject ourselves ("…replaced by a `<<cg:HASH>>` marker"),
+so it was always true and **every** stream was silently buffered (issue #26).
+
+`/stats` reports this directly, counted **once per client request** (not per upstream round, so a
+request that drove several expand rounds is one sample): `sse_streamed`, `sse_buffered`,
+`sse_buffered_pct`, `sse_ttfb_ms_avg` and `sse_ttfb_ms_avg_buffered`. On traffic that never offloads,
+`sse_buffered` stays 0; it starts counting from the first turn that carries a marker. Note that
+`sse_ttfb_ms_avg_buffered` is time-to-*last*-byte by construction — a buffered response is read in
+full before the client is written to — so it is not comparable to `sse_ttfb_ms_avg`.
+
+!!! note "Markers usually arrive HTML-escaped"
+    A marker the model reads as `<<cg:HASH>>` normally travels on the wire as
+    `<<cg:HASH>>`: Go's `encoding/json` escapes `<` by default (callers can opt out
+    with `Encoder.SetEscapeHTML(false)`, and some non-Go clients never escape it), and `sjson`
+    escapes it whenever the value contains a newline — which is how every marker is appended. Any
+    check matching markers against raw request bytes must accept both spellings, case-insensitively
+    (`<` is as valid as `<`); `expand.rawMarkerRe` does, deliberately. A miss there is a
+    false negative — a real expand call streamed past uninspected — which is worse than
+    over-buffering.
+
+    Because that matcher accepts the plain form too, a document or message quoting a literal
+    `<<cg:HASH>>` example (like this page) counts as marker-bearing. That is the intended bias:
+    over-inspect rather than miss a real call.
+
+!!! warning "Streaming restoration is Anthropic-only"
+    `expand.AggregateSSE` reconstructs the Anthropic Messages event stream only. A marker-bearing
+    **OpenAI** streaming response cannot be reconstructed, so it is replayed raw (fail-open) and
+    restoration does not fire on that request. Non-streaming OpenAI restoration works normally, as
+    does streaming Anthropic. Every streaming coding agent in scope speaks the Anthropic dialect;
+    OpenAI SSE aggregation will be added when a real agent needs it.
+
 ### 3. `GET /expand?id=`
 The proxy exposes `GET /expand?id=<hash>` to recover an offloaded original directly, out of band
 from the model loop.

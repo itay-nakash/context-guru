@@ -156,6 +156,30 @@ An expired/evicted original resolves to an explicit placeholder rather than bein
 provider requires one `tool_result` per `tool_call_id`). A miss silently turns a lossless offload
 lossy — the known TTL edge.
 
+### The loop on a streaming response
+
+The loop needs a whole assistant message; SSE delivers events. So the host decides per request,
+from the request bytes, whether it can afford to look:
+
+- **no marker in `messages`/`system`** → nothing to expand → stream through untouched;
+- **marker present** → buffer the stream, rebuild the message with `expand.AggregateSSE`
+  (Anthropic dialect only — other dialects return `ok=false` and are replayed raw), inspect, and
+  either continue the loop or replay the buffered bytes verbatim.
+
+Buffering is the one thing that turns a stream into a non-stream, so the marker test must be tight
+in *both* directions: a false negative loses a real expand call, a false positive silently costs
+every request its time-to-first-byte. It scans only model-visible content (`messages`, `system`) —
+scanning the whole body also matched the expand tool description the host injects itself, which made
+it unconditionally true (issue #26). `/stats` exposes `sse_streamed` / `sse_buffered` /
+`sse_buffered_pct` and the two TTFB averages so the fast path is measured, not assumed.
+
+**Markers on the wire are usually HTML-escaped.** `encoding/json` escapes `<` by default — a caller
+can opt out with `Encoder.SetEscapeHTML(false)`, and some non-Go clients never escape it — and `sjson`
+escapes it whenever the value contains a newline, which is how every marker is appended. So `<<cg:H>>`
+in the model's view is normally `<<cg:H>>` in the bytes. Marker matching on *decoded* content
+(`expand.HasPlaceholder`, used by the components) sees the plain form; matching on *raw request
+bytes* (`expand.rawMarkerRe`, used by the host's streaming decision) must accept both, and does.
+
 ## State: the Store
 
 One `Store` interface, in-memory TTL+LRU default (both hosts share it). Defaults: **1800s TTL,
@@ -184,7 +208,13 @@ vocabulary), `Aggregator` (in-process rollups behind `/stats`), `Tee` (fan-out),
 of per-request percentages. It also reports:
 - `wasted_tokens` / `bounces` — content offloaded then re-served via expand (a premature offload);
 - `adjusted_saved` = saved − wasted (bounce-adjusted, may be negative);
-- `top_passthrough` — components that ran but never changed a request: dead weight to drop.
+- `top_passthrough` — components that ran but never changed a request: dead weight to drop;
+- `sse_streamed` / `sse_buffered` / `sse_buffered_pct` and `sse_ttfb_ms_avg` /
+  `sse_ttfb_ms_avg_buffered` — streaming health: how many SSE responses had to be buffered whole to
+  be inspected for an expand call, and what that cost in time-to-first-byte.
+
+Fields are only ever **added** to `/stats`; the harbor harnesses parse it, so no field is renamed
+or removed.
 
 ## Config & registry
 

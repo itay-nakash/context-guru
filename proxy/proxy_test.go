@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	_ "github.com/rossoctl/context-guru/components/all"
 	"github.com/rossoctl/context-guru/config"
@@ -427,6 +428,350 @@ func TestExpandPartialResolutionWellFormed(t *testing.T) {
 	}
 	if !strings.Contains(string(secondBody), "RESOLVED ORIGINAL") || !strings.Contains(string(secondBody), "no longer available") {
 		t.Fatalf("continuation should carry the resolved original and a placeholder for the expired id: %s", secondBody)
+	}
+}
+
+// anthropicSSEBody builds a streaming Anthropic request that declares a tool (so
+// expand injection fires) without Go's HTML-escaping, so the caller controls exactly
+// which marker spelling reaches the proxy.
+func anthropicSSEBody(t *testing.T, userText string) []byte {
+	t.Helper()
+	var bb bytes.Buffer
+	enc := json.NewEncoder(&bb)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(map[string]any{
+		"model":  "claude",
+		"stream": true,
+		"tools": []map[string]any{
+			{"name": "Bash", "description": "run", "input_schema": map[string]any{"type": "object"}},
+		},
+		"messages": []map[string]any{{"role": "user", "content": userText}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return bb.Bytes()
+}
+
+// anthropicSSEBodyHTMLEscaped is the same request encoded WITH Go's HTML escaping —
+// i.e. any marker in userText reaches the proxy only as <<cg:HASH>>, which
+// is how markers actually arrive on the wire (see expand.rawMarkerRe).
+func anthropicSSEBodyHTMLEscaped(t *testing.T, userText string) []byte {
+	t.Helper()
+	b, err := json.Marshal(map[string]any{
+		"model":  "claude",
+		"stream": true,
+		"tools": []map[string]any{
+			{"name": "Bash", "description": "run", "input_schema": map[string]any{"type": "object"}},
+		},
+		"messages": []map[string]any{{"role": "user", "content": userText}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(userText, "cg:") && !strings.Contains(string(b), `u003ccg:`) {
+		t.Fatalf("fixture is not HTML-escaped as expected: %s", b)
+	}
+	return b
+}
+
+// sseTextStream is a minimal Anthropic text event-stream, split so a test upstream
+// can send the head, pause, and only then finish.
+const (
+	sseHead = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"role\":\"assistant\"}}\n\n" +
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"first\"}}\n\n"
+	sseTail = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"last\"}}\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+)
+
+// TestMarkerFreeSSEStreamsThrough is the failing-test proof for issue #26. The
+// upstream sends the head of an event-stream, then blocks until the test says the
+// client has already seen bytes. If context-guru buffers the response, nothing
+// reaches the client until the upstream finishes, the upstream never gets released,
+// and the test deadlocks out — which is exactly what happened before the fix,
+// because hasMarkers matched the expand tool description we inject ourselves.
+//
+// The request carries NO marker, so per the documented contract ("Requests without
+// markers stream straight through with zero added latency") it must not be buffered.
+func TestMarkerFreeSSEStreamsThrough(t *testing.T) {
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte(sseHead))
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-time.After(5 * time.Second): // fail fast instead of hanging the suite
+		}
+		w.Write([]byte(sseTail))
+	}))
+	defer upstream.Close()
+
+	h, _ := buildHandler(t, "pipeline: []\n", upstream.URL)
+	srv := httptest.NewServer(h.Mux())
+	defer srv.Close()
+
+	body := anthropicSSEBody(t, "no markers in this request at all")
+	resp, err := http.Post(srv.URL+"/anthropic/v1/messages", "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	// Read the first chunk. The upstream has NOT sent the tail yet and will not until
+	// this test releases it, so a streaming proxy can only hand us the head. A
+	// buffering proxy cannot return anything here at all — it deadlocks until the
+	// upstream's own 5s escape hatch fires, and then delivers head+tail in one go,
+	// which is what the "last" assertion below detects.
+	buf := make([]byte, 4096)
+	n, rerr := resp.Body.Read(buf)
+	first := string(buf[:n])
+	close(release)
+	if n == 0 {
+		t.Fatalf("first read returned no bytes: %v", rerr)
+	}
+	if !strings.Contains(first, "first") {
+		t.Fatalf("expected the first streamed delta, got %q", first)
+	}
+	if strings.Contains(first, "last") {
+		t.Fatal("marker-free SSE response was BUFFERED: the client received the whole " +
+			"stream at once, after the upstream had finished (issue #26 — hasMarkers " +
+			"matched the expand tool description we inject ourselves)")
+	}
+	rest, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(rest), "last") {
+		t.Fatalf("stream did not complete, tail=%q", rest)
+	}
+
+	// And the fast path must be visible in /stats, not merely inferred.
+	var snap metrics.Snapshot
+	st, _ := http.Get(srv.URL + "/stats")
+	json.NewDecoder(st.Body).Decode(&snap)
+	st.Body.Close()
+	if snap.SSEStreamed != 1 || snap.SSEBuffered != 0 {
+		t.Fatalf("stats should show one streamed, zero buffered SSE: %+v", snap)
+	}
+}
+
+// TestMarkerBearingSSEIsBuffered is the other half of the contract: when the request
+// really does carry a marker (in its HTML-escaped wire form, which is how markers
+// actually arrive), buffering is correct and must still happen — otherwise a real
+// expand call would stream past uninspected.
+func TestMarkerBearingSSEIsBuffered(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte(sseHead + sseTail))
+	}))
+	defer upstream.Close()
+
+	h, _ := buildHandler(t, "pipeline: []\n", upstream.URL)
+	srv := httptest.NewServer(h.Mux())
+	defer srv.Close()
+
+	// The escaped spelling, written after a newline exactly as offload emits it.
+	body := anthropicSSEBodyHTMLEscaped(t, "output\nline2 <<cg:HASH>>")
+	resp, err := http.Post(srv.URL+"/anthropic/v1/messages", "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(out), "first") || !strings.Contains(string(out), "last") {
+		t.Fatalf("normal answer must be replayed verbatim: %q", out)
+	}
+
+	var snap metrics.Snapshot
+	st, _ := http.Get(srv.URL + "/stats")
+	json.NewDecoder(st.Body).Decode(&snap)
+	st.Body.Close()
+	if snap.SSEBuffered != 1 || snap.SSEStreamed != 0 {
+		t.Fatalf("a marker-bearing SSE request must still be buffered for inspection: %+v", snap)
+	}
+}
+
+// TestExpandSSEWithOtherToolReplaysVerbatim covers the otherTools bail on the
+// streaming path: the model batches expand alongside a Bash call. The proxy cannot
+// answer only half a batch (the client owns Bash), so it must replay the stream
+// unchanged rather than continue — and the client's stream must stay well-formed.
+func TestExpandSSEWithOtherToolReplaysVerbatim(t *testing.T) {
+	var calls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"role\":\"assistant\"}}\n\n" +
+			"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"context_guru_expand\"}}\n\n" +
+			"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"id\\\":\\\"HASH\\\"}\"}}\n\n" +
+			"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+			"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_2\",\"name\":\"Bash\"}}\n\n" +
+			"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"ls\\\"}\"}}\n\n" +
+			"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n" +
+			"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n" +
+			"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	h, st := buildHandler(t, "pipeline: []\n", upstream.URL)
+	st.Put("HASH", []byte("THE ORIGINAL CONTENT"))
+	srv := httptest.NewServer(h.Mux())
+	defer srv.Close()
+
+	body := anthropicSSEBody(t, "look at <<cg:HASH>> then list files")
+	resp, err := http.Post(srv.URL+"/anthropic/v1/messages", "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if calls != 1 {
+		t.Fatalf("batched expand+Bash must NOT trigger a continuation, got %d upstream calls", calls)
+	}
+	// Verbatim replay: both blocks intact, indices unrenumbered, no injected content.
+	if !strings.Contains(string(out), `"index":1`) || !strings.Contains(string(out), `"name":"Bash"`) {
+		t.Fatalf("client must receive the original stream unchanged: %s", out)
+	}
+	if strings.Contains(string(out), "THE ORIGINAL CONTENT") {
+		t.Fatalf("proxy must not splice resolved content into a stream it declined: %s", out)
+	}
+}
+
+// TestExpandSSEMultiRoundCapped drives the streaming loop past maxExpandRounds: an
+// upstream that answers every request with another expand call must be cut off, and
+// the client must still get a well-formed stream (the model's own last call).
+func TestExpandSSEMultiRoundCapped(t *testing.T) {
+	var calls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		calls++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"role\":\"assistant\"}}\n\n" +
+			"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"context_guru_expand\"}}\n\n" +
+			"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"id\\\":\\\"HASH\\\"}\"}}\n\n" +
+			"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+			"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n" +
+			"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	h, st := buildHandler(t, "pipeline: []\n", upstream.URL)
+	st.Put("HASH", []byte("THE ORIGINAL CONTENT"))
+	srv := httptest.NewServer(h.Mux())
+	defer srv.Close()
+
+	body := anthropicSSEBody(t, "look at <<cg:HASH>>")
+	resp, err := http.Post(srv.URL+"/anthropic/v1/messages", "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	// maxExpandRounds continuations, then one final pass-through: 4 upstream calls.
+	if calls != 4 {
+		t.Fatalf("round cap not honored: %d upstream calls (want 4 = 3 rounds + terminal)", calls)
+	}
+	if !strings.Contains(string(out), "message_stop") {
+		t.Fatalf("client must still receive a complete stream after the cap: %s", out)
+	}
+
+	// SSE stats are per CLIENT REQUEST, not per upstream round. This one request drove
+	// 4 upstream calls; recording per round would report streamed=1/buffered=3 and —
+	// worse — count the terminal round as a healthy "streamed" TTFB timed from that
+	// round alone, hiding the 3 round-trips the client actually waited for.
+	var snap metrics.Snapshot
+	stx, _ := http.Get(srv.URL + "/stats")
+	json.NewDecoder(stx.Body).Decode(&snap)
+	stx.Body.Close()
+	if snap.SSEBuffered != 1 || snap.SSEStreamed != 0 {
+		t.Fatalf("one client request must yield exactly one buffered sample, got %+v", snap)
+	}
+	if snap.SSEBufferedPct != 100 {
+		t.Fatalf("buffered_pct must be a share of requests (want 100), got %v", snap.SSEBufferedPct)
+	}
+}
+
+// TestExpandSSEAggregateFailureReplaysRaw covers the fail-open path INSIDE
+// aggregateAnthropicSSE (expand/sse.go:132): a truncated input_json_delta leaves the
+// tool_use input unparseable, so AggregateSSE returns ok=false even though the
+// provider IS anthropic — a different branch from the provider gate at sse.go:21.
+// The client must still receive the original bytes unchanged.
+func TestExpandSSEAggregateFailureReplaysRaw(t *testing.T) {
+	var calls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "text/event-stream")
+		// partial_json is TRUNCATED — it cannot reconstruct to valid JSON.
+		w.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"role\":\"assistant\"}}\n\n" +
+			"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"context_guru_expand\"}}\n\n" +
+			"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"id\\\":\\\"HA\"}}\n\n" +
+			"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	h, st := buildHandler(t, "pipeline: []\n", upstream.URL)
+	st.Put("HASH", []byte("THE ORIGINAL CONTENT"))
+	srv := httptest.NewServer(h.Mux())
+	defer srv.Close()
+
+	body := anthropicSSEBody(t, "look at <<cg:HASH>>")
+	resp, err := http.Post(srv.URL+"/anthropic/v1/messages", "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if calls != 1 {
+		t.Fatalf("an unreconstructable stream must not drive a continuation: %d calls", calls)
+	}
+	if !strings.Contains(string(out), `\"id\":\"HA`) || !strings.Contains(string(out), "message_stop") {
+		t.Fatalf("client must get the raw stream back verbatim (fail-open): %s", out)
+	}
+	if strings.Contains(string(out), "THE ORIGINAL CONTENT") {
+		t.Fatalf("nothing may be spliced into a stream we could not parse: %s", out)
+	}
+}
+
+// TestExpandOpenAISSEFallsBackToRaw documents (and pins) the OpenAI streaming
+// limitation: AggregateSSE only reconstructs the Anthropic event stream, so a
+// marker-bearing OpenAI SSE response is replayed raw and restoration does not fire.
+// Correctness is preserved (fail-open); only the feature is absent.
+func TestExpandOpenAISSEFallsBackToRaw(t *testing.T) {
+	var calls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte(`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"context_guru_expand","arguments":"{\"id\":\"HASH\"}"}}]}}]}` + "\n\n" +
+			"data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	h, st := buildHandler(t, "pipeline: []\n", upstream.URL)
+	st.Put("HASH", []byte("THE ORIGINAL CONTENT"))
+	srv := httptest.NewServer(h.Mux())
+	defer srv.Close()
+
+	var bb bytes.Buffer
+	enc := json.NewEncoder(&bb)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(map[string]any{
+		"model":    "gpt-x",
+		"stream":   true,
+		"tools":    []map[string]any{{"type": "function", "function": map[string]any{"name": "Bash", "parameters": map[string]any{"type": "object"}}}},
+		"messages": []map[string]any{{"role": "user", "content": "look at <<cg:HASH>>"}},
+	})
+	resp, err := http.Post(srv.URL+"/openai/v1/chat/completions", "application/json", strings.NewReader(bb.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if calls != 1 {
+		t.Fatalf("OpenAI SSE cannot be aggregated, so no continuation is possible: %d calls", calls)
+	}
+	if !strings.Contains(string(out), "[DONE]") || strings.Contains(string(out), "THE ORIGINAL CONTENT") {
+		t.Fatalf("OpenAI SSE must be replayed raw (fail-open): %s", out)
 	}
 }
 

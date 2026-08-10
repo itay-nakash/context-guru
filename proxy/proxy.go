@@ -410,14 +410,35 @@ var errNoUpstream = errors.New("no upstream configured")
 // lone expand call, the buffered SSE bytes are replayed to the client verbatim (a
 // one-time latency cost, no correctness change). Requests without markers — early in
 // a session — stream straight through with zero added latency and no possible expand.
+//
+// Buffering is the only thing that stops a stream being a stream, so the marker test
+// is scoped to the model-visible content and both outcomes are counted (agg.RecordSSE
+// → /stats sse_streamed / sse_buffered). It previously matched the expand tool
+// description this proxy injects itself, so it was unconditionally true and the
+// zero-added-latency promise above never held for any request (issue #26).
 func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschemas.ModelProvider, up upstream, body []byte, bypassed bool) {
 	injectOn := h.opts.InjectExpand != expand.InjectNever
 	// For SSE we must buffer to inspect (a latency cost), so only do it when the request
 	// actually carries expandable markers (offload happened → the model might expand).
-	// Tolerate a client that HTML-escapes "<" in JSON (as <) — a false positive
-	// only costs one buffered response; a false negative would miss a real expand.
-	bodyStr := string(body)
-	hasMarkers := expand.HasPlaceholder(bodyStr) || strings.Contains(bodyStr, "\\u003ccg:")
+	// Scoped to messages+system on purpose: a whole-body check also matched the expand
+	// tool description we inject ourselves, which made this unconditionally true and
+	// silently buffered EVERY stream. Both the plain and HTML-escaped marker spellings
+	// count — see expand.HasMarkersInMessages.
+	hasMarkers := expand.HasMarkersInMessages(body)
+	// SSE accounting is PER CLIENT REQUEST, not per upstream round: one client request
+	// that drives several expand rounds waited for all of them, so timing a single
+	// round would report a healthy TTFB for a client that waited three round-trips.
+	// Recorded in a defer so every terminal return path is covered exactly once —
+	// stream-through, aggregate-failure replay, normal-answer replay, nothing-resolved
+	// replay, and the round-cap exit.
+	reqStart := time.Now()
+	sse, sseBuffered := false, false
+	var sseFirstByte time.Time // zero on buffered paths: the client's first byte is the write itself
+	defer func() {
+		if sse && h.agg != nil {
+			h.agg.RecordSSE(msSince(reqStart, sseFirstByte), sseBuffered)
+		}
+	}()
 	for round := 0; ; round++ {
 		upStart := time.Now()
 		resp, err := h.doUpstream(r, up, body)
@@ -434,11 +455,21 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 		// buffered+inspected when markers are present (else stream through, no added latency).
 		checkExpand := injectOn && round < maxExpandRounds && (!isSSE || hasMarkers)
 		if !checkExpand {
-			h.stream(w, resp)
+			// sseBuffered is sticky: if an earlier round was buffered the client already
+			// lost its stream, so this request counts as buffered however it ends.
+			sse = sse || isSSE
+			if first := h.stream(w, resp); !sseBuffered {
+				sseFirstByte = first
+			}
 			return
 		}
 		respBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
+		if isSSE {
+			// Buffered: the client sees nothing until the whole stream has arrived, so its
+			// first byte lands no earlier than the write on whichever path we return from.
+			sse, sseBuffered, sseFirstByte = true, true, time.Time{}
+		}
 
 		// Reconstruct the message the loop reasons over. For SSE, aggregate the events;
 		// if that fails, replay the raw stream unchanged (fail-open).
@@ -514,8 +545,9 @@ func (h *Handler) doUpstream(r *http.Request, up upstream, body []byte) (*http.R
 	return h.client.Do(req)
 }
 
-// stream copies an upstream response through with flushing (SSE-friendly).
-func (h *Handler) stream(w http.ResponseWriter, resp *http.Response) {
+// stream copies an upstream response through with flushing (SSE-friendly) and
+// returns the instant the client got its first byte (zero if the body was empty).
+func (h *Handler) stream(w http.ResponseWriter, resp *http.Response) (firstByte time.Time) {
 	defer resp.Body.Close()
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
@@ -524,6 +556,9 @@ func (h *Handler) stream(w http.ResponseWriter, resp *http.Response) {
 	for {
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
+			if firstByte.IsZero() {
+				firstByte = time.Now()
+			}
 			w.Write(buf[:n])
 			if flush != nil {
 				flush.Flush()
@@ -533,6 +568,16 @@ func (h *Handler) stream(w http.ResponseWriter, resp *http.Response) {
 			break
 		}
 	}
+	return firstByte
+}
+
+// msSince returns milliseconds from start to at (falling back to now if the
+// response carried no bytes).
+func msSince(start, at time.Time) float64 {
+	if at.IsZero() {
+		at = time.Now()
+	}
+	return float64(at.Sub(start).Microseconds()) / 1000.0
 }
 
 func (h *Handler) stats(w http.ResponseWriter, _ *http.Request) {
