@@ -7,21 +7,30 @@ taken exactly from the `presets` map in `config/config.go`.
 
 | Preset | Ordered pipeline | When to use |
 |---|---|---|
-| `codesmart` | `format` → `dedup` → `failed_run` → `cmdfilter` → `extract_llm` → `extract` → `cacheinject` | **The default.** The SWE-bench-winning cache-aware config: structural offloaders + a cheap-model relevance-trimmer (`extract_llm`, routed to `CHEAP_MODEL`, gated so most turns make no model call) + deterministic `extract`. `extract_llm` no-ops (→ deterministic) when no cheap model is configured. |
-| `codesafe` | `format` → `dedup` → `failed_run` → `cmdfilter` → `extract` → `collapse` → `cacheinject` | `codesmart` minus the LLM pass — **deterministic-only, zero model calls by policy**. The safe control / the choice when you don't want an LLM on the hot path. |
+| `codesmart` | `format` → `dedup` → `failed_run` → `cmdfilter` → `extract_llm` → `extract` → `cachesplit` | **The default.** The SWE-bench-winning cache-aware config: structural offloaders + a cheap-model relevance-trimmer (`extract_llm`, routed to `CHEAP_MODEL`, gated so most turns make no model call) + deterministic `extract`. `extract_llm` no-ops (→ deterministic) when no cheap model is configured. |
+| `codesafe` | `format` → `dedup` → `failed_run` → `cmdfilter` → `extract` → `collapse` → `cachesplit` | `codesmart` minus the LLM pass — **deterministic-only, zero model calls by policy**. The safe control / the choice when you don't want an LLM on the hot path. |
 | `off` | *(empty)* | Passthrough — no components. The baseline / A-B control. |
-| `safe` | `format` → `cacheinject` | Lossless only: repack JSON compactly and add `cache_control`. Zero risk of dropping content. |
-| `balanced` | `format` → `dedup` → `failed_run` → `cmdfilter` → `cacheinject` | Lossless repack + conservative offloads (dedupe, drop superseded/failed runs, filter command noise) + cache. |
-| `aggressive` | `format` → `dedup` → `failed_run` → `cmdfilter` → `smartcrush` → `extract` → `extract_llm` → `cacheinject` | `balanced` plus `smartcrush` (crush long homogeneous arrays), deterministic `extract` (noise collapse), and `extract_llm` (cheap-model relevance trim) for deeper savings. |
-| `coding` | `format` → `skeleton` → `cmdfilter` → `cacheinject` | Coding agents: `skeleton` reduces big source-file reads to their structure via tree-sitter. |
-| `mcp` | `format` → `smartcrush` → `cacheinject` | Tool/MCP servers returning long homogeneous JSON arrays (list endpoints, search hits). |
-| `agent` | `format` → `dedup` → `failed_run` → `mask` → `extract` → `cacheinject` | Long agentic sessions (e.g. Claude Code on SWE-bench) where re-sent tool outputs dominate cost. `mask` is the biggest lever — ~27% content-token savings with no task-reward loss (see [Benchmarks](../RESULTS.md)). |
+| `safe` | `format` → `cachesplit` | Lossless only: repack JSON compactly and split the volatile system tail so the shared prefix stays cacheable. Zero risk of dropping content. |
+| `balanced` | `format` → `dedup` → `failed_run` → `cmdfilter` → `cachesplit` | Lossless repack + conservative offloads (dedupe, drop superseded/failed runs, filter command noise) + the cache split. **Not recommended for agentic traffic** — it omits `mask`, the biggest lever there. |
+| `aggressive` | `format` → `dedup` → `failed_run` → `cmdfilter` → `smartcrush` → `extract` → `extract_llm` → `cachesplit` | `balanced` plus `smartcrush` (crush long homogeneous arrays), deterministic `extract` (noise collapse), and `extract_llm` (cheap-model relevance trim) for deeper savings. |
+| `coding` | `format` → `skeleton` → `cmdfilter` → `cachesplit` | Coding agents: `skeleton` reduces big source-file reads to their structure via tree-sitter. |
+| `mcp` | `format` → `smartcrush` → `cachesplit` | Tool/MCP servers returning long homogeneous JSON arrays (list endpoints, search hits). |
+| `agent` | `format` → `dedup` → `failed_run` → `mask` → `extract` → `extract_llm` → `cachesplit` | Long agentic sessions (e.g. Claude Code on SWE-bench) where re-sent tool outputs dominate cost. `mask` is the biggest lever — ~27% content-token savings with no task-reward loss (see [Benchmarks](../RESULTS.md)). |
+| `general` | `format` → `toon` → `dedup` → `failed_run` → `cmdfilter` → `mask` → `extract` → `extract_llm` → `collapse` → `cachesplit` | The recommended all-round pipeline: the reward-neutral levers of `agent` plus the situational shrinkers (`toon` / `cmdfilter` / `collapse`) that cost nothing when they don't fire. |
 | `summarize` | `summarize` | Long trajectories where the transcript itself is the cost. **Runs alone** — it restructures the whole transcript (changes the message count), so no other component's in-place edits race the rebuild. |
 
 !!! tip "Order matters"
     Components run in pipeline order: lossless repack first, then offloads
-    (old-then-large), with `cacheinject` last so it keeps the reduced prefix
-    cacheable.
+    (old-then-large), with `cachesplit` last because it edits the top-level
+    `system` array rather than `messages`.
+
+!!! info "`cachesplit`, not `cacheinject`"
+    Every preset that touches caching carries [`cachesplit`](../components/cachesplit.md),
+    which enables the measured volatile-tail split. Breakpoint *placement*
+    ([`cacheinject`](../components/cacheinject.md)) is in **no** preset: its marks only
+    began reaching the provider in
+    [#36](https://github.com/rossoctl/context-guru/pull/36), and placement has never been
+    shown to help. Add it by hand if you want to run the placement study.
 
 Not sure which to pick? See [Choose a preset](../how-to/choose-a-preset.md).
 Every component's config lives in [Components](../components.md).

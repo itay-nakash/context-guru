@@ -11,8 +11,8 @@ infrastructure the components sit on.
 | Package | Role |
 |---|---|
 | `components/` | `Component`/`Reformat`/`Offload` interfaces, `Report`, `Ctx`, the `Pipeline`, the registry |
-| `components/reformat/` | lossless components: `format`, `cacheinject` |
-| `components/offload/` | lossy-reversible components: `skeleton`, `dedup`, `collapse`, `failed_run`, `cmdfilter`, `extract`, `smartcrush`, `mask` |
+| `components/reformat/` | lossless components: `format`, `toon`, `cacheinject`, `cachesplit` |
+| `components/offload/` | lossy-reversible components: `skeleton`, `dedup`, `collapse`, `failed_run`, `cmdfilter`, `extract`, `extract_llm`, `smartcrush`, `mask`, `summarize` |
 | `components/dsl/` | declarative text-filter engine (wrapped by `cmdfilter`) |
 | `components/all/` | blank-imports every component so `init()` registrations run |
 | `schema/` | helpers over bifrost's schema: token counting, deep-clone, `MessageText`/`SetMessageText`, `Rewritable` |
@@ -57,7 +57,8 @@ YAML block as bytes), `NeedsModel` (declares it calls a cheap LLM — the model 
 yet wired).
 
 - **Reformat** = lossless repack (`format` re-encodes JSON compact; `cacheinject` adds
-  `cache_control`). No information leaves the wire, so nothing is stashed.
+  `cache_control`; `cachesplit` is a marker enabling a body-level split). No information leaves the
+  wire, so nothing is stashed.
 - **Offload** = lossy-but-reversible. It drops bytes and returns the `cache_keys` under which
   it stashed the originals. If it shrinks the request but returns no keys, the pipeline treats
   it as a **failed offload and reverts** — you cannot silently lose data. Returning no keys and
@@ -220,8 +221,8 @@ bytes* (`expand.rawMarkerRe`, used by the host's streaming decision) must accept
 
 ## State: the Store
 
-One `Store` interface, in-memory TTL+LRU default (both hosts share it). Defaults: **10000s TTL,
-1000 entries, 100 sticky sessions**. It carries, keyed per session:
+One `Store` interface, in-memory TTL+LRU default (both hosts share it). Defaults: **10000s sliding
+TTL, 1000 entries, 100 sticky sessions**. It carries, keyed per session:
 
 - **Rewind** — `cache_key → original bytes` (what the expand loop resolves).
 - **Sticky** — the set of content ids already reduced on prior turns (for byte-stable output
@@ -272,12 +273,16 @@ set — the payload need not survive, only the knowledge that it existed):
   the repair branch would buy a model call for nothing. There is no upside, so a lost `extract_llm`
   decision simply declines and the message is forwarded verbatim. (Its entry is still pinned, so
   the common case is that it is never lost at all.) Re-enabling it would need deterministic
-  decoding *plus* a check that the re-derived bytes match the stored hash before splicing.
+  decoding *plus* a check that the re-derived bytes match the stored hash before splicing. The
+  dedicated `repairLostResult` path that used to attempt it was **removed** rather than left
+  disabled — a repair that can splice different bytes is not a repair worth keeping behind a flag.
+  `cg:res:` also unifies what were two keys (`cg:res:` + `cg:sum1:`) into one JSON value, so the
+  projection and its summary line cannot half-survive a drop.
 
 `/stats` reports `frozen_hits`, `frozen_misses`, `frozen_dropped`, `frozen_repaired`, and
 `frozen_flips` (= dropped − repaired; should be 0). `frozen_misses` is a *lookup* counter dominated
 by the ordinary "not compacted yet" case — `frozen_dropped` is the one that measures harm. See
-[Routes](reference/routes.md#stats-freeze-replay-fields).
+[Routes](reference/routes.md#freeze-replay-health).
 
 The related fail-*open* on `MaxCachedIdx`: `prevLen` returning 0 on a store miss yields
 `MaxCachedIdx = -1`, and `Ctx.TailOnly` then permits mutating any index (measured on 11.2% of
@@ -301,19 +306,33 @@ vocabulary), `Aggregator` (in-process rollups behind `/stats`), `Tee` (fan-out),
 of per-request percentages. It also reports:
 - `wasted_tokens` / `bounces` — content offloaded then re-served via expand (a premature offload);
 - `adjusted_saved` = saved − wasted (bounce-adjusted, may be negative);
-- `top_passthrough` — components that ran but never changed a request: dead weight to drop;
+- `top_passthrough` — components that ran but never changed a request: dead weight to drop. A
+  component that mutated without saving *content* tokens (`cachesplit`) is not listed;
+- `discarded_changes` (per component) / `top_discarded` — changes the writeback layer threw away.
+  Before this existed, a mutated-then-discarded component was indistinguishable from a working
+  Reformat, which is how the `cacheinject` bug survived two benchmark studies;
 - `sse_streamed` / `sse_buffered` / `sse_buffered_pct` and `sse_ttfb_ms_avg` /
   `sse_ttfb_ms_avg_buffered` — streaming health: how many SSE responses had to be buffered whole to
-  be inspected for an expand call, and what that cost in time-to-first-byte.
+  be inspected for an expand call, and what that cost. The `_buffered` average is
+  time-to-*last*-byte by construction, so it is not comparable to `sse_ttfb_ms_avg`;
+- `frozen_hits` / `frozen_misses` / `frozen_dropped` / `frozen_repaired` / `frozen_flips` — the
+  cache-write cost line (see [Freeze lifetime](#freeze-lifetime-and-which-way-to-fail));
+- `cmdfilter_families` / `cmdfilter_filters` / `cmdfilter_selector_misses` — which command families
+  and individual filters pay off, and which output shapes matched nothing;
+- `saved_tokens` vs `saved_tokens_unique` and `overcount_ratio` — cumulative vs distinct. The agent
+  re-sends history verbatim every turn, so the cumulative figure double-counts. Quote the unique one;
+- `mode` / `sync_enforced`, and the `potential_*` / `projected_*` observe namespace.
 
 Fields are only ever **added** to `/stats`; the harbor harnesses parse it, so no field is renamed
-or removed.
+or removed. The full field list is in [Routes](reference/routes.md#get-stats).
 
 ## Operating modes
 
 Two modes, set explicitly by `mode:` (or `--mode` / `MODE`) and threaded onto
-`components.Ctx` as `Ctx.Mode`. Never inferred. `sync` is the default and reproduces
-pre-mode behavior byte for byte; a golden test compares the two entry points' output.
+`components.Ctx` as `Ctx.Mode`, whose zero value resolves to `sync`. Never inferred. `sync`
+reproduces pre-mode behavior byte for byte; a golden test compares the two entry points' output.
+An `async` mode is implemented on a held branch and is **not** available — the loader accepts
+only `sync` and `observe`.
 
 See [Operating modes](how-to/operating-modes.md) for the operator's view. What follows is
 the mechanism.
@@ -383,7 +402,7 @@ Unknown keys are rejected.
 
 ```yaml
 preset: balanced
-pipeline: [format, dedup, failed_run, cmdfilter, cacheinject]   # order + enable
+pipeline: [format, dedup, failed_run, cmdfilter, cachesplit]   # order + enable
 components:
   collapse:   { max_tokens: 2000, head_lines: 20, tail_lines: 20 }
   smartcrush: { min_items: 5, keep_first: 3, keep_last: 2 }
@@ -396,8 +415,9 @@ component's config.
 
 ## LLM components
 
-Most components are deterministic. Two call an LLM: `extract` (`strategy: code`/`rlm`, a Starlark
-filter run in a sandbox) and `summarize` (whole-transcript summary). They implement `NeedsModel` and
+Most components are deterministic. Two call an LLM: `extract_llm` (`strategy: code`, a Starlark
+filter run in a sandbox) and `summarize` (whole-transcript summary). The deterministic `extract` is a
+separate component and never calls a model. They implement `NeedsModel` and
 call `Ctx.Model` — a `ModelSpec` the host resolves per request:
 
 ```mermaid
@@ -405,7 +425,7 @@ flowchart LR
   cfg["component config<br/>model.source"] --> res{"ModelSpec.For(source)"}
   res -->|incoming| inc["Incoming: request's own<br/>model + upstream + key<br/>(built in proxy.chat)"]
   res -->|config| stat["Static: cheap model<br/>(CHEAP_MODEL* env)"]
-  res -->|nil| deg["degrade: extract→deterministic,<br/>summarize→no-op"]
+  res -->|nil| deg["degrade: extract_llm→no-op,<br/>summarize→no-op"]
   inc --> call["Model.Complete(ctx, prompt)"]
   stat --> call
 ```
@@ -413,6 +433,7 @@ flowchart LR
 - **`incoming`** (default) reuses the proxied request's model + the gateway's key — zero extra config,
   works through the eval-containers gateway. **`config`** uses a dedicated cheap model (`internal/cheapmodel`
   Anthropic/OpenAI). The AuthBridge host offers only `config` (its incoming key is a placeholder).
-- The call is synchronous in the request path, so it's bounded (short timeout, retry) and **fail-open**:
-  any error reverts the component (pipeline guarantee), and a missing model degrades gracefully.
+- The call is synchronous in the request path (in `sync` mode; in `observe` it happens off-path), so
+  it's bounded (short timeout, retry) and **fail-open**: any error reverts the component (pipeline
+  guarantee), and a missing model degrades gracefully.
 - Reversibility is unchanged — the LLM output is still stashed under a `<<cg:HASH>>` marker for `expand`.

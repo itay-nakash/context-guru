@@ -49,8 +49,8 @@ config order:
 ```mermaid
 flowchart TD
   C["Component — Name() · Enabled(ctx)"]
-  C --> R["Reformat: lossless repack<br/>format · cacheinject"]
-  C --> O["Offload: drop + stash, returns cache_keys<br/>skeleton · dedup · collapse · failed_run<br/>cmdfilter · extract · smartcrush · mask"]
+  C --> R["Reformat: lossless repack<br/>format · toon · cachesplit · cacheinject"]
+  C --> O["Offload: drop + stash, returns cache_keys<br/>skeleton · dedup · collapse · failed_run · cmdfilter<br/>extract · extract_llm · smartcrush · mask · summarize"]
 ```
 
 ## Core concepts

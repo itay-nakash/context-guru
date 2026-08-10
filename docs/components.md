@@ -11,8 +11,8 @@ messages (`role:"tool"`; for Anthropic, `tool_result` blocks normalized to that 
 |---|---|---|---|---|---|
 | `format` | Reformat | nothing (compacts JSON) | n/a (lossless) | pretty-printed JSON tool output | `min_tokens` (50) |
 | `toon` | Reformat | nothing (re-encodes JSON arrays as TOON) | n/a (lossless) | uniform flat JSON object-arrays | `min_tokens` (50) |
-| `cacheinject` | Reformat | nothing (adds `cache_control`) | n/a (lossless) | Anthropic-family requests; **opt-in, in no preset** — placement is unmeasured (#32) | `ttl` (5m) |
-| `cachesplit` | Reformat | nothing (splits a `system` block) | n/a (lossless) | Anthropic-family requests; **in the default presets** — enables the measured volatile-tail split | — |
+| `cacheinject` | Reformat | nothing (adds `cache_control`) | n/a (lossless) | Anthropic-family requests; **opt-in, in no preset** — placement is unmeasured ([#36](https://github.com/rossoctl/context-guru/pull/36)) | `ttl` (5m) |
+| `cachesplit` | Reformat | nothing (splits a `system` block) | n/a (lossless) | Anthropic-family requests; **in every caching preset** — enables the measured volatile-tail split | — (no config) |
 | `skeleton` | Offload | function/method bodies | via expand | fenced ` ```lang ` code blocks | `min_tokens` (80) |
 | `dedup` | Offload | later byte-identical tool outputs | via expand | repeated identical outputs | `min_tokens` (100) |
 | `collapse` | Offload | middle of an oversized output | via expand | any large tool output (fallback) | `max_tokens` (2000), `head_lines` (20), `tail_lines` (20) |
@@ -24,16 +24,25 @@ messages (`role:"tool"`; for Anthropic, `tool_result` blocks normalized to that 
 | `mask` | Offload | older tool outputs (age-based) | via expand | more than `keep_recent` outputs | `keep_recent` (3), `min_tokens` (100), `keep_head_chars` (96) |
 | `summarize` | Offload (LLM) | the middle of the transcript → one summary | via expand | long trajectories | `summary_level` (regular), `keep_last` (3), `min_tokens` (500), `resummarize_tokens` (6000), `model.source`, `trigger` |
 
-Presets (`config`): `off` `[]` · `safe` `[format, cachesplit]` · `balanced`
-`[format, dedup, failed_run, cmdfilter, cachesplit]` · `aggressive` adds `smartcrush, extract` ·
+Presets (`config/config.go`), verbatim: **`codesmart`** (the proxy default)
+`[format, dedup, failed_run, cmdfilter, extract_llm, extract, cachesplit]` · **`codesafe`**
+`[format, dedup, failed_run, cmdfilter, extract, collapse, cachesplit]` (deterministic-only) ·
+`off` `[]` · `safe` `[format, cachesplit]` · `balanced`
+`[format, dedup, failed_run, cmdfilter, cachesplit]` · `aggressive`
+`[format, dedup, failed_run, cmdfilter, smartcrush, extract, extract_llm, cachesplit]` ·
 `coding` `[format, skeleton, cmdfilter, cachesplit]` · `mcp` `[format, smartcrush, cachesplit]` ·
-**`agent`** `[format, dedup, failed_run, mask, extract, cachesplit]` — for long agentic sessions;
-`mask` is the biggest lever there (~27–30% content-token savings, no reward loss — see [RESULTS.md](RESULTS.md)) ·
-**`general`** `[format, toon, dedup, failed_run, cmdfilter, mask, extract, collapse, cachesplit]` — the
-recommended all-round pipeline: the reward-neutral levers of `agent` plus the situational shrinkers
-(`toon`/`cmdfilter`/`collapse`) that cost nothing when they don't fire. `balanced` is **not** recommended
-for agentic traffic — it omits `mask`, so it barely helps (6% vs 31% in the Terminal-Bench replay) ·
+**`agent`** `[format, dedup, failed_run, mask, extract, extract_llm, cachesplit]` — for long agentic
+sessions; `mask` is the biggest lever there (~27–30% content-token savings, no reward loss — see
+[RESULTS.md](RESULTS.md)) ·
+**`general`** `[format, toon, dedup, failed_run, cmdfilter, mask, extract, extract_llm, collapse, cachesplit]`
+— the recommended all-round pipeline: the reward-neutral levers of `agent` plus the situational
+shrinkers (`toon`/`cmdfilter`/`collapse`) that cost nothing when they don't fire. `balanced` is
+**not** recommended for agentic traffic — it omits `mask`, so it barely helps (6% vs 31% in the
+Terminal-Bench replay) ·
 `summarize` `[summarize]` (run alone — it restructures the whole transcript).
+
+Every preset that touches caching carries `cachesplit`, never `cacheinject` — see
+[Presets](reference/presets.md).
 
 **Dynamic, model-aware triggers.** Trigger thresholds can be expressed as **fractions of the model's
 context window** (resolved dynamically via LiteLLM's public model map, no hand-maintained list):
@@ -48,10 +57,12 @@ store persists), so Offload markers are genuinely recoverable — not just descr
 offloader also applies a **marker-inclusive** never-worse check per message, so a rewrite never grows a
 message by the marker's tokens.
 
-**LLM-based components** (`extract` with `strategy: code`/`rlm`, and `summarize`) call a model, chosen by
+**LLM-based components** (`extract_llm`, and `summarize`) call a model, chosen by
 `model.source`: `incoming` (default — reuse the proxied request's own model + key) or `config` (a dedicated
 cheap model set via `CHEAP_MODEL*` env / the gateway's `CheapModel`). When no model is available they
-degrade — `extract` to its deterministic projection, `summarize` to a no-op. See [design.md](design.md#llm-components).
+degrade — `extract_llm` to a no-op (the deterministic `extract` beside it in every preset does the
+cheap pass), `summarize` to a no-op. `extract` itself never calls a model. See
+[design.md](design.md#llm-components).
 
 Common gates every Offload respects: skip non-text (`Rewritable`) messages, skip content already
 carrying a marker (no double-offload), and skip if the rewrite (marker + hint included) isn't
@@ -101,16 +112,35 @@ Places Anthropic `cache_control: {type: ephemeral}` breakpoints at the positions
 billed input cost, so the provider KV cache is read rather than re-processed. Adds control
 directives, changes no model-visible content.
 
-**In no preset — opt in explicitly.** Until [#32](https://github.com/rossoctl/context-guru/issues/32)
-its breakpoints never reached the provider on Claude Code traffic, so the placement policy has
-never been measured. The presets carry `cachesplit` instead, which enables the volatile-tail split
-(measured) without the placement (not).
+**In no preset — opt in explicitly.** Until [#36](https://github.com/rossoctl/context-guru/pull/36)
+its breakpoints never reached the provider on Claude Code traffic (46 applied, 0 forwarded), so the
+placement policy has never been measured. The presets carry [`cachesplit`](components/cachesplit.md)
+instead, which enables the volatile-tail split (measured) without the placement (not). The one live
+placement measurement since the fix is n=1 and mildly *harmful* per step, with no mechanism
+established — see [cacheinject](components/cacheinject.md#what-placement-is-actually-worth).
 
 - **Lossiness:** none. **Shines:** Anthropic/Bedrock/Vertex agents that don't self-cache (the
   savings lever is provider-side cache hits, invisible to `/stats` token counts). **Inert:**
   non-cache-aware providers, string-content messages (can't carry a block breakpoint), a
   breakpoint already present. `/stats` will list it under `top_passthrough` since it saves no
   *content* tokens — that's expected, not dead weight.
+
+### `cachesplit`
+Splits the volatile tail of the top-level `system` array off its stable head — `[stable][volatile]`
+as two text blocks with the same concatenated text, breakpoint on the first — so the provider's
+cache boundary excludes the churn. Adjacent text blocks concatenate, so the model sees a
+byte-identical prompt.
+
+**In every caching preset.** It is a *marker* component: the `Reformat` method always skips, and the
+rewrite is body-level (`apply/prefixsplit.go`), gated on this name being in the pipeline. That
+separation exists so disabling breakpoint placement does not silently disable the split.
+
+- **Config:** none. **Lossiness:** none. **Shines:** Anthropic-family agents whose system prompt
+  carries a churning tail (env snapshot, git status, timestamp) in front of a breakpoint — measured
+  −34.1% mean cost on one Terminal-Bench task over three trials. **Inert:** implicit-prefix-cache
+  providers (OpenAI, Gemini), or a system block with no separable tail. Always in
+  `top_passthrough` (its saving is a provider-side cache effect). Full page:
+  [cachesplit](components/cachesplit.md).
 
 ---
 
@@ -184,19 +214,22 @@ after:   [superseded by a later run] <<cg:7d1c…>> [full output: …]   [run 2]
 
 ### `cmdfilter`
 Shrinks tool output with **declarative DSL filters** (see below). Matches a filter on the output's
-first non-empty line, applies its 8-stage pipeline, stashes the original, and appends a recovery
-hint only when the filter was actually lossy. Ships 23 filters (test runners, build tools, package
-managers, IaC plans, verbose network clients) — see [cmdfilter](components/cmdfilter.md).
+first **six** non-empty lines (the selector), applies its 8-stage pipeline, stashes the original, and
+appends a recovery hint only when the filter was actually lossy — typed by *what* was lost. Ships
+**24** filters across 5 families (`builds` 10, `pkg` 7, `iac` 3, `net` 3, `tests` 1) — see
+[cmdfilter](components/cmdfilter.md).
 
 ```
 before:  pytest … 100 lines of PASSED + warnings + 1 failure
 after:   <failures + summary, passing noise stripped, ≤80 lines> <<cg:…>> [full output: …]
 ```
 
-- **Config:** `filters` (inline filter YAML docs, added with no recompile), `disable_builtins`.
-  `Enabled` only when ≥1 filter is loaded. **Shines:** noisy but structured command/log output
-  (test runners, package managers, build tools). **Inert:** output whose first line matches no
-  filter, or where filtering doesn't shrink it.
+- **Config:** `filters` (inline filter YAML docs, added with no recompile), `disable_builtins`,
+  `marker_mode`, `min_size` (500-byte floor — below it the marker routinely costs more than the
+  filter saves). `Enabled` only when ≥1 filter is loaded. **Shines:** noisy but structured
+  command/log output (test runners, package managers, build tools). **Inert:** output whose selector
+  matches no filter (logged in `cmdfilter_selector_misses`), output under `min_size`, or where
+  filtering doesn't shrink it.
 
 ### `extract`
 **Deterministic, no-LLM.** Collapses only *obvious, provably redundant* noise: consecutively repeated
@@ -310,10 +343,11 @@ The summarizer is grounded in the **current task** (first user turn + recent tur
 
 ## The DSL filter engine
 
-`components/dsl` is a declarative, user-extensible text-filter engine (adapted from rtk), wrapped
-by `cmdfilter`. Filters are authored in YAML (no recompile), matched first-by-sorted-name, and each
-runs a fixed **8-stage** pipeline. Because filters drop lines they are lossy, which is why the
-wrapping `cmdfilter` component is an Offload (it stashes the original first).
+`components/dsl` is a declarative, user-extensible text-filter engine (adapted from rtk — Apache-2.0,
+see `THIRD-PARTY-NOTICES`), wrapped by `cmdfilter`. Filters are authored in YAML (no recompile),
+matched by **descending `priority` then by name**, and each runs a fixed **8-stage** pipeline. Because
+filters drop lines they are lossy, which is why the wrapping `cmdfilter` component is an Offload (it
+stashes the original first).
 
 ```mermaid
 flowchart LR
@@ -322,26 +356,32 @@ flowchart LR
   S6 --> S7[7 max_lines] --> S8[8 on_empty] --> O[output + Lossiness]
 ```
 
-Filter fields (all optional except `match`): `match` (regex vs the selector = first non-empty
-line), `strip_ansi`, `replace` (chained `pattern`→`replacement`, `$1` backrefs), `match_output`
-(whole-blob short-circuit: `pattern`/`message`/`unless`), `strip_lines_matching` **xor**
-`keep_lines_matching`, `truncate_lines_at` (per-line char cap), `head_lines`/`tail_lines`,
-`max_lines` (absolute cap with omission marker), `on_empty` (replacement when output is blank).
+Filter fields (all optional except `match`): `match` (regex vs the selector = the first six
+non-empty lines, compiled with `(?m)`), `family` (per-family `/stats` attribution), `priority`
+(match order, higher first), `strip_ansi`, `replace` (chained `pattern`→`replacement`, `$1`
+backrefs), `match_output` (whole-blob short-circuit: `pattern`/`message`/`unless`),
+`strip_lines_matching` **xor** `keep_lines_matching`, `truncate_lines_at` (per-line char cap),
+`head_lines`/`tail_lines`, `cap`/`cap_reduce` (a shared line-budget class), `max_lines` (absolute
+cap with omission marker, wins over `cap`), `on_empty` (replacement when output is blank).
 
-`Lossiness` reported back to `cmdfilter` (drives whether a recovery hint is appended): `None`
-(nothing dropped / reversible reformat), `Tail` (a clean contiguous tail dropped), `Whole`
-(non-contiguous or whole-blob loss).
+`Lossiness` reported back to `cmdfilter` (drives *which* recovery hint is appended): `None`
+(nothing dropped / reversible reformat → no hint), `Tail` (a clean contiguous tail dropped → the
+hint names the cut point, since re-reading from there is cheaper than a full expand), `Whole`
+(non-contiguous or whole-blob loss → the hint points at the expand tool). `Tail` and `Whole` used
+to share one hint text; they are now distinct.
 
 ```yaml
 schema_version: 1
 filters:
   pytest:
     description: keep failures + summary, drop passing noise
+    family: tests
+    priority: 10
     match: "(pytest|=+ test session starts)"
     strip_lines_matching: ["^\\s*$", " PASSED", "^\\.+$"]
-    max_lines: 80
+    cap: buildlog            # shared budget class; or a literal max_lines
     on_empty: "pytest: all passed"
-tests:                       # inline; run via dsl.RunTests (a `verify` command)
+tests:                       # inline; run AT LOAD, and via dsl.RunTests
   pytest:
     - name: all-green
       input: "pytest\n....\n"
@@ -349,4 +389,6 @@ tests:                       # inline; run via dsl.RunTests (a `verify` command)
 ```
 
 Documents load with `schema_version: 1` and strict unknown-field rejection. Inline `tests`
-(input → expected) run via `dsl.RunTests`, so a filter ships with its own regression check.
+(input → expected) run **at load time** as well as via `dsl.RunTests`, so a filter whose tests fail
+never loads at all. Load also rejects duplicate filter names, an uncompilable regex, `strip` and
+`keep` both set, an unknown `cap` class, and `cap_reduce` without `cap`.

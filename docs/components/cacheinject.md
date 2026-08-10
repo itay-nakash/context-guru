@@ -1,8 +1,11 @@
 # cacheinject
 
-!!! info "Reformat — lossless"
+!!! info "Reformat — lossless. **In no preset: opt in explicitly.**"
     Places Anthropic `cache_control` breakpoints at the positions that minimise billed
-    input cost, so the provider KV cache is read rather than re-processed.
+    input cost, so the provider KV cache is read rather than re-processed. Placement has
+    never been shown to help, so no shipped preset enables it — the presets carry
+    [`cachesplit`](cachesplit.md), which enables the *measured* volatile-tail split. See
+    [Configuration](#configuration).
 
 !!! danger "Every placement number below predates the fix in #32 — read this first"
     Until #32, **this component's breakpoints never reached the wire on Claude Code
@@ -27,9 +30,15 @@
     with a 400. That never fired in production *only* because the first defect
     suppressed the marks; fixing one without the other would have produced a live 400.
 
-    Both are fixed (see [design.md](../design.md) — the metadata-write exception).
-    Breakpoints now reach the wire on **86 of 92** replayed captured requests, and the
-    wire total is asserted never to exceed 4.
+    Both are fixed in [#36](https://github.com/rossoctl/context-guru/pull/36) (see
+    [design.md](../design.md) — the metadata-write exception). Breakpoints now reach the wire
+    on **86 of 92** replayed captured requests, and the wire total is asserted never to
+    exceed 4.
+
+    One earlier attribution is also corrected: bifrost does **not** drop `cache_control` on a
+    `tool_result` block — it round-trips it fine. The mark on that block is dropped by *this
+    repo's own* `toolMessage()` in `normalize`, which rebuilds the block into a synthetic
+    `role=tool` message from text + `tool_use_id` alone. The bug was ours.
 
     **Consequence for every figure on this page:** the placement rows measured a
     component whose output was discarded. The `acted=0` / "placement contributes $0"
@@ -86,10 +95,15 @@ after:   [ tools ][ system ]…[ msg d−1 {cache_control} ]…[ newest turn {ca
                               ^ rescues the stable head    ^ writes this turn's growth
 ```
 
-## What it is worth — measured, not asserted
+## What it is worth — simulated
 
-Simulated on a captured 91-request SWE-bench stream, calibrated to within 2.10 pp of
-the cache-hit rate a live 50-task run actually billed:
+Everything in this section is a **simulation** over a captured request stream, not a live
+billed comparison. It was calibrated to within 2.10 pp of the cache-hit rate a live 50-task
+run billed, which makes it a credible model of the billing rule — it does not make it a
+measurement of the policy. For the one live reading, see
+[What placement is actually worth](#what-placement-is-actually-worth).
+
+Simulated on a captured 91-request SWE-bench stream:
 
 | policy | cost | hit | vs the agent's own placement |
 |---|--:|--:|--:|
@@ -120,9 +134,10 @@ saving against claude-code:
    below a divergence when a prefix mutates mid-conversation — neither of which
    claude-code needs.
 
-The measurable cost saving on claude-code traffic comes from the **cross-session
-prefix repairs** in `apply/prefixsplit.go`, which are gated on this component being
-configured but are a different mechanism. See below.
+The measurable cost saving on claude-code traffic comes from the **volatile-tail split** in
+`apply/prefixsplit.go` — a different mechanism, now carried by its own
+[`cachesplit`](cachesplit.md) component so it no longer depends on this one being configured.
+See below.
 
 !!! warning "v1 was a regression"
     v1 placed a single breakpoint on the message *before* the newest turn, which by
@@ -133,10 +148,13 @@ configured but are a different mechanism. See below.
 
 ## What placement is actually worth
 
-**Still unmeasured.** #32 made the policy reach the provider for the first time; it did
-not establish what the policy is worth. One `cacheonly` vs `off` pair was attempted and
-is reported here in full because it is all the evidence there is — not because it settles
-anything.
+**Still effectively unmeasured, and the one live reading is mildly negative.**
+[#36](https://github.com/rossoctl/context-guru/pull/36) made the policy reach the provider
+for the first time; it did not establish what the policy is worth. One `cacheonly` vs `off`
+pair was attempted and is reported here in full because it is all the evidence there is —
+not because it settles anything. **Per step it is +7.9% cost and +61.9% cache-write, at n=1,
+with no mechanism established and the obvious mechanism ruled out.** That is why placement
+ships off.
 
 SWE-bench Verified, `aws/claude-sonnet-5`, n=1 per arm. `off`'s second trial died on a
 Docker-compose error, so only `astropy-12907` completed in both arms:

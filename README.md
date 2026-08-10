@@ -79,7 +79,7 @@ Components implement one of two lossiness-typed interfaces and are stacked in co
 ```mermaid
 flowchart TD
   C["Component — Name() · Enabled(ctx)"]
-  C --> R["Reformat: lossless repack<br/>format · toon · cacheinject"]
+  C --> R["Reformat: lossless repack<br/>format · toon · cachesplit · cacheinject"]
   C --> O["Offload: drop + stash, returns cache_keys<br/>skeleton · dedup · collapse · failed_run<br/>cmdfilter · extract · extract_llm · smartcrush · mask · summarize"]
 ```
 
@@ -126,9 +126,10 @@ curl -s localhost:4000/anthropic/v1/messages \
 ```
 
 Presets: **`codesmart`** (the default — the SWE-bench-winning cache-aware config
-`[format, dedup, failed_run, cmdfilter, extract_llm, extract, cacheinject]`), **`codesafe`** (the same
-minus the LLM pass — deterministic-only `[format, dedup, failed_run, cmdfilter, extract, collapse, cacheinject]`,
-zero model calls by policy), plus `general`, `agent`, `coding`, `mcp`, `balanced`, `safe`, `summarize`, `off`.
+`[format, dedup, failed_run, cmdfilter, extract_llm, extract, cachesplit]`), **`codesafe`** (the same
+minus the LLM pass — deterministic-only `[format, dedup, failed_run, cmdfilter, extract, collapse, cachesplit]`,
+zero model calls by policy), plus `general`, `agent`, `aggressive`, `coding`, `mcp`, `balanced`, `safe`,
+`summarize`, `off`.
 `codesmart`'s LLM relevance-trimmer (`extract_llm`) engages only when a cheap model is configured
 (`CHEAP_MODEL*`); without one it safely no-ops and behaves like `codesafe`.
 See [docs/components.md](docs/components.md) and [docs/reference/presets.md](docs/reference/presets.md).
@@ -158,7 +159,8 @@ are in **[docs/components.md](docs/components.md)** and **[docs/results/componen
 |---|---|---|
 | `format` | Reformat | re-encodes pretty JSON tool output as compact JSON |
 | `toon` | Reformat | re-encodes a uniform JSON array as TOON (header once, one row per item) |
-| `cacheinject` | Reformat | adds an Anthropic `cache_control` breakpoint on a stable prefix boundary |
+| `cachesplit` | Reformat | splits the volatile tail off the `system` prompt so the shared prefix stays cacheable (in the default presets) |
+| `cacheinject` | Reformat | places Anthropic `cache_control` breakpoints — **opt-in, in no preset**; placement is unmeasured |
 | `dedup` | Offload | replaces a byte-identical earlier tool output with a pointer |
 | `failed_run` | Offload | collapses superseded test/build runs, keeps the latest in full |
 | `cmdfilter` | Offload | shrinks structured command output via declarative DSL filters |

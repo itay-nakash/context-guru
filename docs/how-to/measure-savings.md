@@ -2,7 +2,8 @@
 
 context-guru reports what it actually saved through the proxy's `GET /stats` endpoint, backed by
 an in-process metrics aggregator. Savings are measured on **message content text** — what the model
-reads — not the JSON envelope, so a control directive like `cacheinject` never looks "worse".
+reads — not the JSON envelope, so a control directive like a `cache_control` breakpoint never looks
+"worse".
 
 ## `GET /stats`
 
@@ -16,13 +17,23 @@ The proxy exposes `GET /stats` with in-process savings rollups. Savings are **to
 | `bounces` | how many offloads were re-served (the count behind `wasted_tokens`) |
 | `adjusted_saved` | `saved − wasted` — bounce-adjusted, may be negative |
 | `top_passthrough` | components that ran but never changed a request: dead weight to drop |
+| `top_discarded` | components whose changes the **writeback layer threw away** — they mutated but never reached the wire. Always worth investigating. |
+| `saved_tokens_unique` / `overcount_ratio` | distinct compactions, and how many times each was re-counted. Prefer the unique figure: the agent re-sends history verbatim every turn, so the cumulative `saved_tokens` is inflated. |
 | `mode` | the operating mode these numbers came from: `sync` \| `observe` |
 | `sync_enforced` | requests whose forwarded body context-guru actually shaped. **0 in observe mode by construction.** |
 
 !!! tip "Reading top_passthrough"
-    A component in `top_passthrough` isn't necessarily broken. `cacheinject` always lands there —
-    its savings are provider-side KV-cache hits, invisible to content-token counts. But a
+    A component in `top_passthrough` isn't necessarily broken. `cachesplit` always lands there —
+    its saving is a provider-side KV-cache hit, invisible to content-token counts, and the
+    component itself deliberately always skips (the rewrite is body-level). But a
     content-offloader that never fires is a candidate to drop from your pipeline.
+
+!!! warning "`top_discarded` is never expected"
+    An entry in `top_discarded` means a component ran, mutated the request, and the writeback
+    layer threw the change away before it reached the wire. Unlike `top_passthrough` this is
+    always worth investigating: it is exactly the signature that hid the `cacheinject` bug for
+    two whole benchmark studies, because a mutated-then-discarded component looks byte-identical
+    to a working Reformat. Check the per-component `discarded_changes` count.
 
 !!! warning "Enforced vs hypothetical"
     Everything above is what context-guru **actually did**. In

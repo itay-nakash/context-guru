@@ -40,26 +40,31 @@ is nothing to expand.
 - **Fits:** any traffic where you want a zero-risk win and no reversibility surface.
 - **Caveat:** `cachesplit`'s savings are provider-side cache hits, invisible to `/stats` token
   counts — it will show up under `top_passthrough`. That's expected, not dead weight.
-- **Note:** breakpoint *placement* (`cacheinject`) is deliberately **not** here — it is unmeasured
-  and opt-in since [#32](https://github.com/rossoctl/context-guru/issues/32). `cachesplit` carries
-  the part with measured savings.
+- **Note:** breakpoint *placement* (`cacheinject`) is deliberately **not** here — it is opt-in
+  since [#36](https://github.com/rossoctl/context-guru/pull/36), and the one live reading since
+  its marks began reaching the provider is mildly *negative* per step at n=1 with no mechanism
+  established. `cachesplit` carries the part with measured savings.
 
 ### `balanced` — `[format, dedup, failed_run, cmdfilter, cachesplit]`
-The default. Adds three cheap, high-precision offloaders: exact-dup removal (`dedup`), superseded
-test/build runs (`failed_run`), and DSL command-log filtering (`cmdfilter`).
+Adds three cheap, high-precision offloaders: exact-dup removal (`dedup`), superseded test/build
+runs (`failed_run`), and DSL command-log filtering (`cmdfilter`).
 
-- **Fits:** general agent traffic; the safe everyday choice.
-- **Caveat:** `cmdfilter` only fires when ≥1 filter is loaded and the output's first line matches
-  one. It ships 23 filters covering test runners, build tools, package managers, IaC plans and
+- **Fits:** general non-agentic traffic where you want a conservative win.
+- **Caveat:** **not** the choice for long agentic sessions — it omits `mask`, the biggest lever
+  there, and delivered 6% against `general`'s 31% in the Terminal-Bench replay. Use `codesmart`
+  (the actual default), `agent` or `general` for that.
+- **Caveat:** `cmdfilter` only fires when ≥1 filter is loaded and the output's selector matches
+  one. It ships **24** filters covering test runners, build tools, package managers, IaC plans and
   verbose network clients; author more with a [custom DSL filter](custom-dsl-filter.md).
 
-### `aggressive` — `[format, dedup, failed_run, cmdfilter, smartcrush, extract, cachesplit]`
-`balanced` plus JSON-array crushing (`smartcrush`) and query-relevance projection (`extract`).
+### `aggressive` — `[format, dedup, failed_run, cmdfilter, smartcrush, extract, extract_llm, cachesplit]`
+`balanced` plus JSON-array crushing (`smartcrush`), deterministic noise collapse (`extract`) and
+the cheap-model relevance trimmer (`extract_llm`).
 
 - **Fits:** you want more savings and accept structural/LLM offload with expand recovery.
-- **Caveat:** `extract` with `strategy: code`/`rlm` spends a model call (gated by its `trigger`);
-  the default `deterministic` strategy is free. Keep the [store](recover-context.md) on so the
-  extra offloads stay recoverable.
+- **Caveat:** `extract_llm` spends a model call (gated by its `trigger` and throttled per session);
+  `extract` beside it is free and deterministic. With no cheap model configured `extract_llm`
+  no-ops. Keep the [store](recover-context.md) on so the extra offloads stay recoverable.
 
 ### `coding` — `[format, skeleton, cmdfilter, cachesplit]`
 Swaps in `skeleton`, which tree-sitter-parses fenced code blocks and replaces function bodies with
@@ -76,7 +81,7 @@ items plus any item carrying an error signal, drop the middle.
 - **Fits:** MCP tools and REST list endpoints returning long uniform arrays.
 - **Caveat:** inert on non-array output or arrays below `min_items`.
 
-### `agent` — `[format, dedup, failed_run, mask, extract, cachesplit]`
+### `agent` — `[format, dedup, failed_run, mask, extract, extract_llm, cachesplit]`
 Tuned for long agentic sessions (e.g. Claude Code on SWE-bench) where the dominant cost is the
 transcript of old tool outputs re-sent every turn.
 
@@ -85,6 +90,15 @@ transcript of old tool outputs re-sent every turn.
   `keep_recent`. In the SWE-bench sweep it delivered ~27% mean content-token savings (up to 93.5%
   on a long session) with no reward loss ([Benchmarks](../RESULTS.md)). Order matters: lossless
   first, then offload old-then-large, cache last.
+
+### `general` — `[format, toon, dedup, failed_run, cmdfilter, mask, extract, extract_llm, collapse, cachesplit]`
+The recommended all-round pipeline: the reward-neutral levers of `agent` plus the situational
+shrinkers (`toon`, `cmdfilter`, `collapse`) that cost nothing when they don't fire.
+
+- **Fits:** any agent or benchmark, when you don't want to pick per workload.
+- **Caveat:** it stacks one LLM component (`extract_llm`) and one blind fallback (`collapse`). It
+  deliberately does **not** stack `summarize` beside `mask` — they are overlapping old-context
+  reducers, and `mask` is the one kept.
 
 ### `summarize` — `[summarize]`
 One LLM component that collapses the middle of the transcript into a single
@@ -96,7 +110,13 @@ One LLM component that collapses the middle of the transcript into a single
   It needs a model; with none it no-ops.
 
 !!! warning "LLM presets cost model calls"
-    `aggressive` (via `extract` code/rlm) and `summarize` call a model. Both are gated by a
-    `trigger` and reuse prior compactions per session, so they don't fire every turn. Pick the
-    model with `model.source` (`incoming` reuses the request's own model+key; `config` uses a
-    dedicated cheap model). See [LLM components](../design.md#llm-components).
+    `codesmart`, `aggressive`, `agent` and `general` (all via `extract_llm`) and `summarize` call
+    a model. Every call is gated by a `trigger` and throttled per session, and a prior compaction
+    is reused byte-for-byte on later turns, so they don't fire every turn. Pick the model with
+    `model.source` (`incoming` reuses the request's own model+key; `config` uses a dedicated cheap
+    model set via `CHEAP_MODEL*`). With no model available they no-op. See
+    [LLM components](../design.md#llm-components).
+
+!!! info "Every caching preset carries `cachesplit`, not `cacheinject`"
+    Breakpoint *placement* is in no preset — see the note under `safe` above and the
+    [`cacheinject` page](../components/cacheinject.md#what-placement-is-actually-worth).

@@ -21,6 +21,12 @@ All numbers are from the matched 50-task run (see [comparison.md](comparison.md)
 
 ## context-guru — pipeline `[format, dedup, failed_run, cmdfilter, extract_llm, extract, cacheinject]`
 
+!!! note "This is the pipeline as this run used it"
+    `codesmart` now ends in **`cachesplit`**, not `cacheinject` — breakpoint placement was removed
+    from every preset in [#36](https://github.com/rossoctl/context-guru/pull/36). The name is left
+    as-is here because it is what the run actually ran. See
+    [Presets](../reference/presets.md) for the current compositions.
+
 Two type-enforced kinds: **Reformat** (lossless repack, no stash) and **Offload**
 (lossy-but-reversible: leaves a `<<cg:HASH>>` marker + stashes the original, recoverable
 via the `context_guru_expand` tool). Every component is fail-open isolated — an error or
@@ -55,12 +61,21 @@ Run: **0 acts** (cache-aware), but still scans every run-like output (~6.7 s tot
 costliest *deterministic* detection).
 
 ### 4. `cmdfilter` (Offload)
-Declarative DSL filters keyed on a command output's first line (23 shipped, e.g. `pytest`,
+Declarative DSL filters keyed on the shape of a command output's leading lines (e.g. `pytest`,
 `make`, `gradle`, `terraform-plan`, `pulumi`): strip blank/`PASSED`/progress lines, cap length,
 keep failures.
 > **Real example** (pytest session): `1140 → 1068 tok` — passing/blank noise stripped,
 > failures + warnings kept verbatim.
 Run: 3 acts.
+
+!!! note "The filter set has since tripled"
+    This run had **3** filters matched on the output's *first* line only.
+    [#42](https://github.com/rossoctl/context-guru/pull/42) took it to **24** filters, rewrote every
+    selector to match output shape over six leading lines, and added the per-family `/stats` ledger.
+    The 3-act figure is not a ceiling for the current set — but nor is 24 filters a promise of 8×
+    the savings: on the Terminal-Bench dump the four filters *predicted* to matter (`pulumi`,
+    `terraform-plan`, `xcodebuild`, `gradle`) fired zero times, and `apt` + `gcc` carried ~73% of
+    the savings instead. Re-measure rather than extrapolate.
 
 ### 5. `extract_llm` (Offload — the relevance-aware LLM pass)
 A cheap **haiku**-class model writes a sandboxed **Starlark program** that trims *one*
@@ -114,8 +129,10 @@ cache hits across turns. No content change.
 
     So the **97.8% cache-hit rate is not attributable to this component.** That rate is
     claude-code's own breakpoints, which it sets on every request and which the proxy
-    forwarded untouched. Fixed in #32; a re-run must re-measure this row rather than carry
-    the number forward.
+    forwarded untouched. Fixed in [#36](https://github.com/rossoctl/context-guru/pull/36); a
+    re-run must re-measure this row rather than carry the number forward. In the meantime
+    placement has been removed from every preset, so a fresh `codesmart` run has no
+    `cacheinject` row at all — it has a `cachesplit` one.
 
 ---
 
