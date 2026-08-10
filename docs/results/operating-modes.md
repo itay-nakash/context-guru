@@ -5,9 +5,10 @@ pipeline, cache-aware billed cost (fresh $2/M · cache-read $0.20/M · cache-wri
 $2.50/M · output $10/M) recomputed from each trial's token tiers. See
 [REPRODUCE.md](REPRODUCE.md).
 
-**Scale caveat, stated up front.** These are 2-task arms (n=1) — enough to validate
-the *mechanism* and to answer the latency and cache questions, nowhere near enough for
-a cost or solve-rate claim. The 50-task arms in the other results pages are the ones to
+**Scale caveat, stated up front.** Nine trials total: 2 SWE-bench tasks and 2
+Terminal-Bench tasks per mode at n=1, plus one real Claude Code session per mode. Enough
+to validate the *mechanism* and to answer the latency and cache questions, nowhere near
+enough for a cost or solve-rate claim. The 50-task arms in the other results pages are the ones to
 cite for savings. What is measured here is whether each mode does what it says.
 
 ## SWE-bench Verified — 2 tasks, n=1
@@ -118,27 +119,35 @@ that gap is *not* explained away — it is the honest discrepancy this section o
   and is documented as one.
 - 2 tasks at n=1 cannot separate a real bias from trajectory noise.
 
-The controlled same-traffic test is the strong evidence for agreement; the benchmark
-arms are consistent with it but too small to confirm it independently. A 50-task paired
-run is the honest next step.
+The Terminal-Bench arms add a **negative control**, which is the more convincing shape of
+this evidence: there sync achieved 1.02% and observe projected **0%** — on traffic with
+almost nothing to save, observe correctly reports almost nothing rather than inventing a
+number. A projection that only ever agreed on high-savings traffic would be far weaker.
+
+So: the controlled same-traffic test shows exact agreement, Terminal-Bench shows correct
+agreement near zero, and the SWE-bench arms are consistent but too small and too
+differently-shaped to confirm independently. A 50-task paired run is the honest next
+step.
 
 ## Terminal-Bench 2.0 — 2 cache-sensitive tasks, n=1
 
 A second, independent benchmark, and the reason it is worth reporting despite being
 even smaller: it replicates the cache-write result on different traffic.
 
-| | `sync` | `async` |
-|---|---|---|
-| added latency / req | 26.9 ms | 26.8 ms |
-| cache-read | 3,144,887 | 6,311,918 |
-| cache-write | 68,211 | 83,222 |
-| **cache-write per 1M cache-read** | **21,689** | **13,185 (−39.2%)** |
-| cache-hit rate | 97.87% | 98.70% |
-| pipeline runs | 60 | 110 |
-| context-guru's own LLM calls | **0** | **0** |
-| off-path compaction time | — | 2.5 s |
-| `async_realized_saved_tokens` | — | 1,156 |
-| queue `{dropped, stale_discarded}` | — | `{0, 0}` |
+| | `sync` | `async` | `observe` |
+|---|---|---|---|
+| **added latency / req** | 26.9 ms | 26.8 ms | **0.076 ms** |
+| cache-read | 3,144,887 | 6,311,918 | 3,200,254 |
+| cache-write | 68,211 | 83,222 | 93,403 |
+| **cache-write per 1M cache-read** | **21,689** | **13,185 (−39.2%)** | — (not enforcing) |
+| cache-hit rate | 97.87% | 98.70% | 97.15% |
+| content savings (enforced) | 1.02% | 0.11% | — (0 by construction) |
+| projected savings | — | — | 0% |
+| pipeline runs | 60 | 110 | 64 |
+| context-guru's own LLM calls | **0** | **0** | **0** |
+| off-path compaction time | — | 2.5 s | 0.6 s |
+| `async_realized_saved_tokens` | — | 1,156 | — |
+| queue `{dropped, stale_discarded}` | — | `{0, 0}` | `{0, 0}` |
 
 Two things to read here.
 
@@ -154,9 +163,19 @@ useful negative result rather than a disappointment: async buys back the compact
 model call, so on traffic that never triggers one it buys nothing. It also does not
 *cost* anything there, which is the important half.
 
+**Observe's projection is 0%, and that is the right answer.** This is the more
+convincing half of the projection-accuracy question than the SWE-bench arms were,
+because it is a negative control: on traffic where sync achieves almost nothing (1.02%),
+observe correctly projects almost nothing (0%) rather than inventing a headline. A
+projection that only ever agrees on traffic with large savings would be far weaker
+evidence. Observe also reported the overhead sync *would* have added as 9.1 ms/req,
+correctly small here since the pipeline made no model calls — while itself adding
+0.076 ms.
+
 Reward is not quoted from this arm: these are two hard tasks, one hit an
 environment-build exception in each configuration, and the trajectories diverged sharply
-(30 vs 55.5 mean steps). At this scale the step counts drive the cost column entirely.
+(30 / 55.5 / 32.5 mean steps). At this scale the step counts drive the cost column
+entirely.
 
 ## Real Claude Code sessions (one per mode)
 
