@@ -119,3 +119,104 @@ func TestExplicitMinTokensConfigStillReduces(t *testing.T) {
 		t.Fatalf("explicit min_tokens must still reduce (skipped=%v calls=%d)", rep.Skipped, cm.calls)
 	}
 }
+
+// Cross-session reuse must be gated on RECOVERABILITY. In the default rewrite mode the
+// containment proof is deliberately skipped, so a cached result can be a lossy rewrite
+// steered by ANOTHER session's goal. That is tolerable only while `expand` can recover the
+// original — with marker_mode: off there is no way back, so a second session must NOT
+// inherit the first session's lossy rewrite.
+func TestNoCrossSessionReuseOfIrreversibleRewrite(t *testing.T) {
+	off := newComp(t, "extract_llm",
+		"strategy: code\nmin_tokens: 1\neconomic_gate: false\nmarker_mode: off\nmodel:\n  source: config\n")
+	st := store.NewMemory(store.Options{})
+	filter := "data = json.decode(INPUT)\nOUTPUT = json.encode([r for r in data if \"keep\" in r[\"name\"]])\n"
+	cm := &countingModel{resp: filter}
+	pad := strings.Repeat("padding ", 40)
+	body := `[{"id":1,"name":"keep this ` + pad + `"},{"id":2,"name":"drop this ` + pad + `"}]`
+
+	runIn := func(session string) {
+		req := &bschemas.BifrostChatRequest{Input: []bschemas.ChatMessage{
+			userMsg("find the keep records"), toolMsg(body),
+		}}
+		c := &components.Ctx{Ctx: context.Background(), Session: session, Store: st,
+			Model: components.ModelSpec{Static: cm}}
+		var rep components.Report
+		if _, err := off.Offload(req, &rep, c); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	runIn("session-A")
+	first := cm.calls
+	if first == 0 {
+		t.Fatal("first session should have called the model")
+	}
+	runIn("session-B")
+	if cm.calls == first {
+		t.Fatal("an irreversible lossy rewrite must NOT be reused across sessions " +
+			"(no expand path to recover the original)")
+	}
+}
+
+// The same content in the SAME session must still be reused even when irreversible — that
+// costs nothing extra and keeps the request prefix byte-stable.
+func TestSameSessionReuseStillWorksWhenIrreversible(t *testing.T) {
+	off := newComp(t, "extract_llm",
+		"strategy: code\nmin_tokens: 1\neconomic_gate: false\nmarker_mode: off\nmodel:\n  source: config\n")
+	st := store.NewMemory(store.Options{})
+	filter := "data = json.decode(INPUT)\nOUTPUT = json.encode([r for r in data if \"keep\" in r[\"name\"]])\n"
+	cm := &countingModel{resp: filter}
+	pad := strings.Repeat("padding ", 40)
+	body := `[{"id":1,"name":"keep this ` + pad + `"},{"id":2,"name":"drop this ` + pad + `"}]`
+
+	run := func() {
+		req := &bschemas.BifrostChatRequest{Input: []bschemas.ChatMessage{
+			userMsg("find the keep records"), toolMsg(body),
+		}}
+		c := &components.Ctx{Ctx: context.Background(), Session: "one-session", Store: st,
+			Model: components.ModelSpec{Static: cm}}
+		var rep components.Report
+		if _, err := off.Offload(req, &rep, c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run()
+	after := cm.calls
+	run()
+	if cm.calls != after {
+		t.Fatalf("same-session reuse must avoid a second call, calls went %d -> %d", after, cm.calls)
+	}
+}
+
+// SHIPPING DECISION, end to end: on a cache-aware request the component must decline by
+// default however attractive the economics look, and `allow_on_caching_backend: true` must
+// hand control back to the gate.
+func TestCachingBackendDisabledByDefaultInPipeline(t *testing.T) {
+	filter := "data = json.decode(INPUT)\nOUTPUT = json.encode([r for r in data if \"keep\" in r[\"name\"]])\n"
+	// A big output, well above any break-even, so only the default can be declining it.
+	pad := strings.Repeat("padding word here ", 4000)
+	body := `[{"id":1,"name":"keep this ` + pad + `"},{"id":2,"name":"drop this ` + pad + `"}]`
+
+	runWith := func(cfg string) int {
+		off := newComp(t, "extract_llm", cfg)
+		cm := &countingModel{resp: filter}
+		req := &bschemas.BifrostChatRequest{Input: []bschemas.ChatMessage{
+			userMsg("find the keep records"), toolMsg(body),
+		}}
+		c := &components.Ctx{Ctx: context.Background(), Session: "s", Store: store.NewMemory(store.Options{}),
+			Model: components.ModelSpec{Static: cm}, CacheAware: true, MaxCachedIdx: -1,
+			CtxWindow: 200_000}
+		var rep components.Report
+		if _, err := off.Offload(req, &rep, c); err != nil {
+			t.Fatal(err)
+		}
+		return cm.calls
+	}
+
+	if n := runWith("strategy: code\nmin_tokens: 1\nmodel:\n  source: config\n"); n != 0 {
+		t.Errorf("caching backend must be off by default, got %d calls", n)
+	}
+	if n := runWith("strategy: code\nmin_tokens: 1\nallow_on_caching_backend: true\nmodel:\n  source: config\n"); n == 0 {
+		t.Error("allow_on_caching_backend: true must permit a clearly-economic call")
+	}
+}

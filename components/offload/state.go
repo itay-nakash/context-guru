@@ -79,16 +79,21 @@ func putSummaryGlobal(c *components.Ctx, gkey, s string) {
 
 func seenKey(ck string) string { return "cg:xseen:" + ck }
 
-// hasSeenContent reports whether this content was considered for extraction before.
-func hasSeenContent(c *components.Ctx, ck string) bool {
-	_, ok := c.Store.Get(seenKey(ck))
-	return ok
-}
-
-// markSeenContent records that this content was considered, so a later encounter reads as
-// recurring.
-func markSeenContent(c *components.Ctx, ck string) {
-	c.Store.Put(seenKey(ck), []byte{1})
+// markSeenContent records that this content was OBSERVED and reports whether it had
+// ALREADY been seen (on an earlier turn, or in another session).
+//
+// Test-and-set in one call so the gate cannot read a flag that this same sighting just
+// wrote. Marking after the gate allowed a call made first sight reclassify itself as
+// recurring and collect a 50% valuation bump (6 expected reuses vs 4) it had not earned.
+// Marking on observation also means a SUPPRESSED candidate still counts as seen, which is
+// correct: recurrence is a property of the content, not of what we chose to spend on it.
+func markSeenContent(c *components.Ctx, ck string) bool {
+	k := seenKey(ck)
+	_, seen := c.Store.Get(k)
+	if !seen {
+		c.Store.Put(k, []byte{1})
+	}
+	return seen
 }
 
 // --- Freeze + reapply (cache stability) -------------------------------------

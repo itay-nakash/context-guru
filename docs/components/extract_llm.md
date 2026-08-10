@@ -33,6 +33,9 @@ costing ~$0.012 must therefore remove a *lot* of tokens to break even:
 | Non-caching | seen once | ~3,400 tokens |
 | Non-caching | recurring | **~1,800 tokens** |
 
+The caching figures are why the component is now **off by default on caching backends**: no
+realistic tool output reaches 30,500 tokens, so the gate would only ever be declining.
+
 These use the **measured** compression ratio, and that measurement is the uncomfortable part: on
 real captures an accepted extraction removed only **31–254 tokens per call** on outputs of
 400–2,000 tokens — an actual ratio around **0.10–0.12**, not the ~0.45 one might assume. The model
@@ -47,49 +50,53 @@ where it cannot win.
 
 ### Measured after #28 (replay of real captures, `aws/claude-haiku-4-5`)
 
-`forced` = pre-#28 behavior (`economic_gate: false`); `gated` = post-#28 default. Same
-capture, same floor, same model — the only difference is the gate.
+`forced` = pre-#28 behavior (`economic_gate: false`); `gated` = post-#28 defaults. Same
+capture, same floor, same model. **"Saved" is extract_llm's OWN savings**, not the pipeline's
+— an earlier draft of this table credited the whole pipeline's savings to this component and
+consequently reported a win that did not exist. Attribution is the difference between
+"positive" and "negative" here, so it is worth stating twice.
 
 **Terminal-Bench capture (20 requests):**
 
-| Arm | Backend | LLM calls | Cost | Tokens saved | Gross value | **NET** | Avg latency |
+| Arm | Backend | Calls | Cost | Own tokens saved | Gross value | **NET** | Avg latency |
 |---|---|---|---|---|---|---|---|
-| forced | caching | 4 | $0.0086 | 1,220 | $0.0004 | **−$0.0082** | 9,726 ms |
-| **gated** | caching | 3 | $0.0065 | 0 | $0 | **−$0.0065** | 6,966 ms |
-| forced | non-caching | 6 | $0.0109 | 6,664 | $0.0200 | **+$0.0091** | 10,287 ms |
-| **gated** | non-caching | 7 | $0.0232 | **17,286** | $0.0519 | **+$0.0287** | **4,654 ms** |
+| forced | caching | 5 | $0.0095 | 2 | $0.0000 | **−$0.0095** | 11,666 ms |
+| **gated** | caching | **0** | $0 | 0 | $0 | **$0** | — |
+| forced | non-caching | 6 | $0.0233 | 2,018 | $0.0061 | **−$0.0172** | 11,385 ms |
+| **gated** | non-caching | 3 | $0.0126 | **2,394** | $0.0072 | **−$0.0054** | 10,534 ms |
 
 **SWE-bench capture (19 requests):**
 
-| Arm | Backend | LLM calls | Cost | Tokens saved | **NET** | Avg latency |
+| Arm | Backend | Calls | Cost | Own tokens saved | **NET** | Avg latency |
 |---|---|---|---|---|---|---|
-| forced | caching | 2 | $0.0098 | 793 | **−$0.0095** | 8,173 ms |
-| **gated** | caching | 2 | $0.0092 | 806 | **−$0.0089** | 5,060 ms |
-| forced | non-caching | **13** | $0.0593 | 726 | **−$0.0571** | 5,150 ms |
-| **gated** | non-caching | **2** | $0.0090 | **2,451** | **−$0.0016** | 3,754 ms |
+| forced | caching | 2 | $0.0090 | 0 | **−$0.0090** | 8,556 ms |
+| **gated** | caching | **0** | $0 | 0 | **$0** | — |
+| forced | non-caching | **26** | $0.0660 | 274 | **−$0.0652** | 11,302 ms |
+| **gated** | non-caching | 1 | $0.0000 | 0 | **$0.0000** | 15,004 ms |
 
 Reading these:
 
-- **On a non-caching backend the gate is a clear win.** Terminal-Bench: net **+$0.0287 vs
-  +$0.0091** (3.2×) with **2.6× more tokens saved** and **half the latency**. SWE-bench: it cuts
-  13 calls to 2 and the loss from **−$0.0571 to −$0.0016** — a **97% reduction in waste**.
-- **On a caching backend it is still slightly negative**, because even the gate's minimum
-  exploration spend exceeds what cache-read-rate savings can return on these output sizes. The
-  gate reduces the loss (−$0.0082 → −$0.0065; −$0.0095 → −$0.0089) and cuts latency ~30%, but it
-  does not turn the component positive. **This is the honest verdict: on a caching backend
-  `extract_llm` does not earn its place on these workloads.**
-- The `reasons` breakdown shows the gate working for the documented reasons —
-  `allow: recurring content, amortized over reuses`, `allow: non-caching backend, saved tokens at
-  full rate`, `suppressed: cache-aware, saving below call cost`.
+- **The gate is a strict improvement in every arm.** It never loses more than the pre-#28
+  behavior and usually far less: −$0.0172 → −$0.0054 (68% less waste) on Terminal-Bench
+  non-caching *while saving more tokens*, and 26 calls → 1 on SWE-bench non-caching, taking
+  a −$0.0652 loss to break-even.
+- **On a caching backend the component now makes zero calls and loses nothing**, because it
+  is disabled there by default (see below). That is the honest resolution: the gate could
+  reduce the loss but never eliminate it, so the default stops paying for it at all.
+- **Even on a non-caching backend the component does not clearly earn its place** on these
+  workloads — the best result is break-even, not profit. It removes only 31–254 tokens per
+  call at ~10 s of added latency. It earns its place when outputs are genuinely large
+  (>~1,800 tokens on a non-caching backend); these captures mostly are not.
 
 !!! tip "If you only remember one thing"
     On a caching backend, expect `extract_llm` to suppress most candidates and contribute
     little; its value comes from the **result cache**, not from new LLM calls. On a
     **non-caching** backend it is genuinely valuable. Check
-    `/stats` → `extract.net_value_usd` — if it is negative on your workload, remove the
-    component from the pipeline. **On the caching backends measured here it IS negative even
-    after #28**, so the recommendation for caching traffic is `codesafe` (which has no LLM pass)
-    or dropping `extract_llm` from `codesmart`.
+    **`extract_llm` is disabled by default on prompt-caching backends** as of #28 — in code,
+    not just documentation, because every caching workload measured came out net-negative even
+    with a correctly-working gate. It runs on non-caching traffic, where the gate decides per
+    call. Set `allow_on_caching_backend: true` to override. Check `/stats` →
+    `extract.net_value_usd` on your own workload before doing so.
 
 ## How it works
 
@@ -294,7 +301,8 @@ Lossy but reversible — the original is stashed and recovered via `context_guru
 
 | Key | Default | Meaning |
 |---|---|---|
-| `economic_gate` | `true` | Only call the LLM when expected saving > expected cost. `false` restores pre-#28 spend-on-size behavior. |
+| `allow_on_caching_backend` | `false` | **Off by default on prompt-caching backends** — measured net-negative there even with the gate working. `true` re-enables it and lets the gate decide per call. |
+| `economic_gate` | `true` | Only call the LLM when expected saving > expected cost. `false` restores pre-#28 spend-on-size behavior (and implies `allow_on_caching_backend`). |
 | `min_tokens` | *derived* | Output floor. **Unset = derived from context pressure** (no tuning). Set explicitly to pin it (folds into `trigger.min_output_tokens`). |
 | `strategy` | `code` | `code` \| `single` \| `rlm` \| `auto` (`rlm` maps to `code`). |
 | `model.source` | `incoming` | `incoming` (proxied model+key) or `config` (cheap model via `CHEAP_MODEL*`). |

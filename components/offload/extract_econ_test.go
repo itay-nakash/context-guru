@@ -17,7 +17,7 @@ func TestGateSuppressesSmallOutputWhenCacheAware(t *testing.T) {
 	if val.cached != true {
 		t.Fatal("cache-aware ctx must price saved tokens at the cache-read rate")
 	}
-	d := evaluateGate(400, defaultCompressionRatio, val, callCost(cheapmodel.HaikuPricing(), 400), false, 5, false)
+	d := evaluateGate(400, defaultCompressionRatio, val, callCost(cheapmodel.HaikuPricing(), 400), false, 5, false, true)
 	if d.allow {
 		t.Fatalf("small cached output must be suppressed: saving=$%.5f cost=$%.5f", d.expSaving, d.expCost)
 	}
@@ -35,9 +35,9 @@ func TestGateSuppressesSmallOutputWhenCacheAware(t *testing.T) {
 func TestGatePermitsOnNonCachingBackend(t *testing.T) {
 	size := 60000 // above both break-evens (~1.8k non-caching, ~42.6k cached)
 	cached := evaluateGate(size, defaultCompressionRatio,
-		savedTokenValue(&components.Ctx{CacheAware: true}), callCost(cheapmodel.HaikuPricing(), size), false, 5, false)
+		savedTokenValue(&components.Ctx{CacheAware: true}), callCost(cheapmodel.HaikuPricing(), size), false, 5, false, true)
 	fresh := evaluateGate(size, defaultCompressionRatio,
-		savedTokenValue(&components.Ctx{CacheAware: false}), callCost(cheapmodel.HaikuPricing(), size), false, 5, false)
+		savedTokenValue(&components.Ctx{CacheAware: false}), callCost(cheapmodel.HaikuPricing(), size), false, 5, false, true)
 
 	if !fresh.allow {
 		t.Fatalf("non-caching backend must permit a %d-token output: saving=$%.5f cost=$%.5f",
@@ -58,8 +58,8 @@ func TestGatePermitsHighReuseContent(t *testing.T) {
 	// cached-once one. This size is the gate's whole thesis in one fixture — recurrence is
 	// what tips an otherwise-losing call into profit, so the SAME size goes both ways.
 	size := 34000
-	once := evaluateGate(size, defaultCompressionRatio, val, callCost(cheapmodel.HaikuPricing(), size), false, 5, false)
-	recur := evaluateGate(size, defaultCompressionRatio, val, callCost(cheapmodel.HaikuPricing(), size), true, 5, false)
+	once := evaluateGate(size, defaultCompressionRatio, val, callCost(cheapmodel.HaikuPricing(), size), false, 5, false, true)
+	recur := evaluateGate(size, defaultCompressionRatio, val, callCost(cheapmodel.HaikuPricing(), size), true, 5, false, true)
 
 	if recur.expSaving <= once.expSaving {
 		t.Fatalf("recurring content must be valued higher: recur=%v once=%v", recur.expSaving, once.expSaving)
@@ -83,7 +83,7 @@ func TestBreakEvenSizesMatchTheDocumentedVerdict(t *testing.T) {
 	breakEven := func(cacheAware, recurring bool) int {
 		val := savedTokenValue(&components.Ctx{CacheAware: cacheAware})
 		for size := 200; size <= 400_000; size += 100 {
-			if evaluateGate(size, defaultCompressionRatio, val, callCost(cheapmodel.HaikuPricing(), size), recurring, 5, false).allow {
+			if evaluateGate(size, defaultCompressionRatio, val, callCost(cheapmodel.HaikuPricing(), size), recurring, 5, false, true).allow {
 				return size
 			}
 		}
@@ -257,7 +257,7 @@ func TestGateIsDecidableFromColdOnFirstCall(t *testing.T) {
 
 	small := 2000
 	d := evaluateGate(small, defaultCompressionRatio, val,
-		callCost(cheapmodel.HaikuPricing(), small), false, 5, false)
+		callCost(cheapmodel.HaikuPricing(), small), false, 5, false, true)
 	if d.allow {
 		t.Errorf("a %d-token output should not pay at the measured 0.12 ratio: "+
 			"saving=$%.5f cost=$%.5f", small, d.expSaving, d.expCost)
@@ -265,7 +265,7 @@ func TestGateIsDecidableFromColdOnFirstCall(t *testing.T) {
 
 	big := 20000 // comfortably above the ~1.8k-3.4k non-caching break-even
 	d = evaluateGate(big, defaultCompressionRatio, val,
-		callCost(cheapmodel.HaikuPricing(), big), false, 5, false)
+		callCost(cheapmodel.HaikuPricing(), big), false, 5, false, true)
 	if !d.allow {
 		t.Errorf("a %d-token output on a non-caching backend must pay on the first call: "+
 			"saving=$%.5f cost=$%.5f", big, d.expSaving, d.expCost)
@@ -288,23 +288,30 @@ func TestGateExploresThenSettles(t *testing.T) {
 	var r ratioTracker
 	explored := 0
 	for i := 0; i < 20; i++ {
-		if r.exploring() {
+		if r.exploring("sessA") {
 			explored++
 		}
 	}
 	if explored != maxExploreCalls {
-		t.Fatalf("exploration must be bounded to %d calls, got %d", maxExploreCalls, explored)
+		t.Fatalf("exploration must be bounded to %d calls per session, got %d", maxExploreCalls, explored)
+	}
+	// PER SESSION, not per process: a second session gets its own budget. A process-wide
+	// counter spent everything on the first session, leaving every later one with an
+	// unrevisable prior — the off-switch failure exploration exists to prevent, at process
+	// scope.
+	if !r.exploring("sessB") {
+		t.Fatal("a different session must get its own exploration budget")
 	}
 
 	// An exploration slot must actually flip an otherwise-suppressed decision.
 	val := savedTokenValue(&components.Ctx{CacheAware: true})
 	size := 400 // far below break-even: normally suppressed
 	cost := callCost(cheapmodel.HaikuPricing(), size)
-	suppressed := evaluateGate(size, defaultCompressionRatio, val, cost, false, 5, false)
+	suppressed := evaluateGate(size, defaultCompressionRatio, val, cost, false, 5, false, true)
 	if suppressed.allow {
 		t.Fatal("without an exploration slot a tiny cached output must be suppressed")
 	}
-	exploring := evaluateGate(size, defaultCompressionRatio, val, cost, false, 5, true)
+	exploring := evaluateGate(size, defaultCompressionRatio, val, cost, false, 5, true, true)
 	if !exploring.allow {
 		t.Fatal("an exploration slot must permit the call so the ratio can be learned")
 	}
@@ -315,7 +322,96 @@ func TestGateExploresThenSettles(t *testing.T) {
 	// Once enough evidence exists, exploration stops even if slots remain unused.
 	var r2 ratioTracker
 	r2.observe(200, minRatioSampleTokens+1)
-	if r2.exploring() {
+	if r2.exploring("anySession") {
 		t.Fatal("with sufficient evidence the gate must stop exploring")
+	}
+}
+
+// REGRESSION (H2): the learned ratio must be shrunk toward the prior and capped.
+// minRatioSampleTokens is about one medium output, so a raw mean can be n=1 — and an
+// unbounded n=1 estimate would drop the cached break-even from ~30,500 tokens to ~7,000
+// permanently, with the gate then spending on that basis for the rest of the process.
+func TestLearnedRatioIsShrunkAndCapped(t *testing.T) {
+	// One highly-compressible observation, just past the sample threshold.
+	var r ratioTracker
+	r.observe(1800, 2000) // raw ratio 0.90
+	got := r.ratio()
+	if got >= 0.90 {
+		t.Errorf("a single observation must not be taken at face value, got %v", got)
+	}
+	if got <= defaultCompressionRatio {
+		t.Errorf("real evidence must still move the estimate up from %v, got %v",
+			defaultCompressionRatio, got)
+	}
+
+	// Overwhelming consistent evidence may dominate the prior, but never exceed the cap.
+	var r2 ratioTracker
+	for i := 0; i < 200; i++ {
+		r2.observe(1900, 2000) // raw ratio 0.95, far above any plausible acceptance
+	}
+	if capped := r2.ratio(); capped > maxLearnedRatio {
+		t.Errorf("learned ratio must be capped at %v, got %v", maxLearnedRatio, capped)
+	}
+
+	// Consistent misses must still drive it down toward zero (the gate-shutting direction).
+	var r3 ratioTracker
+	for i := 0; i < 200; i++ {
+		r3.observe(0, 2000)
+	}
+	if low := r3.ratio(); low >= defaultCompressionRatio {
+		t.Errorf("repeated misses must lower the estimate below %v, got %v",
+			defaultCompressionRatio, low)
+	}
+}
+
+// SHIPPING DECISION (in code, not prose): the component is disabled by default on caching
+// backends, because every caching workload measured came out net-negative even with a
+// correctly-working gate. A default guarded only by a doc note is not a default.
+func TestSuppressedByDefaultOnCachingBackend(t *testing.T) {
+	val := savedTokenValue(&components.Ctx{CacheAware: true})
+	// A candidate far ABOVE the cached break-even — economics alone would permit it.
+	size := 200_000
+	cost := callCost(cheapmodel.HaikuPricing(), size)
+
+	blocked := evaluateGate(size, defaultCompressionRatio, val, cost, true, 5, false, false)
+	if blocked.allow {
+		t.Fatal("caching backend must be declined by default even when the economics pass")
+	}
+	if blocked.reason == "" {
+		t.Fatal("the default decline must explain itself")
+	}
+
+	// Explicitly allowed: the gate's economics then apply as normal and this passes.
+	forced := evaluateGate(size, defaultCompressionRatio, val, cost, true, 5, false, true)
+	if !forced.allow {
+		t.Fatalf("allow_on_caching_backend must hand control back to the economics: "+
+			"saving=$%.5f cost=$%.5f", forced.expSaving, forced.expCost)
+	}
+
+	// The default must NOT block a non-caching backend — that is where the component wins.
+	fresh := savedTokenValue(&components.Ctx{CacheAware: false})
+	ok := evaluateGate(20000, defaultCompressionRatio, fresh,
+		callCost(cheapmodel.HaikuPricing(), 20000), false, 5, false, false)
+	if !ok.allow {
+		t.Fatalf("non-caching traffic must still be permitted: saving=$%.5f cost=$%.5f",
+			ok.expSaving, ok.expCost)
+	}
+}
+
+// The latency brake (PR #37): exploration spends wall clock as well as money, and an agent
+// on a task deadline feels the former more. Once calls are observed slow, stop speculating.
+func TestTooSlowToExplore(t *testing.T) {
+	if tooSlowToExplore(0, 0) {
+		t.Error("no observations must not read as slow")
+	}
+	if tooSlowToExplore(500, 3) {
+		t.Error("fast calls must allow exploration")
+	}
+	if !tooSlowToExplore(slowCallMs, 1) {
+		t.Error("at the threshold exploration must stop")
+	}
+	// The #37 shape: 17.8s across 2 calls.
+	if !tooSlowToExplore(17800.0/2, 2) {
+		t.Error("PR #37's measured latency must stop exploration")
 	}
 }

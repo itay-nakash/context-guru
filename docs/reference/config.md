@@ -64,6 +64,11 @@ Defaults are `claude-haiku-4-5` list rates; override them to match your contract
 
 An unparseable or absent value silently keeps the default — pricing must never fail a request.
 
+!!! note "`extract_llm` is off by default on caching backends"
+    Independently of pricing, the component declines to run on prompt-caching traffic unless
+    `allow_on_caching_backend: true` is set — measured net-negative there. See
+    [extract_llm](../components/extract_llm.md#the-honest-verdict).
+
 ## Diagnostics
 
 | Env | Effect |

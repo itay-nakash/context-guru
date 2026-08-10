@@ -70,6 +70,9 @@ type ExtractLLM struct {
 	// gate enables the economic gate (#28 D). Default on; `economic_gate: false` restores
 	// the old spend-on-size behavior for anyone who needs to reproduce old numbers.
 	gate bool
+	// allowCached permits extraction on prompt-caching backends. Default FALSE — see
+	// extractLLMConfig.AllowOnCachingBackend for why the default ships disabled there.
+	allowCached bool
 	// pricing prices the extraction model's tokens for the gate's cost side (#28 D).
 	pricing cheapmodel.Pricing
 	// ratios learns this workload's real compression ratio instead of assuming one.
@@ -94,6 +97,14 @@ type extractLLMConfig struct {
 	// required verbatim by the sanity check. Default true (the powerful mode) — set
 	// false to force verified deletion-only.
 	Rewrite *bool `yaml:"rewrite"`
+	// AllowOnCachingBackend re-enables extraction on prompt-caching backends. Unset =
+	// FALSE: the component is disabled by default there, because every caching workload
+	// measured in #28 came out net-negative even with the gate working correctly
+	// (break-even ~30,500 tokens/output against a largest-observed 2,053). Shipping a
+	// component our own numbers say loses money, guarded only by a doc note, is not a
+	// defensible default. Set true if your outputs are genuinely huge; the gate's
+	// economics then decide each call as normal.
+	AllowOnCachingBackend *bool `yaml:"allow_on_caching_backend"`
 	// EconomicGate opts out of the expected-value gate (#28 D). Unset = ON (the default):
 	// only call the LLM when the expected saving exceeds the expected call cost, priced
 	// from real model rates and the cache-awareness of the traffic. Set false to restore
@@ -144,13 +155,21 @@ func newExtractLLM(raw []byte) (components.Component, error) {
 	if cfg.EconomicGate != nil {
 		gate = *cfg.EconomicGate
 	}
+	// Off by default on caching backends (see AllowOnCachingBackend). Disabling the gate
+	// entirely is an explicit request for pre-#28 behavior, so honor it here too — otherwise
+	// `economic_gate: false` would still be silently blocked on caching traffic.
+	allowCached := !gate
+	if cfg.AllowOnCachingBackend != nil {
+		allowCached = *cfg.AllowOnCachingBackend
+	}
 	return &ExtractLLM{
 		minTokens: cfg.MinTokens, strategy: cfg.Strategy,
 		modelSource: cfg.Model.Source, modelClient: cfg.Model.Client(),
 		trigger: cfg.Trigger, mode: parseMarkerMode(cfg.MarkerMode), rewrite: rewrite,
 		llmEveryN: cfg.LLMEveryN, llmMaxPerReq: cfg.LLMMaxPerReq,
 		skipFileReads: cfg.SkipFileReads, llmSeen: map[string]int{},
-		minTokensSet: explicit, gate: gate, pricing: cheapmodel.PricingFromEnv(),
+		minTokensSet: explicit, gate: gate, allowCached: allowCached,
+		pricing:    cheapmodel.PricingFromEnv(),
 		prevTokens: map[string]int{}, modelName: cfg.Model.Model,
 	}, nil
 }
@@ -318,8 +337,21 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 		// different session reuses the reduction instead of paying for it again (measured:
 		// 82 of 103 unique contents recurred across sessions). A version/model/config
 		// change misses rather than serving a stale extraction.
+		//
+		// Cross-session reuse is gated on RECOVERABILITY, not verification. The result was
+		// derived toward the goal of whichever session produced it, and in the default rewrite
+		// mode the containment proof is deliberately skipped — so a reused result can be a lossy
+		// rewrite steered by an unrelated task. That is acceptable only while the agent can get
+		// the original back: with a full (reversible) marker the stash is refreshed and `expand`
+		// recovers it. Without one (marker_mode summary/off, or a non-persisting store) the drop
+		// is permanent, and reusing another session's lossy rewrite could silently lose content
+		// THIS task needed. There, fall back to same-session reuse only.
 		gkey := extract.ResultKey(id, e.modelName, extCfg)
-		cached, hit := getResultGlobal(c, gkey)
+		var cached []byte
+		hit := false
+		if !e.rewrite || effectiveMode(c, e.mode) == markerFull {
+			cached, hit = getResultGlobal(c, gkey)
+		}
 		if !hit {
 			// One-time migration read: honor a pre-#28 session-scoped entry so upgrading
 			// does not re-pay for work already done in this session.
@@ -368,12 +400,21 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 		// LLM call worth it for THIS output, given that a saved token in a cached region
 		// is worth 10x less? Where caching makes extraction pointless, suppress it; on a
 		// non-caching backend or for recurring content, allow it.
+		// Record the sighting BEFORE the gate reads it, and read the PRIOR value. The flag
+		// means "seen on an earlier turn/session", so marking it after the gate allowed a
+		// call made first sight reclassify itself as recurring and collect a 50% valuation
+		// bump (6 expected reuses vs 4) it had not earned — the gate over-firing in the
+		// opposite direction from the two pessimistic priors fixed earlier. Marking on
+		// OBSERVATION also means a suppressed candidate still counts as seen, which is
+		// correct: recurrence is a property of the content, not of what we decided to spend.
+		seenBefore := markSeenContent(c, id)
 		if e.gate {
-			// Content the store has seen before in ANY session is likely to recur again,
-			// which is what amortizes the call across turns.
-			seenBefore := hasSeenContent(c, id)
+			// Stop exploring once calls are observed to be slow: exploration spends wall
+			// clock as well as money, and an agent on a task deadline feels the former more.
+			explore := !tooSlowToExplore(metrics.ExtractionAvgLatencyMs()) &&
+				e.ratios.exploring(c.Session)
 			d := evaluateGate(sz, ratio, val, callCost(e.pricing, sz), seenBefore, turnsSoFar,
-				e.ratios.exploring())
+				explore, e.allowCached)
 			if !d.allow {
 				metrics.RecordExtractionSuppressed(d.reason)
 				if debugExtractLLM {
@@ -385,7 +426,6 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 			}
 			metrics.RecordExtractionReason(d.reason)
 		}
-		markSeenContent(c, id)
 		cands = append(cands, cand{i, content, id})
 	}
 	if debugExtractLLM && len(tools) > 0 {
@@ -438,10 +478,21 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 			if out[k].projected == "" {
 				continue
 			}
+			// Publish to the GLOBAL namespace only when the result is recoverable (or verified
+			// deletion-only) — the same condition the read side checks. An unverified, lossy
+			// rewrite with no way back must not become another session's starting point; keep it
+			// session-scoped so this session still benefits across its own turns.
 			gkey := extract.ResultKey(cands[k].id, e.modelName, extCfg)
-			putResultGlobal(c, gkey, []byte(out[k].projected))
-			if out[k].summary != "" {
-				putSummaryGlobal(c, gkey, out[k].summary)
+			if !e.rewrite || effectiveMode(c, e.mode) == markerFull {
+				putResultGlobal(c, gkey, []byte(out[k].projected))
+				if out[k].summary != "" {
+					putSummaryGlobal(c, gkey, out[k].summary)
+				}
+			} else {
+				putResult(c, cands[k].id, []byte(out[k].projected))
+				if out[k].summary != "" {
+					putSummary(c, cands[k].id, out[k].summary)
+				}
 			}
 			apply(cands[k].i, cands[k].content, out[k].projected, out[k].summary)
 		}

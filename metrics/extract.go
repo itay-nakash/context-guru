@@ -46,6 +46,18 @@ func RecordExtractionCacheLookup(hit bool) {
 	}
 }
 
+// ExtractionAvgLatencyMs returns the observed mean wall time per extraction call and the
+// number of calls it averages. The gate reads this to stop SPECULATIVE calls once they are
+// observed to be slow — exploration spends wall clock as well as money, and an agent with a
+// task deadline feels the former more (PR #37: 17.8s across 2 calls that saved 0 tokens).
+func ExtractionAvgLatencyMs() (float64, int64) {
+	calls := xCalls.Load()
+	if calls == 0 {
+		return 0, 0
+	}
+	return float64(xLatencyMs.Load()) / float64(calls), calls
+}
+
 // RecordExtractionSuppressed notes that the economic gate declined a call, with its reason.
 func RecordExtractionSuppressed(reason string) {
 	xSuppressed.Add(1)
@@ -105,17 +117,29 @@ type ExtractStats struct {
 	TopReason string `json:"top_reason,omitempty"`
 }
 
-// ExtractSnapshot builds the extraction stats. cost is the component's own LLM spend and
-// grossValue the dollar value of its saved tokens; both are computed by the caller, which
-// is the layer that knows the model pricing and the cache-awareness of the traffic.
-func ExtractSnapshot(cost, grossValue float64, cacheWrite, cacheRead int64) ExtractStats {
+// ExtractSnapshot builds the extraction stats.
+//
+// cost is the component's own LLM spend. perSavedTokenUSD is the value of ONE saved token
+// at the rate it would actually have been billed (cache-read vs fresh — the caller knows
+// the traffic's cache-awareness); the value side is computed HERE, against this
+// component's own GrossSavedTokens.
+//
+// Taking a RATE rather than a pre-computed total is deliberate. The obvious signature
+// (grossValue float64) invites the caller to pass the pipeline-wide savings figure, which
+// prices every other component's work (format, dedup, cmdfilter, extract, …) against
+// extract_llm's cost and reports the component as POSITIVE when its own arithmetic says
+// otherwise. That is the single number this whole issue exists to get right, so the
+// signature makes the mistake impossible to express.
+func ExtractSnapshot(cost, perSavedTokenUSD float64, cacheWrite, cacheRead int64) ExtractStats {
 	calls := xCalls.Load()
 	lookups := xLookups.Load()
 	hits := xCacheHits.Load()
+	gross := xGrossSaved.Load()
+	grossValue := float64(gross) * perSavedTokenUSD
 
 	s := ExtractStats{
 		Calls: calls, CallsAvoided: hits, CallsSuppressed: xSuppressed.Load(),
-		CacheLookups: lookups, GrossSavedTokens: xGrossSaved.Load(),
+		CacheLookups: lookups, GrossSavedTokens: gross,
 		PromptCacheReadTokens: cacheRead, PromptCacheWriteTokens: cacheWrite,
 		ExtractionCostUSD: round4(cost), GrossValueUSD: round4(grossValue),
 		NetValueUSD: round4(grossValue - cost),
