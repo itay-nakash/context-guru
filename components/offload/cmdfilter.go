@@ -6,8 +6,10 @@ package offload
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/components"
@@ -102,7 +104,9 @@ func (f *Cmdfilter) Offload(req *schemas.BifrostChatRequest, rep *components.Rep
 				// FIRST line — the selector is multi-line, and keying the bounded ledger
 				// on whole multi-line blobs would make almost every entry unique and
 				// exhaust the cap on noise instead of ranking real shapes.
-				fs.FilterMiss(firstLine(key))
+				if mk := firstLine(key); mk != "" {
+					fs.FilterMiss(mk)
+				}
 			}
 			continue
 		}
@@ -165,12 +169,48 @@ func (f *Cmdfilter) Offload(req *schemas.BifrostChatRequest, rep *components.Rep
 const selectorHeadLines = 6
 
 // firstLine returns the leading line of a (possibly multi-line) selector key.
+// maxMissKeyLen caps a ledger key. A selector is a SHAPE, so a short prefix identifies it;
+// the tail only makes near-identical misses occupy separate slots. Chosen well above any real
+// command banner and well below a payload.
+const maxMissKeyLen = 120
+
+// firstLine reduces a multi-line selector to one bounded ledger key.
+//
+// Bounding the LENGTH matters as much as the count. maxMissKeys caps how many keys the
+// ledger holds, not how big they are, and selectorKey runs on whatever the tool returned —
+// so on multimodal traffic the top slots filled with base64 image payloads
+// (`[{"type":"image","source":{"type":"base64","data":"iVBOR…`). The ledger exists to answer
+// "which filter is worth writing next"; 200 image blobs answer nothing, and they sit in the
+// aggregator under its lock and ship in every /stats scrape.
+//
+// Non-text blocks are dropped entirely rather than truncated: an image has no output shape a
+// filter could ever match, so recording it is noise by construction, not a key that is merely
+// too long.
 func firstLine(key string) string {
 	if i := strings.IndexByte(key, '\n'); i >= 0 {
-		return key[:i]
+		key = key[:i]
+	}
+	if notTextShape(key) {
+		return ""
+	}
+	if len(key) > maxMissKeyLen {
+		// Cut on a rune boundary so a truncated key stays valid UTF-8 in the JSON payload.
+		for len(key) > maxMissKeyLen {
+			key = key[:len(key)-1]
+		}
+		for len(key) > 0 && !utf8.ValidString(key) {
+			key = key[:len(key)-1]
+		}
 	}
 	return key
 }
+
+// nonTextBlock matches the serialized head of a content block that carries no command output:
+// an image or any other base64 payload. Anchored on the serialized JSON shape, because that is
+// what selectorKey sees.
+var nonTextBlock = regexp.MustCompile(`^\[?\{"type":\s*"(image|document|audio|video)"|"data":\s*"[A-Za-z0-9+/]{64,}`)
+
+func notTextShape(key string) bool { return nonTextBlock.MatchString(key) }
 
 // selectorKey is the string a filter's match regex is tested against: the first few
 // non-empty, trimmed lines of the tool output, newline-joined.

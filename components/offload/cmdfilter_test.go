@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/components"
@@ -290,3 +291,40 @@ type recordingSink struct{ acts, misses int }
 
 func (r *recordingSink) FilterAct(_, _, _ string, _ int) { r.acts++ }
 func (r *recordingSink) FilterMiss(string)               { r.misses++ }
+
+// maxMissKeys bounds how MANY keys the selector-miss ledger holds, not how big they are, and
+// selectorKey runs on whatever the tool returned. So on multimodal traffic the top slots filled
+// with base64 image payloads: the ledger exists to answer "which filter is worth writing next",
+// and 200 image blobs answer nothing while sitting in the aggregator under its lock and
+// shipping in every /stats scrape.
+func TestMissLedgerKeysAreBoundedAndTextOnly(t *testing.T) {
+	long := "docker build -t " + strings.Repeat("x", 400) + " ."
+	if got := firstLine(long); len(got) > maxMissKeyLen {
+		t.Errorf("key not bounded: %d bytes (cap %d)", len(got), maxMissKeyLen)
+	} else if !strings.HasPrefix(got, "docker build") {
+		t.Errorf("truncation lost the identifying prefix: %q", got)
+	}
+
+	// A cut must not split a multi-byte rune, or the key ships as invalid UTF-8 in the payload.
+	if got := firstLine("build " + strings.Repeat("é", 200)); !utf8.ValidString(got) {
+		t.Errorf("truncated key is not valid UTF-8: %q", got)
+	}
+
+	// Non-text blocks carry no output shape a filter could ever match, so they are dropped
+	// rather than truncated — a truncated blob is still a useless ledger entry.
+	for _, blob := range []string{
+		`[{"type":"image","source":{"type":"base64","data":"iVBORw0KGgoAAAANSUhEUgAAAoAAAAKACAIAAACDr150AACQZUlEQVR4nO3dd3wUZf4H8O"}}]`,
+		`{"type": "image", "source": {"data": "` + strings.Repeat("A", 120) + `"}}`,
+	} {
+		if got := firstLine(blob); got != "" {
+			t.Errorf("non-text block recorded as a miss shape: %q", got)
+		}
+	}
+
+	// A real command banner must still survive intact — the bound must not cost the signal.
+	for _, ok := range []string{"Reading package lists...", "> Task :app:compileDebugKotlin", "make[1]: Entering directory '/src'"} {
+		if got := firstLine(ok); got != ok {
+			t.Errorf("real selector altered: %q -> %q", ok, got)
+		}
+	}
+}
