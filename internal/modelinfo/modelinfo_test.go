@@ -109,3 +109,103 @@ func TestChainAndStaticFallback(t *testing.T) {
 		t.Fatalf("chain should fall back to static: %d,%v", w, ok)
 	}
 }
+
+// dirtySample mirrors what the real LiteLLM document actually contains: a
+// `sample_spec` entry whose numeric fields hold prose, and models that spell an
+// integer as a float. A strict whole-map decode fails on the first of these and
+// yields NOTHING — the bug that left every window and price unresolved in
+// production. Per-entry decode must skip the bad rows and keep the good ones.
+const dirtySample = `{
+  "sample_spec": {"max_input_tokens": "max input tokens, if the provider specifies it",
+                  "max_tokens": "LEGACY parameter", "input_cost_per_token": "the cost"},
+  "float-window-model": {"max_input_tokens": 128000.0, "input_cost_per_token": 1e-06},
+  "aws/claude-sonnet-5": {"max_input_tokens": 1000000, "input_cost_per_token": 2e-06,
+                          "output_cost_per_token": 1e-05,
+                          "cache_read_input_token_cost": 2e-07,
+                          "cache_creation_input_token_cost": 2.5e-06},
+  "no-cache-model": {"max_input_tokens": 8192, "input_cost_per_token": 4e-06, "output_cost_per_token": 8e-06}
+}`
+
+func TestLiteLLMSkipsMalformedEntries(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(dirtySample))
+	}))
+	defer srv.Close()
+	l := NewLiteLLM(srv.URL, srv.Client(), time.Hour)
+	ctx := context.Background()
+	for i := 0; i < 400; i++ {
+		if _, ok := l.Window(ctx, "float-window-model"); ok {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// The prose-filled sample_spec must not have poisoned the whole map.
+	if w, ok := l.Window(ctx, "aws/claude-sonnet-5"); !ok || w != 1000000 {
+		t.Fatalf("window for aws/claude-sonnet-5 = %d,%v; want 1000000,true (a malformed sibling entry poisoned the decode)", w, ok)
+	}
+	// A float-spelled integer must still resolve.
+	if w, ok := l.Window(ctx, "float-window-model"); !ok || w != 128000 {
+		t.Errorf("float-spelled window = %d,%v; want 128000,true", w, ok)
+	}
+	// Prices must resolve, with the four tiers intact.
+	p, ok := l.Price(ctx, "aws/claude-sonnet-5")
+	if !ok {
+		t.Fatal("Price(aws/claude-sonnet-5) not resolved")
+	}
+	want := Price{Input: 2e-06, Output: 1e-05, CacheRead: 2e-07, CacheWrite: 2.5e-06}
+	if p != want {
+		t.Errorf("price = %+v; want %+v", p, want)
+	}
+	// A model with no published cache rates must not be priced as if a cached
+	// request were FREE: the provider-standard multiples fill in.
+	np, ok := l.Price(ctx, "no-cache-model")
+	if !ok {
+		t.Fatal("Price(no-cache-model) not resolved")
+	}
+	if np.CacheRead == 0 || np.CacheWrite == 0 {
+		t.Errorf("missing cache tiers left at zero (%+v): a cached request would price as free", np)
+	}
+	if np.CacheRead >= np.Input || np.CacheWrite <= np.Input {
+		t.Errorf("filled cache tiers are not read<input<write: %+v", np)
+	}
+	// An entry with no pricing at all must report unknown, not a zero Price.
+	if _, ok := l.Price(ctx, "totally-absent-xyz"); ok {
+		t.Error("Price() reported ok for an unknown model")
+	}
+}
+
+func TestPriceCostAndZero(t *testing.T) {
+	if !(Price{}).Zero() {
+		t.Error("empty Price should be Zero")
+	}
+	p := Price{Input: 1e-06, Output: 2e-06, CacheRead: 1e-07, CacheWrite: 1.25e-06}
+	if p.Zero() {
+		t.Error("populated Price should not be Zero")
+	}
+	// 1000 fresh, 10000 read, 2000 write, 500 out.
+	got := p.Cost(1000, 10000, 2000, 500)
+	want := 1000*1e-06 + 10000*1e-07 + 2000*1.25e-06 + 500*2e-06
+	if diff := got - want; diff > 1e-12 || diff < -1e-12 {
+		t.Errorf("Cost = %v; want %v", got, want)
+	}
+}
+
+func TestChainPriceSkipsNonPricers(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(dirtySample))
+	}))
+	defer srv.Close()
+	l := NewLiteLLM(srv.URL, srv.Client(), time.Hour)
+	ctx := context.Background()
+	// Static resolves windows but cannot price; the Chain must fall through to the
+	// LiteLLM element rather than reporting unknown.
+	c := Chain{DefaultStatic(), l}
+	for i := 0; i < 400; i++ {
+		if _, ok := c.Price(ctx, "aws/claude-sonnet-5"); ok {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("Chain.Price never resolved through a non-Pricer element")
+}

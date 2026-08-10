@@ -84,6 +84,33 @@ type slot struct {
 	lossless bool   // wholeMessage: does bifrost round-trip this message without dropping fields
 }
 
+// Trace is the per-request record of what BodyFull actually did: the resolved
+// session, the pipeline's own run report (per-component accounting), the
+// before/after text of every rewritten message, and the cache-awareness facts
+// that decided which messages were even eligible. It is the dashboard's capture
+// input — the same material CONTEXT_GURU_DUMP writes to a file, handed to a
+// caller instead. Purely observational: nothing on it affects the rewrite.
+type Trace struct {
+	Session      string
+	Bypassed     bool
+	CacheAware   bool
+	MaxCachedIdx int
+	// Messages is the normalized message count this request carried.
+	Messages int
+	// AttemptedTokens is the token count of the messages age/supersession
+	// offloaders were ALLOWED to touch (the uncached tail when cache-aware, the
+	// whole request otherwise). It is the honest denominator for
+	// "saved / attempted-to-compress"; TokensBefore−AttemptedTokens is the
+	// compaction our own cache-safety mechanism deliberately gave up.
+	AttemptedTokens int
+	// FrozenTokens is TokensBefore−AttemptedTokens: the cost of cache safety.
+	FrozenTokens int
+	// Run is the pipeline's aggregate report (nil when the pipeline never ran).
+	Run *components.RunReport
+	// Changes lists each rewritten message's before/after text (clipped).
+	Changes []Change
+}
+
 // Body runs the pipeline with no LLM clients available (deterministic components
 // only). See BodyWithModel to supply model clients for LLM-based components.
 func Body(ctx context.Context, pipe *components.Pipeline, st store.Store, provider bschemas.ModelProvider, body []byte, explicitSession string, bypass bool) ([]byte, bool) {
@@ -121,10 +148,16 @@ func BodyFull(ctx context.Context, pipe *components.Pipeline, st store.Store, pr
 }
 
 // BodyOpts is the full entry point: everything BodyFull takes plus the operating mode
-// (#31) and the per-session boundary tracker. Hosts that support modes call this;
-// BodyFull is the positional shim every other caller keeps using.
+// (#31), the per-session boundary tracker, and the observational Trace the dashboard's
+// capture path reads. Hosts that support modes call this; BodyFull is the positional
+// shim every other caller keeps using.
+//
+// The rewrite is byte-identical whether or not anyone reads the trace: every trace
+// field is filled from a value the rewrite already computed, and nothing branches on it.
 func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o Opts) (res Result) {
 	body, provider, bypass := o.Body, o.Provider, o.Bypass
+	tr := &res.Trace
+	tr.Bypassed = bypass
 	// Top-level fail-open backstop: the per-component recover in pipeline.runOne only
 	// covers component code. A panic anywhere else on the rewrite path (normalize, the
 	// sjson splice, rebuildCountChanged, a marshal) must NOT 500 the client — forward
@@ -143,7 +176,11 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 	models := o.Models
 	msgsRaw := gjson.GetBytes(body, "messages")
 	if !msgsRaw.Exists() || !msgsRaw.IsArray() {
-		return Result{Body: body}
+		// Assign rather than return a fresh Result: res already carries the trace fields
+		// set above, and a bypassed request that also lacks a messages array must still
+		// report itself as bypassed rather than as "no messages".
+		res.Body = body
+		return res
 	}
 
 	// Volatile-tail split, before anything else touches the body. This is a
@@ -166,7 +203,8 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 
 	norm, slots := normalize(provider, msgsRaw.Array())
 	if len(norm) == 0 {
-		return Result{Body: body, Changed: systemSplit} // keep the split even with nothing to compact
+		res.Body, res.Changed = body, systemSplit // keep the split even with nothing to compact
+		return res
 	}
 
 	if debugTraffic {
@@ -175,7 +213,6 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 	chat := &bschemas.BifrostChatRequest{Provider: provider, Input: norm}
 	sys, firstUser := systemAndFirstUser(norm)
 	sessionID := session.Resolve(o.Session, sys, firstUser)
-	res.Session = sessionID
 	cacheAware := resolveCacheAware(o.CacheMode, provider, body)
 	maxCachedIdx := -1
 	if cacheAware && !bypass {
@@ -211,6 +248,11 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 		ExistingBreakpoints: wireBreakpoints(body),
 		Mode:                mode,
 	}
+	tr.Session, tr.CacheAware, tr.MaxCachedIdx, tr.Messages = sessionID, cacheAware, maxCachedIdx, len(norm)
+	// The eligible (attempted) denominator: what age/supersession offloaders were
+	// allowed to touch. Everything before MaxCachedIdx is frozen for cache safety —
+	// the cost of that mechanism, reported next to its benefit.
+	tr.AttemptedTokens = attemptedTokens(norm, c)
 
 	// Canonical form of each normalized message BEFORE the pipeline, so a
 	// count-changing component (summarize) can be mapped back to the body.
@@ -220,7 +262,13 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 	}
 
 	rr := pipe.Run(chat, c)
-	res.Run = rr
+	tr.Run = rr
+	if rr != nil {
+		tr.FrozenTokens = rr.TokensBefore - tr.AttemptedTokens
+		if tr.FrozenTokens < 0 {
+			tr.FrozenTokens = 0
+		}
+	}
 
 	// A component changed the message count (summarize restructures the transcript
 	// to [msg0, <summary>, last-K]). Rebuild the messages array preserving each
@@ -240,7 +288,7 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 	// The tail split already rewrote `body`, so the result must be forwarded even
 	// if no component changes a message.
 	changed := systemSplit
-	var changes []change
+	var changes []Change
 	// Per-message count of changes this writeback threw away, attributed back to the
 	// components that made them once the loop is done.
 	discarded := map[int]int{}
@@ -297,6 +345,7 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 		}
 	}
 	pipe.RecordDiscards(rr, discarded)
+	tr.Changes = changes
 	if changed && dumpPath != "" {
 		dumpChanges(c.Session, changes)
 	}
@@ -399,9 +448,24 @@ func putLen(st store.Store, session string, n int) {
 	st.Put("cg:len:"+session, []byte(strconv.Itoa(n)))
 }
 
-// change is one rewritten message, captured for the CONTEXT_GURU_DUMP trace so a
-// human can see exactly what context-guru did to the wire.
-type change struct {
+// attemptedTokens sums the tokens of the messages an age/supersession offloader
+// was allowed to touch this turn (Ctx.TailOnly). With cache-awareness off it is
+// the whole request; with it on it is the uncached tail, and the difference is
+// what cache safety cost us in foregone compaction.
+func attemptedTokens(norm []bschemas.ChatMessage, c *components.Ctx) int {
+	n := 0
+	for i := range norm {
+		if c.TailOnly(i) {
+			n += schema.TextTokens(schema.MessageText(norm[i]))
+		}
+	}
+	return n
+}
+
+// Change is one rewritten message, captured for the CONTEXT_GURU_DUMP trace and
+// for the dashboard's before/after diff view, so a human can see exactly what
+// context-guru did to the wire.
+type Change struct {
 	Path         string `json:"path"`
 	BeforeTokens int    `json:"before_tokens"`
 	AfterTokens  int    `json:"after_tokens"`
@@ -409,8 +473,8 @@ type change struct {
 	After        string `json:"after"`
 }
 
-func mkChange(path, before, after string) change {
-	return change{
+func mkChange(path, before, after string) Change {
+	return Change{
 		Path: path, BeforeTokens: schema.TextTokens(before), AfterTokens: schema.TextTokens(after),
 		Before: clip(before, 4000), After: clip(after, 4000),
 	}
@@ -430,7 +494,7 @@ func clip(s string, n int) string {
 var dumpPath = os.Getenv("CONTEXT_GURU_DUMP")
 
 // dumpChanges appends one JSON line describing this request's rewrites.
-func dumpChanges(session string, changes []change) {
+func dumpChanges(session string, changes []Change) {
 	f, err := os.OpenFile(dumpPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return

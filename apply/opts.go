@@ -33,15 +33,17 @@ type Opts struct {
 }
 
 // Result is BodyOpts' output.
+//
+// The embedded Trace carries everything observational: the resolved Session, the
+// pipeline's Run report (which observe mode reads as its ONLY output, since the body
+// is thrown away), the cache-awareness facts, and each rewritten message's
+// before/after text for the dashboard. It is embedded rather than duplicated so
+// there is exactly one Session and one Run in the codebase — two copies of the same
+// value is how one of them goes stale.
 type Result struct {
 	// Body is the body to forward. Always valid: on any trouble it is the input.
 	Body []byte
 	// Changed is false when Body is the untouched input.
 	Changed bool
-	// Session is the resolved session id (the caller usually cannot compute it: it falls
-	// back to a content hash of system + first user message).
-	Session string
-	// Run is the pipeline's report for this request, nil when the pipeline did not run.
-	// Observe mode needs it: the run is the ONLY output, since the body is thrown away.
-	Run *components.RunReport
+	Trace
 }
