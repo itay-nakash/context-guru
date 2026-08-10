@@ -32,28 +32,27 @@ taken exactly from the `presets` map in `config/config.go`.
     [#36](https://github.com/rossoctl/context-guru/pull/36), and placement has never been
     shown to help. Add it by hand if you want to run the placement study.
 
-!!! warning "`extract_llm` now declines uneconomic calls (`codesmart`, `aggressive`)"
+!!! warning "`extract_llm` is now OFF by default on prompt-caching backends (`codesmart`, `aggressive`)"
     `extract_llm` is the only component that spends money to save money, and on a
     prompt-caching backend it was measured **~8× underwater**: a token removed from a cached
     region saves the cache-read rate (`$0.30/MTok`), not the fresh-input rate (`$3/MTok`), so
-    break-even is **~30,500 tokens per output** at the measured compression ratio — far above a typical tool output (the largest in one capture was 2,053).
+    break-even is **~30,500 tokens per output** at the measured compression ratio — far above a
+    typical tool output (the largest in one capture was 2,053).
 
-    Since #28 it applies an [economic gate](../components/extract_llm.md#economics): it calls
-    the LLM only when the expected saving exceeds the expected cost. On a caching backend that
-    means **most candidates are suppressed** and `codesmart`/`aggressive` make far fewer model
-    calls than before — cheaper and faster, with savings coming mainly from the (now global)
-    result cache. On a **non-caching** backend the gate permits far more, because there the
-    reduction is worth 10× more.
+    Since #28 the component **declines to run at all on caching backends** unless
+    `allow_on_caching_backend: true` is set. This is enforced in code rather than documented as
+    advice, because every caching workload measured came out net-negative even with the
+    [economic gate](../components/extract_llm.md#economics) working correctly. So `codesmart`
+    and `aggressive` still list `extract_llm`, but on caching traffic it makes **zero calls**
+    and costs nothing; the deterministic passes do the work.
 
-    **Measured verdict:** on a **non-caching** backend the gate is a clear win (net
-    **+$0.0287 vs +$0.0091** on one capture, 2.6× more tokens saved at half the latency; on
-    another it cut 13 calls to 2 and reduced waste **97%**). On a **caching** backend it reduces
-    the loss and the latency but does **not** turn the component positive — so for caching
-    traffic prefer **`codesafe`** (no LLM pass) or drop `extract_llm` from `codesmart`. See
-    [the component's measured tables](../components/extract_llm.md#measured-after-28-replay-of-real-captures-awsclaude-haiku-4-5).
+    On **non-caching** traffic it runs, and the gate decides per call — a strict improvement
+    over the old behavior in every arm measured (waste cut 68% while saving more tokens on one
+    capture; 26 calls reduced to 1 on another). Even there the honest result on those captures
+    is break-even rather than profit: it earns its place when outputs are genuinely large.
+    See [the component's measured tables](../components/extract_llm.md#measured-after-28-replay-of-real-captures-awsclaude-haiku-4-5).
 
-    Check `/stats` → `extract.net_value_usd` on your own workload. `codesmart`'s pinned
-    `min_tokens: 3000` still governs its per-output floor, so that part is unchanged.
+    `codesmart`'s pinned `min_tokens: 3000` still governs its per-output floor, unchanged.
 
 Not sure which to pick? See [Choose a preset](../how-to/choose-a-preset.md).
 Every component's config lives in [Components](../components.md).

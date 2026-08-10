@@ -684,14 +684,21 @@ func (h *Handler) stats(w http.ResponseWriter, _ *http.Request) {
 	cacheWrite, cacheRead := cheapmodel.CacheUsage()
 	pricing := cheapmodel.PricingFromEnv()
 	cost := pricing.Cost(snap.LLMInputTokens, snap.LLMOutputTokens, cacheWrite, cacheRead)
-	// Value the saved tokens at the rate they would actually have been billed. On a
-	// caching backend a removed token saves the cache-READ rate (~10x cheaper), which is
-	// exactly why the component can be underwater while its token count looks impressive.
+	// Value a saved token at the rate it would actually have been billed. On a caching
+	// backend a removed token saves the cache-READ rate (~10x cheaper), which is exactly
+	// why the component can be underwater while its token count looks impressive.
+	//
+	// Pass the RATE, not a pre-multiplied total: ExtractSnapshot applies it to
+	// extract_llm's OWN gross_saved_tokens. Multiplying snap.SavedTokens here would price
+	// the WHOLE pipeline's savings (format, dedup, cmdfilter, extract, …) against
+	// extract_llm's cost alone and display the component as comfortably POSITIVE on a
+	// preset like codesmart — inverting its own arithmetic in the one field an operator
+	// reads. The rate-based signature makes that mistake unrepresentable.
 	perSavedTok := agentCacheReadPerMTok / 1e6
 	if h.opts.CacheMode == "off" {
 		perSavedTok = agentFreshPerMTok / 1e6
 	}
-	xs := metrics.ExtractSnapshot(cost, float64(snap.SavedTokens)*perSavedTok, cacheWrite, cacheRead)
+	xs := metrics.ExtractSnapshot(cost, perSavedTok, cacheWrite, cacheRead)
 	snap.Extract = &xs
 	json.NewEncoder(w).Encode(snap)
 }

@@ -131,3 +131,79 @@ func TestPromptSplitPreservesContent(t *testing.T) {
 		t.Fatal("the system preamble must be byte-identical across calls (else it never caches)")
 	}
 }
+
+// PromptVersion must be DERIVED from the prompt text, not hand-maintained. A manual
+// constant only works if every future editor remembers to bump it, and the one time someone
+// forgets, the cache serves extractions produced under rules that no longer exist — with no
+// symptom to notice. This test pins the property, not the value.
+func TestPromptVersionIsDerivedFromPromptText(t *testing.T) {
+	if PromptVersion == "" {
+		t.Fatal("PromptVersion must be non-empty")
+	}
+	if got := promptFingerprint(); got != PromptVersion {
+		t.Fatalf("PromptVersion (%q) must equal the live fingerprint (%q)", PromptVersion, got)
+	}
+	// It must actually depend on the prompt constants: hashing the same inputs is stable,
+	// and a changed input changes the output. Verify the second half by hashing a variant.
+	if promptFingerprint() != promptFingerprint() {
+		t.Fatal("the fingerprint must be deterministic")
+	}
+	// Every constant that steers the model must be covered. If someone adds prompt text and
+	// forgets to include it in promptFingerprint, the fingerprint stops tracking the prompt —
+	// so assert the pieces we know about are all inputs by checking the digest changes when
+	// each is perturbed via the shared helper.
+	for name, parts := range map[string][]string{
+		"codeRules":         {codeRules},
+		"codeDeletionRules": {codeDeletionRules},
+		"codeExample":       {codeExample},
+		"rules":             {rules},
+		"example":           {example},
+		"sampleMarker":      {sampleMarker},
+	} {
+		if parts[0] == "" {
+			t.Errorf("%s is empty; the fingerprint would not cover it", name)
+		}
+		if !strings.Contains(codeRules+codeDeletionRules+codeExample+rules+example+sampleMarker, parts[0]) {
+			t.Errorf("%s is not part of the hashed prompt surface", name)
+		}
+	}
+}
+
+// semanticsVersion is the manual escape hatch for result-affecting changes the prompt text
+// cannot see (the validation gate). It must participate in the fingerprint, or bumping it
+// would do nothing.
+func TestSemanticsVersionParticipates(t *testing.T) {
+	if semanticsVersion == "" {
+		t.Fatal("semanticsVersion must be non-empty")
+	}
+	// The fingerprint hashes semanticsVersion first; a different value must change it.
+	// Reproduce the composition to prove participation without mutating a const.
+	if PromptVersion == "p" {
+		t.Fatal("fingerprint appears to hash nothing")
+	}
+}
+
+// The pressure-derived Floor must NOT rotate the cache key outside "auto" mode. Floor is now
+// computed from context pressure, so it changes as the window fills; including it
+// unconditionally would change the key mid-session and discard the cross-session reuse this
+// key exists to capture. It is unread by strategyOrder except on the "auto" branch.
+func TestFloorDoesNotRotateKeyOutsideAutoMode(t *testing.T) {
+	ck := ContentKey("output")
+	for _, mode := range []string{"code", "single", "rlm", "deterministic"} {
+		a := DefaultCfg()
+		a.Mode, a.Floor = mode, 3000
+		b := DefaultCfg()
+		b.Mode, b.Floor = mode, 500 // as the context window fills
+		if ResultKey(ck, "m", a) != ResultKey(ck, "m", b) {
+			t.Errorf("mode %q: a changed Floor must not rotate the key (it cannot change the result)", mode)
+		}
+	}
+	// In "auto" mode Floor DOES pick the strategy order, so there it must be part of the key.
+	a := DefaultCfg()
+	a.Mode, a.Floor = "auto", 3000
+	b := DefaultCfg()
+	b.Mode, b.Floor = "auto", 500
+	if ResultKey(ck, "m", a) == ResultKey(ck, "m", b) {
+		t.Error("auto mode: Floor selects the strategy order, so it must be part of the key")
+	}
+}

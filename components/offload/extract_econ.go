@@ -193,7 +193,7 @@ func expectedReuses(seenBefore bool, turnsSoFar int) float64 {
 //
 // Allow only when saving strictly exceeds cost. Every suppression carries a reason.
 func evaluateGate(sizeTokens int, ratio float64, val tokenValue, cost float64,
-	seenBefore bool, turnsSoFar int, explore bool) gateDecision {
+	seenBefore bool, turnsSoFar int, explore, allowCached bool) gateDecision {
 
 	expectedRemoved := float64(sizeTokens) * ratio
 	reuses := expectedReuses(seenBefore, turnsSoFar)
@@ -201,6 +201,18 @@ func evaluateGate(sizeTokens int, ratio float64, val tokenValue, cost float64,
 	saving := expectedRemoved * (1 + reuses) * val.perToken
 
 	d := gateDecision{expSaving: saving, expCost: cost}
+	// Hard decline on a caching backend unless explicitly forced. This is the SHIPPING
+	// DECISION, in code rather than prose: the measurements in this change show the
+	// component net-negative on every caching workload tested, even with the gate working
+	// correctly (break-even ~30,500 tokens/output against a largest-observed 2,053). A
+	// default that ships a component our own numbers say loses money — guarded only by a
+	// doc note nobody reads — is not a defensible default. `allow_on_caching_backend: true`
+	// re-enables it for anyone whose workload genuinely has huge outputs; the gate's
+	// economics then apply as normal.
+	if val.cached && !allowCached {
+		d.reason = "suppressed: disabled by default on caching backends (measured net-negative)"
+		return d
+	}
 	if saving <= cost && explore {
 		// No trustworthy ratio yet — spend a bounded call to find out rather than
 		// letting a pessimistic prior justify itself forever.
@@ -249,10 +261,17 @@ const defaultCompressionRatio = 0.12
 // the estimate down and shut the gate, which is precisely the feedback the old
 // fixed-threshold design lacked.
 type ratioTracker struct {
-	mu       sync.Mutex
-	removed  int64
-	total    int64
-	explored int // calls spent learning the ratio (bounded by maxExploreCalls)
+	mu      sync.Mutex
+	removed int64
+	total   int64
+	// explored counts exploration calls PER SESSION. A process-wide counter spent its
+	// whole budget on the first session, after which every later session inherited an
+	// unrevisable prior — reintroducing the self-justifying-prior failure at process scope,
+	// which is the exact thing exploration exists to prevent. The tracker lives on the
+	// Pipeline for the proxy's lifetime, so the map must be keyed by session.
+	// ponytail: unbounded map keyed by session; the store's own TTL/LRU bounds sessions in
+	// practice, so prune here only if a long-lived proxy shows growth.
+	explored map[string]int
 }
 
 // observe records one attempted extraction: removedTok of totalTok (0 removed on a miss).
@@ -266,16 +285,44 @@ func (r *ratioTracker) observe(removedTok, totalTok int) {
 	r.mu.Unlock()
 }
 
-// ratio returns the observed compression ratio, or the conservative default until enough
-// tokens have been seen for the estimate to mean anything.
+// ratio returns the estimated compression ratio: the conservative default until enough
+// tokens have been seen, then the observed ratio SHRUNK toward that default and capped.
+//
+// Raw observation is too sharp a tool here. minRatioSampleTokens is about one medium
+// output, so the first estimate can be n=1; an unbounded mean would let a single
+// compressible early output drop the cached break-even from ~30,500 tokens to ~7,000
+// permanently, and the gate would then spend on that basis for the rest of the process.
+// Shrinkage (a standard weighted prior) makes early estimates move a little and later ones
+// move a lot; the cap stops any amount of evidence claiming an implausible ratio.
 func (r *ratioTracker) ratio() float64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.total < minRatioSampleTokens {
 		return defaultCompressionRatio
 	}
-	return float64(r.removed) / float64(r.total)
+	observed := float64(r.removed) / float64(r.total)
+	// Weight the observation by how much evidence backs it, against a fixed pseudo-count
+	// of prior "evidence" worth shrinkPriorTokens.
+	w := float64(r.total) / float64(r.total+shrinkPriorTokens)
+	est := w*observed + (1-w)*defaultCompressionRatio
+	if est > maxLearnedRatio {
+		return maxLearnedRatio
+	}
+	if est < 0 {
+		return 0
+	}
+	return est
 }
+
+// shrinkPriorTokens is how much "evidence" the conservative prior is worth. Set to a few
+// medium outputs so a single observation cannot swing the estimate far, while a session's
+// worth of consistent evidence dominates it.
+const shrinkPriorTokens = 8000
+
+// maxLearnedRatio caps the learned ratio. Even a genuinely compressible workload should not
+// let the gate assume more than this, because the accepted-result sanity checks bound how
+// much an extraction can remove and still be accepted. Measured ratios were ~0.10-0.12.
+const maxLearnedRatio = 0.60
 
 // exploring reports whether the tracker still lacks the evidence to estimate a ratio, and
 // consumes one exploration slot if so.
@@ -288,23 +335,45 @@ func (r *ratioTracker) ratio() float64 {
 // this. A gate that can never revise its own prior is not a gate, it is an off switch.
 //
 // So allow a small, BOUNDED number of calls through before the estimate is trustworthy.
-// The exploration budget is tiny relative to a session (each call is ~$0.003-0.008), and it
-// buys the one thing the gate cannot compute from first principles: whether THIS workload's
-// outputs actually compress.
-func (r *ratioTracker) exploring() bool {
+// The budget is PER SESSION: each session's traffic can differ, and a process-wide budget
+// would be exhausted by the first session and leave every later one unable to revise its
+// prior — the same off-switch failure at a larger scale.
+func (r *ratioTracker) exploring(session string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.total >= minRatioSampleTokens || r.explored >= maxExploreCalls {
+	if r.total >= minRatioSampleTokens {
+		return false // enough evidence; no need to spend on learning
+	}
+	if r.explored == nil {
+		r.explored = map[string]int{}
+	}
+	if r.explored[session] >= maxExploreCalls {
 		return false
 	}
-	r.explored++
+	r.explored[session]++
 	return true
 }
 
-// maxExploreCalls bounds the exploration budget. Small on purpose: enough to learn the
-// ratio (a handful of outputs clears minRatioSampleTokens), far too few to reproduce the
-// 271-call loss even if every one of them is wasted.
-const maxExploreCalls = 3
+// maxExploreCalls bounds the exploration budget PER SESSION. Small on purpose: enough to
+// learn the ratio (a couple of outputs clears minRatioSampleTokens), far too few to
+// reproduce the 271-call loss even if every one is wasted. Each call is ~$0.003-0.008 and
+// ~5-15s of latency, so this is also the knob that bounds exploration's latency cost.
+const maxExploreCalls = 2
+
+// slowCallMs is the mean per-call latency above which the gate stops exploring. Exploration
+// is a bet that costs money AND wall-clock time, and on an agent with a task deadline the
+// wall clock is the scarcer resource: PR #37 measured 17.8s across 2 calls that saved 0
+// tokens, contributing to a task exhausting its budget. Money-only reasoning cannot see
+// that, so latency gets its own brake — once calls are observed to be this slow, a
+// speculative call is no longer worth making however cheap it looks.
+const slowCallMs = 6000
+
+// tooSlowToExplore reports whether observed extraction latency is high enough that
+// speculative calls should stop. Uses the observed mean, so it self-tunes to the deployment
+// rather than assuming a gateway's speed.
+func tooSlowToExplore(avgLatencyMs float64, calls int64) bool {
+	return calls > 0 && avgLatencyMs >= slowCallMs
+}
 
 // minRatioSampleTokens is how much observed content the ratio estimate needs before it
 // displaces the default. Kept small so a workload that genuinely compresses well is

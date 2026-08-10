@@ -11,8 +11,8 @@ func TestNetValueGoesNegativeWhenUnderwater(t *testing.T) {
 	resetExtract()
 	// The measured Terminal-Bench shape: ~197,548 unique tokens saved at the cache-read
 	// rate ($0.30/MTok) against $3.26 of extraction spend.
-	grossValue := 197548 * 0.30 / 1e6
-	s := ExtractSnapshot(3.26, grossValue, 0, 0)
+	RecordExtractionSaving(197548)
+	s := ExtractSnapshot(3.26, 0.30/1e6, 0, 0)
 	if s.NetValueUSD >= 0 {
 		t.Fatalf("net must be negative when spend exceeds value: net=%v gross=%v cost=%v",
 			s.NetValueUSD, s.GrossValueUSD, s.ExtractionCostUSD)
@@ -36,7 +36,8 @@ func TestExtractSnapshotExposesAllCounters(t *testing.T) {
 	RecordExtractionSaving(1200)
 	RecordExtractionReason("high context pressure")
 
-	s := ExtractSnapshot(0.024, 0.5, 800, 0)
+	// 1,200 own saved tokens at a rate chosen to give gross value exactly $0.50.
+	s := ExtractSnapshot(0.024, 0.5/1200, 800, 0)
 	if s.Calls != 2 {
 		t.Errorf("Calls = %d, want 2", s.Calls)
 	}
@@ -72,7 +73,7 @@ func TestPromptCacheReadZeroIsReported(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		RecordExtractionCall(400)
 	}
-	s := ExtractSnapshot(0.06, 0.01, 0, 0)
+	s := ExtractSnapshot(0.06, 0.30/1e6, 0, 0)
 	if s.Calls != 5 || s.PromptCacheReadTokens != 0 {
 		t.Fatalf("expected 5 calls with 0 cache reads, got calls=%d read=%d",
 			s.Calls, s.PromptCacheReadTokens)
@@ -110,7 +111,7 @@ func TestSnapshotJSONKeysAreBackwardCompatible(t *testing.T) {
 
 	// And when present, it must carry the net figure.
 	snap := a.Snapshot()
-	xs := ExtractSnapshot(1.0, 0.1, 0, 0)
+	xs := ExtractSnapshot(1.0, 0.30/1e6, 0, 0)
 	snap.Extract = &xs
 	b2, _ := json.Marshal(snap)
 	var m2 map[string]any
@@ -139,4 +140,54 @@ func resetExtract() {
 	xReasonMu.Lock()
 	xReasons = map[string]int64{}
 	xReasonMu.Unlock()
+}
+
+// REGRESSION (H3, reviewer-verified): /stats must value extract_llm's OWN savings, never
+// the pipeline total. The bug was `ExtractSnapshot(cost, snap.SavedTokens*rate, ...)` — every
+// component's savings priced against extract_llm's cost alone, which on a preset like
+// codesmart displays the component as comfortably POSITIVE while its own arithmetic proves
+// it negative. It inverts the conclusion in the single field an operator reads.
+//
+// The signature now takes a RATE and applies it internally to GrossSavedTokens, so the
+// mistake is unrepresentable. This test fails if anyone re-wires it to a pre-multiplied
+// total, because that is exactly the class of bug that silently outlives a PR.
+func TestNetValueUsesComponentOwnSavingsNotPipelineTotal(t *testing.T) {
+	resetExtract()
+	// The component itself saved 1,000 tokens and spent $0.05.
+	RecordExtractionSaving(1000)
+	const rate = 0.30 / 1e6 // cache-read rate per token
+	s := ExtractSnapshot(0.05, rate, 0, 0)
+
+	wantGross := 1000 * rate
+	if d := s.GrossValueUSD - round4(wantGross); d > 1e-9 || d < -1e-9 {
+		t.Fatalf("GrossValueUSD = %v, want %v (1,000 own tokens x rate)", s.GrossValueUSD, round4(wantGross))
+	}
+	if s.NetValueUSD >= 0 {
+		t.Fatalf("net must be negative: spent $0.05 to save $%.6f", wantGross)
+	}
+	// The pipeline-wide figure in a real run is orders of magnitude larger. Prove the
+	// snapshot is NOT reading anything like it: had a 2,000,000-token pipeline total leaked
+	// in at this rate, gross would be ~$0.60 and net would flip positive.
+	if s.GrossValueUSD > 0.01 {
+		t.Fatalf("GrossValueUSD = %v looks like a pipeline-wide total, not this component's",
+			s.GrossValueUSD)
+	}
+	if s.GrossSavedTokens != 1000 {
+		t.Fatalf("GrossSavedTokens = %d, want 1000", s.GrossSavedTokens)
+	}
+}
+
+// The latency brake reads this accessor, so it must report the observed mean and the call
+// count (0 calls => no signal, must not read as "fast").
+func TestExtractionAvgLatencyMs(t *testing.T) {
+	resetExtract()
+	if avg, calls := ExtractionAvgLatencyMs(); avg != 0 || calls != 0 {
+		t.Fatalf("with no calls expected (0,0), got (%v,%d)", avg, calls)
+	}
+	RecordExtractionCall(4000)
+	RecordExtractionCall(8000)
+	avg, calls := ExtractionAvgLatencyMs()
+	if calls != 2 || avg != 6000 {
+		t.Fatalf("got (%v,%d), want (6000,2)", avg, calls)
+	}
 }

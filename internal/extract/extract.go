@@ -125,9 +125,19 @@ const keySchema = "k1"
 func cfgFingerprint(cfg Cfg) string {
 	allowed := append([]string(nil), cfg.AllowedStrategies...)
 	sort.Strings(allowed) // order-insensitive: the same set must fingerprint the same
+	// Floor is included ONLY in "auto" mode. It is now derived from context pressure, so it
+	// changes as the window fills; including it unconditionally would rotate the cache key
+	// mid-session and throw away most of the cross-session reuse this key exists to capture.
+	// And it cannot change the result elsewhere: strategyOrder reads Floor only on the
+	// "auto" branch (max(Floor*4, 8000), deciding whether "rlm" precedes "code"); in
+	// code/single/rlm/deterministic modes it is unread. Include it exactly where it matters.
+	floor := "-"
+	if cfg.Mode == "auto" {
+		floor = strconv.Itoa(cfg.Floor)
+	}
 	return strings.Join([]string{
 		cfg.Mode,
-		strconv.Itoa(cfg.Floor),
+		floor,
 		strconv.FormatBool(cfg.Rewrite),
 		strconv.FormatBool(cfg.AllowDeterministic),
 		strconv.FormatFloat(cfg.MinKeepRatio, 'f', 4, 64),

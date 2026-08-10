@@ -1,6 +1,8 @@
 package extract
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"strings"
 )
@@ -185,12 +187,36 @@ lines into one indented marker. Kept lines stay byte-identical (line numbers kep
 // the full INPUT at runtime).
 const maxCodeContentChars = 32000
 
-// PromptVersion identifies the extractor's prompt + acceptance semantics. The result
-// cache key includes it, so bumping it MISSES every stale entry rather than serving an
-// extraction derived under different rules. BUMP THIS whenever codeContract, codeRules,
-// codeDeletionRules, codeExample, or the validation gate changes in a way that could
-// change a result — getting this wrong silently serves a stale extraction forever.
-const PromptVersion = "v2"
+// PromptVersion identifies the extractor's prompt + acceptance semantics. The result cache
+// key includes it, so a change MISSES every stale entry rather than serving an extraction
+// derived under different rules.
+//
+// DERIVED, not hand-maintained. A manual constant only works if every future editor of the
+// prompt remembers to bump it, and the one time someone forgets, the cache serves
+// extractions produced under rules that no longer exist — exactly the failure the issue
+// warned about, and one with no symptom to notice. Hashing the prompt text makes the version
+// a consequence of the prompt instead of a promise about it.
+var PromptVersion = promptFingerprint()
+
+// semanticsVersion covers result-affecting changes OUTSIDE the prompt strings — the
+// validation gate (validateExtraction / extractionIsSane) and the sandbox contract. Bump it
+// when what gets ACCEPTED changes while the prompt text does not.
+const semanticsVersion = "s1"
+
+// promptFingerprint hashes every prompt constant that can change what the model returns.
+// Add new prompt text here as it is introduced: anything omitted is invisible to the key.
+func promptFingerprint() string {
+	h := sha256.New()
+	for _, part := range []string{
+		semanticsVersion,
+		codeContract, codeRules, codeDeletionRules, codeExample,
+		rules, example, sampleMarker,
+	} {
+		h.Write([]byte(part))
+		h.Write([]byte{0})
+	}
+	return "p" + hex.EncodeToString(h.Sum(nil))[:12]
+}
 
 // codeSystemPreamble is the INVARIANT half of the code-strategy prompt: the sandbox
 // contract, the rules, and the worked examples. It is byte-identical on every call, so
