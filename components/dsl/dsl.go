@@ -155,7 +155,11 @@ func Compile(name string, d Def) (*Compiled, error) {
 	} else if d.CapReduce != 0 {
 		return nil, fmt.Errorf("dsl: filter %q sets cap_reduce without cap", name)
 	}
-	m, err := regexp.Compile(d.Match)
+	// The selector spans a few leading lines, not one, so `^`/`$` in a match regex must
+	// mean "start/end of A line" rather than "of the whole selector". Without (?m) a
+	// filter anchored at ^ only matches output whose very FIRST line is its signature,
+	// which is exactly the output-framing dependence a multi-line selector removes.
+	m, err := regexp.Compile("(?m)" + d.Match)
 	if err != nil {
 		return nil, fmt.Errorf("dsl: filter %q match: %w", name, err)
 	}
