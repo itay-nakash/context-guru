@@ -164,10 +164,112 @@ output $10/M), cache-hit rate, proxy savings %, per-component savings + own late
 context-guru's own cheap-model cost (priced at the haiku rate), and expand/restoration
 bounces.
 
-## 6. Result docs
+## 7. Terminal-Bench 2.0 (second benchmark)
 
-- [`baseline.md`](baseline.md) — baseline (`off`) full results.
+The same harness pattern extends to **Terminal-Bench 2.0** (89 open-ended terminal tasks,
+harder/longer-horizon than SWE-bench). Only the Harbor dataset and jobs-root change; the
+`claude-code` trajectory parser, cache-aware cost model, and summarizer are agent-specific,
+so every metric is computed identically and is methodologically comparable to the SWE study.
+Harness: [`deploy/harbor/terminalbench.py`](https://github.com/rossoctl/context-guru/blob/main/deploy/harbor/terminalbench.py)
+(a thin adaptation of `swebench.py` with `-d terminal-bench@2.0`).
+
+```
+cd /home/vpcuser/projects/context-engineering/context-guru
+# task list: all 89 task names from the terminal-bench registry entry (see below)
+# baseline (off passthrough), parallel:
+python3 -u deploy/harbor/terminalbench.py \
+  --tasks /tmp/tb-runs/tb89.txt --configs off --jobs-root /tmp/tb-runs/tb89 \
+  --n 24 --agent-mult 1.5 --max-retries 4
+```
+
+Build the 89-task list from the registry:
+```
+python3 - <<'PY'
+import json
+d=json.load(open('/home/vpcuser/projects/context-engineering/harbor/registry.json'))
+def find(o):
+    r=[]
+    if isinstance(o,list):
+        for e in o:
+            if isinstance(e,dict) and e.get('name')=='terminal-bench': r.append(e)
+            r+=find(e)
+    elif isinstance(o,dict):
+        for v in o.values(): r+=find(v)
+    return r
+open('/tmp/tb-runs/tb89.txt','w').write('\n'.join(t['name'] for t in find(d)[0]['tasks'])+'\n')
+PY
+```
+
+**Concurrency (feasibility on this 16-core / 62 GB box).** `--n` is Harbor's `--n-concurrent`.
+Agents are network-bound (~300 MB, ~0.5% CPU while waiting on the ~26 s/request gateway), so RAM
+is not the limit — **build-phase CPU** is (compile tasks run `make -j` and saturate cores; Harbor
+self-limits build ramp), and **disk** (`--no-delete` image accumulation). `--n 24` is the sweet
+spot (~10× faster than `n=2`, ~2.7 h for all 89); `n=45` only widens the disk/rate-limit blast
+radius without building faster. Prune unused images (`docker image prune -af`, safe — protects
+in-flight containers) if disk gets tight.
+
+**Timeouts / time-budget policy.** TB's task timeouts assume a fast endpoint; this gateway is
+~26 s/request, so long-horizon tasks can exhaust the wall-clock budget. Two effects, separated:
+(1) at `n=24`, CPU oversubscription (load ~45) inflated wall time and timed out ~9 edge tasks —
+**rerun those at `n=6`** (no oversubscription) to clear the artifact; (2) genuinely long tasks were
+given an extended **`--agent-mult 4.0`** budget to measure capability. Merge the best clean result
+per task (`/tmp/tb-runs/merge_tb.py`). Any task that still times out at 4× is a genuine failure
+(reward 0). All 89 tasks carry a scored outcome (solved / failed / timeout).
+
+Analyze → doc (totals, cache-aware cost, by-difficulty/category, timeouts, per-task):
+```
+# task metadata (difficulty/category) from Harbor's task cache — needs py3.11+ (tomllib):
+/home/vpcuser/projects/context-engineering/harbor/.venv/bin/python - <<'PY'
+import glob, json, os, tomllib
+names=set(l.strip() for l in open('/tmp/tb-runs/tb89.txt') if l.strip()); meta={}
+for f in glob.glob('/home/vpcuser/.cache/harbor/tasks/*/*/task.toml'):
+    t=os.path.basename(os.path.dirname(f))
+    if t not in names: continue
+    d=tomllib.load(open(f,'rb')); m=d.get('metadata',{})
+    if t in meta and (meta[t]['difficulty']!='unknown' or m.get('difficulty') is None): continue
+    meta[t]=dict(difficulty=m.get('difficulty','unknown'),category=m.get('category','unknown'),
+                 agent_timeout_sec=(d.get('agent',{}) or {}).get('timeout_sec'))
+json.dump(meta, open('/tmp/tb-runs/task_meta.json','w'), indent=1)
+PY
+python3 deploy/harbor/gen_tb_docs.py /tmp/tb-runs/tb89/rows-off.json \
+  docs/results/terminal-bench-baseline.md --meta /tmp/tb-runs/task_meta.json
+```
+
+### 7b. Terminal-Bench framework arms (context-guru / headroom / rtk)
+
+The three compaction arms reuse the SWE harnesses, re-pointed at `terminal-bench@2.0`
+([`terminalbench.py`](https://github.com/rossoctl/context-guru/blob/main/deploy/harbor/terminalbench.py)
+for context-guru's `codesmart`,
+[`terminalbench_headroom.py`](https://github.com/rossoctl/context-guru/blob/main/deploy/harbor/terminalbench_headroom.py),
+[`terminalbench_rtk.py`](https://github.com/rossoctl/context-guru/blob/main/deploy/harbor/terminalbench_rtk.py)).
+All ran at a **flat `--agent-mult 4.0`** budget (see the [comparison](terminal-bench-comparison.md)
+for why this is fair vs the baseline's mixed budget), `n=12` (headroom + rtk in parallel on
+their separate ports 4010/4000; context-guru on 4000):
+
+```
+cd /home/vpcuser/projects/context-engineering/context-guru
+# context-guru (codesmart) — dumps the change log for the per-component analysis
+python3 -u deploy/harbor/terminalbench.py --tasks /tmp/tb-runs/tb89.txt --configs codesmart \
+  --jobs-root /tmp/tb-runs/cg --n 12 --agent-mult 4.0 --max-retries 4 --dump-configs codesmart
+# headroom (hd-cache; --no-ccr + HEADROOM_TOOL_SEARCH=0 baked in, as on SWE)
+python3 -u deploy/harbor/terminalbench_headroom.py --tasks /tmp/tb-runs/tb89.txt --configs hd-cache \
+  --jobs-root /tmp/tb-runs/hd --n 12 --agent-mult 4.0 --max-retries 4
+# rtk (claude-code-rtk agent + off-proxy routing; needs the rtk binary + registered agent)
+RTK_BIN_HOST=/tmp/rtk-runs/rtk python3 -u deploy/harbor/terminalbench_rtk.py --tasks /tmp/tb-runs/tb89.txt \
+  --jobs-root /tmp/tb-runs/rtk --n 12 --agent-mult 4.0 --max-retries 4
+```
+
+Each writes `rows-<cfg>.json` + `summary.json` under its jobs-root (headroom also dumps
+`/tmp/tb-runs/stats-hd-cache.json`; rtk's ledger is in each trial's `agent/rtk-gain.json`).
+Per-arm pages via `gen_tb_docs.py --kind arm --label "<name>"`; the four-way
+[comparison](terminal-bench-comparison.md) is assembled from the four `rows-*.json`.
+
+## 8. Result docs
+
+- [`baseline.md`](baseline.md) — SWE-bench baseline (`off`) full results.
 - [`context-guru.md`](context-guru.md) — context-guru `codesmart` full results.
 - [`headroom.md`](headroom.md) — headroom full results.
 - [`rtk.md`](rtk.md) — rtk (Rust Token Killer) full results.
-- [`comparison.md`](comparison.md) — the four-way comparison across all metrics.
+- [`comparison.md`](comparison.md) — the four-way SWE-bench comparison across all metrics.
+- [`terminal-bench-comparison.md`](terminal-bench-comparison.md) — the four-way **Terminal-Bench 2.0** comparison.
+- [`terminal-bench-baseline.md`](terminal-bench-baseline.md) · [`-context-guru`](terminal-bench-context-guru.md) · [`-headroom`](terminal-bench-headroom.md) · [`-rtk`](terminal-bench-rtk.md) — TB per-arm full results.
