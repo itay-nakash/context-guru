@@ -117,8 +117,8 @@ is the difference between async being cheaper than sync and being worse than it.
 The agent receives its request **untouched, byte for byte**. The request path does not
 run the pipeline at all, and does not inject the expand tool either — injecting a tool
 declaration would modify the request, which is the one thing this mode promises never
-to do. A copy of the request runs off-path against a store overlay that is never
-committed, purely to record what compaction *would* have achieved.
+to do. A copy of the request runs off-path against observe's own state store — disjoint
+from the live one — purely to record what compaction *would* have achieved.
 
 This is the answer to "will context-guru help *my* traffic" that does not require
 enforcing it in production and comparing against history.
