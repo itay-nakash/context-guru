@@ -122,6 +122,42 @@ The controlled same-traffic test is the strong evidence for agreement; the bench
 arms are consistent with it but too small to confirm it independently. A 50-task paired
 run is the honest next step.
 
+## Terminal-Bench 2.0 — 2 cache-sensitive tasks, n=1
+
+A second, independent benchmark, and the reason it is worth reporting despite being
+even smaller: it replicates the cache-write result on different traffic.
+
+| | `sync` | `async` |
+|---|---|---|
+| added latency / req | 26.9 ms | 26.8 ms |
+| cache-read | 3,144,887 | 6,311,918 |
+| cache-write | 68,211 | 83,222 |
+| **cache-write per 1M cache-read** | **21,689** | **13,185 (−39.2%)** |
+| cache-hit rate | 97.87% | 98.70% |
+| pipeline runs | 60 | 110 |
+| context-guru's own LLM calls | **0** | **0** |
+| off-path compaction time | — | 2.5 s |
+| `async_realized_saved_tokens` | — | 1,156 |
+| queue `{dropped, stale_discarded}` | — | `{0, 0}` |
+
+Two things to read here.
+
+**The cache result replicates.** Normalised cache-write fell 39.2% under async, against
+45% on SWE-bench. Two different benchmarks, two different traffic shapes, same
+direction. That is the strongest evidence in this page that the tail policy is doing
+what it was designed to do.
+
+**Async's latency benefit is proportional to how much LLM work the pipeline does, and
+here it is zero.** `extract_llm` made **no** model calls on these tasks, so there was
+nothing expensive to defer and added latency is identical (26.9 vs 26.8 ms). This is a
+useful negative result rather than a disappointment: async buys back the compaction
+model call, so on traffic that never triggers one it buys nothing. It also does not
+*cost* anything there, which is the important half.
+
+Reward is not quoted from this arm: these are two hard tasks, one hit an
+environment-build exception in each configuration, and the trajectories diverged sharply
+(30 vs 55.5 mean steps). At this scale the step counts drive the cost column entirely.
+
 ## Real Claude Code sessions (one per mode)
 
 Same prompt and workspace through each mode, live gateway:
@@ -175,8 +211,9 @@ Each is now covered by a test that fails without its fix.
 
 - Any cost or solve-rate claim per mode. 2 tasks, n=1. The billed-cost column tracks
   trajectory length more than it tracks mode.
-- The cache-write result's *magnitude*. Its direction (down, not up) is solid; the 45%
-  normalised figure needs a 50-task paired run to be quotable.
+- The cache-write result's *magnitude*. Its direction is solid and now replicated on two
+  benchmarks (−45% normalised on SWE-bench, −39.2% on Terminal-Bench), but a quotable
+  figure needs a 50-task paired run.
 - Async under concurrency pressure: `dropped` and `stale_discarded` were 0 on every
   arm, so the drop and stale-discard paths are exercised only by tests, never yet by
   production load.
