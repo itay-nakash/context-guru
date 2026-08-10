@@ -13,10 +13,30 @@ package offload
 //     terraform/tofu init; the five pulumi subcommands). Splitting them would
 //     only make the shared selector ambiguous and the ordering arbitrary.
 //
-// Plus: every success-collapse (`match_output`) rule carries an `unless` guard —
-// rtk ships 9 of 11 unguarded, and in a proxy the agent cannot re-run the command
-// to discover the warning that got swallowed. And line budgets come from the
-// shared `cap` classes (dsl.Caps) rather than 25 hand-picked max_lines.
+// Collapsing output to a one-line summary is the dangerous operation here — in a proxy
+// the agent cannot re-run the command to discover the warning that got swallowed. There
+// are TWO mechanisms that do it, and they are safe for DIFFERENT reasons. Both invariants
+// are enforced by TestCollapseInvariants; a new filter must satisfy the one it uses.
+//
+//  1. `match_output` — pattern-matched success collapse. Safe because every rule carries
+//     an `unless` guard naming the diagnostics that must veto the collapse. rtk ships 9
+//     of 11 unguarded; ours are all guarded.
+//  2. `on_empty` — fires only when `strip_lines_matching` removed EVERYTHING. Safe for a
+//     structural reason instead: every strip list is an explicit allow-list of known
+//     boilerplate prefixes with NO catch-all pattern, so an unrecognised line is simply
+//     not stripped, the output is therefore not empty, and the collapse never fires. An
+//     `unless` guard would be redundant. This is the stronger of the two designs — a guard
+//     enumerates what to fear, an allow-list enumerates what is known-harmless and so is
+//     safe against diagnostics nobody anticipated.
+//
+// 12 of the filters collapse via `on_empty` (apt, pytest, make, gcc, gradle, xcodebuild,
+// pulumi, terraform-plan, terraform-init, liquibase, turbo, npm-install), so #2 is the
+// common case, not the exception. Adding `.*` or `^.*$` to any strip list would silently
+// void it — hence the test. See `apt`'s deliberate exclusion of `^debconf: ` for the shape
+// of the reasoning: it would swallow "debconf: unable to initialize frontend".
+//
+// Line budgets come from the shared `cap` classes (dsl.Caps) rather than 25 hand-picked
+// max_lines.
 //
 // Every filter ships inline tests; they run at load time (dsl.Registry.Load) and
 // TestBuiltinFiltersSelfCheck asserts each test's input actually routes to its own

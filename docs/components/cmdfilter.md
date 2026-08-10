@@ -112,14 +112,45 @@ The `apt` filter originally stripped `^debconf: `, which also swallowed
 class of mistake by asserting a list of must-survive lines against a wall of boilerplate. Any new
 strip rule on a high-volume filter should be run past a list like it.
 
-### Every success-collapse carries an `unless` guard
+### Collapsing to one line is safe two different ways
 
-Nine of rtk's eleven `match_output` success-collapse rules are unguarded — a build that emits a
-warning *and* a success marker collapses to `ok` and the warning is gone. rtk learned this itself
-(its `swift-build` test is named "warnings not swallowed when Build complete present"). In a proxy
-the stakes are higher: the agent cannot re-run the command to find out. So every collapse rule here
-carries an `unless`, plus an explicit negative test proving a warning + success marker does **not**
-collapse. `TestEveryMatchOutputRuleIsGuarded` fails the build if one is added without a guard.
+Collapsing output to a one-line summary is the dangerous operation in this component: in a proxy the
+agent **cannot re-run the command** to find the warning that got swallowed. Two mechanisms collapse,
+and they are safe for different reasons. `TestCollapseInvariants` enforces both against the shipped
+filter data, so a new filter must satisfy whichever it uses.
+
+**1. `match_output` — guarded.** Nine of rtk's eleven success-collapse rules are unguarded: a build
+that emits a warning *and* a success marker collapses to `ok` and the warning is gone. rtk learned
+this itself (its `swift-build` test is named "warnings not swallowed when Build complete present").
+Every collapse rule here carries an `unless` naming the diagnostics that veto the collapse, plus an
+explicit negative test proving a warning + success marker does **not** collapse.
+
+**2. `on_empty` — structural, and this is the common case.** `on_empty` fires only when
+`strip_lines_matching` removed *everything*. **12 of the filters collapse this way** — `apt`,
+`pytest`, `make`, `gcc`, `gradle`, `xcodebuild`, `pulumi`, `terraform-plan`, `terraform-init`,
+`liquibase`, `turbo`, `npm-install` — and none carries an `unless`, because it would be redundant.
+Every strip list is an **explicit allow-list of known boilerplate prefixes with no catch-all**, so an
+unrecognised line is simply not stripped, the output is therefore not empty, and the collapse never
+fires.
+
+Verified behaviourally on the heaviest-firing filter, `apt`:
+
+| input | output |
+|---|---|
+| boilerplate + `E: Unable to locate package nginx` | `E: Unable to locate package nginx` |
+| boilerplate + `W: Failed to fetch … 404 Not Found` | `W: Failed to fetch … 404 Not Found` |
+| boilerplate + `dpkg: error processing package nginx` | `dpkg: error processing package nginx` |
+| clean boilerplate only | `apt: install ok` |
+
+This is arguably the **stronger** of the two designs: a guard enumerates what to *fear*, while an
+allow-list enumerates what is *known-harmless*, so it stays safe against diagnostics nobody
+anticipated. `apt`'s deliberate exclusion of `^debconf: ` shows the shape of the reasoning — that
+prefix would swallow `debconf: unable to initialize frontend`, so only the specific delaying notice
+is stripped.
+
+The failure mode the test exists for: adding `.*` or `^.*$` to any strip list would silently void the
+guarantee, and **nothing else would catch it** — the filter's own inline tests would still pass,
+because they exercise the boilerplate it was written for.
 
 `dotnet-build`'s guard is worth noting: dotnet prints `0 Error(s)` on success, so a guard on the
 word "error" would never let it collapse. It guards on the diagnostic *form* instead
