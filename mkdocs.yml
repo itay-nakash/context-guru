@@ -117,6 +117,7 @@ nav:
       - Reformat:
           - format: components/format.md
           - toon: components/toon.md
+          - cachesplit: components/cachesplit.md
           - cacheinject: components/cacheinject.md
       - "Offload (reversible)":
           - skeleton: components/skeleton.md

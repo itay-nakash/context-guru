@@ -54,16 +54,26 @@ The loop reasons over a complete assistant message, but a streaming response arr
 on SSE the proxy makes a per-request choice from the request bytes:
 
 - **No marker in `messages`/`system`** → the model has nothing to expand, so the response is
-  streamed straight through, byte for byte, with no added latency.
+  streamed straight through, byte for byte, with no added latency. This fast path only started
+  working in [#33](https://github.com/rossoctl/context-guru/pull/33): the marker check tested the
+  *whole* request body, which also matched the `context_guru_expand` tool description context-guru
+  injects itself, so it was unconditionally true and **every** SSE response was buffered. Measured
+  on a fake 1 s SSE upstream, medians of 12 trials: marker-free TTFB **1007 ms → 43 ms**;
+  marker-bearing stayed at 1008 ms, which is correct — it is being inspected.
 - **A marker is present** → the response is read in full, reconstructed with `expand.AggregateSSE`,
   and inspected. If it is a lone expand call the loop runs; otherwise the buffered bytes are
   replayed to the client verbatim.
 
 Buffering costs the client its streaming for that request (time-to-first-byte becomes
 time-to-last-byte), which is why the marker test is narrow. It scans **only** `messages` and
-`system` — the model-visible content. It used to scan the whole request body, which also matched the
-`context_guru_expand` tool description we inject ourselves ("…replaced by a `<<cg:HASH>>` marker"),
-so it was always true and **every** stream was silently buffered (issue #26).
+`system` — the model-visible content, via `expand.HasMarkersInMessages`. Requiring the full marker
+shape would not have been enough on its own: the injected tool description contains the full shape
+too, so **scoping** is the actual fix (issue #26).
+
+!!! success "Restoration does fire through the streaming path"
+    Worth stating, because a fast path that never buffers could equally mean restoration is
+    unreachable. It is not: a real agent invoked restoration through the streaming path —
+    `bounces=1`, 3,372 tokens re-served. The loop works end to end on SSE, not only in tests.
 
 `/stats` reports this directly, counted **once per client request** (not per upstream round, so a
 request that drove several expand rounds is one sample): `sse_streamed`, `sse_buffered`,
@@ -104,9 +114,24 @@ The store is the whole reversibility mechanism. It defaults to an in-memory TTL+
 refreshed on every read, so a stash an active session keeps touching does not expire under it.
 It holds, per session:
 
-- **Rewind** — `cache_key → original bytes`, what the expand loop resolves.
+- **Rewind** — `cache_key → original bytes`, what the expand loop resolves. Fully evictable: these
+  are the large payloads.
 - **Sticky** — the set of content ids already reduced on prior turns (byte-stable output across
   turns).
+- **Frozen decisions** — the exact replacement bytes an offloader must replay so an already-cached
+  message stays byte-identical (`cg:frz:` for `mask`/`failed_run`, `cg:res:` for `extract_llm`'s
+  result, `cg:len:` for `apply`'s cache-boundary counter). These are **pinned** against LRU
+  eviction, because losing one is not a cache miss — it flips a message inside the provider's
+  cached prefix and the whole suffix is re-written at 11.5× the read price. The pin is capped at
+  half `max_entries` so one pathological session cannot starve the rewind stashes.
+
+A dropped frozen decision is re-derived where re-derivation is *reproducible* — `mask` and
+`failed_run` qualify, since their replacement is a pure function of `(content, config)`.
+`extract_llm` is deliberately excluded: its replacement is a **sampled** model output (no
+temperature, no seed sent), so re-deriving could splice *different* bytes into a cached prefix,
+which is the exact corruption the repair exists to prevent. Health counters:
+`frozen_hits` / `frozen_misses` / `frozen_dropped` / `frozen_repaired` / `frozen_flips` — see
+[Routes](../reference/routes.md#freeze-replay-health).
 
 !!! warning "No store, no recovery"
     Set `store.enabled: false` and offloads become **one-way** — a `store.Nop` is wired in and

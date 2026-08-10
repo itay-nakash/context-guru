@@ -56,7 +56,7 @@ The class names and the first four values are rtk's (`src/core/truncate.rs`); `b
 | `cap` | lines | for |
 |---|--:|---|
 | `errors` | 20 | error lists — most actionable, shown the most |
-| `warnings` | 10 | warnings and test failures — lower signal density |
+| `warnings` | 10 | warnings — lower signal density than errors |
 | `list` | 20 | flat lists (packages, services): one line per item |
 | `inventory` | 50 | exhaustive lookups (installed packages, file listings) |
 | `buildlog` | 80 | full build/plan transcripts — verbose, and the signal can sit anywhere |

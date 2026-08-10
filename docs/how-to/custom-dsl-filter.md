@@ -135,15 +135,15 @@ components:
             strip_lines_matching: ["^\\s*$", " PASSED", "^\\.+$"]
             max_lines: 80
             on_empty: "pytest: all passed"
-    disable_builtins: false   # keep the 23 shipped filters too
+    disable_builtins: false   # keep the 24 shipped filters too
     min_size: 500             # byte floor: below it the marker costs more than the saving
 ```
 
 - `cmdfilter` is `Enabled` only when ≥1 filter is loaded.
 - It ships [24 filters](../components/cmdfilter.md#the-shipped-filter-set); set
   `disable_builtins: true` to run only your own.
-- The output's first non-empty line is the selector each filter's `match` is tested against, in
-  descending `priority` then name order.
+- The output's first **six** non-empty lines are the selector each filter's `match` is tested
+  against, in descending `priority` then name order.
 - Outputs smaller than `min_size` (default 500 bytes) are skipped entirely.
 
 !!! tip

@@ -6,9 +6,10 @@
 ## How it works
 
 `cmdfilter` shrinks tool output with **declarative DSL filters** (see
-[The DSL filter engine](dsl.md)). It matches a filter on the output's first non-empty line, applies
-its 8-stage pipeline, stashes the original, and appends a recovery hint only when the filter was
-actually lossy. It is `Enabled` only when ≥1 filter is loaded.
+[The DSL filter engine](dsl.md)). It matches a filter on the output's **first six non-empty lines**
+(the selector), applies its 8-stage pipeline, stashes the original, and appends a recovery hint only
+when the filter was actually lossy — typed by *what* was lost. Filters are tried in descending
+`priority`, then by name. It is `Enabled` only when ≥1 filter is loaded.
 
 Deterministic filtering costs nothing — no LLM call, ~0 latency — and it is cache-safe: it acts on
 the newest tool output, in the mutable tail.
@@ -35,8 +36,9 @@ and `$` anchor per line.
 That is also the structural advantage: rtk's hook only sees Bash calls, so an agent's built-in
 `Read`/`Grep`/`Glob` tools are invisible to it. A proxy sees every tool result regardless of origin.
 
-A `TestEveryBuiltinFilterHasTestsAndRoutes` guardrail asserts every filter's own test input actually
-routes to that filter, so a selector rewrite is verified rather than hoped for.
+A `TestEveryBuiltinFilterHasTestsAndRoutes` guardrail asserts every filter ships ≥1 inline test and
+that each test's input actually routes to *that* filter, so a selector rewrite is verified rather
+than hoped for.
 
 ### Size floor
 
@@ -91,10 +93,17 @@ shapes dominated the misses:
   matches the command, so its patterns never had to name this shape; ported as-is, the filter would
   miss the most common way gcc output starts.
 
-Meanwhile the IaC and mobile-build filters (`pulumi`, `terraform-plan`, `xcodebuild`, `gradle`) fired
-**zero** times on that dump. They are kept — they are correct, tested and cost nothing when inert —
-but the honest reading is that a filter set's value is decided by the workload, not by its size. The
+Between them those two shapes carry roughly **73% of the live savings** on that dump.
+
+Meanwhile the filters that had been *planned* as Tier 1 — `pulumi`, `terraform-plan`, `xcodebuild`,
+`gradle` — fired **zero** times on it. They are kept: they are correct, tested and cost nothing when
+inert. But the honest reading is that a filter set's value is decided by the workload, not by its
+size, and the prediction about which filters would matter was wrong. The
 `cmdfilter_selector_misses` ledger exists so that stays measurable rather than assumed.
+
+!!! note "One benchmark, one dump"
+    The 73% / zero-fire split is Terminal-Bench tool output. A repo full of Terraform would
+    invert it. Read the ledger on *your* traffic before pruning a filter.
 
 ### A cautionary note on strip rules
 

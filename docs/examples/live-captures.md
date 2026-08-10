@@ -39,9 +39,13 @@ after:   [6]{id,name,status}:
          … 4 more rows …
 ```
 
-### `cacheinject` — adds a cache breakpoint on the stable prefix
-The last content block of the message *before* the newest turn gains a `cache_control` directive
-(no model-visible content changes):
+### `cacheinject` — adds a cache breakpoint (opt-in, in no preset)
+A `cache_control` directive is attached to the last content block of a chosen message (no
+model-visible content changes). The v1 policy of always marking the message *before* the newest
+turn was a **+5.5% regression** and is gone; the current policy marks the newest message plus the
+last one still matching the previous turn. This capture predates
+[#36](https://github.com/rossoctl/context-guru/pull/36), so on Claude Code traffic a mark like this
+would have been discarded by the writeback layer rather than reaching the provider:
 ```json
 {"role":"assistant","content":[{"type":"text",
   "text":"Here is a fairly long answer … worth caching across turns.",
@@ -151,8 +155,10 @@ the `general` preset against a real gateway, `GET /stats` reported:
 ```
 
 `dedup` + `mask` are deterministic; `extract_llm` made one real cheap-model call. Components that
-found nothing to do (`format`, `toon`, `cmdfilter`, `collapse`, `extract`, `failed_run`,
-`cacheinject`) sit in `top_passthrough` at zero cost — the pipeline is never worse.
+found nothing to do (`format`, `toon`, `cmdfilter`, `collapse`, `extract`, `failed_run`) sit in
+`top_passthrough` at zero cost — the pipeline is never worse. `cachesplit` is there too, but
+permanently and by design: its `Reformat` always skips because the split it enables is a body-level
+rewrite in `apply`.
 
 ## Reversibility, verified
 
