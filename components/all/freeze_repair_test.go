@@ -43,8 +43,13 @@ func (m *varyingModel) calls() int {
 // Only mask/failed_run get the depth repair, because their replacement is a pure function
 // of (content, config) and so is genuinely reproducible.
 func TestLostExtractLLMResultIsNotReDerivedAtDepth(t *testing.T) {
+	// allow_on_caching_backend + economic_gate: false keep this fixture exercising the
+	// CACHE-SAFETY path under test. extract_llm is off by default on caching backends and
+	// its gate declines small outputs, so without these turn 1 never compacts and the guard
+	// passes vacuously — which is the same trap #40 hit with the wrong MaxCachedIdx.
 	off := newComp(t, "extract_llm",
-		"strategy: code\nmin_tokens: 1\nmodel:\n  source: config\ntrigger:\n  min_request_tokens: 1\n")
+		"strategy: code\nmin_tokens: 1\nallow_on_caching_backend: true\neconomic_gate: false\n"+
+			"model:\n  source: config\ntrigger:\n  min_request_tokens: 1\n")
 	now := time.Unix(0, 0)
 	st := store.NewMemory(store.Options{TTLSeconds: 10})
 	st.SetClock(func() time.Time { return now })

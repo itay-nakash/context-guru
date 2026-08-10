@@ -86,7 +86,11 @@ func runStarlark(ctx context.Context, body, goal string, keepIDs []string, model
 	if model == nil {
 		return "", ""
 	}
-	src, err := model.Complete(ctx, buildCodePrompt(body, goal, keepIDs, rewrite))
+	// Split shape: the invariant contract+examples go in a cacheable system block, the
+	// goal/keep-list/output in the user message. Falls back to one message on a client
+	// without the capability. Same content either way.
+	sys, user := buildCodePromptSplit(body, goal, keepIDs, rewrite)
+	src, err := completeSplit(ctx, model, sys, user)
 	if err != nil {
 		return "", ""
 	}

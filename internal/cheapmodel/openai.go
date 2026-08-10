@@ -20,6 +20,15 @@ type OpenAI struct {
 }
 
 func (o OpenAI) Complete(ctx context.Context, prompt string) (string, error) {
+	return o.CompleteSystem(ctx, "", prompt)
+}
+
+// CompleteSystem puts the invariant instructions in a leading `system` message. OpenAI
+// has no explicit cache breakpoints — caching is automatic on a shared prefix — so there
+// is nothing to mark; a stable leading system message IS the cacheable-prefix idiom here.
+// The split is therefore honest on both backends: same call shape, provider-appropriate
+// mechanism, and no `cache_control` field invented for an API that would reject it.
+func (o OpenAI) CompleteSystem(ctx context.Context, system, prompt string) (string, error) {
 	base := o.BaseURL
 	if base == "" {
 		base = "https://api.openai.com"
@@ -32,10 +41,15 @@ func (o OpenAI) Complete(ctx context.Context, prompt string) (string, error) {
 	if client == nil {
 		client = http.DefaultClient
 	}
+	msgs := []any{}
+	if system != "" {
+		msgs = append(msgs, map[string]any{"role": "system", "content": system})
+	}
+	msgs = append(msgs, map[string]any{"role": "user", "content": prompt})
 	reqBody, _ := json.Marshal(map[string]any{
 		"model":      o.Model,
 		"max_tokens": maxTok,
-		"messages":   []any{map[string]any{"role": "user", "content": prompt}},
+		"messages":   msgs,
 	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		strings.TrimRight(base, "/")+"/v1/chat/completions", bytes.NewReader(reqBody))
@@ -60,14 +74,21 @@ func (o OpenAI) Complete(ctx context.Context, prompt string) (string, error) {
 			} `json:"message"`
 		} `json:"choices"`
 		Usage struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
+			PromptTokens        int `json:"prompt_tokens"`
+			CompletionTokens    int `json:"completion_tokens"`
+			PromptTokensDetails struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
 		} `json:"usage"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return "", err
 	}
-	recordUsage(out.Usage.PromptTokens, out.Usage.CompletionTokens) // track CG component LLM cost
+	// OpenAI reports automatic prefix caching as cached_tokens, and counts them INSIDE
+	// prompt_tokens (unlike Anthropic, which reports the tiers disjointly). Subtract so
+	// the "fresh input" figure means the same thing on both backends.
+	cached := out.Usage.PromptTokensDetails.CachedTokens
+	recordUsageCache(out.Usage.PromptTokens-cached, out.Usage.CompletionTokens, 0, cached)
 	if len(out.Choices) == 0 {
 		return "", nil
 	}

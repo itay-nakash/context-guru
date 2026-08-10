@@ -90,6 +90,22 @@ for every component's config block.
 | `--store` / `STORE` | on | Enable/disable the state store; `--store=false` disables offload reversibility. Wins over the file's `store:` block. |
 | `--mode` / `MODE` | `sync` | Operating mode: `sync` \| `observe`. Wins over the file's `mode:`. |
 
+### Extraction-model pricing
+
+[`extract_llm`](../components/extract_llm.md)'s economic gate only calls the LLM when the
+expected saving exceeds the expected cost, so it needs the real price of a call. The cost is
+computed from **observed token usage × these rates** — never a hard-coded per-call constant.
+Defaults are `claude-haiku-4-5` list rates; override them to match your contract.
+
+| Env | Default | Purpose |
+|---|---|---|
+| `CHEAP_MODEL_PRICE_IN` | `1.00` | Extraction-model input price, **dollars per million tokens**. |
+| `CHEAP_MODEL_PRICE_OUT` | `5.00` | Output price per MTok. |
+| `CHEAP_MODEL_PRICE_CACHE_WRITE` | `1.25` | Cache-write price per MTok (1.25× input). |
+| `CHEAP_MODEL_PRICE_CACHE_READ` | `0.10` | Cache-read price per MTok (0.1× input). |
+
+An unparseable or absent value silently keeps the default — pricing must never fail a request.
+
 ## Diagnostics
 
 | Env | Effect |

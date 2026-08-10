@@ -416,6 +416,11 @@ type Snapshot struct {
 	LLMCalls        int64 `json:"llm_calls"`
 	LLMInputTokens  int64 `json:"llm_input_tokens"`
 	LLMOutputTokens int64 `json:"llm_output_tokens"`
+	// Extract is extract_llm's own economics (#28 part F), including NET savings after
+	// its LLM cost — the honest headline for the one component that spends to save.
+	// Purely ADDITIVE: no field above was renamed or removed, so deploy/harbor/*.py
+	// keeps parsing /stats unchanged.
+	Extract *ExtractStats `json:"extract,omitempty"`
 	// End-to-end latency (W7): mean ms context-guru added per request, and mean
 	// provider round-trip on the active vs bypassed (baseline) path — a with/without
 	// context-guru session-latency comparison.
