@@ -31,6 +31,24 @@ func (t Tee) Run(r components.RunReport) {
 	}
 }
 
+// FilterAct / FilterMiss forward cmdfilter's ledger to whichever tee'd emitters
+// record it (so a Tee still satisfies components.FilterStatsSink).
+func (t Tee) FilterAct(family, filter, contentKey string, saved int) {
+	for _, e := range t {
+		if s, ok := e.(components.FilterStatsSink); ok {
+			s.FilterAct(family, filter, contentKey, saved)
+		}
+	}
+}
+
+func (t Tee) FilterMiss(selector string) {
+	for _, e := range t {
+		if s, ok := e.(components.FilterStatsSink); ok {
+			s.FilterMiss(selector)
+		}
+	}
+}
+
 // Slog logs each component and run in the GenAI semantic-convention vocabulary.
 type Slog struct{ L *slog.Logger }
 
@@ -94,6 +112,66 @@ type Aggregator struct {
 	sseTTFBMsBuf float64
 	sseStreamed  int64
 	sseBuffered  int64
+	// cmdfilter's per-family / per-filter ledger, plus the selector-miss ledger that
+	// makes the next filter to write data instead of guesswork.
+	filterFam  map[string]*filterStat
+	filterName map[string]*filterStat
+	filterMiss map[string]int64
+}
+
+// filterStat is one cmdfilter family's or filter's ledger. SavedUnique dedups by
+// content key exactly as compStat does — the agent re-sends history verbatim every
+// turn, so the cumulative figure double-counts the same compaction.
+type filterStat struct {
+	Acts        int64 `json:"acts"`
+	Saved       int64 `json:"saved_tokens"`
+	SavedUnique int64 `json:"saved_tokens_unique"`
+
+	seenKeys map[string]struct{} // content keys already counted (not serialized)
+}
+
+// maxMissKeys bounds the selector-miss ledger; output shapes are unbounded in
+// principle. Once full we only keep counting selectors already tracked.
+// ponytail: fixed cap, no eviction — first-seen wins. Swap for a count-min sketch if
+// the ledger ever gets dominated by whatever arrived first.
+const maxMissKeys = 200
+
+// FilterAct implements components.FilterStatsSink: one applied cmdfilter filter.
+func (a *Aggregator) FilterAct(family, filter, contentKey string, saved int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.filterFam == nil {
+		a.filterFam, a.filterName = map[string]*filterStat{}, map[string]*filterStat{}
+	}
+	bump(a.filterFam, family, contentKey, saved)
+	bump(a.filterName, filter, contentKey, saved)
+}
+
+func bump(m map[string]*filterStat, key, contentKey string, saved int) {
+	fs := m[key]
+	if fs == nil {
+		fs = &filterStat{seenKeys: map[string]struct{}{}}
+		m[key] = fs
+	}
+	fs.Acts++
+	fs.Saved += int64(saved)
+	if _, seen := fs.seenKeys[contentKey]; !seen {
+		fs.seenKeys[contentKey] = struct{}{}
+		fs.SavedUnique += int64(saved)
+	}
+}
+
+// FilterMiss implements components.FilterStatsSink: a selector that matched nothing.
+func (a *Aggregator) FilterMiss(selector string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.filterMiss == nil {
+		a.filterMiss = map[string]int64{}
+	}
+	if _, known := a.filterMiss[selector]; !known && len(a.filterMiss) >= maxMissKeys {
+		return
+	}
+	a.filterMiss[selector]++
 }
 
 type compStat struct {
@@ -291,6 +369,18 @@ type Snapshot struct {
 	FrozenDropped  int64 `json:"frozen_dropped"`
 	FrozenRepaired int64 `json:"frozen_repaired"`
 	FrozenFlips    int64 `json:"frozen_flips"`
+	// cmdfilter attribution: which command FAMILIES pay off (builds/tests/iac/pkg/net),
+	// which individual filters fire, and which output shapes matched no filter (the
+	// backlog of filters worth writing). Additive fields — nothing above is renamed.
+	CmdfilterFamilies map[string]filterStat `json:"cmdfilter_families,omitempty"`
+	CmdfilterFilters  map[string]filterStat `json:"cmdfilter_filters,omitempty"`
+	CmdfilterMisses   []SelectorMiss        `json:"cmdfilter_selector_misses,omitempty"`
+}
+
+// SelectorMiss is one output shape that matched no filter, with how often it appeared.
+type SelectorMiss struct {
+	Selector string `json:"selector"`
+	Count    int64  `json:"count"`
 }
 
 // Snapshot returns a point-in-time copy of the rollups.
@@ -351,5 +441,43 @@ func (a *Aggregator) Snapshot() Snapshot {
 		AddedLatencyMsAvg: addedAvg, UpstreamMsAvg: upAvg, UpstreamMsAvgBypassed: upAvgByp,
 		SSEStreamed: a.sseStreamed, SSEBuffered: a.sseBuffered,
 		SSETTFBMsAvg: ttfb, SSETTFBMsAvgBuf: ttfbBuf, SSEBufferedPct: bufPct,
+		CmdfilterFamilies: copyFilterStats(a.filterFam),
+		CmdfilterFilters:  copyFilterStats(a.filterName),
+		CmdfilterMisses:   topMisses(a.filterMiss, 20),
 	}
+}
+
+func copyFilterStats(src map[string]*filterStat) map[string]filterStat {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make(map[string]filterStat, len(src))
+	for k, v := range src {
+		fs := *v
+		fs.seenKeys = nil // don't serialize the working set
+		out[k] = fs
+	}
+	return out
+}
+
+// topMisses returns the n most frequent unmatched selectors, descending (ties by
+// selector, so the output is deterministic).
+func topMisses(src map[string]int64, n int) []SelectorMiss {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make([]SelectorMiss, 0, len(src))
+	for s, c := range src {
+		out = append(out, SelectorMiss{Selector: s, Count: c})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Count != out[j].Count {
+			return out[i].Count > out[j].Count
+		}
+		return out[i].Selector < out[j].Selector
+	})
+	if len(out) > n {
+		out = out[:n]
+	}
+	return out
 }

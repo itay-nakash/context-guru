@@ -36,10 +36,42 @@ const (
 	LossWhole                  // non-contiguous / whole-blob loss; only full retrieval recovers
 )
 
+// Caps are the shared line budgets a filter picks by SIGNAL DENSITY (`cap: errors`)
+// instead of hand-picking a max_lines per filter. The first four names and values
+// are rtk's (src/core/truncate.rs); `buildlog` is ours — a build/plan transcript is
+// mostly noise but the line that matters can sit anywhere in it, so it gets a
+// deliberately generous budget. One map tunes the whole filter set.
+var Caps = map[string]int{
+	"errors":    20, // most actionable, shown the most
+	"warnings":  10, // lower signal density than errors
+	"list":      20, // flat lists (packages, services): one line per item
+	"inventory": 50, // exhaustive lookups (installed packages, file listings)
+	"buildlog":  80, // full build/plan transcripts: verbose, signal is positional
+}
+
+// ReducedCap is rtk's `reduced` deviation helper: a cap lowered for a more verbose
+// data class, underflow-safe — a deviation can never empty the budget.
+func ReducedCap(cap, by int) int {
+	if by > 0 && by < cap {
+		return cap - by
+	}
+	return cap
+}
+
 // Def is a raw filter definition (from YAML). All fields except Match are optional.
 type Def struct {
-	Description        string        `yaml:"description"`
-	Match              string        `yaml:"match"` // regex against the selector key
+	Description string `yaml:"description"`
+	Match       string `yaml:"match"` // regex against the selector key
+	// Family groups filters for per-family metrics (builds, tests, iac, pkg, net, ...).
+	Family string `yaml:"family"`
+	// Priority orders matching: higher first, then by name. Absent (0) = today's
+	// behavior (name order). Use it to put a specific filter ahead of a generic one,
+	// which matters more here than in rtk because we match on output shape.
+	Priority int `yaml:"priority"`
+	// Cap selects a shared budget class from Caps instead of a literal MaxLines;
+	// CapReduce lowers it for an extra-verbose variant. MaxLines wins if both are set.
+	Cap                string        `yaml:"cap"`
+	CapReduce          int           `yaml:"cap_reduce"`
 	StripANSI          bool          `yaml:"strip_ansi"`
 	Replace            []ReplaceRule `yaml:"replace"`
 	MatchOutput        []MatchRule   `yaml:"match_output"`
@@ -111,7 +143,23 @@ func Compile(name string, d Def) (*Compiled, error) {
 	if len(d.StripLinesMatching) > 0 && len(d.KeepLinesMatching) > 0 {
 		return nil, fmt.Errorf("dsl: filter %q sets both strip_lines_matching and keep_lines_matching", name)
 	}
-	m, err := regexp.Compile(d.Match)
+	if d.Cap != "" {
+		base, ok := Caps[d.Cap]
+		if !ok {
+			return nil, fmt.Errorf("dsl: filter %q unknown cap %q", name, d.Cap)
+		}
+		if d.MaxLines == nil { // an explicit max_lines still wins
+			n := ReducedCap(base, d.CapReduce)
+			d.MaxLines = &n
+		}
+	} else if d.CapReduce != 0 {
+		return nil, fmt.Errorf("dsl: filter %q sets cap_reduce without cap", name)
+	}
+	// The selector spans a few leading lines, not one, so `^`/`$` in a match regex must
+	// mean "start/end of A line" rather than "of the whole selector". Without (?m) a
+	// filter anchored at ^ only matches output whose very FIRST line is its signature,
+	// which is exactly the output-framing dependence a multi-line selector removes.
+	m, err := regexp.Compile("(?m)" + d.Match)
 	if err != nil {
 		return nil, fmt.Errorf("dsl: filter %q match: %w", name, err)
 	}
@@ -189,20 +237,28 @@ func Apply(c *Compiled, input string) (string, Lossiness) {
 	} else if len(c.keepLines) > 0 {
 		lines = filterLines(lines, c.keepLines, true)
 	}
-	// 5. truncate_lines_at (unicode-safe per-line cap)
+	// 5. truncate_lines_at (unicode-safe per-line cap). An intra-line cut is a REAL
+	// loss and is non-contiguous by nature (every long line loses its own tail), so
+	// it types as LossWhole; and it appends an ellipsis, because a silent mid-line
+	// cut reads as corrupted output to a model (both after rtk).
+	loss := LossNone
 	if c.def.TruncateLinesAt != nil {
 		n := *c.def.TruncateLinesAt
 		for i, l := range lines {
-			if r := []rune(l); len(r) > n {
-				lines[i] = string(r[:n])
+			if t := truncateRunes(l, n); t != l {
+				lines[i] = t
+				loss = LossWhole
 			}
 		}
 	}
 
-	loss := LossNone
 	// 6. head/tail
 	if c.def.HeadLines != nil || c.def.TailLines != nil {
-		lines, loss = headTail(lines, c.def.HeadLines, c.def.TailLines)
+		var htLoss Lossiness
+		lines, htLoss = headTail(lines, c.def.HeadLines, c.def.TailLines)
+		if htLoss > loss { // keep the more severe of an intra-line cut and a line drop
+			loss = htLoss
+		}
 	}
 	// 7. max_lines (absolute cap, counts the omission marker)
 	if c.def.MaxLines != nil && len(lines) > *c.def.MaxLines {
@@ -212,7 +268,7 @@ func Apply(c *Compiled, input string) (string, Lossiness) {
 		if loss == LossNone {
 			loss = LossTail
 		} else {
-			loss = LossWhole
+			loss = LossWhole // already lossy above: the cap is no longer a clean tail cut
 		}
 	}
 	out := strings.Join(lines, "\n")
@@ -221,6 +277,20 @@ func Apply(c *Compiled, input string) (string, Lossiness) {
 		return *c.def.OnEmpty, LossNone
 	}
 	return out, loss
+}
+
+// truncateRunes caps a line at n runes, marking the cut with an ellipsis that fits
+// INSIDE the budget (so the result is never longer than n). Ported from rtk's
+// utils::truncate.
+func truncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	if n < 3 {
+		return "..."
+	}
+	return string(r[:n-3]) + "..."
 }
 
 func filterLines(lines []string, res []*regexp.Regexp, keep bool) []string {
@@ -272,11 +342,27 @@ func headTail(lines []string, head, tail *int) ([]string, Lossiness) {
 	return lines, LossNone
 }
 
-// Registry holds compiled filters, matched first-by-sorted-name for determinism.
-type Registry struct{ filters []*Compiled }
+// Family is the filter's command family, used for per-family metrics. "" when unset.
+func (c *Compiled) Family() string {
+	if c.def.Family == "" {
+		return "other"
+	}
+	return c.def.Family
+}
+
+// Registry holds compiled filters, matched by descending priority then by name for
+// determinism (specific-before-generic without relying on alphabetical luck).
+type Registry struct {
+	filters []*Compiled
+	names   map[string]struct{}
+}
 
 // Load parses a YAML filter document and appends its filters to the registry.
-// schema_version must be 1. Filters are stored sorted by name.
+// schema_version must be 1. Duplicate filter names are rejected (a silently
+// shadowed filter is a debugging trap — rtk's build.rs rejects them too) and any
+// inline tests the document carries must pass, so a broken filter fails loudly at
+// load instead of quietly mangling output. (Requiring a test to EXIST is enforced
+// for the shipped builtins by a unit test, not here — user configs stay free.)
 func (r *Registry) Load(b []byte) error {
 	var f File
 	dec := yaml.NewDecoder(strings.NewReader(string(b)))
@@ -292,13 +378,31 @@ func (r *Registry) Load(b []byte) error {
 		names = append(names, n)
 	}
 	sort.Strings(names)
+	if r.names == nil {
+		r.names = map[string]struct{}{}
+	}
 	for _, n := range names {
+		if _, dup := r.names[n]; dup {
+			return fmt.Errorf("dsl: duplicate filter name %q", n)
+		}
 		c, err := Compile(n, f.Filters[n])
 		if err != nil {
 			return err
 		}
+		for _, tc := range f.Tests[n] {
+			if got, _ := Apply(c, tc.Input); !sameText(got, tc.Expected) {
+				return fmt.Errorf("dsl: filter %q test %q failed: got %q want %q", n, tc.Name, got, tc.Expected)
+			}
+		}
+		r.names[n] = struct{}{}
 		r.filters = append(r.filters, c)
 	}
+	sort.SliceStable(r.filters, func(i, j int) bool {
+		if r.filters[i].def.Priority != r.filters[j].def.Priority {
+			return r.filters[i].def.Priority > r.filters[j].def.Priority
+		}
+		return r.filters[i].Name < r.filters[j].Name
+	})
 	return nil
 }
 
@@ -310,6 +414,10 @@ func (r *Registry) Match(key string) *Compiled {
 		}
 	}
 	return nil
+}
+
+func sameText(got, want string) bool {
+	return strings.TrimRight(got, "\n") == strings.TrimRight(want, "\n")
 }
 
 // Len reports how many filters are loaded.
@@ -329,7 +437,7 @@ func RunTests(b []byte) (failures []string, err error) {
 		}
 		for _, tc := range f.Tests[name] {
 			got, _ := Apply(c, tc.Input)
-			if strings.TrimRight(got, "\n") != strings.TrimRight(tc.Expected, "\n") {
+			if !sameText(got, tc.Expected) {
 				failures = append(failures, name+"/"+tc.Name)
 			}
 		}

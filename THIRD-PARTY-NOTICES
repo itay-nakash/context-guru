@@ -1,0 +1,54 @@
+THIRD-PARTY NOTICES
+===================
+
+context-guru includes third-party material. This file records the notices those
+works require. It covers material adapted INTO this source tree; Go module
+dependencies carry their own licenses in the module cache and in go.sum.
+
+-------------------------------------------------------------------------------
+rtk (Rust Token Killer)
+-------------------------------------------------------------------------------
+
+Project:   rtk
+Homepage:  https://github.com/rtk-ai/rtk
+License:   Apache License, Version 2.0
+Notice:    Copyright 2024 rtk-ai and rtk-ai Labs
+
+Portions of this software are adapted from rtk, with modifications:
+
+  - components/dsl (DSL filter pipeline). The declarative filter engine — the
+    eight-stage pipeline (strip_ansi, replace, match_output+unless, strip/keep
+    lines, truncate_lines_at, head/tail, max_lines, on_empty), the field names,
+    the Lossiness typing, and the shared truncation cap classes (CAP_ERRORS,
+    CAP_WARNINGS, CAP_LIST, CAP_INVENTORY) — is adapted from rtk's TOML filter
+    DSL (src/core/toml_filter.rs, src/core/truncate.rs) and re-implemented in Go.
+
+  - components/offload (cmdfilter filter definitions and test corpora). The
+    shipped filter set is adapted from rtk's src/filters/*.toml, including its
+    inline test cases.
+
+Modifications made:
+
+  - Re-implemented in Go, from Rust.
+  - Filter documents are YAML with a schema_version, not TOML.
+  - Every filter's selector is rewritten. rtk matches a shell COMMAND string
+    (match_command); context-guru is a proxy and never sees the command, so each
+    filter matches an output-shape signature against the first non-empty line of
+    the tool output instead. rtk's command regexes are not portable as written.
+  - Filters whose outputs are indistinguishable from the output alone are merged
+    (terraform/tofu plan; terraform/tofu init; the pulumi subcommands).
+  - Every success-collapse (match_output) rule carries an `unless` guard; most of
+    rtk's do not. A proxy's agent cannot re-run a command to discover a warning
+    that a bare collapse swallowed.
+  - Per-filter line budgets are replaced by shared `cap` budget classes, applying
+    rtk's truncate.rs cap idea to the filter definitions (rtk's own TOML filters
+    hand-pick a max_lines each).
+  - truncate_lines_at records intra-line loss and marks the cut with an ellipsis.
+  - A `buildlog` cap class, a `family` field (per-family metrics), a `priority`
+    field (selector ordering), load-time guardrails (duplicate names rejected,
+    inline tests executed at load), and a selector-miss ledger were added.
+  - rtk's filter_stderr, its command-detection rules, and its native Rust
+    (non-DSL) filters are not ported — a proxy has no analogue for them.
+
+The Apache-2.0 license text is available at http://www.apache.org/licenses/LICENSE-2.0
+and, since context-guru is itself Apache-2.0 licensed, in this repository's LICENSE.
