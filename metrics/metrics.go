@@ -173,6 +173,14 @@ func (a *Aggregator) Component(r components.Report) {
 		a.observeComp(r)
 		return
 	}
+	// An off-path async run forwarded nothing. Its savings are counted when a later
+	// turn REPLAYS the frozen decision on the request path (RecordRealized), so
+	// counting them here too would double-count every deferred compaction — and would
+	// credit savings to a request that never carried them. The deferred work itself is
+	// visible as async_deferred_runs / async_deferred_ms_total and the queue tuple.
+	if r.Deferred {
+		return
+	}
 	cs := a.perComp[r.Component]
 	if cs == nil {
 		cs = &compStat{}
@@ -298,6 +306,9 @@ func (a *Aggregator) Run(r components.RunReport) {
 	defer a.mu.Unlock()
 	// Observe: hypothetical. Separate counters, separate JSON keys (potential_* /
 	// projected_*), never added to requests/before/after.
+	if r.Deferred {
+		return // off-path: nothing was forwarded (see Component)
+	}
 	if r.Mode == components.ModeObserve {
 		a.potentialRuns++
 		a.potentialBefore += int64(r.TokensBefore)

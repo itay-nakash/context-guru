@@ -102,7 +102,14 @@ func (c Cacheinject) ttl() *string {
 
 func (Cacheinject) Name() string { return "cacheinject" }
 
-func (Cacheinject) Enabled(c *components.Ctx) bool { return true }
+// Enabled is true except on an off-path (deferred) async run. Two reasons, and either
+// alone is sufficient: a deferred run's BODY is discarded, so breakpoints it places go
+// nowhere; and it keeps per-turn divergence digests, which are turn state. A deferred
+// job commits some turns after the one it was built from, so committing its digests
+// would replay turn N's digests over turn N+2's and make the next turn compute the
+// wrong divergence point. Only an offloader's frozen decisions are meant to survive a
+// deferred run.
+func (Cacheinject) Enabled(c *components.Ctx) bool { return c == nil || !c.Deferred }
 
 func (ci Cacheinject) Reformat(req *schemas.BifrostChatRequest, rep *components.Report, c *components.Ctx) error {
 	if !cacheAware(req.Provider) || len(req.Input) == 0 {

@@ -363,3 +363,23 @@ func TestSyncPlacementUnaffectedByTheNewFields(t *testing.T) {
 		t.Fatalf("sync placement changed: %v vs %v", base, sync)
 	}
 }
+
+// A deferred (off-path) async run must not run cacheinject at all: its body is
+// discarded so the breakpoints go nowhere, and its per-turn divergence digests are turn
+// state that would be replayed over a newer turn's if the job's buffer were committed.
+func TestSkippedOnDeferredRun(t *testing.T) {
+	c := ctx()
+	c.Mode = components.ModeAsync
+	c.Deferred = true
+	if (Cacheinject{}).Enabled(c) {
+		t.Fatal("cacheinject ran on a deferred async job; its turn digests would be committed stale")
+	}
+	// Every on-path mode still runs it.
+	for _, m := range []components.Mode{components.ModeSync, components.ModeAsync, components.ModeObserve} {
+		on := ctx()
+		on.Mode = m
+		if !(Cacheinject{}).Enabled(on) {
+			t.Fatalf("cacheinject disabled on the %s request path", m)
+		}
+	}
+}

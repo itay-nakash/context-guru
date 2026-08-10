@@ -225,6 +225,11 @@ type Report struct {
 	// from Ctx.Mode. Emitters MUST branch on it: an observe-mode report is a
 	// HYPOTHETICAL and may never be summed into enforced savings.
 	Mode Mode
+	// Deferred marks a report from an OFF-PATH async run (Ctx.Deferred). Nothing it
+	// produced was forwarded, so its savings must not be counted as enforced — the
+	// tokens are counted when a later turn REPLAYS the frozen decision on the request
+	// path. Counting both would double-count every deferred compaction.
+	Deferred bool
 }
 
 // Saved returns non-negative tokens saved by this component.
@@ -244,6 +249,8 @@ type RunReport struct {
 	Components   []Report
 	// Mode is the operating mode this run happened under (see Report.Mode).
 	Mode Mode
+	// Deferred marks an OFF-PATH async run (see Report.Deferred).
+	Deferred bool
 }
 
 // Saved returns the net tokens saved across the run.
