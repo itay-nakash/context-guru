@@ -15,11 +15,18 @@ On a **prompt-caching backend** (the default for Anthropic/Bedrock traffic), `ex
 |---|---|
 | Extraction calls | 271 |
 | Extraction cost | $3.26 |
-| Cumulative added latency | ~1,592 s (~450 ms/call) |
-| Unique tokens saved | ~197,548 |
-| Value of those tokens at the **cache-read** rate | ~$0.06 |
-| **Net** | **deeply negative (~8× underwater against cache-aware value)** |
+| Cumulative added latency | 1,592,467 ms (~1,592 s, ~450 ms/call) |
+| Unique tokens saved | 197,548 |
+| Value of those tokens at the **cache-read** rate | **$0.0395** (197,548 × $0.20/MTok) |
+| **Net** | **$0.0395 − $3.26 = −$3.22 — 82× underwater** |
 | Share of realized value that came from the **replay cache**, not the LLM | **~93%** |
+
+The improvement plan's original figure was **~8×** underwater. That implicitly priced the saved
+tokens as fresh input; they were not. All 197,548 sat in the **cached prefix**, so they bill at the
+cache-read rate, and the honest ratio is **82×** — an order of magnitude worse, plus the 1,592,467
+ms of blocking time, which is not priced at all. A later Terminal-Bench arm that excluded
+`extract_llm` entirely re-derived this independently. The verdict below was right; it was
+understated.
 
 The reason is arithmetic, not implementation quality. A request to a caching backend is
 ~99.95% cached, so a token removed from a cached region saves the **cache-read** rate

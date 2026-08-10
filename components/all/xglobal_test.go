@@ -93,6 +93,68 @@ func TestExtractGateSuppressesInPipelineWhenCacheAware(t *testing.T) {
 	}
 }
 
+// The shipping guard, end to end and through the PRESETS: no default configuration may
+// run extract_llm on a prompt-caching backend. The unit test in components/offload covers
+// evaluateGate's hard decline directly; this one covers the wiring, so a rebase that drops
+// `allow_on_caching_backend` from the config struct or forgets to thread `allowCached`
+// into the gate fails here rather than shipping silently.
+//
+// The output is deliberately HUGE (far above the ~30,500-token cached break-even), so the
+// economics alone would permit the call — only the hard decline can suppress it.
+func TestNoDefaultConfigRunsExtractLLMOnCachingBackend(t *testing.T) {
+	filter := "data = json.decode(INPUT)\nOUTPUT = json.encode([r for r in data if \"keep\" in r[\"name\"]])\n"
+	pad := strings.Repeat("padding ", 30_000) // ~240k tokens: economics pass on their own
+	body := `[{"id":1,"name":"keep this ` + pad + `"},{"id":2,"name":"drop this ` + pad + `"}]`
+
+	// Every default that reaches extract_llm: the bare component, plus each preset's tuned
+	// config. None of them may spend on caching traffic.
+	cfgs := map[string]string{
+		"defaults": "strategy: code\nmodel:\n  source: config\n",
+		"codesmart": "strategy: code\nmodel:\n  source: config\nmin_tokens: 3000\n" +
+			"trigger:\n  min_request_tokens: 3000\nllm_every_n_requests: 1\nllm_max_per_request: 4\n",
+	}
+	for name, cfg := range cfgs {
+		t.Run(name, func(t *testing.T) {
+			off := newComp(t, "extract_llm", cfg)
+			cm := &countingModel{resp: filter}
+			req := &bschemas.BifrostChatRequest{Input: []bschemas.ChatMessage{
+				userMsg("find the keep records"), toolMsg(body),
+			}}
+			c := &components.Ctx{Ctx: context.Background(), Session: "s1",
+				Store: store.NewMemory(store.Options{}), Model: components.ModelSpec{Static: cm},
+				CacheAware: true, MaxCachedIdx: -1, CtxWindow: 1_000_000}
+			var rep components.Report
+			if _, err := off.Offload(req, &rep, c); err != nil {
+				t.Fatal(err)
+			}
+			if cm.calls != 0 {
+				t.Fatalf("a default config must NOT call the LLM on a caching backend "+
+					"(measured net-negative), calls=%d", cm.calls)
+			}
+			if schema.MessageText(req.Input[1]) != body {
+				t.Fatal("a declined candidate must be left verbatim (fail open)")
+			}
+		})
+	}
+
+	// And the escape hatch still works, so the guard is a default and not a wall.
+	off := newComp(t, "extract_llm", "strategy: code\nmodel:\n  source: config\n"+
+		"allow_on_caching_backend: true\ntrigger:\n  min_request_tokens: 1\n")
+	cm := &countingModel{resp: filter}
+	req := &bschemas.BifrostChatRequest{Input: []bschemas.ChatMessage{
+		userMsg("find the keep records"), toolMsg(body),
+	}}
+	if _, err := off.Offload(req, &components.Report{}, &components.Ctx{
+		Ctx: context.Background(), Session: "s2", Store: store.NewMemory(store.Options{}),
+		Model: components.ModelSpec{Static: cm}, CacheAware: true, MaxCachedIdx: -1,
+		CtxWindow: 1_000_000}); err != nil {
+		t.Fatal(err)
+	}
+	if cm.calls == 0 {
+		t.Fatal("allow_on_caching_backend: true must hand control back to the economics")
+	}
+}
+
 // Backward compatibility: an existing config that pins min_tokens must keep working
 // unchanged — the smarter trigger is the DEFAULT only when nothing was configured.
 func TestExplicitMinTokensConfigStillReduces(t *testing.T) {
