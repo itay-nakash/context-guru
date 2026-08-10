@@ -103,21 +103,29 @@ const maxWireBreakpoints = 4
 // cap applies across all of them together. Structural (gjson path queries) for the
 // same reason hasCacheBreakpoint is: a tool output whose text merely contains the
 // string "cache_control" must not count.
+//
+// `cachePoint` is the Bedrock Converse spelling, and Bedrock places it as its OWN
+// entry in the `system` and `tools` arrays — the two locations defect 2 is about. Those
+// paths must be counted or the cap stays breachable on Bedrock exactly as it was on
+// Anthropic (constructed: 6 on the wire, counter blind to 3 of them).
 var breakpointPaths = []string{
 	"system.#.cache_control",
 	"tools.#.cache_control",
 	"messages.#.cache_control",
 	"messages.#.content.#.cache_control",
+	"system.#.cachePoint",
+	"tools.#.cachePoint",
 	"messages.#.content.#.cachePoint",
 }
 
 // wireBreakpoints counts every breakpoint the provider will see in this request.
 //
-// A component cannot count these for itself: `system` and `tools` never reach it, and
-// bifrost drops cache_control on block types it does not model — on real Claude Code
-// traffic that hides all three of the agent's own breakpoints (2 in `system`, 1 on a
-// `tool_result` block). Counting only what the component saw yielded a budget of 3
-// free slots when 1 was free: 6 on the wire, and a 400 (issue #32).
+// A component cannot count these for itself. `system` and `tools` never reach it at
+// all, and the `tool_result` blocks this package normalizes into synthetic role=tool
+// messages lose their mark on the way in (see toolMessage) — so on real Claude Code
+// traffic all three of the agent's own breakpoints were invisible to it (2 in
+// `system`, 1 on a `tool_result` block), and it computed 3 free slots when 1 was free:
+// 6 on the wire, and a 400 (issue #32).
 func wireBreakpoints(body []byte) int {
 	n := 0
 	for _, p := range breakpointPaths {

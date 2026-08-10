@@ -283,8 +283,8 @@ func TestTTLConfig(t *testing.T) {
 }
 
 // The provider's cap counts breakpoints this component cannot see: `system` and
-// `tools` never reach it, and bifrost drops cache_control on block types it does not
-// model. Real Claude Code traffic carries (system=2, tools=0, messages=1), so the
+// `tools` never reach it, and the host's normalize step drops the mark on tool_result
+// blocks it rewrites. Real Claude Code traffic carries (system=2, tools=0, messages=1), so the
 // true remaining budget is 1, not 3 (issue #32, defect 2). The synthetic 60-message
 // shape below is exactly the probe that produced 4 message marks — 6 on the wire.
 func TestBudgetCountsInvisibleBreakpoints(t *testing.T) {

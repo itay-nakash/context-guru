@@ -1,6 +1,10 @@
 package apply
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/tidwall/sjson"
+)
 
 // The metadata-write exception must be exactly that: added cache_control keys and
 // nothing else. Anything wider would put us back to splicing a lossy re-marshal
@@ -42,6 +46,21 @@ func TestApplyMetaWritesRefusesOnShapeMismatch(t *testing.T) {
 	}
 }
 
+// Bedrock spells the breakpoint `cachePoint` and puts it as its OWN entry in `system`
+// and `tools` — the two locations defect 2 is about. Missing those paths left the cap
+// breachable on Bedrock exactly as it was on Anthropic.
+func TestBedrockCachePointCounted(t *testing.T) {
+	body := []byte(`{
+		"system":[{"text":"a"},{"cachePoint":{"type":"default"}},{"text":"b"},{"cachePoint":{"type":"default"}}],
+		"tools":[{"toolSpec":{"name":"x"}},{"cachePoint":{"type":"default"}}],
+		"messages":[{"role":"user","content":[{"text":"hi"},{"cachePoint":{"type":"default"}}]}]}`)
+	// 2 in system + 1 in tools + 1 in message content = 4, all of them at the cap. The
+	// pre-fix counter saw only the content one, so it believed 3 slots were free.
+	if got := wireBreakpoints(body); got != 4 {
+		t.Fatalf("wireBreakpoints = %d, want 4 (2 system + 1 tool + 1 content); a Bedrock cap breach would go unseen", got)
+	}
+}
+
 func TestBreakpointCounting(t *testing.T) {
 	body := []byte(`{
 		"system":[{"type":"text","cache_control":{"type":"ephemeral"}},{"type":"text","cache_control":{"type":"ephemeral"}},{"type":"text"}],
@@ -53,5 +72,32 @@ func TestBreakpointCounting(t *testing.T) {
 		]}`)
 	if got := wireBreakpoints(body); got != 5 {
 		t.Errorf("wireBreakpoints = %d, want 5", got)
+	}
+}
+
+// A request that arrives already over the cap is the client's problem — we forward it
+// untouched. Shouting ERROR about it would blame context-guru for a request it never
+// changed, so the breach check compares against the inbound count. Asserted at the
+// condition level: the log call itself is not observable from here.
+func TestBreachIsOursOnly(t *testing.T) {
+	over := []byte(`{"system":[
+		{"type":"text","cache_control":{"type":"ephemeral"}},{"type":"text","cache_control":{"type":"ephemeral"}},
+		{"type":"text","cache_control":{"type":"ephemeral"}},{"type":"text","cache_control":{"type":"ephemeral"}},
+		{"type":"text","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":"hi"}]}`)
+	inbound := wireBreakpoints(over)
+	if inbound != 5 {
+		t.Fatalf("fixture should carry 5 inbound breakpoints, got %d", inbound)
+	}
+	// Unchanged body: over the cap, but out == inbound, so it is not ours to report.
+	if out := wireBreakpoints(over); out > maxWireBreakpoints && out > inbound {
+		t.Fatal("a client-caused breach we did not add to must not be reported as ours")
+	}
+	// If we DID add one, it must be reported.
+	worse, err := sjson.SetRawBytes(over, "messages.0.cache_control", []byte(`{"type":"ephemeral"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out := wireBreakpoints(worse); !(out > maxWireBreakpoints && out > inbound) {
+		t.Fatalf("we added a breakpoint over the cap (%d -> %d); that must be reported", inbound, out)
 	}
 }

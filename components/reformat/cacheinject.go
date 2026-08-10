@@ -146,7 +146,7 @@ func (ci Cacheinject) Reformat(req *schemas.BifrostChatRequest, rep *components.
 	// happen with them: the positions we can SEE are dropped from `want` (never mark
 	// twice), and the BUDGET is computed from the host's raw-body count, which also
 	// sees the ones we cannot — the `system` array components never receive, and
-	// `tool_result` blocks whose cache_control bifrost drops on unmarshal. On real
+	// `tool_result` blocks whose mark apply's own normalize drops. On real
 	// Claude Code traffic that is all 3 of them, so counting only Input gave a budget
 	// of 3 free slots when 1 was free: 6 on the wire, and a 400 (issue #32).
 	visible := 0
@@ -291,4 +291,36 @@ func cacheAware(p schemas.ModelProvider) bool {
 	default:
 		return false
 	}
+}
+
+// --------------------------------------------------------------------------- //
+
+func init() { components.Register("cachesplit", newCachesplit) }
+
+// Cachesplit is a marker component: it carries no logic of its own, and exists so a
+// preset can enable the volatile-tail split (apply/prefixsplit.go) WITHOUT also
+// enabling cacheinject's breakpoint placement.
+//
+// The two were one config entry until #32, which separated them because their evidence
+// is not comparable. The split is measured: −34.1% cost and 0% → 96.7% cache hit in an
+// isolated A/B, because it moves a churning env snapshot out of a hashed prefix.
+// Placement has never been measured at all — until #32 its breakpoints never reached
+// the provider. So the split ships on by default and placement does not.
+//
+// It is a Reformat that always skips: the actual rewrite is body-level (it edits the
+// top-level `system` array, which components never see) and lives in `apply`, gated on
+// this name being present. ponytail: a marker beats plumbing a new config flag through
+// every host.
+type Cachesplit struct{}
+
+func newCachesplit([]byte) (components.Component, error) { return Cachesplit{}, nil }
+
+func (Cachesplit) Name() string { return "cachesplit" }
+
+func (Cachesplit) Enabled(*components.Ctx) bool { return true }
+
+// Reformat is intentionally a no-op — see the type doc. The split happens in apply.
+func (Cachesplit) Reformat(_ *schemas.BifrostChatRequest, rep *components.Report, _ *components.Ctx) error {
+	rep.Skipped = true
+	return nil
 }

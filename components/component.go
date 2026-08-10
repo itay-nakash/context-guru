@@ -129,7 +129,7 @@ type Ctx struct {
 	// budget against this number rather than what it can see in Input, for two reasons
 	// measured on real Claude Code traffic: 2 of its 3 breakpoints live in the
 	// top-level `system` array, which components never see at all, and the third sits
-	// on a `tool_result` block whose cache_control bifrost drops on unmarshal. Both
+	// on a `tool_result` block whose mark the host's own normalize step drops. Both
 	// were invisible, so the budget came out as 3 free slots when only 1 was free —
 	// enough to put 6 on the wire and take a 400 (issue #32). The host fills it from
 	// the raw body; 0 means "unknown, fall back to what you can see".

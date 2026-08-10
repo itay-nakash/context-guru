@@ -3,6 +3,7 @@ package apply_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -455,4 +456,105 @@ func TestDiscardedChangeIsCounted(t *testing.T) {
 	if r := snap.Components["testrewrite"].Runs; r != 1 {
 		t.Fatalf("Runs should stay 1, got %d", r)
 	}
+}
+
+// reverter always errors, so the pipeline rolls its change back. A reverted component
+// must NOT be charged a discard: its change never reached the writeback layer at all.
+type reverter struct{}
+
+func (reverter) Name() string                 { return "testrevert" }
+func (reverter) Enabled(*components.Ctx) bool { return true }
+func (reverter) Reformat(req *bschemas.BifrostChatRequest, _ *components.Report, _ *components.Ctx) error {
+	for i := range req.Input {
+		if req.Input[i].Role == bschemas.ChatMessageRoleAssistant && req.Input[i].Content != nil {
+			for b := range req.Input[i].Content.ContentBlocks {
+				if req.Input[i].Content.ContentBlocks[b].Text != nil {
+					s := "mutated then reverted"
+					req.Input[i].Content.ContentBlocks[b].Text = &s
+				}
+			}
+		}
+	}
+	return errors.New("deliberate failure so the pipeline reverts")
+}
+
+func init() {
+	components.Register("testrevert", func([]byte) (components.Component, error) { return reverter{}, nil })
+}
+
+// A rolled-back component must not appear as a discard. Otherwise the counter meant to
+// catch #32-class bugs becomes a false-positive generator.
+func TestRevertedComponentNotChargedDiscard(t *testing.T) {
+	// testrewrite runs AFTER and produces the discard, so the writeback layer really does
+	// throw a change away at that index. Pre-fix, testrevert's ChangedIdx was recorded
+	// before the rollback, so it got charged for a discard caused by the other component.
+	cfg := pipe(t, "pipeline: [testrewrite, testrevert]\n")
+	agg := metrics.NewAggregator()
+	p, _ := cfg.Build(agg)
+
+	body := []byte(`{"model":"claude-x","messages":[
+		{"role":"user","content":"go"},
+		{"role":"assistant","content":[{"type":"text","text":"narration"},{"type":"tool_use","id":"toolu_r","name":"Bash","input":{}}]}
+	]}`)
+	apply.Body(context.Background(), p, store.NewMemory(store.Options{}), bschemas.Anthropic, body, "", false)
+
+	cs := agg.Snapshot().Components["testrevert"]
+	if cs.Reverted != 1 {
+		t.Fatalf("expected the component to be reverted, got %+v", cs)
+	}
+	if cs.Discarded != 0 {
+		t.Fatalf("reverted component charged %d discards — its change never reached writeback", cs.Discarded)
+	}
+}
+
+// One discarded message is charged to exactly ONE component, not to every component
+// that touched it. Two components rewrite the same unmodellable message; only the last
+// one's change is what the writeback layer actually threw away.
+func TestDiscardChargedOnceNotPerToucher(t *testing.T) {
+	cfg := pipe(t, "pipeline: [testrewrite, testrewrite2]\n")
+	agg := metrics.NewAggregator()
+	p, _ := cfg.Build(agg)
+
+	body := []byte(`{"model":"claude-x","messages":[
+		{"role":"user","content":"go"},
+		{"role":"assistant","content":[{"type":"text","text":"a long narration both components rewrite"},{"type":"tool_use","id":"toolu_d","name":"Bash","input":{}}]}
+	]}`)
+	apply.Body(context.Background(), p, store.NewMemory(store.Options{}), bschemas.Anthropic, body, "", false)
+
+	snap := agg.Snapshot()
+	total := snap.Components["testrewrite"].Discarded + snap.Components["testrewrite2"].Discarded
+	if total != 1 {
+		t.Fatalf("one discarded message charged %d times (testrewrite=%d testrewrite2=%d)",
+			total, snap.Components["testrewrite"].Discarded, snap.Components["testrewrite2"].Discarded)
+	}
+	// It must land on the LAST toucher — its change is the discarded state.
+	if snap.Components["testrewrite2"].Discarded != 1 {
+		t.Fatalf("discard should be charged to the last component to change the message, got %v", snap.TopDiscarded)
+	}
+}
+
+// contentRewriter2 is a second rewriter so two components touch one message.
+type contentRewriter2 struct{}
+
+func (contentRewriter2) Name() string                 { return "testrewrite2" }
+func (contentRewriter2) Enabled(*components.Ctx) bool { return true }
+func (contentRewriter2) Reformat(req *bschemas.BifrostChatRequest, _ *components.Report, _ *components.Ctx) error {
+	for i := range req.Input {
+		if req.Input[i].Role != bschemas.ChatMessageRoleAssistant || req.Input[i].Content == nil {
+			continue
+		}
+		for b := range req.Input[i].Content.ContentBlocks {
+			if req.Input[i].Content.ContentBlocks[b].Text != nil {
+				s := "even shorter"
+				req.Input[i].Content.ContentBlocks[b].Text = &s
+			}
+		}
+	}
+	return nil
+}
+
+func init() {
+	components.Register("testrewrite2", func([]byte) (components.Component, error) {
+		return contentRewriter2{}, nil
+	})
 }

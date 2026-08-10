@@ -18,10 +18,13 @@
 
     A second, independent defect compounded it: the 4-breakpoint budget counted only
     `messages`. Real traffic puts 2 of its 3 breakpoints in the top-level `system` array
-    and the third on a `tool_result` block whose `cache_control` bifrost drops — all
-    three invisible. The component computed 3 free slots when 1 was free. On a
-    60-message request it emitted 4 message marks, **6 on the wire**, which the provider
-    rejects with a 400. That never fired in production *only* because the first defect
+    and the third on a `tool_result` block — and that third mark is lost by **this
+    repo's own** `normalize`, which rebuilds each `tool_result` into a synthetic
+    `role=tool` message from text + `tool_use_id` alone (`toolMessage`), dropping
+    `cache_control` along with everything else it does not copy. So all three were
+    invisible and the component computed 3 free slots when 1 was free. On a 60-message
+    request it emitted 4 message marks, **6 on the wire**, which the provider rejects
+    with a 400. That never fired in production *only* because the first defect
     suppressed the marks; fixing one without the other would have produced a live 400.
 
     Both are fixed (see [design.md](../design.md) — the metadata-write exception).
@@ -130,7 +133,41 @@ configured but are a different mechanism. See below.
 
 ## What placement is actually worth
 
-Placeholder — filled by the `cacheonly` vs `off` measurement in #32.
+**Still unmeasured.** #32 made the policy reach the provider for the first time; it did
+not establish what the policy is worth. One `cacheonly` vs `off` pair was attempted and
+is reported here in full because it is all the evidence there is — not because it settles
+anything.
+
+SWE-bench Verified, `aws/claude-sonnet-5`, n=1 per arm. `off`'s second trial died on a
+Docker-compose error, so only `astropy-12907` completed in both arms:
+
+| metric | off | cacheonly | delta |
+|---|--:|--:|--:|
+| steps | 14 | 11 | −21.4% |
+| billed cost | $0.17607 | $0.14931 | −15.2% |
+| cache-read | 609,968 | 461,844 | −24.3% |
+| cache-write | 8,695 | 11,062 | +27.2% |
+| cache-hit | 98.59% | 96.66% | −1.93 pp |
+
+The −15.2% is **not a saving** — the agent took 3 fewer steps, and on this traffic cost
+tracks steps at corr 0.95. Per step, cost is +7.9% and cache-write +61.9%.
+
+!!! warning "What this does NOT show"
+    **No mechanism is established for the cache-write difference, and the obvious one is
+    ruled out.** The tempting story — that the extra breakpoint lands *above*
+    claude-code's own and shortens the readable prefix — does not hold: across three
+    captures, **0 of 106** of our marks land above the agent's. Ours consistently sits one
+    message *below*, where the policy's own Rule 2 says an extra breakpoint costs exactly
+    zero.
+
+    **`acted=0` does not isolate placement.** It only rules out content compaction. The
+    `cacheonly` arm still runs `splitVolatileTail`, which rewrites the `system` array, so
+    the arm is "placement + split", not "placement". A single trial per arm also cannot
+    separate either from the step-count nondeterminism that produced the 3-step gap.
+
+    Treat the table as one task, once, on a contended box, with a degenerate control. The
+    honest summary is that placement's value **has still never been measured** — which is
+    why `cacheinject` is not in any default preset.
 
 ## How the breakpoints reach the wire
 
@@ -154,20 +191,22 @@ that let this survive unnoticed.
 ## The 4-breakpoint budget is computed by the host, not the component
 
 The provider caps `cache_control` at **4 across `system` + `tools` + `messages`
-together**, and a component sees none of the first two. Worse, bifrost drops
-`cache_control` on block types it does not model, so even some *message* breakpoints are
-invisible to it.
+together**, and a component sees none of the first two. Worse, `apply`'s own `normalize`
+rebuilds each `tool_result` block into a synthetic `role=tool` message from text +
+`tool_use_id` alone (`toolMessage`), so a `cache_control` on such a block never reaches
+the component either — even some *message* breakpoints are invisible to it.
 
 On real Claude Code traffic that hides **all three** of the agent's own breakpoints —
 measured, 1,771 of 1,794 requests carry exactly `(system=2, tools=0, messages=1)`, with
 the message one sitting on a `tool_result` block. Counting only what it could see, the
-component computed `budget = 4 − 1 = 3` when 1 slot was free, and on a 60-message
+component computed `budget = 4 − 0 = 4` when 1 slot was free, and on a 60-message
 request emitted 4 marks: **6 on the wire, which the provider rejects with a 400.**
 
 So `apply` counts them structurally from the raw body and passes the total as
-`Ctx.ExistingBreakpoints`; the component budgets against that. `apply` also counts the
-output and logs an error if it ever exceeds 4, so a breach shows up in telemetry rather
-than as a provider 400.
+`Ctx.ExistingBreakpoints`; the component budgets against that. The count covers the
+Bedrock `cachePoint` spelling too, including its own entries in `system` and `tools`.
+`apply` also counts the output and logs an error if **we** pushed it over 4 — a request
+that arrived over the cap is forwarded as-is and is not reported as ours.
 
 ## Lossiness
 
@@ -180,6 +219,19 @@ are skipped rather than restructured, and the breakpoint falls back to the neare
 markable block below so the prefix is still written.
 
 ## Configuration
+
+!!! warning "Not enabled by any preset — opt in explicitly"
+    Since #32, `cacheinject` is in **no** default preset. Its breakpoints only began
+    reaching the provider with that fix, and placement has never been shown to help, so
+    shipping it on by default would enable an unmeasured policy on every request.
+
+    The presets carry **`cachesplit`** instead — a marker component that enables the
+    [volatile-tail split](#the-volatile-tail-split) (which *is* measured) without the
+    breakpoint placement. The two were one config entry until #32; separating them is
+    what keeps disabling placement from silently disabling the split too.
+
+    Add `cacheinject` to a pipeline by hand to run the placement study, or when your agent
+    does not set its own `cache_control` (the case where the policy should help most).
 
 ```yaml
 components:
@@ -208,9 +260,14 @@ it believed it had three.
 
 ## The volatile-tail split
 
-Enabling `cacheinject` also switches on a body-level repair in `apply/prefixsplit.go`
-that no breakpoint placement can achieve, because a cache entry hashes **everything
-before** its breakpoint and no position can exclude part of a single block.
+Enabling **`cachesplit`** (or `cacheinject`) switches on a body-level repair in
+`apply/prefixsplit.go` that no breakpoint placement can achieve, because a cache entry
+hashes **everything before** its breakpoint and no position can exclude part of a single
+block.
+
+This is the mechanism the default presets keep. It is a different lever from placement
+and has its own, much stronger evidence — everything below was measured with placement
+contributing `$0`, so none of it depends on the policy this page's other half describes.
 
 Claude Code appends a live environment snapshot to the **end** of its main system
 block:

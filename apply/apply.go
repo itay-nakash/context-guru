@@ -132,11 +132,18 @@ func BodyFull(ctx context.Context, pipe *components.Pipeline, st store.Store, pr
 	// Volatile-tail split, before anything else touches the body. This is a
 	// body-level concern rather than a component one: the pipeline operates on
 	// `messages`, but the block that needs splitting lives in the top-level `system`
-	// array, which components never see. Gated on cacheinject being configured, so it
-	// is opt-in via the same pipeline entry and adds no new config surface. See
-	// prefixsplit.go for what it splits and why.
+	// array, which components never see. See prefixsplit.go for what it splits and why.
+	//
+	// Gated on `cachesplit` OR `cacheinject`. The two were coupled only because the split
+	// had to hang off some existing config entry, but they are independent mechanisms
+	// with very different evidence: the split is measured (−34.1% cost, 0% → 96.7% hit in
+	// an isolated A/B), while breakpoint PLACEMENT has never been measured — so #32 drops
+	// cacheinject from the default presets and puts `cachesplit` there instead. Without
+	// its own gate the split would have gone down with cacheinject, turning "disable an
+	// unproven component" into a real cost regression. It stays opt-in rather than
+	// unconditional so `off` remains a true passthrough control for A/B runs.
 	systemSplit := false
-	if !bypass && pipe != nil && pipe.Has("cacheinject") {
+	if !bypass && pipe != nil && (pipe.Has("cachesplit") || pipe.Has("cacheinject")) {
 		body, systemSplit = splitVolatileTail(body, provider)
 	}
 
@@ -171,7 +178,7 @@ func BodyFull(ctx context.Context, pipe *components.Pipeline, st store.Store, pr
 		CacheAware:   cacheAware,
 		MaxCachedIdx: maxCachedIdx,
 		// Every breakpoint already on the wire — including the ones no component can
-		// see (`system`, `tools`, and cache_control on blocks bifrost drops). The
+		// see (`system`, `tools`, and the marks our own normalize drops). The
 		// provider's cap of four counts them all (issue #32, defect 2).
 		ExistingBreakpoints: wireBreakpoints(body),
 	}
@@ -258,11 +265,14 @@ func BodyFull(ctx context.Context, pipe *components.Pipeline, st store.Store, pr
 	if changed && dumpPath != "" {
 		dumpChanges(c.Session, changes)
 	}
-	if n := wireBreakpoints(out); n > maxWireBreakpoints {
-		// Should be unreachable: the component budgets against OuterBreakpoints. Loud
-		// rather than a 400 from the provider, and it names the request shape.
+	// A cap breach WE caused is a bug and must be loud. A request that arrived already
+	// over the cap is the client's to fix — we forward it as-is (fail open), and an ERROR
+	// blaming context-guru for it would be a false alarm. So compare against the inbound
+	// count and only shout when we added to an over-cap total.
+	if n := wireBreakpoints(out); n > maxWireBreakpoints && n > c.ExistingBreakpoints {
 		slog.Error("context-guru: cache breakpoint count exceeds the provider cap",
-			"breakpoints", n, "cap", maxWireBreakpoints, "session", c.Session)
+			"breakpoints", n, "inbound", c.ExistingBreakpoints,
+			"cap", maxWireBreakpoints, "session", c.Session)
 	}
 	return out, changed
 }

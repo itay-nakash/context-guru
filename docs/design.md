@@ -144,14 +144,21 @@ breakpoint the caller set.
 the component that made it (via `Report.ChangedIdx`), surfacing as `discarded_changes` per
 component and `top_discarded` in `/stats`. Before this, a mutated-then-discarded component looked
 byte-identical to a working Reformat — which is how #32 survived two full benchmark studies.
+Attribution is deliberately conservative, because a counter meant to catch that class of bug is
+worthless if it cries wolf: `ChangedIdx` is recorded only on the surviving path (a reverted
+component is never charged), and one discarded message is charged to exactly ONE component — the
+last one to change it, whose state is what the writeback layer actually threw away.
 
 **Breakpoint budgeting is a host job.** The provider caps `cache_control` at 4 across `system` +
-`tools` + `messages` together, and a component sees none of the first two — nor cache_control on
-blocks bifrost drops. On real Claude Code traffic that hides all three of the agent's own
-breakpoints, so a component counting only what it saw computed 3 free slots when 1 was free.
-`apply` counts them from the raw body (`wireBreakpoints`) and passes the total as
-`Ctx.ExistingBreakpoints`; exceeding the cap on output logs an error rather than waiting for the
-provider's 400.
+`tools` + `messages` together, and a component sees none of the first two. Nor does it see a
+`cache_control` on a `tool_result` block: `normalize` rebuilds those into synthetic `role=tool`
+messages from text + `tool_use_id` alone (`toolMessage`), dropping the mark. (bifrost is not the
+culprit here — it round-trips `cache_control` on `tool_result` fine.) On real Claude Code traffic
+that hides all three of the agent's own breakpoints, so a component counting only what it saw
+computed 4 free slots when 1 was free. `apply` counts them from the raw body (`wireBreakpoints`,
+covering the Bedrock `cachePoint` spelling and its own `system`/`tools` entries) and passes the
+total as `Ctx.ExistingBreakpoints`. A breach is logged only when *we* pushed the total over the
+cap — an already-over-cap request is forwarded untouched and is not ours to report.
 
 If a component changes the message *count* (none of the v1 set does), the slot map no longer
 aligns, so `apply` forwards the original untouched.
