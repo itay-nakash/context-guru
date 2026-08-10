@@ -28,6 +28,13 @@ ms of blocking time, which is not priced at all. A later Terminal-Bench arm that
 `extract_llm` entirely re-derived this independently. The verdict below was right; it was
 understated.
 
+!!! note "Which cache-read rate"
+    The 82× figure prices the saved tokens at **$0.20/MTok**, the rate quoted in the original
+    issue. The break-even tables below use the **$0.30/MTok** sonnet-class rate the gate itself
+    applies (`agentCacheReadPerMTok`), which gives $0.0593 and **55×**. Same conclusion either
+    way — neither is within two orders of magnitude of paying for $3.26 — and the gate reasons
+    with the *more generous* rate, so the shipped decline is the conservative one.
+
 The reason is arithmetic, not implementation quality. A request to a caching backend is
 ~99.95% cached, so a token removed from a cached region saves the **cache-read** rate
 (`$0.30/MTok`), not the fresh-input rate (`$3/MTok`) — a **10× haircut**. An extraction call
