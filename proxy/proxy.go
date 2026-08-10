@@ -266,11 +266,22 @@ func (h *Handler) compact(w http.ResponseWriter, r *http.Request) {
 	if q := r.URL.Query().Get("cache"); q != "" {
 		cacheMode = q
 	}
+	// Resolve the model's context window here too, exactly as the chat path does. It used
+	// to be hard-coded 0 ("unknown"), which silently disabled every fraction-based Trigger
+	// threshold AND extract_llm's context-pressure triggering on this endpoint — so
+	// /compact did not reflect production, and offline replay/eval measured a different
+	// component than the one that ships.
+	window := 0
+	if h.opts.Windows != nil {
+		if w, ok := h.opts.Windows.Window(r.Context(), gjson.GetBytes(body, "model").String()); ok {
+			window = w
+		}
+	}
 	out, _ := apply.BodyFull(
 		r.Context(), pipe, h.store, provider, body,
 		r.Header.Get("x-context-guru-session"),
 		strings.EqualFold(r.Header.Get("x-context-guru-bypass"), "true"),
-		models, 0, cacheMode,
+		models, window, cacheMode,
 	)
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(out)

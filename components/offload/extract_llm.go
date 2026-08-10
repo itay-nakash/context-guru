@@ -249,7 +249,6 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 	}
 	// Gate inputs shared by every candidate this request.
 	val := savedTokenValue(c)
-	perCall := callCost(e.pricing)
 	ratio := e.ratios.ratio()
 	turnsSoFar := len(req.Input)
 	extCfg := extract.DefaultCfg()
@@ -297,7 +296,7 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 	if e.skipFileReads != nil {
 		skipFR = *e.skipFileReads
 	}
-	var dbgTail, dbgFloor, dbgPlace, dbgReapply, dbgBigTailBlocked int
+	var dbgTail, dbgFloor, dbgPlace, dbgReapply, dbgBigTailBlocked, dbgMaxSz int
 	for _, i := range tools {
 		msg := &req.Input[i]
 		if !schema.Rewritable(*msg) {
@@ -336,6 +335,9 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 		// suffix is cache-written either way, so re-deriving would buy a model call for
 		// nothing. The model may also not run at all (throttle, timeout, floor), which would
 		// leave the output verbatim at depth after the gate had already been lifted.
+		if sz > dbgMaxSz {
+			dbgMaxSz = sz
+		}
 		if c.CacheAware && !c.TailOnly(i) {
 			dbgTail++
 			if sz >= floor {
@@ -387,7 +389,8 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 			// Content the store has seen before in ANY session is likely to recur again,
 			// which is what amortizes the call across turns.
 			seenBefore := hasSeenContent(c, id)
-			d := evaluateGate(sz, ratio, val, perCall, seenBefore, turnsSoFar)
+			d := evaluateGate(sz, ratio, val, callCost(e.pricing, sz), seenBefore, turnsSoFar,
+				e.ratios.exploring())
 			if !d.allow {
 				metrics.RecordExtractionSuppressed(d.reason)
 				if debugExtractLLM {
@@ -405,7 +408,7 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 	if debugExtractLLM && len(tools) > 0 {
 		slog.Info("cg.debug.extract_llm", "tools", len(tools), "cands", len(cands),
 			"reapplied", dbgReapply, "skip_placeholder", dbgPlace, "skip_tail", dbgTail,
-			"skip_floor", dbgFloor, "big_but_not_tail", dbgBigTailBlocked,
+			"skip_floor", dbgFloor, "max_output_tokens", dbgMaxSz, "big_but_not_tail", dbgBigTailBlocked,
 			"cacheAware", c.CacheAware, "maxCachedIdx", c.MaxCachedIdx, "floor", floor,
 			"nInput", len(req.Input))
 	}

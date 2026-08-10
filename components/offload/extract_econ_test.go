@@ -17,7 +17,7 @@ func TestGateSuppressesSmallOutputWhenCacheAware(t *testing.T) {
 	if val.cached != true {
 		t.Fatal("cache-aware ctx must price saved tokens at the cache-read rate")
 	}
-	d := evaluateGate(400, defaultCompressionRatio, val, priorCallCost, false, 5)
+	d := evaluateGate(400, defaultCompressionRatio, val, callCost(cheapmodel.HaikuPricing(), 400), false, 5, false)
 	if d.allow {
 		t.Fatalf("small cached output must be suppressed: saving=$%.5f cost=$%.5f", d.expSaving, d.expCost)
 	}
@@ -33,11 +33,11 @@ func TestGateSuppressesSmallOutputWhenCacheAware(t *testing.T) {
 // more valuable — so the same output that loses under caching can win here. This is the
 // asymmetry the gate exists to exploit, so assert it on ONE fixture, not two.
 func TestGatePermitsOnNonCachingBackend(t *testing.T) {
-	size := 12000
+	size := 60000 // above both break-evens (~1.8k non-caching, ~42.6k cached)
 	cached := evaluateGate(size, defaultCompressionRatio,
-		savedTokenValue(&components.Ctx{CacheAware: true}), priorCallCost, false, 5)
+		savedTokenValue(&components.Ctx{CacheAware: true}), callCost(cheapmodel.HaikuPricing(), size), false, 5, false)
 	fresh := evaluateGate(size, defaultCompressionRatio,
-		savedTokenValue(&components.Ctx{CacheAware: false}), priorCallCost, false, 5)
+		savedTokenValue(&components.Ctx{CacheAware: false}), callCost(cheapmodel.HaikuPricing(), size), false, 5, false)
 
 	if !fresh.allow {
 		t.Fatalf("non-caching backend must permit a %d-token output: saving=$%.5f cost=$%.5f",
@@ -54,12 +54,12 @@ func TestGatePermitsOnNonCachingBackend(t *testing.T) {
 // 82/103 across sessions, so this is the common case, not an edge case.
 func TestGatePermitsHighReuseContent(t *testing.T) {
 	val := savedTokenValue(&components.Ctx{CacheAware: true})
-	// 14000 tokens: above the ~12.7k cached-recurring break-even, below the ~17.8k
+	// 34000 tokens: above the ~30.5k cached-RECURRING break-even, below the ~42.6k
 	// cached-once one. This size is the gate's whole thesis in one fixture — recurrence is
 	// what tips an otherwise-losing call into profit, so the SAME size goes both ways.
-	size := 14000
-	once := evaluateGate(size, defaultCompressionRatio, val, priorCallCost, false, 5)
-	recur := evaluateGate(size, defaultCompressionRatio, val, priorCallCost, true, 5)
+	size := 34000
+	once := evaluateGate(size, defaultCompressionRatio, val, callCost(cheapmodel.HaikuPricing(), size), false, 5, false)
+	recur := evaluateGate(size, defaultCompressionRatio, val, callCost(cheapmodel.HaikuPricing(), size), true, 5, false)
 
 	if recur.expSaving <= once.expSaving {
 		t.Fatalf("recurring content must be valued higher: recur=%v once=%v", recur.expSaving, once.expSaving)
@@ -83,7 +83,7 @@ func TestBreakEvenSizesMatchTheDocumentedVerdict(t *testing.T) {
 	breakEven := func(cacheAware, recurring bool) int {
 		val := savedTokenValue(&components.Ctx{CacheAware: cacheAware})
 		for size := 200; size <= 400_000; size += 100 {
-			if evaluateGate(size, defaultCompressionRatio, val, priorCallCost, recurring, 5).allow {
+			if evaluateGate(size, defaultCompressionRatio, val, callCost(cheapmodel.HaikuPricing(), size), recurring, 5, false).allow {
 				return size
 			}
 		}
@@ -91,16 +91,17 @@ func TestBreakEvenSizesMatchTheDocumentedVerdict(t *testing.T) {
 	}
 	cachedRecur := breakEven(true, true)
 	freshRecur := breakEven(false, true)
-	if cachedRecur < 11_000 || cachedRecur > 14_000 {
-		t.Errorf("cached+recurring break-even = %d tokens, expected ~12,700 "+
+	if cachedRecur < 26_000 || cachedRecur > 35_000 {
+		t.Errorf("cached+recurring break-even = %d tokens, expected ~30,500 "+
 			"(docs/components/extract_llm.md states this figure)", cachedRecur)
 	}
-	if freshRecur < 1_000 || freshRecur > 1_600 {
-		t.Errorf("fresh+recurring break-even = %d tokens, expected ~1,270", freshRecur)
+	if freshRecur < 1_400 || freshRecur > 2_400 {
+		t.Errorf("fresh+recurring break-even = %d tokens, expected ~1,800", freshRecur)
 	}
-	// The 10x rate haircut must show up as a ~10x break-even gap.
-	if ratio := float64(cachedRecur) / float64(freshRecur); ratio < 8 || ratio > 12 {
-		t.Errorf("cached/fresh break-even ratio = %.1fx, expected ~10x", ratio)
+	// The gap is WIDER than the bare 10x rate haircut, because cost stops growing once the
+	// prompt hits the shown-content cap while value keeps scaling with output size.
+	if ratio := float64(cachedRecur) / float64(freshRecur); ratio < 12 || ratio > 30 {
+		t.Errorf("cached/fresh break-even ratio = %.1fx, expected ~20x", ratio)
 	}
 }
 
@@ -128,7 +129,7 @@ func TestCostModelMatchesKnownTokensTimesKnownPrice(t *testing.T) {
 // callCost must fall back to the prior only until a real observation exists; it must never
 // return zero, which would make the gate permit everything.
 func TestCallCostNeverZero(t *testing.T) {
-	if c := callCost(cheapmodel.HaikuPricing()); c <= 0 {
+	if c := callCost(cheapmodel.HaikuPricing(), 3000); c <= 0 {
 		t.Fatalf("callCost must be positive, got %v", c)
 	}
 }
@@ -207,5 +208,114 @@ func TestRatioTrackerLearnsFromObservations(t *testing.T) {
 	r.observe(0, 20000) // plenty of evidence that this workload does not compress
 	if got := r.ratio(); got >= 0.10 {
 		t.Fatalf("repeated misses must drive the ratio down, got %v", got)
+	}
+}
+
+// REGRESSION (found on a live capture): a FLAT per-call cost estimate deadlocks the gate.
+// The gate priced every call at the ~$0.012 Terminal-Bench average — roughly 5x the true
+// cost on a workload with small outputs — so it suppressed everything; and because it
+// suppressed everything, no call was ever observed and the estimate could never correct
+// itself. Measured: observed $0.0024/call vs the $0.012 prior, and the gate declined calls
+// that were in fact ~2.2x profitable.
+//
+// The fix is that cost must be ANALYTIC and SIZE-AWARE, so the estimate is right on the
+// very first call with no observations at all.
+func TestCallCostIsSizeAwareNotFlat(t *testing.T) {
+	p := cheapmodel.HaikuPricing()
+	small := callCost(p, 400)
+	mid := callCost(p, 2000)
+	big := callCost(p, 5000)
+
+	if !(small < mid && mid < big) {
+		t.Fatalf("cost must scale with candidate size, got %v %v %v", small, mid, big)
+	}
+	// A small candidate must cost far less than the old flat prior, or the gate
+	// re-deadlocks on exactly the workload that exposed the bug.
+	if small >= priorCallCost {
+		t.Fatalf("a 400-token candidate must cost well under the flat prior $%.4f, got $%.5f",
+			priorCallCost, small)
+	}
+	// The preamble dominates a small call, so it must be included — a cost model that
+	// forgot it would under-price and let the gate permit everything.
+	if small <= p.Cost(preambleTokens, 0, 0, 0)*0.5 {
+		t.Fatalf("cost must include the ~%d-token preamble, got $%.5f", preambleTokens, small)
+	}
+	// Beyond the shown-content cap the prompt is truncated, so cost must stop growing —
+	// otherwise a huge output is priced as if the whole thing were sent.
+	if callCost(p, 50_000) != callCost(p, 500_000) {
+		t.Fatal("cost must plateau past the shown-content cap (the prompt is truncated)")
+	}
+}
+
+// The gate must be decidable on the FIRST call, with no observations — that is what the
+// size-aware cost model buys. A 2,000-token output (the largest actually present in the
+// measured capture) does not pay even on a non-caching backend at the measured 0.12 ratio,
+// and the gate must say so from cold rather than needing a warm-up; a clearly larger output
+// must be permitted from cold too. Both directions, no observations, first call.
+func TestGateIsDecidableFromColdOnFirstCall(t *testing.T) {
+	val := savedTokenValue(&components.Ctx{CacheAware: false})
+
+	small := 2000
+	d := evaluateGate(small, defaultCompressionRatio, val,
+		callCost(cheapmodel.HaikuPricing(), small), false, 5, false)
+	if d.allow {
+		t.Errorf("a %d-token output should not pay at the measured 0.12 ratio: "+
+			"saving=$%.5f cost=$%.5f", small, d.expSaving, d.expCost)
+	}
+
+	big := 20000 // comfortably above the ~1.8k-3.4k non-caching break-even
+	d = evaluateGate(big, defaultCompressionRatio, val,
+		callCost(cheapmodel.HaikuPricing(), big), false, 5, false)
+	if !d.allow {
+		t.Errorf("a %d-token output on a non-caching backend must pay on the first call: "+
+			"saving=$%.5f cost=$%.5f", big, d.expSaving, d.expCost)
+	}
+	// And it must be permitted for the right reason, not by accident.
+	if d.reason == "" {
+		t.Error("an allowed call must carry a reason")
+	}
+}
+
+// REGRESSION (found on a live capture): a pessimistic ratio prior can justify itself
+// forever. The ratio starts at 0.12; on a workload whose outputs sit below the resulting
+// break-even the gate suppresses every call, so the tracker never observes anything and the
+// prior becomes permanent. Measured: the gate forwent a genuine +$0.0094 net this way.
+//
+// A BOUNDED exploration budget breaks the loop. This is the same failure shape as the
+// flat-cost deadlock (see TestCallCostIsSizeAwareNotFlat) — a gate that cannot revise its
+// own prior is an off switch, not a gate.
+func TestGateExploresThenSettles(t *testing.T) {
+	var r ratioTracker
+	explored := 0
+	for i := 0; i < 20; i++ {
+		if r.exploring() {
+			explored++
+		}
+	}
+	if explored != maxExploreCalls {
+		t.Fatalf("exploration must be bounded to %d calls, got %d", maxExploreCalls, explored)
+	}
+
+	// An exploration slot must actually flip an otherwise-suppressed decision.
+	val := savedTokenValue(&components.Ctx{CacheAware: true})
+	size := 400 // far below break-even: normally suppressed
+	cost := callCost(cheapmodel.HaikuPricing(), size)
+	suppressed := evaluateGate(size, defaultCompressionRatio, val, cost, false, 5, false)
+	if suppressed.allow {
+		t.Fatal("without an exploration slot a tiny cached output must be suppressed")
+	}
+	exploring := evaluateGate(size, defaultCompressionRatio, val, cost, false, 5, true)
+	if !exploring.allow {
+		t.Fatal("an exploration slot must permit the call so the ratio can be learned")
+	}
+	if exploring.reason == "" || exploring.reason == suppressed.reason {
+		t.Fatalf("exploration must be distinguishable in the reason, got %q", exploring.reason)
+	}
+
+	// Once enough evidence exists, exploration stops even if slots remain unused.
+	var r2 ratioTracker
+	r2.observe(200, minRatioSampleTokens+1)
+	if r2.exploring() {
+		t.Fatal("with sufficient evidence the gate must stop exploring")
 	}
 }

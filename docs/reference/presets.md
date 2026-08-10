@@ -36,7 +36,7 @@ taken exactly from the `presets` map in `config/config.go`.
     `extract_llm` is the only component that spends money to save money, and on a
     prompt-caching backend it was measured **~8× underwater**: a token removed from a cached
     region saves the cache-read rate (`$0.30/MTok`), not the fresh-input rate (`$3/MTok`), so
-    break-even is **~12,700 tokens per output** — far above a typical tool output.
+    break-even is **~30,500 tokens per output** at the measured compression ratio — far above a typical tool output (the largest in one capture was 2,053).
 
     Since #28 it applies an [economic gate](../components/extract_llm.md#economics): it calls
     the LLM only when the expected saving exceeds the expected cost. On a caching backend that
@@ -45,9 +45,15 @@ taken exactly from the `presets` map in `config/config.go`.
     result cache. On a **non-caching** backend the gate permits far more, because there the
     reduction is worth 10× more.
 
-    Check `/stats` → `extract.net_value_usd`. If it is negative on your workload, drop
-    `extract_llm` from the pipeline (or use `codesafe`, which never had it). `codesmart`'s
-    pinned `min_tokens: 3000` still governs its per-output floor, so that part is unchanged.
+    **Measured verdict:** on a **non-caching** backend the gate is a clear win (net
+    **+$0.0287 vs +$0.0091** on one capture, 2.6× more tokens saved at half the latency; on
+    another it cut 13 calls to 2 and reduced waste **97%**). On a **caching** backend it reduces
+    the loss and the latency but does **not** turn the component positive — so for caching
+    traffic prefer **`codesafe`** (no LLM pass) or drop `extract_llm` from `codesmart`. See
+    [the component's measured tables](../components/extract_llm.md#measured-after-28-replay-of-real-captures-awsclaude-haiku-4-5).
+
+    Check `/stats` → `extract.net_value_usd` on your own workload. `codesmart`'s pinned
+    `min_tokens: 3000` still governs its per-output floor, so that part is unchanged.
 
 Not sure which to pick? See [Choose a preset](../how-to/choose-a-preset.md).
 Every component's config lives in [Components](../components.md).

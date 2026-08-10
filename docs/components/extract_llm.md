@@ -28,22 +28,68 @@ costing ~$0.012 must therefore remove a *lot* of tokens to break even:
 
 | Backend | Content | Break-even output size |
 |---|---|---|
-| Caching | seen once | **~17,800 tokens** |
-| Caching | recurring (amortized over replays) | **~12,700 tokens** |
-| Non-caching | seen once | ~1,780 tokens |
-| Non-caching | recurring | **~1,270 tokens** |
+| Caching | seen once | **~42,600 tokens** |
+| Caching | recurring (amortized over replays) | **~30,500 tokens** |
+| Non-caching | seen once | ~3,400 tokens |
+| Non-caching | recurring | **~1,800 tokens** |
 
-Most tool outputs are nowhere near 12,700 tokens. That is why the same component **wins on a
-non-caching backend and loses on a caching one**, and why the fix is not "compress harder" but
-"decide per call". Since #28 the [economic gate](#economics) makes that decision automatically,
-so the component is safe to leave enabled — it simply declines to spend where it cannot win.
+These use the **measured** compression ratio, and that measurement is the uncomfortable part: on
+real captures an accepted extraction removed only **31–254 tokens per call** on outputs of
+400–2,000 tokens — an actual ratio around **0.10–0.12**, not the ~0.45 one might assume. The model
+declines to cut aggressively, and correctly so: its contract is recall-first.
+
+Most tool outputs are nowhere near 30,500 tokens — in one measured Terminal-Bench capture the
+**largest** tool output was 2,053 tokens, ~15× below the cached break-even. That is why the same
+component **wins on a non-caching backend and loses on a caching one**, and why the fix is not
+"compress harder" but "decide per call". Since #28 the [economic gate](#economics) makes that
+decision automatically, so the component is safe to leave enabled — it simply declines to spend
+where it cannot win.
+
+### Measured after #28 (replay of real captures, `aws/claude-haiku-4-5`)
+
+`forced` = pre-#28 behavior (`economic_gate: false`); `gated` = post-#28 default. Same
+capture, same floor, same model — the only difference is the gate.
+
+**Terminal-Bench capture (20 requests):**
+
+| Arm | Backend | LLM calls | Cost | Tokens saved | Gross value | **NET** | Avg latency |
+|---|---|---|---|---|---|---|---|
+| forced | caching | 4 | $0.0086 | 1,220 | $0.0004 | **−$0.0082** | 9,726 ms |
+| **gated** | caching | 3 | $0.0065 | 0 | $0 | **−$0.0065** | 6,966 ms |
+| forced | non-caching | 6 | $0.0109 | 6,664 | $0.0200 | **+$0.0091** | 10,287 ms |
+| **gated** | non-caching | 7 | $0.0232 | **17,286** | $0.0519 | **+$0.0287** | **4,654 ms** |
+
+**SWE-bench capture (19 requests):**
+
+| Arm | Backend | LLM calls | Cost | Tokens saved | **NET** | Avg latency |
+|---|---|---|---|---|---|---|
+| forced | caching | 2 | $0.0098 | 793 | **−$0.0095** | 8,173 ms |
+| **gated** | caching | 2 | $0.0092 | 806 | **−$0.0089** | 5,060 ms |
+| forced | non-caching | **13** | $0.0593 | 726 | **−$0.0571** | 5,150 ms |
+| **gated** | non-caching | **2** | $0.0090 | **2,451** | **−$0.0016** | 3,754 ms |
+
+Reading these:
+
+- **On a non-caching backend the gate is a clear win.** Terminal-Bench: net **+$0.0287 vs
+  +$0.0091** (3.2×) with **2.6× more tokens saved** and **half the latency**. SWE-bench: it cuts
+  13 calls to 2 and the loss from **−$0.0571 to −$0.0016** — a **97% reduction in waste**.
+- **On a caching backend it is still slightly negative**, because even the gate's minimum
+  exploration spend exceeds what cache-read-rate savings can return on these output sizes. The
+  gate reduces the loss (−$0.0082 → −$0.0065; −$0.0095 → −$0.0089) and cuts latency ~30%, but it
+  does not turn the component positive. **This is the honest verdict: on a caching backend
+  `extract_llm` does not earn its place on these workloads.**
+- The `reasons` breakdown shows the gate working for the documented reasons —
+  `allow: recurring content, amortized over reuses`, `allow: non-caching backend, saved tokens at
+  full rate`, `suppressed: cache-aware, saving below call cost`.
 
 !!! tip "If you only remember one thing"
     On a caching backend, expect `extract_llm` to suppress most candidates and contribute
     little; its value comes from the **result cache**, not from new LLM calls. On a
     **non-caching** backend it is genuinely valuable. Check
     `/stats` → `extract.net_value_usd` — if it is negative on your workload, remove the
-    component from the pipeline.
+    component from the pipeline. **On the caching backends measured here it IS negative even
+    after #28**, so the recommendation for caching traffic is `codesafe` (which has no LLM pass)
+    or dropping `extract_llm` from `codesmart`.
 
 ## How it works
 
@@ -80,7 +126,9 @@ expected saving = tokens expected to remove
                 x (1 + expected future replays)
                 x per-token value       <-- cache-read rate when cache-aware, else fresh rate
 
-expected cost   = observed mean cost of one extraction call
+expected cost   = analytic size-aware cost of one extraction call
+                  (preamble + shown content + overhead, at real rates),
+                  reconciled with the observed mean once calls exist
 ```
 
 Each input is measured rather than assumed:
@@ -88,8 +136,8 @@ Each input is measured rather than assumed:
 | Input | Source |
 |---|---|
 | Per-token value | `Ctx.CacheAware` selects the cache-read vs fresh rate (the 10× factor) |
-| Expected compression ratio | **Learned** from this workload's accepted results; a conservative 0.45 until ~4k tokens of evidence. Repeated misses drive it toward 0, shutting the gate |
-| Call cost | **Observed mean** of real calls (tokens × real model pricing), not a hard-coded constant. Falls back to a ~$0.012 prior only before the first call |
+| Expected compression ratio | **Learned** from this workload's accepted results; a conservative **0.12** (the measured figure) until ~1.5k tokens of evidence. Repeated misses drive it toward 0, shutting the gate. Note the direction of conservatism: for a *spending* gate, conservative means under-estimating the saving |
+| Call cost | **Analytic and size-aware** — `preamble (1,463 tok) + shown content + overhead`, priced at real model rates — then reconciled with the observed mean once real calls exist. A flat per-call constant is not just imprecise, it **deadlocks**: pricing every call at the $0.012 average (≈5× the true cost on small outputs) suppressed everything, so nothing was ever observed and the estimate could never correct itself. Measured: $0.0024/call actual vs the $0.012 prior |
 | Model pricing | `claude-haiku-4-5` list rates by default; override with `CHEAP_MODEL_PRICE_IN` / `_OUT` / `_CACHE_WRITE` / `_CACHE_READ` (dollars per MTok) |
 | Expected replays | Recurrence: content seen before in **any** session is expected to recur (measured 82/103 across sessions) |
 | Remaining horizon | Fewer expected replays late in a long session |
@@ -116,6 +164,12 @@ calls. When the context window is unknown (0) the derived logic is skipped and t
 absolute `trigger` applies — the same fail-open convention `Trigger` already uses.
 
 **`min_tokens` still governs when set explicitly**, so existing configs keep their behavior.
+
+!!! note "`/compact` now resolves the context window too"
+    The `/compact` endpoint used to hard-code the window as unknown, which silently disabled
+    every fraction-based `trigger` threshold *and* this pressure-based logic on that path — so
+    offline replay/eval measured a different component than the one that ships. It now resolves
+    the window exactly as the chat path does.
 
 ## Caching
 
