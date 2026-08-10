@@ -100,7 +100,9 @@ from the model loop.
 ## Reversibility requires the store
 
 The store is the whole reversibility mechanism. It defaults to an in-memory TTL+LRU backend —
-**1800s TTL, 1000 entries, 100 sticky sessions** — shared by every host. It holds, per session:
+**10000s sliding TTL, 1000 entries, 100 sticky sessions** — shared by every host. The TTL is
+refreshed on every read, so a stash an active session keeps touching does not expire under it.
+It holds, per session:
 
 - **Rewind** — `cache_key → original bytes`, what the expand loop resolves.
 - **Sticky** — the set of content ids already reduced on prior turns (byte-stable output across

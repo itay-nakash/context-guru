@@ -83,8 +83,12 @@ func (m *Mask) Offload(req *bschemas.BifrostChatRequest, rep *components.Report,
 		}
 		// A NEW mask only in the uncached tail: masking content the provider already
 		// cached flips it full→masked and forces a cache-write of the suffix. Frozen masks
-		// are replayed everywhere above; new ones stay in the tail.
-		if !c.TailOnly(i) {
+		// are replayed everywhere above; new ones stay in the tail. The one exception is a
+		// freeze this session established and the store then LOST — there the provider
+		// already holds the masked bytes, so re-deriving them (deterministic: same content
+		// + config ⇒ same text and same sha256 key) PRESERVES the cache and leaving the
+		// output verbatim is what destroys it.
+		if !c.TailOnly(i) && !repairLostFreeze(c, m.Name(), content) {
 			continue
 		}
 		prefix := "[older tool output masked] "

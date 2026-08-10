@@ -590,6 +590,13 @@ func (h *Handler) stats(w http.ResponseWriter, _ *http.Request) {
 	// Fill the CG components' own LLM cost (cheap-model usage) — kept out of the
 	// metrics package (layering) and merged here at serve time.
 	snap.LLMCalls, snap.LLMInputTokens, snap.LLMOutputTokens = cheapmodel.Usage()
+	// Freeze-replay health, same layering: the counters live with the code that owns
+	// them (offload for the replay path, the store for dropped/repaired decisions).
+	snap.FrozenHits, snap.FrozenMisses = offload.FrozenStats()
+	if fl, ok := h.store.(*store.Memory); ok {
+		snap.FrozenDropped, snap.FrozenRepaired = fl.FrozenLossStats()
+		snap.FrozenFlips = snap.FrozenDropped - snap.FrozenRepaired
+	}
 	json.NewEncoder(w).Encode(snap)
 }
 

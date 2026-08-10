@@ -227,8 +227,7 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 			continue
 		}
 		if cached, hit := getResult(c, id); hit {
-			summary, _ := getSummary(c, id)
-			apply(i, content, string(cached), summary)
+			apply(i, content, cached.Projected, cached.Summary)
 			dbgReapply++
 			continue
 		}
@@ -238,6 +237,13 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 		// caching is off, any message is fair game. File reads included (largest mass);
 		// safe because we never touch already-cached content and freeze+reapply the result.
 		sz := schema.TextTokens(content)
+		// No lost-decision repair here, unlike mask/failed_run: this replacement is a SAMPLED
+		// model output (cheapmodel sends no temperature/seed), so re-deriving at depth could
+		// emit different bytes inside the cached prefix — the very thing the repair exists to
+		// prevent. And the trade doesn't pay even setting that aside: if the bytes differ the
+		// suffix is cache-written either way, so re-deriving would buy a model call for
+		// nothing. The model may also not run at all (throttle, timeout, floor), which would
+		// leave the output verbatim at depth after the gate had already been lifted.
 		if c.CacheAware && !c.TailOnly(i) {
 			dbgTail++
 			if sz >= floor {
@@ -303,10 +309,7 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 			if out[k].projected == "" {
 				continue
 			}
-			putResult(c, cands[k].id, []byte(out[k].projected))
-			if out[k].summary != "" {
-				putSummary(c, cands[k].id, out[k].summary)
-			}
+			putResult(c, cands[k].id, out[k].projected, out[k].summary)
 			apply(cands[k].i, cands[k].content, out[k].projected, out[k].summary)
 		}
 	}
