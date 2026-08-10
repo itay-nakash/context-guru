@@ -21,6 +21,7 @@ infrastructure the components sit on.
 | `store/` | `Store` interface + in-memory TTL+LRU backend (rewind + sticky ids) |
 | `session/` | resolve the session key (explicit id, else content hash) |
 | `metrics/` | `Emitter` implementations: `Slog`, `Aggregator` (for `/stats`), `Tee` |
+| `dash/` | the persistent observability layer: SQLite store, off-hot-path capture, SSE hub, JSON API, embedded UI |
 | `config/` | strict YAML loader, presets, pipeline builder |
 | `proxy/` | the standalone/gateway HTTP proxy |
 | `adapters/bifrost/` | `LLMPlugin` adapter to embed the pipeline in a bifrost deployment |
@@ -185,6 +186,72 @@ of per-request percentages. It also reports:
 - `wasted_tokens` / `bounces` — content offloaded then re-served via expand (a premature offload);
 - `adjusted_saved` = saved − wasted (bounce-adjusted, may be negative);
 - `top_passthrough` — components that ran but never changed a request: dead weight to drop.
+- the four provider-billed token tiers (`fresh_input_tokens`, `cache_read_tokens`,
+  `cache_write_tokens`, `output_tokens`), plus `attempted_tokens` / `frozen_tokens` and the
+  two extra ratios derived from them (`savings_pct_attempted`, `savings_pct_new_input`).
+
+`/stats` is **append-only by contract**: `deploy/harbor/*.py` parses it to produce every
+published benchmark result, so a rename would invalidate the reproduction path *silently*
+(the harness would keep running and report zeros). A golden test asserts the exact key set
+of both the top-level object and each per-component object.
+
+## Observability: the dashboard store (D11)
+
+`Aggregator` answers "what is happening now" and forgets everything on restart. The
+[dashboard](dashboard.md) answers "what happened, and was it worth it" — which needs
+durability, filtering and per-request detail. It is a **separate, additive layer**: the
+aggregator is untouched and stays the fast in-process counter.
+
+```mermaid
+flowchart LR
+  H[chat handler] -->|apply.BodyTrace| P[pipeline]
+  P --> U[upstream]
+  U --> C[client]
+  H -. one struct,<br/>one non-blocking send .-> Q[[capture channel<br/>buffered · drops + counts]]
+  Q --> W[writer goroutine<br/>batched transaction]
+  W --> DB[(SQLite · WAL<br/>requests<br/>request_components<br/>request_content<br/>bench_runs/tasks)]
+  W --> S[SSE hub<br/>write timeout + eviction]
+  DB --> A[/api/*<br/>filters · keyset paging · query-time buckets/]
+  S --> A
+  A --> UI[go:embed single-page UI]
+```
+
+Five decisions, and what each one refuses:
+
+**Capture is off the hot path, and drops rather than blocks.** The handler builds one
+`dash.Event` from values the request path already computed and does a channel send with a
+`default:` branch. A full queue increments a drop counter that the dashboard itself
+displays. Measured cost on the request goroutine: **~175 ns**, with a regression test that
+fails above 50 µs. *Refuses:* observability that can add latency to, or fail, a request.
+
+**`apply.BodyTrace` is the capture point.** `BodyFull` delegates to it, so the rewrite is
+byte-identical whether or not anyone is looking; the `Trace` carries the resolved session,
+the `RunReport`, the cache-awareness facts (`AttemptedTokens` / `FrozenTokens`) and each
+rewritten message's before/after text — the same material `CONTEXT_GURU_DUMP` writes to a
+file. *Refuses:* a parallel accounting path that could disagree with the pipeline's own.
+
+**Redaction before the database, never on read.** Headers are blanket-redacted by key
+against a short allowlist (a denylist fails the moment a gateway invents a new auth
+header); config keys are allowlisted, with credential-named keys always withheld; captured
+content is pattern-scrubbed and size-capped. *Refuses:* a secret on disk, and a
+redact-on-read filter one forgotten code path from leaking it.
+
+**Percentages at read time, cost at write time.** Ratios are derived per query, so a
+filter change needs no rebuild. Costs are computed when the row is written, so history does
+not reprice when a model's published rate changes. *Refuses:* a "savings" figure that
+silently changes retroactively.
+
+**No rollup tables.** Time series are bucketed in SQL (`ts/bucket*bucket GROUP BY 1`).
+*Refuses:* a pre-aggregation layer to keep consistent before any query is measurably slow.
+
+Timestamps are epoch **milliseconds** throughout — a formatted locale string cannot be
+range-queried, sorted portably or bucketed. Retention is bounded by age **and** size. The
+schema carries a version; a mismatch renames the old file aside and starts fresh, because a
+dashboard is a derived view and discarding it beats refusing to boot.
+
+Per-request **content** and the effective **configuration** are served to loopback or an
+explicit trusted CIDR only; aggregates are open, because a proxy bound to `0.0.0.0` should
+still report its own numbers.
 
 ## Config & registry
 

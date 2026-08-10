@@ -145,8 +145,42 @@ See [docs/components.md](docs/components.md) and [docs/reference/presets.md](doc
 | `FORCE_MODEL` | — | overwrite the request `model` (eval-containers `EVAL_MODEL`) |
 
 Routes: `POST /openai/v1/chat/completions`, `POST /anthropic/v1/messages`, `GET /healthz`,
-`GET /stats` (savings rollups), `GET /expand?id=` (recover an offloaded original). Per-request: header
+`GET /stats` (savings rollups), `GET /expand?id=` (recover an offloaded original), and — with
+`--dashboard` — `GET /dashboard/` plus `/api/*`. Per-request: header
 `x-context-guru-session` sets the session key; `x-context-guru-bypass: true` skips the pipeline.
+
+## Dashboard
+
+`--dashboard` adds a persistent observability UI at `/dashboard/` plus a JSON/SSE API at
+`/api/*`. It exists to answer the question the product exists to answer — **what value is
+context-guru providing?** — and to make the answer falsifiable.
+
+```sh
+context-guru-proxy --preset codesmart --dashboard
+# open http://localhost:4000/dashboard/
+```
+
+[![The context-guru dashboard](docs/img/dashboard/01-overview.jpg)](docs/dashboard.md)
+
+- **Four labelled savings denominators**, because a single "savings %" is a lie of
+  omission: of what we tried to compact · of new provider-billed input · of the whole
+  request (diluted) · unique-of-whole. Each one states what it divides by, and reports
+  **n/a** rather than a number it cannot compute.
+- **Baseline vs actual cumulative cost**, with the saved area shaded, plus an honest
+  savings **waterfall** that will show a negative net if we spent more than we saved.
+- **The cost of our own safety mechanisms beside their benefit** — cache-frozen tokens,
+  restorations, reverts, and context-guru's own latency and LLM spend.
+- **Per-component economics**: unique vs gross savings, `overcount_ratio`, own latency, and
+  a verdict — so a component that burns wall time for nothing is obvious without a doc.
+- **Sessions, requests, and the before/after Git-style diff** of exactly what was removed.
+- **Benchmark ingestion** straight from `summary.json` + `rows-*.json`, with cost-vs-reward
+  per arm and per-task drill-down.
+
+Embedded via `go:embed` — no CDN, no npm, no build step, so it works air-gapped. Capture is
+off the hot path (**~175 ns** per request, drops rather than blocks) and redaction happens
+before anything reaches disk. `/stats` is unchanged.
+
+Full guide: **[docs/dashboard.md](docs/dashboard.md)**.
 
 ## The pipeline
 
@@ -182,7 +216,8 @@ Details in [docs/integrations.md](docs/integrations.md).
 
 ## Docs
 
-- [docs/design.md](docs/design.md) — architecture: component model, fail-open pipeline, store, session, expand loop, metrics.
+- [docs/design.md](docs/design.md) — architecture: component model, fail-open pipeline, store, session, expand loop, metrics, the dashboard's capture/store layer.
+- [docs/dashboard.md](docs/dashboard.md) — the persistent observability dashboard: metrics semantics, the diff view, storage, access gating, API.
 - [docs/components.md](docs/components.md) — every registered component: how it works, live before→after, lossiness, config, best use.
 - [docs/integrations.md](docs/integrations.md) — proxy gateway vs AuthBridge plugin, with request paths.
 - [docs/setup.md](docs/setup.md) — setup + a concrete SWE-bench run through the eval-containers gateway.

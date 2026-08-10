@@ -112,6 +112,7 @@ nav:
       - Setup & evaluation: setup.md
   - Concepts:
       - Architecture (deep dive): design.md
+      - Dashboard: dashboard.md
   - Components:
       - Overview: components.md
       - Reformat:
