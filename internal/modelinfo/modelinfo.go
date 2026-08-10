@@ -15,6 +15,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -120,18 +121,38 @@ func (l *LiteLLM) fetch(ctx context.Context) (map[string]int, error) {
 	if err != nil {
 		return nil, err
 	}
-	var raw map[string]struct {
-		MaxInputTokens int `json:"max_input_tokens"`
-		MaxTokens      int `json:"max_tokens"`
-	}
+	// Decode PER ENTRY, not into one typed map[string]struct{…}. The upstream
+	// document is community-maintained and not schema-clean: it carries a
+	// `sample_spec` documentation entry whose numeric fields hold prose
+	// ("deprecation_date": "date when the model becomes deprecated…"), and a
+	// handful of models spell an integer field as a float. encoding/json aborts the
+	// WHOLE map on the first type error, so a strict decode returned (nil, err)
+	// after successfully parsing ~2,900 good rows — which is why every context
+	// window resolved to "unknown" in production and no fraction-based trigger has
+	// ever fired. Skip the bad entries; keep the good ones; say so out loud.
+	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(b, &raw); err != nil {
 		return nil, err
 	}
 	m := make(map[string]int, len(raw)*2)
-	for k, v := range raw {
-		w := v.MaxInputTokens
+	var skipped []string
+	for k, rv := range raw {
+		if k == sampleSpecKey {
+			continue // the document's own schema documentation, not a model
+		}
+		var v struct {
+			// float64, not int: a few entries spell an integer window as 128000.0,
+			// which an int field rejects.
+			MaxInputTokens float64 `json:"max_input_tokens"`
+			MaxTokens      float64 `json:"max_tokens"`
+		}
+		if err := json.Unmarshal(rv, &v); err != nil {
+			skipped = append(skipped, k)
+			continue
+		}
+		w := int(v.MaxInputTokens)
 		if w == 0 {
-			w = v.MaxTokens
+			w = int(v.MaxTokens)
 		}
 		if w == 0 {
 			continue
@@ -142,8 +163,23 @@ func (l *LiteLLM) fetch(ctx context.Context) (map[string]int, error) {
 			m[tail] = w
 		}
 	}
+	// Degrading silently here is what hid this bug for the life of the package: an
+	// empty map is indistinguishable from "no model has a window" at every call
+	// site, because every lookup fails open. Both outcomes get a log line.
+	if len(m) == 0 {
+		slog.Warn("modelinfo: the model-window document decoded to nothing; every context window will read as unknown and fraction-based triggers will not fire",
+			"url", l.URL, "entries", len(raw), "skipped", len(skipped))
+	} else if len(skipped) > 0 {
+		slog.Info("modelinfo: skipped malformed model entries", "skipped", len(skipped),
+			"kept", len(m), "examples", skipped[:min(3, len(skipped))])
+	}
 	return m, nil
 }
+
+// sampleSpecKey is the LiteLLM document's self-documenting entry: its fields are
+// prose descriptions of the schema, not values. Skipped by name so it never even
+// counts as a decode failure.
+const sampleSpecKey = "sample_spec"
 
 // Window returns the model's context window from the cached LiteLLM map.
 func (l *LiteLLM) Window(ctx context.Context, model string) (int, bool) {
