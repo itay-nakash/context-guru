@@ -250,3 +250,43 @@ func TestFamilyMetricsAndSelectorMisses(t *testing.T) {
 		t.Fatalf("expected the unmatched selector to be logged, got %v", fs.misses)
 	}
 }
+
+// The per-filter ledger is an ENFORCED-namespace field with no potential_* counterpart, so
+// an observe-mode run populating it reports savings that never happened — and a consumer
+// cannot tell them apart from real ones. #31 named that as its primary correctness risk: a
+// mislabelled hypothetical is worse than no number, because it inflates the product's own
+// headline claim.
+//
+// The gate lives on Ctx.Stats() rather than at this component's two call sites, so it also
+// covers the next sink added to Ctx — a component author reaching for c.FilterStats has no
+// reason to think about modes. Asserting that sync DOES record proves the gate rather than a
+// dead sink.
+func TestObserveModeDoesNotRecordFilterStats(t *testing.T) {
+	const aptOut = "Reading package lists...\nSetting up git (1:2.43.0-1ubuntu7.3) ...\n" +
+		"Processing triggers for libc-bin (2.39-0ubuntu8.6) ...\n"
+
+	for _, tc := range []struct {
+		mode       components.Mode
+		wantRecord bool
+	}{{components.ModeSync, true}, {components.ModeObserve, false}} {
+		sink := &recordingSink{}
+		f := newFilterComp(t, "min_size: 1\n")
+		req := &schemas.BifrostChatRequest{Provider: schemas.Anthropic,
+			Input: []schemas.ChatMessage{cmdToolMsg(aptOut)}}
+		c := &components.Ctx{Ctx: context.Background(), Session: "s",
+			Store: store.NewMemory(store.Options{}), MaxCachedIdx: -1,
+			Mode: tc.mode, FilterStats: sink}
+		if _, err := f.Offload(req, &components.Report{}, c); err != nil {
+			t.Fatalf("mode=%s: %v", tc.mode, err)
+		}
+		if got := sink.acts + sink.misses; (got > 0) != tc.wantRecord {
+			t.Errorf("mode=%s: %d ledger events (acts=%d misses=%d), wantRecord=%v",
+				tc.mode, got, sink.acts, sink.misses, tc.wantRecord)
+		}
+	}
+}
+
+type recordingSink struct{ acts, misses int }
+
+func (r *recordingSink) FilterAct(_, _, _ string, _ int) { r.acts++ }
+func (r *recordingSink) FilterMiss(string)               { r.misses++ }

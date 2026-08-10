@@ -158,6 +158,9 @@ type Ctx struct {
 	MaxCachedIdx int
 	// FilterStats receives cmdfilter's per-filter ledger (which command families pay
 	// off, and which output shapes matched nothing). nil = not recording.
+	//
+	// Read it through Stats(), never directly: in observe mode nothing is forwarded, so
+	// recording into an enforced-namespace field would report savings that never happened.
 	FilterStats FilterStatsSink
 	// ExistingBreakpoints is how many prompt-cache breakpoints the RAW request already
 	// carries, counted across `system`, `tools` and `messages` — which is what the
@@ -205,6 +208,30 @@ func (c *Ctx) TailOnly(i int) bool {
 		return true
 	}
 	return i > c.MaxCachedIdx
+}
+
+// Stats returns the per-filter ledger sink, or nil in observe mode.
+//
+// Observe computes what compaction WOULD have done and forwards the request untouched, so
+// every enforced-namespace metric must stay zero: a figure that cannot be told apart from
+// a real saving is worse than no figure, because it silently inflates the product's own
+// headline. The savings totals are already namespaced (potential_* / projected_*), but the
+// filter ledger is not — an observe-only run was reporting real-looking `cmdfilter_families`
+// and `cmdfilter_filters` entries with no mode label and no hypothetical counterpart.
+//
+// Gating here rather than at the call site is deliberate. A component author reaching for
+// c.FilterStats has no reason to think about modes, and the next sink added to Ctx would
+// reproduce the bug; an accessor makes the safe path the only convenient one.
+//
+// Two enforced fields are deliberately NOT suppressed in observe mode, because they are real
+// rather than hypothetical: cg_added_ms_avg (a true measurement of the enforced path, which
+// correctly reads ~0) and context-guru's own model spend (observe measures off-path, and that
+// costs real money). Those are labelled instead — see metrics.Snapshot's observe notices.
+func (c *Ctx) Stats() FilterStatsSink {
+	if c == nil || c.Mode == ModeObserve {
+		return nil
+	}
+	return c.FilterStats
 }
 
 // Report is the per-component result, modelled after lean-ctx's ToolOutput
