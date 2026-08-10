@@ -135,7 +135,7 @@ filters:
   gcc:
     description: strip include traces and diagnostic counters, keep every error and warning
     family: builds
-    match: '^(In file included from|/usr/bin/ld:|collect2: error:|\S+:\d+:(\d+:)? (error|warning|note):)'
+    match: '^(In file included from|/usr/bin/ld:|collect2: error:|\S+: In function|\S+:\d+:(\d+:)? (error|warning|note):)'
     strip_ansi: true
     strip_lines_matching:
       - '^\s*$'
@@ -420,6 +420,36 @@ filters:
         unless: 'error|Error|warning|failed'
     cap: list
 
+  apt:
+    description: collapse apt/dpkg install boilerplate, keep errors and configuration prompts
+    family: pkg
+    match: '^(Get:\d+ http|Selecting previously unselected package|Preparing to unpack |Unpacking |Setting up |Processing triggers for |Reading package lists|Building dependency tree)'
+    strip_ansi: true
+    strip_lines_matching:
+      - '^\s*$'
+      - '^Get:\d+ http'
+      - '^Selecting previously unselected package'
+      - '^Preparing to unpack '
+      - '^Unpacking '
+      - '^Setting up '
+      - '^Processing triggers for '
+      - '^Reading package lists'
+      - '^Building dependency tree'
+      - '^Reading state information'
+      - '^\(Reading database \.\.\.'
+      - '^Fetched \d'
+      - '^Need to get \d'
+      - '^After this operation'
+      # NOT '^debconf: ' — that swallows real diagnostics like
+      # "debconf: unable to initialize frontend". Only the delaying notice is noise.
+      - '^debconf: delaying package configuration'
+      - '^update-alternatives: '
+      - '^Created symlink '
+      - '^Creating config file '
+      - '^\d+ upgraded, \d+ newly installed'
+    cap: list
+    on_empty: 'apt: install ok'
+
   brew-install:
     description: strip brew download/pour chatter, collapse an already-installed formula
     family: pkg
@@ -522,6 +552,10 @@ tests:
     - name: linker error kept
       input: "/usr/bin/ld: /tmp/main.o: undefined reference to 'missing_func'\ncollect2: error: ld returned 1 exit status\n"
       expected: "/usr/bin/ld: /tmp/main.o: undefined reference to 'missing_func'\ncollect2: error: ld returned 1 exit status"
+
+    - name: In-function header routes and diagnostics survive
+      input: "/tmp/spherepeak.c: In function 'main':\n/tmp/spherepeak.c:12:9: warning: unused variable 'r' [-Wunused-variable]\n   12 |     int r = 0;\n      |         ^\n1 warning generated.\n"
+      expected: "/tmp/spherepeak.c: In function 'main':\n/tmp/spherepeak.c:12:9: warning: unused variable 'r' [-Wunused-variable]\n   12 |     int r = 0;\n      |         ^"
 
   swift-build:
     - name: successful build collapses
@@ -714,6 +748,17 @@ tests:
     - name: failure not swallowed by Audited
       input: "Resolved 42 packages in 123ms\nwarning: 'pytest' was not found in the lockfile\nAudited 42 packages in 0.05ms\n"
       expected: "Resolved 42 packages in 123ms\nwarning: 'pytest' was not found in the lockfile\nAudited 42 packages in 0.05ms"
+
+  apt:
+    - name: pure install boilerplate collapses
+      input: "Setting up libx11-data (2:1.8.7-1build1) ...\nSetting up perl-modules-5.38 (5.38.2-3.2ubuntu0.3) ...\nSetting up git (1:2.43.0-1ubuntu7.3) ...\nProcessing triggers for libc-bin (2.39-0ubuntu8.6) ...\n"
+      expected: 'apt: install ok'
+    - name: errors and prompts kept
+      input: "Reading package lists...\nBuilding dependency tree...\nGet:1 http://archive.ubuntu.com/ubuntu noble/main amd64 libfoo amd64 1.0 [12 kB]\nE: Unable to locate package libnope\nSetting up libfoo (1.0) ...\n"
+      expected: 'E: Unable to locate package libnope'
+    - name: dpkg failure kept
+      input: "Preparing to unpack .../libbar_2.0_amd64.deb ...\nUnpacking libbar (2.0) ...\ndpkg: error processing archive libbar_2.0_amd64.deb (--unpack):\n trying to overwrite '/usr/lib/libbar.so', which is also in package libbaz\nSetting up libfoo (1.0) ...\n"
+      expected: "dpkg: error processing archive libbar_2.0_amd64.deb (--unpack):\n trying to overwrite '/usr/lib/libbar.so', which is also in package libbaz"
 
   brew-install:
     - name: already installed collapses

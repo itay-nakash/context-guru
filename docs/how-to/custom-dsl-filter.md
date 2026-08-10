@@ -91,7 +91,16 @@ fine and never fires. Paste a real sample of the output, take its first non-empt
 regex against *that* (`^Refreshing state`, `^> Task :`, `^==> Downloading`).
 
 Selectors that match nothing are logged: `/stats` exposes `cmdfilter_selector_misses`, the frequency-
-ranked list of output shapes no filter claimed. That is the backlog of filters worth writing.
+ranked list of output shapes no filter claimed. That is the backlog of filters worth writing — the
+shipped `apt` filter and `gcc`'s widened selector both came out of reading it.
+
+### Be conservative with strip rules
+
+A strip rule matching more than you meant is silent: the line is gone and the output still looks
+plausible. `^debconf: ` looks like install noise and also matches
+`debconf: unable to initialize frontend`. Write the rule as narrowly as the noise allows, and pair a
+high-volume filter with a test that asserts a list of must-survive lines against a wall of
+boilerplate (see `TestAptKeepsProblems`).
 
 ### The load-time guardrails
 
@@ -121,7 +130,7 @@ components:
 ```
 
 - `cmdfilter` is `Enabled` only when ≥1 filter is loaded.
-- It ships [23 filters](../components/cmdfilter.md#the-shipped-filter-set); set
+- It ships [24 filters](../components/cmdfilter.md#the-shipped-filter-set); set
   `disable_builtins: true` to run only your own.
 - The output's first non-empty line is the selector each filter's `match` is tested against, in
   descending `priority` then name order.
