@@ -1,6 +1,8 @@
 package metrics
 
 import (
+	"encoding/json"
+	"strconv"
 	"testing"
 
 	"github.com/rossoctl/context-guru/components"
@@ -111,5 +113,61 @@ func TestMutatedZeroSavingsNotPassthrough(t *testing.T) {
 	}
 	if s.Components["cacheinject"].Mutated != 1 {
 		t.Fatalf("cacheinject should record a mutation, got %+v", s.Components["cacheinject"])
+	}
+}
+
+// The cmdfilter ledger: per-family and per-filter attribution, unique-vs-cumulative
+// dedup, and the bounded selector-miss ledger.
+func TestFilterStatsLedger(t *testing.T) {
+	a := NewAggregator()
+	a.FilterAct("iac", "terraform-plan", "k1", 300)
+	a.FilterAct("iac", "terraform-plan", "k1", 300) // same compaction re-sent next turn
+	a.FilterAct("iac", "terraform-init", "k2", 40)
+	a.FilterAct("builds", "make", "k3", 100)
+	a.FilterMiss("Totally unknown shape")
+	a.FilterMiss("Totally unknown shape")
+	a.FilterMiss("Another shape")
+
+	s := a.Snapshot()
+	if got := s.CmdfilterFamilies["iac"]; got.Acts != 3 || got.Saved != 640 || got.SavedUnique != 340 {
+		t.Fatalf("iac family ledger wrong: %+v", got)
+	}
+	if got := s.CmdfilterFilters["make"]; got.Acts != 1 || got.SavedUnique != 100 {
+		t.Fatalf("per-filter ledger wrong: %+v", got)
+	}
+	if len(s.CmdfilterMisses) != 2 || s.CmdfilterMisses[0].Selector != "Totally unknown shape" || s.CmdfilterMisses[0].Count != 2 {
+		t.Fatalf("misses should be ranked by frequency: %+v", s.CmdfilterMisses)
+	}
+	// the ledger is bounded: unknown selectors past the cap are dropped, not appended
+	for i := 0; i < maxMissKeys*2; i++ {
+		a.FilterMiss("shape-" + strconv.Itoa(i))
+	}
+	if n := len(a.filterMiss); n > maxMissKeys {
+		t.Fatalf("miss ledger grew past its cap: %d", n)
+	}
+}
+
+// /stats must stay backward compatible: the fields deploy/harbor/*.py parses are
+// still present, and the new cmdfilter fields are additive-and-omitted-when-empty.
+func TestSnapshotStaysBackwardCompatible(t *testing.T) {
+	b, err := json.Marshal(NewAggregator().Snapshot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"requests", "tokens_before", "tokens_after", "saved_tokens",
+		"savings_pct", "wasted_tokens", "bounces", "adjusted_saved", "components",
+		"llm_calls", "cg_added_ms_avg", "upstream_ms_avg"} {
+		if _, ok := m[k]; !ok {
+			t.Errorf("/stats lost the %q field the harness parses", k)
+		}
+	}
+	for _, k := range []string{"cmdfilter_families", "cmdfilter_filters", "cmdfilter_selector_misses"} {
+		if _, ok := m[k]; ok {
+			t.Errorf("%q should be omitted when empty", k)
+		}
 	}
 }

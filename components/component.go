@@ -123,6 +123,9 @@ type Ctx struct {
 	// -1 = unknown/first turn/cache off ⇒ no tail restriction. Only meaningful when
 	// CacheAware is true.
 	MaxCachedIdx int
+	// FilterStats receives cmdfilter's per-filter ledger (which command families pay
+	// off, and which output shapes matched nothing). nil = not recording.
+	FilterStats FilterStatsSink
 	// ExistingBreakpoints is how many prompt-cache breakpoints the RAW request already
 	// carries, counted across `system`, `tools` and `messages` — which is what the
 	// provider's cap of four applies to. A component that spends breakpoint slots must
@@ -134,6 +137,19 @@ type Ctx struct {
 	// enough to put 6 on the wire and take a 400 (issue #32). The host fills it from
 	// the raw body; 0 means "unknown, fall back to what you can see".
 	ExistingBreakpoints int
+}
+
+// FilterStatsSink records cmdfilter's per-filter/per-family ledger. metrics.Aggregator
+// implements it; the pipeline depends only on this interface. Implementations must be
+// safe for concurrent use.
+type FilterStatsSink interface {
+	// FilterAct notes one applied filter: its family (builds/tests/iac/pkg/net/...),
+	// its name, the content key (so a compaction re-sent verbatim next turn is counted
+	// once), and the tokens saved.
+	FilterAct(family, filter, contentKey string, saved int)
+	// FilterMiss notes a selector that matched no filter — the ledger that says which
+	// filter is worth writing next (after rtk's parse_failures table).
+	FilterMiss(selector string)
 }
 
 // TailOnly reports whether a supersession/age-based offloader may mutate the message

@@ -31,6 +31,13 @@ func NewPipeline(comps []Component, e Emitter) *Pipeline {
 // are rolled back, so the returned request is never worse than the input.
 func (p *Pipeline) Run(req *schemas.BifrostChatRequest, c *Ctx) *RunReport {
 	rr := &RunReport{Session: c.Session, TokensBefore: schema.MessagesTokens(req)}
+	// Hand cmdfilter its per-family ledger sink when the emitter implements one, so no
+	// host has to thread a second field through every Ctx construction site.
+	if c.FilterStats == nil {
+		if s, ok := p.emitter.(FilterStatsSink); ok {
+			c.FilterStats = s
+		}
+	}
 	if c.Bypass {
 		rr.TokensAfter = rr.TokensBefore
 		return rr

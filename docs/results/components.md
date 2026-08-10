@@ -55,8 +55,9 @@ Run: **0 acts** (cache-aware), but still scans every run-like output (~6.7 s tot
 costliest *deterministic* detection).
 
 ### 4. `cmdfilter` (Offload)
-Declarative DSL filters keyed on a command output's first line (builtin `pytest`,
-`npm-install`, `make`): strip blank/`PASSED`/progress lines, cap length, keep failures.
+Declarative DSL filters keyed on a command output's first line (23 shipped, e.g. `pytest`,
+`make`, `gradle`, `terraform-plan`, `pulumi`): strip blank/`PASSED`/progress lines, cap length,
+keep failures.
 > **Real example** (pytest session): `1140 → 1068 tok` — passing/blank noise stripped,
 > failures + warnings kept verbatim.
 Run: 3 acts.
