@@ -20,6 +20,7 @@ infrastructure the components sit on.
 | `expand/` | reversibility: `<<cg:HASH>>` marker, the `context_guru_expand` tool def, response parsing + continuation |
 | `store/` | `Store` interface + in-memory TTL+LRU backend (rewind + sticky ids) |
 | `session/` | resolve the session key (explicit id, else content hash) |
+| `modes/` | the per-session compaction generation (`Tracker`) + the bounded off-path worker pool (`Pool`) |
 | `metrics/` | `Emitter` implementations: `Slog`, `Aggregator` (for `/stats`), `Tee` |
 | `config/` | strict YAML loader, presets, pipeline builder |
 | `proxy/` | the standalone/gateway HTTP proxy |
@@ -185,6 +186,115 @@ of per-request percentages. It also reports:
 - `wasted_tokens` / `bounces` — content offloaded then re-served via expand (a premature offload);
 - `adjusted_saved` = saved − wasted (bounce-adjusted, may be negative);
 - `top_passthrough` — components that ran but never changed a request: dead weight to drop.
+
+Mode is a dimension. `Report`/`RunReport` carry `Mode`, stamped by the pipeline from
+`Ctx.Mode`, and the `Aggregator` routes on it:
+
+- enforced requests split into `sync_enforced` / `async_enforced`;
+- async adds the whole queue tuple (`queued`, `pending`, `processed`, `dropped`,
+  `errors`, `stale_discarded`) plus `async_realized_saved_tokens`, the savings a turn
+  got by replaying an earlier turn's deferred work;
+- observe results land in **physically separate** accumulators serialized under
+  `potential_*` / `projected_*`, which share no key with an enforced metric. In observe
+  mode every enforced aggregate is zero by construction. Getting this wrong would
+  silently inflate the headline savings claim, so it is a correctness requirement and a
+  test asserts no enforced aggregate can reach an observe result.
+
+Every pre-existing `/stats` field keeps its name and shape; mode fields are additive
+(the harnesses in `deploy/harbor/*.py` parse this payload).
+
+## Operating modes
+
+Three modes, set explicitly by `mode:` (or `--mode` / `MODE`) and threaded onto
+`components.Ctx` as `Ctx.Mode`. Never inferred. `sync` is the default and reproduces
+pre-mode behavior byte for byte; a golden test compares the two entry points' output.
+
+See [Operating modes](how-to/operating-modes.md) for the operator's view. What follows
+is the mechanism.
+
+### Generations: why an async result may be unsafe to apply
+
+An async compaction lands in a session's frozen state at some later, unpredictable
+moment. Between enqueue and commit the agent may have taken another turn, and another
+job may already have committed. Applying a result computed from a snapshot that no
+longer describes the session is how a compaction proxy corrupts a cached prefix.
+
+So `modes.Tracker` keeps, per session under one lock:
+
+- **`prevLen`** — the number of normalized messages the previous turn carried, i.e.
+  the already-cached/uncached boundary. `Turn(session, n)` reads it and records the new
+  one in a single locked call. This replaces the old read-then-`defer putLen` pattern in
+  `apply`, which two concurrent turns of one session raced on (overlaps #25). It only
+  ever grows: an agent re-sending a shorter transcript must not shrink the boundary, or
+  content the provider already cached falls back into the mutable tail.
+- **`gen`** — the compaction generation. A request records the generation it was built
+  from. `CommitIfCurrent(session, gen, commit)` runs `commit` and advances the
+  generation only if the session is still at `gen`, with `commit` called while the
+  lock is held, so two jobs cannot both observe `gen` as current. A stale result is
+  **discarded**, not applied.
+
+The generation advances only when a compaction actually lands. That is what makes the
+scheme non-starving: dedup on `(session, generation)` keeps at most one useful job in
+flight per session, a commit moves the session forward, and the next turn enqueues
+fresh work against the longer transcript.
+
+`store.Buffer` is what makes "discard" possible at all. A deferred run writes frozen
+decisions, stashes and sticky ids as it goes, so throwing the result away after the
+fact is not an option — by then the writes have landed. Running the job against a
+copy-on-write overlay of the store makes the whole result one atomic, discardable
+unit: `Commit()` flushes it, and never calling `Commit()` is the discard.
+
+### Job lifecycle
+
+`modes.Pool` is one bounded queue plus a fixed set of drain goroutines, owned by the
+proxy — not a goroutine per request. The shape is headroom's `BackgroundCompressor`,
+ported and extended.
+
+1. The inline pass runs with **no model clients** (async's whole point), replaying
+   whatever an earlier job froze, and returns the session id, `prevLen` and generation.
+2. `Enqueue(key, run)` with `key = session@generation`. The pending slot is claimed
+   **before** the job is observable in the queue, so dedup is atomic against a
+   concurrent enqueue of the same key. A duplicate key is a coalesced supersession.
+3. A full queue **drops** and counts, never blocks — the request was already forwarded.
+4. The worker runs the pipeline against a `store.Buffer`, with the model clients, under
+   the **pool's** context (not the request's, which is cancelled when the response is
+   written) and with the turn's own `prevLen` (re-resolving would gate the run against
+   a boundary its body never had).
+5. `CommitIfCurrent` decides: flush, or discard and count `stale_discarded`.
+6. `Stop()` cancels and waits; queued jobs are abandoned, since they were pure savings.
+
+### The async cache policy
+
+A cache-write costs 11.5x a cache-read, so letting the un-compacted tail be cached and
+then replacing it converts a read into a write and makes async strictly worse than
+sync — the failure that tripled headroom's cache-write on Terminal-Bench.
+
+`apply` therefore sets `Ctx.TailCachePending` + `Ctx.NoCacheAtOrAfter` in async mode,
+and `cacheinject` drops every wanted breakpoint position at or beyond that index,
+anchoring at the highest safe one instead so the stable prefix is still written.
+
+The protection needs a separate bool rather than a sentinel index, because index 0 is
+a legitimate value ("no breakpoint anywhere") — no integer is free to mean "off". The
+bool defaulting to false also makes an unset field cost a missed optimisation rather
+than a wrong request, which is the opposite of `MaxCachedIdx`'s `-1` (see #25).
+
+`async.cache_uncompacted_tail: true` disables it, for a backend confirmed not to cache.
+
+### Observe
+
+The request path does **not** run the pipeline, and skips `expand.Inject` too — a tool
+declaration is a modification. Byte-identity is therefore structural, not a property of
+careful copying. A copy runs off-path against a `store.Buffer` that is never committed.
+
+### Fail-open per mode
+
+- `sync` / `async`: `apply` has a top-level recover, the pipeline has a per-component
+  one, and the proxy backstops the whole pre-forward block. The pristine inbound body
+  is always a valid fallback.
+- `async` off-path: a panicking job is contained by the pool and counted as an error.
+  Nothing was riding on it — the request went out long ago.
+- `observe`: the forwarded body is the input, so there is nothing for a failure to
+  damage.
 
 ## Config & registry
 
