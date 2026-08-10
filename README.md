@@ -170,6 +170,34 @@ are in **[docs/components.md](docs/components.md)** and **[docs/results/componen
 | `smartcrush` | Offload | keeps anchor items of a long JSON array, drops the middle |
 | `summarize` | Offload (LLM) | compresses the middle of the trajectory into one summary (run alone) |
 
+## Operating modes
+
+`sync` (the default) compacts inline and the caller waits. One other mode changes that:
+
+| Mode | The request path | Use it when |
+|---|---|---|
+| **`sync`** *(default)* | Compacts inline; the caller waits. | You want the savings. |
+| **`observe`** | Forwards the request **untouched, byte for byte**, and reports what compaction *would* have saved. | You want to evaluate context-guru on your own traffic without enforcing it. |
+
+```yaml
+mode: observe
+```
+
+Byte-identity is **structural**: in observe mode the request path never runs the pipeline
+at all (and never injects the expand tool), so no code path could alter a forwarded body.
+Measured cost to the enforced path: **0.062 ms/req**, against 1,599 ms for `sync` on the
+same benchmark.
+
+Observe-mode numbers are reported under their own `potential_*` / `projected_*` keys that
+share no name with an enforced metric, so a hypothetical can never be read as a realized
+saving. On identical traffic its projection matches what `sync` actually achieved exactly
+(23.06% both sides), and on traffic with nothing to save it correctly projects 0%.
+
+This is a genuine differentiator, not a port: headroom has no observe/shadow/dry-run mode
+at all — its `token` and `cache` modes are both enforcing.
+
+Details in [docs/how-to/operating-modes.md](docs/how-to/operating-modes.md).
+
 ## Integrate
 
 | Option | What | Where |
@@ -182,7 +210,8 @@ Details in [docs/integrations.md](docs/integrations.md).
 
 ## Docs
 
-- [docs/design.md](docs/design.md) — architecture: component model, fail-open pipeline, store, session, expand loop, metrics.
+- [docs/design.md](docs/design.md) — architecture: component model, fail-open pipeline, store, session, expand loop, metrics, operating modes.
+- [docs/how-to/operating-modes.md](docs/how-to/operating-modes.md) — sync vs observe: when to use each, and how to read observe's projections.
 - [docs/components.md](docs/components.md) — every registered component: how it works, live before→after, lossiness, config, best use.
 - [docs/integrations.md](docs/integrations.md) — proxy gateway vs AuthBridge plugin, with request paths.
 - [docs/setup.md](docs/setup.md) — setup + a concrete SWE-bench run through the eval-containers gateway.

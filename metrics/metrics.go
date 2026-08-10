@@ -112,6 +112,16 @@ type Aggregator struct {
 	sseTTFBMsBuf float64
 	sseStreamed  int64
 	sseBuffered  int64
+	// Mode dimension (#31). Enforced requests are counted per mode; observe-mode results
+	// are kept in PHYSICALLY separate fields with their own serialized names, so no query
+	// over the enforced rollups can accidentally include a hypothetical.
+	mode            components.Mode // the configured mode, for the /stats banner
+	syncRequests    int64
+	potentialRuns   int64
+	potentialBefore int64
+	potentialAfter  int64
+	potentialMs     float64
+	potentialComp   map[string]*compStat
 	// cmdfilter's per-family / per-filter ledger, plus the selector-miss ledger that
 	// makes the next filter to write data instead of guesswork.
 	filterFam  map[string]*filterStat
@@ -174,6 +184,15 @@ func (a *Aggregator) FilterMiss(selector string) {
 	a.filterMiss[selector]++
 }
 
+// SetMode records the configured operating mode so /stats can label itself — the
+// observe-mode banner has to be unmistakable, and a consumer needs to know from the
+// payload alone whether the numbers were enforced.
+func (a *Aggregator) SetMode(m components.Mode) {
+	a.mu.Lock()
+	a.mode = m
+	a.mu.Unlock()
+}
+
 type compStat struct {
 	Runs        int64 `json:"runs"`
 	Acted       int64 `json:"acted"`   // runs that actually saved tokens
@@ -201,6 +220,15 @@ func NewAggregator() *Aggregator { return &Aggregator{perComp: map[string]*compS
 func (a *Aggregator) Component(r components.Report) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	// Observe mode is a HYPOTHETICAL: nothing was applied to any request. Its numbers live
+	// in a physically separate map with its own vocabulary, so no aggregate over the
+	// enforced rollups can reach them. Mixing them would silently inflate the product's
+	// headline savings claim, which is why this is a correctness boundary rather than a
+	// presentation choice (#31).
+	if r.Mode == components.ModeObserve {
+		a.observeComp(r)
+		return
+	}
 	cs := a.perComp[r.Component]
 	if cs == nil {
 		cs = &compStat{}
@@ -244,6 +272,50 @@ func (a *Aggregator) Component(r components.Report) {
 	}
 	if !r.Reverted && !r.Skipped {
 		cs.Mutated++ // did something, even if it saved no content tokens
+	}
+	if r.Saved() > 0 && !r.Reverted && !r.Skipped {
+		cs.Acted++
+	}
+}
+
+// observeComp accumulates one observe-mode component report into the hypothetical
+// namespace. Caller holds the lock.
+func (a *Aggregator) observeComp(r components.Report) {
+	if a.potentialComp == nil {
+		a.potentialComp = map[string]*compStat{}
+	}
+	cs := a.potentialComp[r.Component]
+	if cs == nil {
+		cs = &compStat{}
+		a.potentialComp[r.Component] = cs
+	}
+	cs.Runs++
+	cs.Saved += int64(r.Saved())
+	cs.DurationMs += r.DurationMs
+	if saved := int64(r.Saved()); saved > 0 && !r.Reverted && !r.Skipped {
+		if cs.seenKeys == nil {
+			cs.seenKeys = map[string]struct{}{}
+		}
+		if len(r.CacheKeys) == 0 {
+			cs.SavedUnique += saved
+		} else {
+			newKeys := 0
+			for _, k := range r.CacheKeys {
+				if _, seen := cs.seenKeys[k]; !seen {
+					cs.seenKeys[k] = struct{}{}
+					newKeys++
+				}
+			}
+			if newKeys > 0 {
+				cs.SavedUnique += saved * int64(newKeys) / int64(len(r.CacheKeys))
+			}
+		}
+	}
+	if r.Reverted {
+		cs.Reverted++
+	}
+	if !r.Reverted && !r.Skipped {
+		cs.Mutated++
 	}
 	if r.Saved() > 0 && !r.Reverted && !r.Skipped {
 		cs.Acted++
@@ -302,9 +374,19 @@ func (a *Aggregator) RecordSSE(ttfbMs float64, buffered bool) {
 func (a *Aggregator) Run(r components.RunReport) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	// Observe: hypothetical. Separate counters, separate JSON keys (potential_* /
+	// projected_*), never added to requests/before/after.
+	if r.Mode == components.ModeObserve {
+		a.potentialRuns++
+		a.potentialBefore += int64(r.TokensBefore)
+		a.potentialAfter += int64(r.TokensAfter)
+		a.potentialMs += r.DurationMs
+		return
+	}
 	a.requests++
 	a.before += int64(r.TokensBefore)
 	a.after += int64(r.TokensAfter)
+	a.syncRequests++
 }
 
 // Snapshot is the JSON served at /stats. It reports both gross savings and the
@@ -375,6 +457,40 @@ type Snapshot struct {
 	CmdfilterFamilies map[string]filterStat `json:"cmdfilter_families,omitempty"`
 	CmdfilterFilters  map[string]filterStat `json:"cmdfilter_filters,omitempty"`
 	CmdfilterMisses   []SelectorMiss        `json:"cmdfilter_selector_misses,omitempty"`
+
+	// --- Operating mode (#31). Everything below is ADDITIVE: no existing key was renamed
+	// or removed, because deploy/harbor/*.py parses this payload. ---
+
+	// Mode is the configured operating mode ("sync" | "observe").
+	Mode string `json:"mode"`
+	// SyncEnforced counts requests whose forwarded body context-guru actually shaped. In
+	// observe mode it is 0 BY CONSTRUCTION — that is the machine-readable form of
+	// "context-guru did not modify requests".
+	SyncEnforced int64 `json:"sync_enforced"`
+
+	// Observe mode: HYPOTHETICALS. Distinct keys (potential_* / projected_*) that never
+	// share a name with an enforced metric, so a consumer cannot sum a hypothetical into a
+	// real saving even by accident. All zero outside observe mode.
+	ObserveNotice            string              `json:"observe_notice,omitempty"`
+	ObserveRequests          int64               `json:"observe_hypothetical_requests"`
+	ActualBaselineTokens     int64               `json:"actual_baseline_tokens"`     // what the agent really sent
+	ProjectedOptimizedTokens int64               `json:"projected_optimized_tokens"` // what it would have sent
+	PotentialSavedTokens     int64               `json:"potential_saved_tokens"`
+	PotentialSavingsPct      float64             `json:"potential_savings_pct"`
+	PotentialComponents      map[string]compStat `json:"potential_components,omitempty"`
+	// PotentialOverheadMsAvg is the mean wall time a compaction WOULD have added to each
+	// request had this mode been enforcing — measured off-path, so it is what sync would
+	// cost, not what observe costs.
+	PotentialOverheadMsAvg float64 `json:"potential_overhead_ms_avg"`
+	// ObserveLLMNotice warns that context-guru's own model spend (llm_calls /
+	// llm_input_tokens / llm_output_tokens, which feed cg_llm_cost in the harnesses) is
+	// OFF-PATH measurement cost in observe mode, not the cost of an enforced compaction.
+	// The tokens were really spent — the number is not hypothetical and must not be moved
+	// into the potential_* namespace — but attributing it to enforcement would be wrong.
+	// cg_added_ms_avg is likewise a real measurement of the enforced path, and in observe
+	// mode it correctly reads ~0 because that path does no pipeline work. Zeroing either
+	// would hide a true number rather than protect anyone.
+	ObserveLLMNotice string `json:"observe_llm_notice,omitempty"`
 }
 
 // SelectorMiss is one output shape that matched no filter, with how often it appeared.
@@ -382,6 +498,18 @@ type SelectorMiss struct {
 	Selector string `json:"selector"`
 	Count    int64  `json:"count"`
 }
+
+// observeNotice is the machine- and human-readable banner: in observe mode nothing was
+// applied, and every number prefixed potential_/projected_ is a hypothetical.
+const observeNotice = "OBSERVE MODE: context-guru did not modify any request. " +
+	"Every potential_*/projected_* field is a hypothetical, not a realized saving."
+
+// observeLLMNotice covers the one place observe legitimately writes an enforced-namespace
+// key: its own model spend is real money, so it stays where cost tooling already reads it,
+// labelled for what it is.
+const observeLLMNotice = "In observe mode llm_calls/llm_input_tokens/llm_output_tokens " +
+	"are the cost of MEASURING off-path, not of enforcing a compaction. The spend is real " +
+	"(not hypothetical); it simply bought a projection rather than a saving."
 
 // Snapshot returns a point-in-time copy of the rollups.
 func (a *Aggregator) Snapshot() Snapshot {
@@ -433,7 +561,11 @@ func (a *Aggregator) Snapshot() Snapshot {
 	if n := a.sseStreamed + a.sseBuffered; n > 0 {
 		bufPct = float64(a.sseBuffered) / float64(n) * 100
 	}
-	return Snapshot{
+	mode := a.mode
+	if mode == "" {
+		mode = components.ModeSync
+	}
+	snap := Snapshot{
 		Requests: a.requests, TokensBefore: a.before, TokensAfter: a.after,
 		SavedTokens: saved, SavingsPct: pct,
 		WastedTokens: a.wasted, Bounces: a.bounces, AdjustedSaved: saved - a.wasted,
@@ -444,7 +576,36 @@ func (a *Aggregator) Snapshot() Snapshot {
 		CmdfilterFamilies: copyFilterStats(a.filterFam),
 		CmdfilterFilters:  copyFilterStats(a.filterName),
 		CmdfilterMisses:   topMisses(a.filterMiss, 20),
+		Mode:              string(mode),
+		SyncEnforced:      a.syncRequests,
 	}
+	if a.potentialRuns > 0 || mode == components.ModeObserve {
+		snap.ObserveNotice = observeNotice
+		snap.ObserveLLMNotice = observeLLMNotice
+		snap.ObserveRequests = a.potentialRuns
+		snap.ActualBaselineTokens = a.potentialBefore
+		snap.ProjectedOptimizedTokens = a.potentialAfter
+		snap.PotentialSavedTokens = a.potentialBefore - a.potentialAfter
+		if a.potentialBefore > 0 {
+			snap.PotentialSavingsPct = float64(a.potentialBefore-a.potentialAfter) / float64(a.potentialBefore) * 100
+		}
+		if a.potentialRuns > 0 {
+			snap.PotentialOverheadMsAvg = a.potentialMs / float64(a.potentialRuns)
+		}
+		if len(a.potentialComp) > 0 {
+			pc := make(map[string]compStat, len(a.potentialComp))
+			for k, v := range a.potentialComp {
+				cs := *v
+				if cs.SavedUnique > 0 {
+					cs.OvercountRatio = float64(cs.Saved) / float64(cs.SavedUnique)
+				}
+				cs.seenKeys = nil
+				pc[k] = cs
+			}
+			snap.PotentialComponents = pc
+		}
+	}
+	return snap
 }
 
 func copyFilterStats(src map[string]*filterStat) map[string]filterStat {

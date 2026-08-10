@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	bschemas "github.com/maximhq/bifrost/core/schemas"
@@ -28,6 +29,7 @@ import (
 	"github.com/rossoctl/context-guru/expand"
 	"github.com/rossoctl/context-guru/internal/cheapmodel"
 	"github.com/rossoctl/context-guru/metrics"
+	"github.com/rossoctl/context-guru/modes"
 	"github.com/rossoctl/context-guru/schema"
 	"github.com/rossoctl/context-guru/store"
 	"github.com/tidwall/gjson"
@@ -79,6 +81,22 @@ type Options struct {
 	// handler always uses the configured pipeline. Supplied by main (which holds
 	// the config + emitter) so proxy stays decoupled from the config package.
 	PipelineFor func(preset string, names []string) (*components.Pipeline, error)
+	// Mode is the operating mode (#31): components.ModeSync (default, and byte-identical
+	// to pre-mode behavior) or ModeObserve. Empty = sync. Explicit by design — never
+	// inferred from the rest of the configuration.
+	Mode components.Mode
+	// Observe tunes observe mode's off-path measurement. Ignored in sync mode.
+	Observe ObserveOptions
+}
+
+// ObserveOptions tunes observe mode: one option per real decision.
+type ObserveOptions struct {
+	// MaxQueue bounds the off-path measurement queue; a full queue DROPS (counted) rather
+	// than blocking the request path. 0 = modes.DefaultMaxQueue.
+	MaxQueue int `yaml:"max_queue"`
+	// Workers is the number of drain goroutines. 0 = modes.DefaultWorkers (1), which keeps
+	// one measurement's cheap-model call in flight per process.
+	Workers int `yaml:"workers"`
 }
 
 // upstream binds a provider to its base URL, the canonical provider path to POST
@@ -97,6 +115,24 @@ type Handler struct {
 	agg    *metrics.Aggregator
 	opts   Options
 	client *http.Client
+	// tracker owns the per-session cached-prefix boundary. Always present: every mode
+	// benefits from reading and recording it in one locked step (the previous
+	// read-then-deferred-write raced between concurrent turns of a session).
+	tracker *modes.Tracker
+	// pool runs off-path measurements. nil in sync mode — there are none.
+	pool *modes.Pool
+	// observeSeq numbers observations so each request enqueues one.
+	observeSeq atomic.Uint64
+	// shadow is observe mode's own state store, separate from the live one. Observe must
+	// not write into the live store — a real request would then replay a decision that was
+	// never enforced — but it also cannot simply discard its writes: offloaders FREEZE a
+	// decision and replay it on every later turn, which is where most of the sustained
+	// saving comes from. Throwing that away each turn makes observe see only the current
+	// tail and UNDER-project by ~3x against what sync achieves.
+	//
+	// So observe gets a store of its own: as persistent as the live one, and completely
+	// disjoint from it.
+	shadow store.Store
 }
 
 // New builds the proxy handler. agg may be nil (no /stats rollups).
@@ -105,8 +141,21 @@ func New(pipe *components.Pipeline, st store.Store, agg *metrics.Aggregator, opt
 	if c == nil {
 		c = &http.Client{Timeout: 5 * time.Minute}
 	}
-	return &Handler{pipe: pipe, store: st, agg: agg, opts: opts, client: c}
+	h := &Handler{pipe: pipe, store: st, agg: agg, opts: opts, client: c, tracker: modes.NewTracker(0)}
+	if h.mode() == components.ModeObserve {
+		h.pool = modes.NewPool(opts.Observe.MaxQueue, opts.Observe.Workers)
+		h.shadow = store.NewMemory(store.Options{})
+	}
+	if agg != nil {
+		agg.SetMode(h.mode())
+	}
+	return h
 }
+
+// Close shuts down the off-path worker pool and waits briefly for its goroutines to exit,
+// so a host that builds and discards handlers (tests, a reload) leaks none. Safe on a
+// sync-mode handler and safe to call twice.
+func (h *Handler) Close() { h.pool.Stop() }
 
 // Mux wires the routes: chat proxying + health/stats/expand management.
 func (h *Handler) Mux() *http.ServeMux {
@@ -361,24 +410,32 @@ func (h *Handler) chat(provider bschemas.ModelProvider, up upstream) http.Handle
 					body = orig
 				}
 			}()
-			applyStart := time.Now()
-			body, _ = apply.BodyFull(
-				r.Context(), h.pipe, h.store, provider, body,
-				r.Header.Get("x-context-guru-session"),
-				bypassed,
-				models, window, h.opts.CacheMode,
-			)
+			var added time.Duration
+			body, added = h.applyMode(&reqInfo{
+				ctx:      r.Context(),
+				provider: provider,
+				body:     body,
+				session:  r.Header.Get("x-context-guru-session"),
+				bypassed: bypassed,
+				models:   models,
+				window:   window,
+			})
 			if h.agg != nil && !bypassed {
-				h.agg.RecordAddedLatency(float64(time.Since(applyStart).Microseconds()) / 1000.0)
+				h.agg.RecordAddedLatency(float64(added.Microseconds()) / 1000.0)
 			}
 			// Advertise the expand tool so the model can recover any offloaded content
 			// (closes the reversibility loop h.serve drives). Sticky/idempotent + appended
 			// last to keep the provider prefix cache warm; gated by InjectExpand + store.
-			mode := h.opts.InjectExpand
-			if mode == "" {
-				mode = expand.InjectAuto
+			// Skipped in observe mode: nothing was offloaded, so there is nothing to
+			// recover, and injecting a tool declaration would MODIFY the request — which is
+			// precisely the one thing observe mode promises never to do.
+			if h.mode() != components.ModeObserve {
+				im := h.opts.InjectExpand
+				if im == "" {
+					im = expand.InjectAuto
+				}
+				body, _ = expand.Inject(string(provider), im, body, h.store.Persists())
 			}
-			body, _ = expand.Inject(string(provider), mode, body, h.store.Persists())
 		}()
 		h.serve(w, r, provider, up, body, bypassed)
 	}

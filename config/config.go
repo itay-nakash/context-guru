@@ -26,6 +26,26 @@ type Config struct {
 	Pipeline   []string             `yaml:"pipeline"`
 	Components map[string]yaml.Node `yaml:"components"`
 	Store      store.Options        `yaml:"store"`
+	// Mode is the operating mode: sync (default) | observe. See #31 and
+	// docs/how-to/operating-modes.md. Empty = sync, which is byte-identical to the
+	// behavior before modes existed.
+	Mode string `yaml:"mode"`
+	// Observe tunes observe mode's off-path measurement; ignored in sync mode.
+	Observe ObserveConfig `yaml:"observe"`
+}
+
+// ObserveConfig is the `observe:` block.
+type ObserveConfig struct {
+	// MaxQueue bounds the off-path measurement queue (0 = 256). A full queue drops,
+	// counted, and never blocks the request path.
+	MaxQueue int `yaml:"max_queue"`
+	// Workers is the number of drain goroutines (0 = 1).
+	Workers int `yaml:"workers"`
+}
+
+// OperatingMode validates and returns the configured mode.
+func (c *Config) OperatingMode() (components.Mode, error) {
+	return components.ParseMode(c.Mode)
 }
 
 // Load reads and parses a YAML config file (strict: unknown keys are rejected).
@@ -48,6 +68,9 @@ func LoadBytes(b []byte) (*Config, error) {
 	}
 	if err := c.applyPreset(); err != nil {
 		return nil, err
+	}
+	if _, err := c.OperatingMode(); err != nil {
+		return nil, fmt.Errorf("config: %w", err)
 	}
 	return &c, nil
 }
