@@ -545,8 +545,35 @@ func (h *Handler) stats(w http.ResponseWriter, _ *http.Request) {
 	// Fill the CG components' own LLM cost (cheap-model usage) — kept out of the
 	// metrics package (layering) and merged here at serve time.
 	snap.LLMCalls, snap.LLMInputTokens, snap.LLMOutputTokens = cheapmodel.Usage()
+	// extract_llm economics (#28 part F). Net-after-cost is the honest headline: the three
+	// LLM* fields above report what the component SPENT, and until now nothing anywhere
+	// compared that against what its savings were WORTH — which is how an ~8x loss stayed
+	// invisible. Computed here, the layer that knows the model pricing and the cache mode.
+	// Purely additive: every pre-existing field keeps its name for deploy/harbor/*.py.
+	cacheWrite, cacheRead := cheapmodel.CacheUsage()
+	pricing := cheapmodel.PricingFromEnv()
+	cost := pricing.Cost(snap.LLMInputTokens, snap.LLMOutputTokens, cacheWrite, cacheRead)
+	// Value the saved tokens at the rate they would actually have been billed. On a
+	// caching backend a removed token saves the cache-READ rate (~10x cheaper), which is
+	// exactly why the component can be underwater while its token count looks impressive.
+	perSavedTok := agentCacheReadPerMTok / 1e6
+	if h.opts.CacheMode == "off" {
+		perSavedTok = agentFreshPerMTok / 1e6
+	}
+	xs := metrics.ExtractSnapshot(cost, float64(snap.SavedTokens)*perSavedTok, cacheWrite, cacheRead)
+	snap.Extract = &xs
 	json.NewEncoder(w).Encode(snap)
 }
+
+// Agent-model token rates used to VALUE saved tokens at /stats (claude-sonnet-5 class,
+// $3/MTok fresh, 0.1x cache read). Mirrors components/offload/extract_econ.go, which
+// applies the same rates inside the gate; kept as local constants rather than a shared
+// export because the two layers may legitimately be priced differently (the gate prices
+// the traffic it sees; /stats prices the aggregate).
+const (
+	agentFreshPerMTok     = 3.00
+	agentCacheReadPerMTok = 0.30
+)
 
 // expand resolves a stashed original by id — the HTTP side of reversibility (the
 // model-callable tool loop is a separate concern, added with response handling).

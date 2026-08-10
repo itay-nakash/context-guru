@@ -78,7 +78,11 @@ func TestSummarizeReusesCheckpoint(t *testing.T) {
 // TestExtractReusesResultCache: the same large tool output re-sent on a later turn
 // reuses the prior compaction — no second model call — and is still reduced.
 func TestExtractReusesResultCache(t *testing.T) {
-	off := newComp(t, "extract_llm", "strategy: code\nmin_tokens: 1\nmodel:\n  source: config\n")
+	// economic_gate: false — this is a MECHANISM test (does the model-written filter
+	// run and reduce?), and its small fixture output is genuinely uneconomic, so the
+	// #28 gate would correctly suppress the call. Gate economics are tested in
+	// components/offload/extract_econ_test.go against the dollar figures directly.
+	off := newComp(t, "extract_llm", "strategy: code\nmin_tokens: 1\neconomic_gate: false\nmodel:\n  source: config\n")
 	st := store.NewMemory(store.Options{})
 	filter := "data = json.decode(INPUT)\nOUTPUT = json.encode([r for r in data if \"keep\" in r[\"name\"]])\n"
 	cm := &countingModel{resp: filter}

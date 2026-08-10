@@ -33,6 +33,64 @@ func putResult(c *components.Ctx, id string, v []byte) {
 	c.Store.Put(resultKey(c.Session, id), v)
 }
 
+// --- Global (session-independent) extraction result cache (#28 C) -----------
+//
+// The session prefix above was throwing away most of the available reuse: an extraction
+// is a CONTEXT-FREE derived result, so the same content under the same extractor
+// semantics reduces the same way in any session. Measured on Terminal-Bench: 82 of 103
+// unique contents recurred ACROSS sessions, and ~93% of the component's realized value
+// came from cache reuse rather than from new LLM calls.
+//
+// Contrast issue #27's xdedup index, which is session-scoped ON PURPOSE: it mints a
+// conversational reference ("same as step N") that is meaningless outside its session.
+// The distinction is reference vs derived result, and it decides the namespace.
+//
+// The key is built by extract.ResultKey (content + prompt version + model + config
+// fingerprint), so a prompt bump, a model switch, or a config change MISSES rather than
+// silently serving a stale extraction. The store is already bounded (TTL + LRU), which
+// bounds this namespace too.
+
+// getResultGlobal returns a previously cached reduced output for a global key.
+func getResultGlobal(c *components.Ctx, gkey string) ([]byte, bool) {
+	return c.Store.Get(gkey)
+}
+
+// putResultGlobal caches a reduced output under its global key.
+func putResultGlobal(c *components.Ctx, gkey string, v []byte) {
+	c.Store.Put(gkey, v)
+}
+
+func getSummaryGlobal(c *components.Ctx, gkey string) (string, bool) {
+	b, ok := c.Store.Get(gkey + ":sum")
+	return string(b), ok
+}
+
+func putSummaryGlobal(c *components.Ctx, gkey, s string) {
+	c.Store.Put(gkey+":sum", []byte(s))
+}
+
+// --- Content recurrence (the economic gate's reuse signal) -------------------
+//
+// The gate needs to know whether content is likely to RECUR, because a compaction's
+// saving is collected on every later turn it is replayed on — recurrence is what makes an
+// extraction call pay for itself under caching. Recording each content key we considered
+// (session-independent, like the result cache) turns "have I seen this before anywhere?"
+// into a cheap store lookup.
+
+func seenKey(ck string) string { return "cg:xseen:" + ck }
+
+// hasSeenContent reports whether this content was considered for extraction before.
+func hasSeenContent(c *components.Ctx, ck string) bool {
+	_, ok := c.Store.Get(seenKey(ck))
+	return ok
+}
+
+// markSeenContent records that this content was considered, so a later encounter reads as
+// recurring.
+func markSeenContent(c *components.Ctx, ck string) {
+	c.Store.Put(seenKey(ck), []byte{1})
+}
+
 // --- Freeze + reapply (cache stability) -------------------------------------
 //
 // The cache-safety invariant: once an offloader compacts an output, it must send the

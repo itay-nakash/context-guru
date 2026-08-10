@@ -23,5 +23,22 @@ taken exactly from the `presets` map in `config/config.go`.
     (old-then-large), with `cacheinject` last so it keeps the reduced prefix
     cacheable.
 
+!!! warning "`extract_llm` now declines uneconomic calls (`codesmart`, `aggressive`)"
+    `extract_llm` is the only component that spends money to save money, and on a
+    prompt-caching backend it was measured **~8× underwater**: a token removed from a cached
+    region saves the cache-read rate (`$0.30/MTok`), not the fresh-input rate (`$3/MTok`), so
+    break-even is **~12,700 tokens per output** — far above a typical tool output.
+
+    Since #28 it applies an [economic gate](../components/extract_llm.md#economics): it calls
+    the LLM only when the expected saving exceeds the expected cost. On a caching backend that
+    means **most candidates are suppressed** and `codesmart`/`aggressive` make far fewer model
+    calls than before — cheaper and faster, with savings coming mainly from the (now global)
+    result cache. On a **non-caching** backend the gate permits far more, because there the
+    reduction is worth 10× more.
+
+    Check `/stats` → `extract.net_value_usd`. If it is negative on your workload, drop
+    `extract_llm` from the pipeline (or use `codesafe`, which never had it). `codesmart`'s
+    pinned `min_tokens: 3000` still governs its per-output floor, so that part is unchanged.
+
 Not sure which to pick? See [Choose a preset](../how-to/choose-a-preset.md).
 Every component's config lives in [Components](../components.md).

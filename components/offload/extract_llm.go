@@ -12,7 +12,9 @@ import (
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/components"
 	"github.com/rossoctl/context-guru/expand"
+	"github.com/rossoctl/context-guru/internal/cheapmodel"
 	"github.com/rossoctl/context-guru/internal/extract"
+	"github.com/rossoctl/context-guru/metrics"
 	"github.com/rossoctl/context-guru/schema"
 	"gopkg.in/yaml.v3"
 )
@@ -60,6 +62,23 @@ type ExtractLLM struct {
 	skipFileReads *bool // nil = auto (skip when cache-aware); true/false = force
 	mu            sync.Mutex
 	llmSeen       map[string]int // session -> count of qualifying (LLM-eligible) requests
+
+	// minTokensSet records whether the operator pinned min_tokens / trigger explicitly.
+	// When they did, their threshold governs (backward compatibility). When they did not,
+	// the derived pressure-based trigger is the default — no per-workload tuning (#28 E).
+	minTokensSet bool
+	// gate enables the economic gate (#28 D). Default on; `economic_gate: false` restores
+	// the old spend-on-size behavior for anyone who needs to reproduce old numbers.
+	gate bool
+	// pricing prices the extraction model's tokens for the gate's cost side (#28 D).
+	pricing cheapmodel.Pricing
+	// ratios learns this workload's real compression ratio instead of assuming one.
+	ratios ratioTracker
+	// prevTokens tracks per-session request size so growth rate is measurable (#28 E).
+	prevTokens map[string]int
+	// modelName identifies the extraction model in the global cache key, so switching
+	// models misses rather than serving another model's extraction (#28 C).
+	modelName string
 }
 
 type extractLLMConfig struct {
@@ -75,6 +94,11 @@ type extractLLMConfig struct {
 	// required verbatim by the sanity check. Default true (the powerful mode) — set
 	// false to force verified deletion-only.
 	Rewrite *bool `yaml:"rewrite"`
+	// EconomicGate opts out of the expected-value gate (#28 D). Unset = ON (the default):
+	// only call the LLM when the expected saving exceeds the expected call cost, priced
+	// from real model rates and the cache-awareness of the traffic. Set false to restore
+	// the pre-#28 spend-on-size behavior — needed only to reproduce old benchmark numbers.
+	EconomicGate *bool `yaml:"economic_gate"`
 	// SkipFileReads controls whether line-numbered source-file dumps are left verbatim.
 	// Tri-state: unset = AUTO (skip when the request is prompt-cached, reduce otherwise);
 	// true = always skip; false = always reduce. Rationale (measured, SWE-bench 50):
@@ -88,7 +112,23 @@ type extractLLMConfig struct {
 
 func newExtractLLM(raw []byte) (components.Component, error) {
 	cfg := extractLLMConfig{MinTokens: 300, Strategy: "code"}
+	// Detect whether the operator pinned a threshold BEFORE defaults are applied: the
+	// distinction between "unset" and "set to the default value" is what decides whether
+	// the smart trigger or their number governs, so it must be read from the raw YAML.
+	explicit := false
 	if len(raw) > 0 {
+		var probe struct {
+			MinTokens *int `yaml:"min_tokens"`
+			Trigger   *struct {
+				MinRequestTokens *int `yaml:"min_request_tokens"`
+				MinOutputTokens  *int `yaml:"min_output_tokens"`
+			} `yaml:"trigger"`
+		}
+		if err := yaml.Unmarshal(raw, &probe); err == nil {
+			explicit = probe.MinTokens != nil ||
+				(probe.Trigger != nil &&
+					(probe.Trigger.MinRequestTokens != nil || probe.Trigger.MinOutputTokens != nil))
+		}
 		if err := yaml.Unmarshal(raw, &cfg); err != nil {
 			return nil, err
 		}
@@ -100,13 +140,29 @@ func newExtractLLM(raw []byte) (components.Component, error) {
 	if cfg.Strategy == "" {
 		cfg.Strategy = "code"
 	}
+	gate := true // economic gate on by default (#28 D)
+	if cfg.EconomicGate != nil {
+		gate = *cfg.EconomicGate
+	}
 	return &ExtractLLM{
 		minTokens: cfg.MinTokens, strategy: cfg.Strategy,
 		modelSource: cfg.Model.Source, modelClient: cfg.Model.Client(),
 		trigger: cfg.Trigger, mode: parseMarkerMode(cfg.MarkerMode), rewrite: rewrite,
 		llmEveryN: cfg.LLMEveryN, llmMaxPerReq: cfg.LLMMaxPerReq,
 		skipFileReads: cfg.SkipFileReads, llmSeen: map[string]int{},
+		minTokensSet: explicit, gate: gate, pricing: cheapmodel.PricingFromEnv(),
+		prevTokens: map[string]int{}, modelName: cfg.Model.Model,
 	}, nil
+}
+
+// noteRequestSize records this request's size for the session and returns the previous
+// one, so the trigger can measure context growth rate (#28 E).
+func (e *ExtractLLM) noteRequestSize(session string, tokens int) int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	prev := e.prevTokens[session]
+	e.prevTokens[session] = tokens
+	return prev
 }
 
 func (*ExtractLLM) Name() string                 { return "extract_llm" }
@@ -166,7 +222,39 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 	if model != nil && fires && !e.llmAllowedThisRequest(c.Session) {
 		model = nil
 	}
+	// Derived trigger (#28 E): context pressure + growth rate replace a hand-tuned
+	// threshold. When min_tokens/trigger is set explicitly the operator's value governs.
+	reqTokens := schema.MessagesTokens(req)
+	prevTokens := e.noteRequestSize(c.Session, reqTokens)
+	pressure := contextPressure(reqTokens, c.CtxWindow)
+	growth := growthRate(reqTokens, prevTokens)
+	pressureFires, triggerReason := shouldFire(pressure, growth, e.minTokensSet)
+	// An unknown context window (0) makes pressure meaningless; fall back to the
+	// configured Trigger alone, the same fail-open convention Trigger itself uses.
+	if c.CtxWindow <= 0 {
+		pressureFires, triggerReason = fires, "context window unknown; absolute trigger only"
+	}
+	if model != nil && !pressureFires {
+		model = nil // no model call this request; frozen reapplications still run below
+	}
+	metrics.RecordExtractionReason(triggerReason)
+
 	floor := e.outputFloor(c.CtxWindow)
+	// Without an explicit min_tokens, derive the per-output floor from context pressure so
+	// there is no per-workload number to pick (#28 E).
+	if !e.minTokensSet {
+		if pf := pressureFloor(c.CtxWindow, pressure); pf > 0 {
+			floor = pf
+		}
+	}
+	// Gate inputs shared by every candidate this request.
+	val := savedTokenValue(c)
+	perCall := callCost(e.pricing)
+	ratio := e.ratios.ratio()
+	turnsSoFar := len(req.Input)
+	extCfg := extract.DefaultCfg()
+	extCfg.Mode, extCfg.Floor, extCfg.Rewrite = e.strategy, floor, e.rewrite
+
 	keepIDs := extract.HarvestIdentifiers(goal, 40)
 	tools := toolIndices(req)
 	var keys []string
@@ -226,8 +314,24 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 		if isKeptVerbatim(c, id) {
 			continue
 		}
-		if cached, hit := getResult(c, id); hit {
-			summary, _ := getSummary(c, id)
+		// Global, content-hash result cache (#28 C). Keyed on content + prompt version +
+		// model + config fingerprint, with NO session prefix — an identical output in a
+		// different session reuses the reduction instead of paying for it again (measured:
+		// 82 of 103 unique contents recurred across sessions). A version/model/config
+		// change misses rather than serving a stale extraction.
+		gkey := extract.ResultKey(id, e.modelName, extCfg)
+		cached, hit := getResultGlobal(c, gkey)
+		if !hit {
+			// One-time migration read: honor a pre-#28 session-scoped entry so upgrading
+			// does not re-pay for work already done in this session.
+			cached, hit = getResult(c, id)
+		}
+		metrics.RecordExtractionCacheLookup(hit)
+		if hit {
+			summary, _ := getSummaryGlobal(c, gkey)
+			if summary == "" {
+				summary, _ = getSummary(c, id)
+			}
 			apply(i, content, string(cached), summary)
 			dbgReapply++
 			continue
@@ -258,6 +362,27 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 		if skipFR && looksLikeFileRead(content) {
 			continue
 		}
+		// The economic gate (#28 D). This is the check the component never had: is one
+		// LLM call worth it for THIS output, given that a saved token in a cached region
+		// is worth 10x less? Where caching makes extraction pointless, suppress it; on a
+		// non-caching backend or for recurring content, allow it.
+		if e.gate {
+			// Content the store has seen before in ANY session is likely to recur again,
+			// which is what amortizes the call across turns.
+			seenBefore := hasSeenContent(c, id)
+			d := evaluateGate(sz, ratio, val, perCall, seenBefore, turnsSoFar)
+			if !d.allow {
+				metrics.RecordExtractionSuppressed(d.reason)
+				if debugExtractLLM {
+					slog.Info("cg.debug.extract_llm.gate", "decision", "suppress",
+						"reason", d.reason, "size", sz, "exp_saving_usd", d.expSaving,
+						"exp_cost_usd", d.expCost, "cacheAware", c.CacheAware)
+				}
+				continue
+			}
+			metrics.RecordExtractionReason(d.reason)
+		}
+		markSeenContent(c, id)
 		cands = append(cands, cand{i, content, id})
 	}
 	if debugExtractLLM && len(tools) > 0 {
@@ -288,13 +413,20 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 				defer wg.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
-				cfg := extract.DefaultCfg()
-				cfg.Mode, cfg.Floor, cfg.Rewrite = e.strategy, floor, e.rewrite
 				ctx, cancel := context.WithTimeout(c.Ctx, llmCallTimeout)
 				defer cancel()
-				res, sum, _ := extract.RunExtractionSummary(ctx, cands[k].content, goal, keepIDs, schema.TextTokens(cands[k].content), cfg, model)
+				before := schema.TextTokens(cands[k].content)
+				start := time.Now()
+				res, sum, _ := extract.RunExtractionSummary(ctx, cands[k].content, goal, keepIDs, before, extCfg, model)
+				metrics.RecordExtractionCall(float64(time.Since(start).Milliseconds()))
 				if res != "" && res != cands[k].content {
 					out[k] = outT{res, sum}
+					// Feed the observed ratio so the gate prices future calls on what this
+					// workload actually achieves, not on an assumption.
+					e.ratios.observe(before-schema.TextTokens(res), before)
+					metrics.RecordExtractionSaving(before - schema.TextTokens(res))
+				} else {
+					e.ratios.observe(0, before) // a miss is real evidence: ratio 0
 				}
 			}(k)
 		}
@@ -303,9 +435,10 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 			if out[k].projected == "" {
 				continue
 			}
-			putResult(c, cands[k].id, []byte(out[k].projected))
+			gkey := extract.ResultKey(cands[k].id, e.modelName, extCfg)
+			putResultGlobal(c, gkey, []byte(out[k].projected))
 			if out[k].summary != "" {
-				putSummary(c, cands[k].id, out[k].summary)
+				putSummaryGlobal(c, gkey, out[k].summary)
 			}
 			apply(cands[k].i, cands[k].content, out[k].projected, out[k].summary)
 		}
