@@ -22,6 +22,7 @@ infrastructure the components sit on.
 | `session/` | resolve the session key (explicit id, else content hash) |
 | `modes/` | per-session cached-prefix boundary (`Tracker`) + the bounded off-path worker pool (`Pool`) |
 | `metrics/` | `Emitter` implementations: `Slog`, `Aggregator` (for `/stats`), `Tee` |
+| `dash/` | the persistent observability layer: SQLite store, off-hot-path capture, SSE hub, JSON API, embedded UI |
 | `config/` | strict YAML loader, presets, pipeline builder |
 | `proxy/` | the standalone/gateway HTTP proxy |
 | `adapters/bifrost/` | `LLMPlugin` adapter to embed the pipeline in a bifrost deployment |
@@ -195,30 +196,6 @@ provider requires one `tool_result` per `tool_call_id`). A miss silently turns a
 lossy — the known TTL edge, much narrower now the TTL slides on every read (see
 [Freeze lifetime](#freeze-lifetime-and-which-way-to-fail)).
 
-### The loop on a streaming response
-
-The loop needs a whole assistant message; SSE delivers events. So the host decides per request,
-from the request bytes, whether it can afford to look:
-
-- **no marker in `messages`/`system`** → nothing to expand → stream through untouched;
-- **marker present** → buffer the stream, rebuild the message with `expand.AggregateSSE`
-  (Anthropic dialect only — other dialects return `ok=false` and are replayed raw), inspect, and
-  either continue the loop or replay the buffered bytes verbatim.
-
-Buffering is the one thing that turns a stream into a non-stream, so the marker test must be tight
-in *both* directions: a false negative loses a real expand call, a false positive silently costs
-every request its time-to-first-byte. It scans only model-visible content (`messages`, `system`) —
-scanning the whole body also matched the expand tool description the host injects itself, which made
-it unconditionally true (issue #26). `/stats` exposes `sse_streamed` / `sse_buffered` /
-`sse_buffered_pct` and the two TTFB averages so the fast path is measured, not assumed.
-
-**Markers on the wire are usually HTML-escaped.** `encoding/json` escapes `<` by default — a caller
-can opt out with `Encoder.SetEscapeHTML(false)`, and some non-Go clients never escape it — and `sjson`
-escapes it whenever the value contains a newline, which is how every marker is appended. So `<<cg:H>>`
-in the model's view is normally `<<cg:H>>` in the bytes. Marker matching on *decoded* content
-(`expand.HasPlaceholder`, used by the components) sees the plain form; matching on *raw request
-bytes* (`expand.rawMarkerRe`, used by the host's streaming decision) must accept both, and does.
-
 ## State: the Store
 
 One `Store` interface, in-memory TTL+LRU default (both hosts share it). Defaults: **10000s sliding
@@ -321,10 +298,16 @@ of per-request percentages. It also reports:
   and individual filters pay off, and which output shapes matched nothing;
 - `saved_tokens` vs `saved_tokens_unique` and `overcount_ratio` — cumulative vs distinct. The agent
   re-sends history verbatim every turn, so the cumulative figure double-counts. Quote the unique one;
-- `mode` / `sync_enforced`, and the `potential_*` / `projected_*` observe namespace.
+- `mode` / `sync_enforced`, and the `potential_*` / `projected_*` observe namespace;
+- the four provider-billed token tiers (`fresh_input_tokens`, `cache_read_tokens`,
+  `cache_write_tokens`, `output_tokens`), plus `attempted_tokens` / `frozen_tokens` and the
+  two extra ratios derived from them (`savings_pct_attempted`, `savings_pct_new_input`).
 
-Fields are only ever **added** to `/stats`; the harbor harnesses parse it, so no field is renamed
-or removed. The full field list is in [Routes](reference/routes.md#get-stats).
+`/stats` is **append-only by contract**: `deploy/harbor/*.py` parses it to produce every
+published benchmark result, so a rename would invalidate the reproduction path *silently*
+(the harness would keep running and report zeros). A golden test asserts the exact key set
+of both the top-level object and each per-component object. The full field list is in
+[Routes](reference/routes.md#get-stats).
 
 ## Operating modes
 
@@ -392,6 +375,82 @@ or cached content falls back into the mutable tail.
   fallback.
 - `observe`: the forwarded body *is* the input, so there is nothing for a failure to
   damage; a panicking observation is contained by the pool and counted.
+
+## Observability: the dashboard store (D11)
+
+`Aggregator` answers "what is happening now" and forgets everything on restart. The
+[dashboard](dashboard.md) answers "what happened, and was it worth it" — which needs
+durability, filtering and per-request detail. It is a **separate, additive layer**: the
+aggregator is untouched and stays the fast in-process counter.
+
+```mermaid
+flowchart LR
+  H[chat handler] -->|apply.BodyOpts| P[pipeline]
+  P --> U[upstream]
+  U --> C[client]
+  H -. one struct,<br/>one non-blocking send .-> Q[[capture channel<br/>buffered · drops + counts]]
+  Q --> W[writer goroutine<br/>batched transaction]
+  W --> DB[(SQLite · WAL<br/>requests<br/>request_components<br/>request_content<br/>bench_runs/tasks)]
+  W --> S[SSE hub<br/>write timeout + eviction]
+  DB --> A[/api/*<br/>filters · keyset paging · query-time buckets/]
+  S --> A
+  A --> UI[go:embed single-page UI]
+```
+
+Five decisions, and what each one refuses:
+
+**Capture is off the hot path, and drops rather than blocks.** The handler builds one
+`dash.Event` from values the request path already computed and does a channel send with a
+`default:` branch. A full queue increments a drop counter that the dashboard itself
+displays. *Refuses:* observability that can add latency to, or fail, a request.
+
+"Off the hot path" has to mean the whole pipeline, not just the send. The first version of
+this layer redacted captured content inside the handler's `defer` — which runs *before the
+handler returns*, so a keep-alive client's next request queued behind nine regexes over up
+to 48 blobs. The channel send was genuinely ~175 ns and the request still got ~53 ms
+slower. Everything expensive (redaction, gzip, the insert, the SSE fan-out) now happens on
+the **writer goroutine**, and the regression test drives a real handler with content
+capture ON rather than calling `Record` directly — a benchmark of the cheap half of a
+two-part path will report the cheap half.
+
+**`apply.BodyOpts` is the capture point.** `BodyFull` delegates to it, so the rewrite is
+byte-identical whether or not anyone is looking; the `Trace` embedded in its `Result`
+carries the resolved session, the `RunReport`, the cache-awareness facts
+(`AttemptedTokens` / `FrozenTokens`) and each rewritten message's before/after text — the
+same material `CONTEXT_GURU_DUMP` writes to a file. *Refuses:* a parallel accounting path
+that could disagree with the pipeline's own.
+
+**Redaction before the database, never on read.** Headers are blanket-redacted by key
+against a short allowlist (a denylist fails the moment a gateway invents a new auth
+header); config keys are allowlisted, with credential-named keys always withheld, and an
+allowlisted key's *value* is still checked for an embedded `user:password@` credential.
+
+Captured message **content** is the one surface that cannot be allowlisted — it is
+arbitrary agent output — so it gets pattern scrubbing, and a pattern denylist is
+structurally always behind reality: a review of 22 realistic credential shapes found 11
+passing through, including `Authorization: Bearer <token>`, where the pattern matched the
+scheme and left the token. The patterns are fixed and the shapes are now a table-driven
+test, but the honest conclusion is that this mechanism cannot be *proved* complete, so
+content capture is **opt-in** (`--dashboard-content`, default off) rather than opt-out.
+*Refuses:* a secret on disk, a redact-on-read filter one forgotten code path from leaking
+it, and a default that writes arbitrary transcripts to disk behind a denylist.
+
+**Percentages at read time, cost at write time.** Ratios are derived per query, so a
+filter change needs no rebuild. Costs are computed when the row is written, so history does
+not reprice when a model's published rate changes. *Refuses:* a "savings" figure that
+silently changes retroactively.
+
+**No rollup tables.** Time series are bucketed in SQL (`ts/bucket*bucket GROUP BY 1`).
+*Refuses:* a pre-aggregation layer to keep consistent before any query is measurably slow.
+
+Timestamps are epoch **milliseconds** throughout — a formatted locale string cannot be
+range-queried, sorted portably or bucketed. Retention is bounded by age **and** size. The
+schema carries a version; a mismatch renames the old file aside and starts fresh, because a
+dashboard is a derived view and discarding it beats refusing to boot.
+
+Per-request **content** and the effective **configuration** are served to loopback or an
+explicit trusted CIDR only; aggregates are open, because a proxy bound to `0.0.0.0` should
+still report its own numbers.
 
 ## Config & registry
 
