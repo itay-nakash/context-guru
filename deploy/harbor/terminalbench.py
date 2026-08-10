@@ -1,23 +1,28 @@
 #!/usr/bin/env python3
-"""SWE-bench Verified benchmark harness: run baseline (off) vs a context-guru config
-LIVE through the proxy with the claude-code agent, and collect the FULL metric set
-per trial — reward, steps, wall-time, and cache-aware token/cost accounting — so we
-can compare a config against baseline honestly (including whether offload preserves
-the prompt-cache hit rate, the subtle way CE can *raise* cost while cutting content).
+"""Terminal-Bench 2.0 benchmark harness: run the baseline (`off` transparent
+passthrough) — and, later, context-guru/headroom/rtk arms — LIVE through the proxy
+with the claude-code agent on aws/claude-sonnet-5, collecting the SAME full metric
+set as the SWE-bench study (reward, steps, wall-time, cache-aware token/cost
+accounting, cache-hit rate).
 
-Per config it: (1) starts the proxy on :4000 with that preset (+ optional stream
-capture for later per-component replay, + optional DUMP for real change logs,
-+ INJECT_EXPAND=auto so offload is reversible); (2) runs harbor over the task list;
-(3) parses each trial's result.json (reward, cost, timings) and
-agent/trajectory.json final_metrics (prompt/cached/creation/read/completion tokens,
-cost, steps). Writes a per-trial CSV + a per-config summary JSON, and prints a
-baseline-vs-config table.
+This is a thin adaptation of `swebench.py`: the ONLY benchmark-specific change is the
+Harbor dataset (`terminal-bench@2.0` instead of `swebench-verified@1.0`) and the
+default jobs-root. The claude-code trajectory parser, the cache-aware cost model, and
+the summarizer are agent-specific (not benchmark-specific), so every number is
+computed identically to the SWE arms and is directly comparable in methodology.
 
-Metrics come from the claude-code agent's own trajectory (cache-aware). We also
-recompute a normalized $ from tokens × the live sonnet-5 price so cost is comparable
-even if the agent's internal pricing differs.
+Baseline routing note: like the SWE baseline arm, "baseline" runs through the `off`
+passthrough proxy on :4000 (transparent — no compaction) so routing/model-forcing is
+byte-identical to how the compaction arms will later run. The only difference between
+baseline and a framework arm is the compaction, never the plumbing.
 
-Usage: swebench.py --tasks /tmp/cg-runs/swe3.txt --configs off general --jobs-root /tmp/cg-runs/swebench --n 3
+Usage:
+  # 1-task smoke:
+  python3 deploy/harbor/terminalbench.py --tasks /tmp/tb-runs/tb1.txt --configs off \
+     --jobs-root /tmp/tb-runs/smoke --n 1
+  # full 89-task baseline:
+  python3 deploy/harbor/terminalbench.py --tasks /tmp/tb-runs/tb89.txt --configs off \
+     --jobs-root /tmp/tb-runs/tb89 --n 2
 """
 import argparse, glob, json, os, subprocess, sys, time, urllib.request
 from pathlib import Path
@@ -27,9 +32,10 @@ HB = Path("/home/vpcuser/projects/context-engineering/harbor")
 BIN = "/tmp/cg-runs/cg-proxy-d1"
 PORT = 4000
 LAN = "9.47.170.83"
+DATASET = "terminal-bench@2.0"  # <-- the only benchmark-specific difference vs swebench.py
 PRICES_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 MODEL = "aws/claude-sonnet-5"
-CHEAP_MODEL = "aws/claude-haiku-4-5"  # fast/cheap model for CG's own compaction LLM (extract_llm)
+CHEAP_MODEL = "aws/claude-haiku-4-5"  # for CG's own compaction LLM (extract_llm) in later arms
 
 
 def creds():
@@ -61,65 +67,28 @@ def stop_proxy():
     time.sleep(2)  # let the port fully release (avoids bind race on restart)
 
 
-# Custom (non-preset) configs, referenced by name on --configs. `codesmart` is the
-# coding-appropriate best-effort config: NO blind `mask` (which hid re-referenced
-# outputs and tripled steps on SWE), instead the LLM extract:code strategy does
-# relevance-aware, deletion-only trimming, plus safe deterministic components.
+# Custom (non-preset) configs for the LATER framework arms — kept identical to the SWE
+# harness so a terminal-bench framework run is a one-flag change. Baseline uses `off`.
 CUSTOM_CONFIGS = {
+    # cacheinject ALONE. Removes no content tokens, so any delta vs `off` is purely
+    # cache mechanics (breakpoint placement + the cross-session prefix repairs that
+    # apply/prefixorder.go gates on this component). Confirmed by
+    # proxy_tokens_before == proxy_tokens_after in the summary.
+    "cacheonly": "pipeline: [cacheinject]\n",
     "codesmart": (
-        # Split extract: the DETERMINISTIC `extract` runs every step (cheap, conservative
-        # noise collapse), then the LLM-driven `extract_llm` does relevance-aware rewriting
-        # on what's still large. NO `collapse` (blind head/tail can drop needed content),
-        # NO `mask` (age-based, harmful on coding traffic). Cache-aware by default
-        # (supersession/age offloaders stay in the uncached tail).
-        # extract_llm BEFORE the deterministic extract: the LLM gets first crack at LARGE
-        # new outputs (relevance skeletonization — the big win), marking them; the
-        # deterministic extract then strips ANSI/noise on the smaller outputs the LLM left
-        # untouched. (When extract ran first it marked outputs so extract_llm skipped them
-        # via HasPlaceholder → the LLM never fired.)
         "pipeline: [format, dedup, failed_run, cmdfilter, extract_llm, extract, cacheinject]\n"
         "components:\n"
         "  extract:\n"
-        "    min_tokens: 400\n"  # deterministic, zero-latency: catches obvious noise every step
+        "    min_tokens: 400\n"
         "  extract_llm:\n"
         "    strategy: code\n"
         "    model:\n"
         "      source: config\n"
-        # LLM compaction is cache-safe by construction: it only ever NEWLY compacts the
-        # single NEWEST tool output (the one not yet in the provider cache), freezes it,
-        # and replays it byte-identically on later turns — so it shrinks this turn's
-        # cache-WRITE with zero prefix mutation. Fires only on MEDIUM/LARGE outputs
-        # (>=1200 tok) so most turns make no model call at all (low latency + low CG cost).
-        # File reads: skip_file_reads unset = AUTO (skipped on cached agents where they
-        # already bill cheap; skeletonized on non-caching backends). failed_run likewise
-        # auto-skips NEW collapses on cached agents (superseded runs already bill cheap).
-        # Threshold raised to 1500: the LLM fires only on genuinely LARGE outputs (which
-        # hold the bulk of the token mass), so most turns make no model call — cutting
-        # latency and CG cost — while the free deterministic `extract` handles smaller
-        # noise. Parallel per-output calls (independent, ~1 call wall-time per turn).
-        # Absolute floor (NO min_output_frac: OutputFloor returns the fraction *instead of*
-        # the absolute, and sonnet-5's window resolves to 1M → 0.0075*1M=7500 → almost
-        # nothing qualified → 0 LLM calls. Absolute 3000 is predictable and fires on large
-        # file reads / big logs — the token mass — without a flood of medium-output calls
-        # (bounds latency). Parallel per-output calls keep a turn's batch to ~1 call's wall.
         "    min_tokens: 3000\n"
         "    trigger:\n"
         "      min_request_tokens: 3000\n"
         "    llm_every_n_requests: 1\n"
         "    llm_max_per_request: 4\n"
-    ),
-    # cacheinject ALONE. Isolates the prompt-cache lever from token reduction: no
-    # component here removes a single content token, so any cost delta vs `off` is
-    # purely breakpoint placement. This is the arm that tests whether cacheinject
-    # earns its place — the offline model says placement headroom against
-    # claude-code's own breakpoints is ~0%, and this is the live check of that.
-    "cacheonly": "pipeline: [cacheinject]\n",
-    # conservative deterministic-only (no LLM, no mask): safe control
-    "codesafe": (
-        "pipeline: [format, dedup, failed_run, cmdfilter, extract, collapse, cacheinject]\n"
-        "components:\n"
-        "  collapse:\n"
-        "    max_tokens: 3000\n"
     ),
 }
 
@@ -137,16 +106,16 @@ def start_proxy(preset, base, token, capture=None, dump=None):
     if dump:
         env["CONTEXT_GURU_DUMP"] = dump
         Path(dump).unlink(missing_ok=True)
-    log = open(f"/tmp/cg-runs/proxy-swebench-{preset}.log", "w")
+    log = open(f"/tmp/tb-runs/proxy-terminalbench-{preset}.log", "w")
     PRESETS = {"off", "safe", "balanced", "aggressive", "coding", "mcp", "agent", "general"}
     if preset in CUSTOM_CONFIGS:
-        cfgp = f"/tmp/cg-runs/cfg-{preset}.yaml"
+        cfgp = f"/tmp/tb-runs/cfg-{preset}.yaml"
         Path(cfgp).write_text(CUSTOM_CONFIGS[preset])
         args = [BIN, "--config", cfgp]
     elif preset in PRESETS:
         args = [BIN, "--preset", preset]
     else:  # single component name -> one-component pipeline
-        cfgp = f"/tmp/cg-runs/cfg-{preset}.yaml"
+        cfgp = f"/tmp/tb-runs/cfg-{preset}.yaml"
         Path(cfgp).write_text(f"pipeline: [{preset}]\n")
         args = [BIN, "--config", cfgp]
     p = subprocess.Popen(args, cwd=str(CG), stdout=log, stderr=log,
@@ -160,23 +129,22 @@ def start_proxy(preset, base, token, capture=None, dump=None):
     raise RuntimeError(f"proxy for {preset} did not come up")
 
 
-def run_harbor(tasks, jobs_dir, n, setup_mult, build_mult, agent_mult):
+def run_harbor(tasks, jobs_dir, n, setup_mult, build_mult, agent_mult, max_retries=2):
     proxy_url = f"http://{LAN}:{PORT}/anthropic"
     inc = " ".join(f"-i {t}" for t in tasks)
     home = os.path.expanduser("~")
     abs_path = f"{home}/.local/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     cmd = (f"cd {HB} && ANTHROPIC_BASE_URL='{proxy_url}' ANTHROPIC_API_KEY='sk-proxy' "
            f"ANTHROPIC_AUTH_TOKEN='sk-proxy' PATH='{abs_path}' HOME='{home}' "
-           f"{home}/.local/bin/uv run harbor run -y -d swebench-verified@1.0 -a claude-code -m '{MODEL}' "
+           f"{home}/.local/bin/uv run harbor run -y -d {DATASET} -a claude-code -m '{MODEL}' "
            f"--env docker {inc} -n {n} --jobs-dir '{jobs_dir}' "
-           # --no-delete keeps each task's image after the trial so it is NOT re-pulled
-           # on later runs — avoids exhausting the Docker Hub anonymous pull quota (the
-           # gotcha that made a back-to-back off+codesmart run fail ~30 env builds).
+           # --no-delete keeps each task's image after the trial so its base layers are
+           # NOT re-pulled on later runs — avoids exhausting the Docker Hub anonymous quota.
            f"--no-delete "
            f"--agent-setup-timeout-multiplier {setup_mult} --environment-build-timeout-multiplier {build_mult} "
-           f"--agent-timeout-multiplier {agent_mult} --max-retries 2 "
+           f"--agent-timeout-multiplier {agent_mult} --max-retries {max_retries} "
            f"--ae ANTHROPIC_BASE_URL='{proxy_url}' --ae ANTHROPIC_API_KEY='sk-proxy' --ae ANTHROPIC_AUTH_TOKEN='sk-proxy'")
-    log = f"/tmp/cg-runs/run-swebench-{Path(jobs_dir).name}.log"
+    log = f"/tmp/tb-runs/run-terminalbench-{Path(jobs_dir).name}.log"
     with open(log, "w") as f:
         subprocess.run(["sg", "docker", "-c", cmd], stdout=f, stderr=f)
     return log
@@ -212,7 +180,6 @@ def parse_trials(jobs_dir, pr):
         cwrite = ex.get("total_cache_creation_input_tokens") or 0
         cread = ex.get("total_cache_read_input_tokens") or cached
         fresh = max(pt - cread - cwrite, 0)  # uncached fresh input
-        # normalized cache-aware cost from live sonnet-5 pricing
         norm_cost = fresh * pr[0] + ct * pr[1] + cread * pr[2] + cwrite * pr[3]
         wall = None
         try:
@@ -251,6 +218,7 @@ def summarize(cfg, rows):
                 mean_completion_tokens=avg("completion_tokens"),
                 cache_hit_rate=round(tot("cache_read") / cacheable, 4) if cacheable else None,
                 total_fresh_input=tot("fresh_input"), total_cache_read=tot("cache_read"),
+                total_cache_write=tot("cache_write"), total_completion=tot("completion_tokens"),
                 total_norm_cost=round(tot("norm_cost"), 4), mean_norm_cost=avg("norm_cost"),
                 mean_agent_cost=avg("agent_cost"), mean_wall_s=avg("wall_s"),
                 mean_agent_wall_s=avg("agent_wall_s"))
@@ -259,36 +227,34 @@ def summarize(cfg, rows):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tasks", required=True)
-    ap.add_argument("--configs", nargs="+", default=["off", "general"])
-    ap.add_argument("--jobs-root", default="/tmp/cg-runs/swebench")
-    ap.add_argument("--n", type=int, default=3, help="harbor concurrency")
+    ap.add_argument("--configs", nargs="+", default=["off"])
+    ap.add_argument("--jobs-root", default="/tmp/tb-runs/tb89")
+    ap.add_argument("--n", type=int, default=2, help="harbor concurrency")
     ap.add_argument("--setup-mult", type=float, default=4.0, help="agent-setup timeout multiplier")
     ap.add_argument("--build-mult", type=float, default=4.0, help="environment-build timeout multiplier")
+    # keep methodology identical to the SWE study (setup 4 / build 4 / agent 1.5) so the two
+    # benchmarks are directly comparable; the task.yaml's own max_agent_timeout_sec still applies.
     ap.add_argument("--agent-mult", type=float, default=1.5, help="agent-execution timeout multiplier")
-    ap.add_argument("--capture-config", default="off", help="which config also captures the stream for replay")
-    ap.add_argument("--dump-configs", nargs="*", default=["general"], help="configs that DUMP before→after change logs")
+    ap.add_argument("--max-retries", type=int, default=2, help="harbor per-trial retries (bump under high concurrency to absorb transient 429s)")
+    ap.add_argument("--capture-config", default=None, help="which config also captures the stream for replay")
+    ap.add_argument("--dump-configs", nargs="*", default=[], help="configs that DUMP before→after change logs")
     a = ap.parse_args()
     base, token = creds()
     pr = price(MODEL)
-    cpr = price(CHEAP_MODEL)  # CG's OWN compaction LLM is the CHEAP model — price it at ITS rate
+    cpr = price(CHEAP_MODEL)
     tasks = [t.strip() for t in open(a.tasks) if t.strip()]
-    print(f"SWE-bench: {len(tasks)} tasks × {len(a.configs)} configs (n={a.n}) | "
+    print(f"Terminal-Bench 2.0: {len(tasks)} tasks × {len(a.configs)} configs (n={a.n}) | "
           f"price in=${pr[0]*1e6:.2f} out=${pr[1]*1e6:.2f} cread=${pr[2]*1e6:.2f} cwrite=${pr[3]*1e6:.2f} /M\n")
     all_summ = []
     for cfg in a.configs:
         jobs = f"{a.jobs_root}/{cfg}"
         subprocess.run(f"rm -rf {jobs}", shell=True)
-        # Captures go under the RUN's jobs_root, not a shared /tmp path. A fixed path
-        # is silently destructive: start_proxy unlinks it, so launching any new run
-        # truncates the capture an earlier analysis was computed from — which is
-        # exactly how the 472-request capture behind docs/cache-optimization.md was
-        # lost mid-analysis. Run-scoped means a new run can never clobber an old one.
-        cap = f"{a.jobs_root}/capture-{cfg}.jsonl" if cfg == a.capture_config else None
-        dump = f"{a.jobs_root}/dump-{cfg}.jsonl" if cfg in a.dump_configs else None
+        cap = f"/tmp/tb-runs/capture-terminalbench.jsonl" if cfg == a.capture_config else None
+        dump = f"/tmp/tb-runs/dump-terminalbench-{cfg}.jsonl" if cfg in a.dump_configs else None
         print(f"### config={cfg} (capture={'yes' if cap else 'no'} dump={'yes' if dump else 'no'}) ...", flush=True)
         start_proxy(cfg, base, token, capture=cap, dump=dump)
         t0 = time.time()
-        run_harbor(tasks, jobs, a.n, a.setup_mult, a.build_mult, a.agent_mult)
+        run_harbor(tasks, jobs, a.n, a.setup_mult, a.build_mult, a.agent_mult, a.max_retries)
         rows = parse_trials(jobs, pr)
         Path(f"{a.jobs_root}/rows-{cfg}.json").write_text(json.dumps(rows, indent=1))
         st = {}
@@ -300,11 +266,7 @@ def main():
         s = summarize(cfg, rows)
         s["proxy_savings_pct"] = round(st.get("savings_pct", 0), 2)
         s["proxy_bounces"] = st.get("bounces")
-        s["proxy_tokens_before"] = st.get("tokens_before")
-        s["proxy_tokens_after"] = st.get("tokens_after")
         s["wall_total_min"] = round((time.time() - t0) / 60, 1)
-        # Per-component CG metrics: savings, invocations, and the component's OWN
-        # latency (duration_ms) — the cost CG itself adds, separate from the agent.
         comps = st.get("components", {}) or {}
         s["per_component"] = {k: {"runs": v.get("runs"), "acted": v.get("acted"),
                                   "saved_tokens": v.get("saved_tokens"),
@@ -314,40 +276,23 @@ def main():
                               for k, v in comps.items()}
         s["cg_added_ms_avg"] = st.get("cg_added_ms_avg")
         s["upstream_ms_avg"] = st.get("upstream_ms_avg")
-        s["upstream_ms_avg_bypassed"] = st.get("upstream_ms_avg_bypassed")
-        # CG components' OWN LLM cost (cheap-model calls, e.g. extract:code) — priced
-        # like the agent (input/output). This is spend CG adds on top of the agent.
         lc, li, lo = st.get("llm_calls", 0), st.get("llm_input_tokens", 0), st.get("llm_output_tokens", 0)
         s["cg_llm_calls"] = lc
-        s["cg_llm_input_tokens"] = li
-        s["cg_llm_output_tokens"] = lo
-        s["cg_llm_cost"] = round(li * cpr[0] + lo * cpr[1], 4)  # cheap-model rate, not agent rate
+        s["cg_llm_cost"] = round(li * cpr[0] + lo * cpr[1], 4)
         s["cg_total_latency_s"] = round(sum(v.get("duration_ms", 0) for v in comps.values()) / 1000, 1)
-        # honest total cost = agent cost (normalized) + CG's own LLM cost
         if s.get("total_norm_cost") is not None:
             s["total_cost_incl_cg"] = round(s["total_norm_cost"] + s["cg_llm_cost"], 4)
         all_summ.append(s)
         print(json.dumps(s, indent=1), flush=True)
-    Path(f"{a.jobs_root}/summary.json").write_text(json.dumps(dict(model=MODEL, price=pr, tasks=len(tasks), configs=all_summ), indent=1))
-    # comparison table
+    Path(f"{a.jobs_root}/summary.json").write_text(json.dumps(dict(model=MODEL, price=pr, dataset=DATASET, tasks=len(tasks), configs=all_summ), indent=1))
     print("\n==== SUMMARY ====")
     hdr = (f"{'config':<10}{'solved':>8}{'rate':>7}{'steps':>7}{'cache_hit':>10}"
-           f"{'agent$/t':>9}{'cg_llm$':>8}{'save%':>7}{'cg_lat_s':>9}{'bounces':>8}")
+           f"{'agent$/t':>9}{'wall_s/t':>9}{'excs':>6}")
     print(hdr)
     for s in all_summ:
         print(f"{s['config']:<10}{str(s['solved'])+'/'+str(s['scored']):>8}{str(s['solve_rate']):>7}"
               f"{str(s['mean_steps']):>7}{str(s['cache_hit_rate']):>10}{str(s['mean_norm_cost']):>9}"
-              f"{str(s.get('cg_llm_cost')):>8}{str(s['proxy_savings_pct']):>7}{str(s.get('cg_total_latency_s')):>9}{str(s['proxy_bounces']):>8}")
-    # per-component breakdown per config
-    print("\n---- per-component (saved_tokens / runs / own-latency_s) ----")
-    for s in all_summ:
-        pc = s.get("per_component", {})
-        if not pc:
-            continue
-        parts = [f"{k}:{v['saved_tokens']}tok/{v['runs']}r/{round((v['duration_ms'] or 0)/1000,1)}s" for k, v in sorted(pc.items(), key=lambda x: -(x[1]['saved_tokens'] or 0))]
-        print(f"  {s['config']}: " + " | ".join(parts))
-        if s.get("cg_llm_calls"):
-            print(f"    cg_llm: {s['cg_llm_calls']} calls, in={s['cg_llm_input_tokens']} out={s['cg_llm_output_tokens']} tokens, cost=${s['cg_llm_cost']}")
+              f"{str(s['mean_agent_wall_s']):>9}{str(s['exceptions']):>6}")
     print(f"\nwrote {a.jobs_root}/summary.json + rows-*.json")
 
 

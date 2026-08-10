@@ -155,6 +155,12 @@ nav:
       - "Results: headroom": results/headroom.md
       - "Results: rtk": results/rtk.md
       - "Results: observe mode": results/observe-mode.md
+      - "Terminal-Bench 2.0: four-way comparison": results/terminal-bench-comparison.md
+      - "Terminal-Bench: baseline": results/terminal-bench-baseline.md
+      - "Terminal-Bench: context-guru": results/terminal-bench-context-guru.md
+      - "Terminal-Bench: headroom": results/terminal-bench-headroom.md
+      - "Terminal-Bench: rtk": results/terminal-bench-rtk.md
+      - Improvement plan (from both benchmarks): results/improvement-plan.md
       - Reproduce the results: results/REPRODUCE.md
   - Reference:
       - Routes & headers: reference/routes.md
