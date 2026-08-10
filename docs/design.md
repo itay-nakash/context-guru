@@ -20,6 +20,7 @@ infrastructure the components sit on.
 | `expand/` | reversibility: `<<cg:HASH>>` marker, the `context_guru_expand` tool def, response parsing + continuation |
 | `store/` | `Store` interface + in-memory TTL+LRU backend (rewind + sticky ids) |
 | `session/` | resolve the session key (explicit id, else content hash) |
+| `modes/` | per-session cached-prefix boundary (`Tracker`) + the bounded off-path worker pool (`Pool`) |
 | `metrics/` | `Emitter` implementations: `Slog`, `Aggregator` (for `/stats`), `Tee` |
 | `config/` | strict YAML loader, presets, pipeline builder |
 | `proxy/` | the standalone/gateway HTTP proxy |
@@ -307,6 +308,71 @@ of per-request percentages. It also reports:
 
 Fields are only ever **added** to `/stats`; the harbor harnesses parse it, so no field is renamed
 or removed.
+
+## Operating modes
+
+Two modes, set explicitly by `mode:` (or `--mode` / `MODE`) and threaded onto
+`components.Ctx` as `Ctx.Mode`. Never inferred. `sync` is the default and reproduces
+pre-mode behavior byte for byte; a golden test compares the two entry points' output.
+
+See [Operating modes](how-to/operating-modes.md) for the operator's view. What follows is
+the mechanism.
+
+### Observe
+
+The request path does **not** run the pipeline, and skips `expand.Inject` too — a tool
+declaration is a modification. Byte-identity is therefore structural, not a property of
+careful copying: no code path in observe mode can alter a forwarded body.
+
+The off-path copy runs against `Handler.shadow`, observe's OWN store: as persistent as the
+live one and completely disjoint from it. Both halves are load-bearing, and both were found
+by comparing observe's projection against sync's actuals rather than by reading the code:
+
+- **Persistent**, because offloaders freeze a decision and replay it on every later turn —
+  that replay is where most of the sustained saving lives. Running observe against a
+  discarded buffer makes it see only the current tail and under-project by ~3x.
+- **Disjoint**, because a decision observe made must never be replayable by a real request.
+  That would be a request modification arriving by the back door.
+
+Observe also shares the `Tracker`, so the projection is gated by the same cached-prefix
+boundary an enforcing mode would use. Without it `MaxCachedIdx` is -1, the tail gate never
+fires, and the projection overstates savings by the amount cache-awareness costs (9.5%
+projected vs 0.8% enforced, measured). Sharing it is safe off-path: the boundary only ever
+grows, so a late job cannot move it backwards.
+
+Measurements run on `modes.Pool` — one bounded queue plus a fixed set of drain goroutines
+owned by the proxy, not a goroutine per request. The shape is headroom's
+`BackgroundCompressor`: dedup by key with the pending slot claimed **before** the job is
+observable in the queue (atomic against a concurrent enqueue), a full queue that **drops**
+and counts rather than blocking, jobs under the pool's context rather than the request's,
+and fail-open on every path including a panicking job. `Stop` bounds its wait: cancelling
+cannot interrupt an in-flight HTTP call to the cheap model, and nothing waits on a
+measurement's result.
+
+### The cached-prefix boundary
+
+`modes.Tracker` holds, per session under one lock, how many normalized messages the
+previous turn carried — the boundary above which offloaders may mutate
+(`Ctx.MaxCachedIdx`). `Turn(session, n)` reads it and records the new value in ONE locked
+call.
+
+That single call is the fix for a real race: the previous implementation read the value
+from the TTL store and wrote it back in a `defer`, so two concurrent turns of one session
+both read the same length and the second's write-back could land first, leaving a boundary
+describing neither turn. A boundary that is too high lets an offloader mutate content the
+provider has already cached, which costs a full cache-write of the suffix. Callers without
+a tracker (library users, `/compact`) keep the legacy path unchanged.
+
+The boundary only ever grows: an agent re-sending a shorter transcript must not shrink it,
+or cached content falls back into the mutable tail.
+
+### Fail-open per mode
+
+- `sync`: `apply` has a top-level recover, the pipeline has a per-component one, and the
+  proxy backstops the whole pre-forward block. The pristine inbound body is always a valid
+  fallback.
+- `observe`: the forwarded body *is* the input, so there is nothing for a failure to
+  damage; a panicking observation is contained by the pool and counted.
 
 ## Config & registry
 

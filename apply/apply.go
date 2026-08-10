@@ -112,7 +112,19 @@ func BodyWithModelWindow(ctx context.Context, pipe *components.Pipeline, st stor
 // cache-awareness when the backend is a prompt-caching provider or the request
 // already carries cache_control breakpoints; "on" forces it; "off" restores the
 // legacy compact-everything behavior (correct for confirmed non-caching backends).
-func BodyFull(ctx context.Context, pipe *components.Pipeline, st store.Store, provider bschemas.ModelProvider, body []byte, explicitSession string, bypass bool, models components.ModelSpec, window int, cacheMode string) (result []byte, changedBody bool) {
+func BodyFull(ctx context.Context, pipe *components.Pipeline, st store.Store, provider bschemas.ModelProvider, body []byte, explicitSession string, bypass bool, models components.ModelSpec, window int, cacheMode string) ([]byte, bool) {
+	r := BodyOpts(ctx, pipe, st, Opts{
+		Provider: provider, Body: body, Session: explicitSession, Bypass: bypass,
+		Models: models, Window: window, CacheMode: cacheMode,
+	})
+	return r.Body, r.Changed
+}
+
+// BodyOpts is the full entry point: everything BodyFull takes plus the operating mode
+// (#31) and the per-session boundary tracker. Hosts that support modes call this;
+// BodyFull is the positional shim every other caller keeps using.
+func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o Opts) (res Result) {
+	body, provider, bypass := o.Body, o.Provider, o.Bypass
 	// Top-level fail-open backstop: the per-component recover in pipeline.runOne only
 	// covers component code. A panic anywhere else on the rewrite path (normalize, the
 	// sjson splice, rebuildCountChanged, a marshal) must NOT 500 the client — forward
@@ -120,13 +132,18 @@ func BodyFull(ctx context.Context, pipe *components.Pipeline, st store.Store, pr
 	// the whole entry point, not just inside components.
 	defer func() {
 		if r := recover(); r != nil {
-			slog.Error("context-guru: recovered from panic in BodyFull; forwarding original request", "panic", r)
-			result, changedBody = body, false
+			slog.Error("context-guru: recovered from panic in BodyOpts; forwarding original request", "panic", r)
+			res = Result{Body: body}
 		}
 	}()
+	mode := o.Mode
+	if mode == "" {
+		mode = components.ModeSync
+	}
+	models := o.Models
 	msgsRaw := gjson.GetBytes(body, "messages")
 	if !msgsRaw.Exists() || !msgsRaw.IsArray() {
-		return body, false
+		return Result{Body: body}
 	}
 
 	// Volatile-tail split, before anything else touches the body. This is a
@@ -149,7 +166,7 @@ func BodyFull(ctx context.Context, pipe *components.Pipeline, st store.Store, pr
 
 	norm, slots := normalize(provider, msgsRaw.Array())
 	if len(norm) == 0 {
-		return body, systemSplit // keep the split even with nothing to compact
+		return Result{Body: body, Changed: systemSplit} // keep the split even with nothing to compact
 	}
 
 	if debugTraffic {
@@ -157,16 +174,27 @@ func BodyFull(ctx context.Context, pipe *components.Pipeline, st store.Store, pr
 	}
 	chat := &bschemas.BifrostChatRequest{Provider: provider, Input: norm}
 	sys, firstUser := systemAndFirstUser(norm)
-	sessionID := session.Resolve(explicitSession, sys, firstUser)
-	cacheAware := resolveCacheAware(cacheMode, provider, body)
+	sessionID := session.Resolve(o.Session, sys, firstUser)
+	res.Session = sessionID
+	cacheAware := resolveCacheAware(o.CacheMode, provider, body)
 	maxCachedIdx := -1
 	if cacheAware && !bypass {
 		// Messages present on the previous turn of this session are already committed
 		// to the provider cache; only the new tail is being cache-written this turn.
 		// Restrict supersession/age offloaders to that tail so they never mutate the
 		// cached prefix. Growth-based (dialect-agnostic; needs no cache_control mapping).
-		maxCachedIdx = prevLen(st, sessionID) - 1
-		defer putLen(st, sessionID, len(norm))
+		//
+		// With a Tracker the boundary is read and this turn's recorded in ONE locked call.
+		// The legacy path below read it from the store and wrote it back in a `defer`, so
+		// two concurrent turns of one session raced on it — see the modes package comment.
+		// Callers without a tracker (library users, /compact) keep the legacy path: same
+		// numbers, same race, no behavior change for them.
+		if o.Tracker != nil {
+			maxCachedIdx = o.Tracker.Turn(sessionID, len(norm)) - 1
+		} else {
+			maxCachedIdx = prevLen(st, sessionID) - 1
+			defer putLen(st, sessionID, len(norm))
+		}
 	}
 	c := &components.Ctx{
 		Ctx:          ctx,
@@ -174,13 +202,14 @@ func BodyFull(ctx context.Context, pipe *components.Pipeline, st store.Store, pr
 		Store:        st,
 		Model:        models,
 		Bypass:       bypass,
-		CtxWindow:    window,
+		CtxWindow:    o.Window,
 		CacheAware:   cacheAware,
 		MaxCachedIdx: maxCachedIdx,
 		// Every breakpoint already on the wire — including the ones no component can
 		// see (`system`, `tools`, and the marks our own normalize drops). The
 		// provider's cap of four counts them all (issue #32, defect 2).
 		ExistingBreakpoints: wireBreakpoints(body),
+		Mode:                mode,
 	}
 
 	// Canonical form of each normalized message BEFORE the pipeline, so a
@@ -191,6 +220,7 @@ func BodyFull(ctx context.Context, pipe *components.Pipeline, st store.Store, pr
 	}
 
 	rr := pipe.Run(chat, c)
+	res.Run = rr
 
 	// A component changed the message count (summarize restructures the transcript
 	// to [msg0, <summary>, last-K]). Rebuild the messages array preserving each
@@ -199,9 +229,11 @@ func BodyFull(ctx context.Context, pipe *components.Pipeline, st store.Store, pr
 	if len(chat.Input) != len(norm) {
 		nb, ok := rebuildCountChanged(body, msgsRaw.Array(), normPre, slots, chat.Input)
 		if !ok && systemSplit {
-			return body, true // keep the split even when the rebuild declined
+			res.Body, res.Changed = body, true // keep the split even when the rebuild declined
+			return res
 		}
-		return nb, ok || systemSplit
+		res.Body, res.Changed = nb, ok || systemSplit
+		return res
 	}
 
 	out := body
@@ -222,14 +254,16 @@ func BodyFull(ctx context.Context, pipe *components.Pipeline, st store.Store, pr
 			}
 			var err error
 			if out, err = sjson.SetBytes(out, s.path, newText); err != nil {
-				return body, false
+				res.Body = body
+				return res
 			}
 			changed = true
 			changes = append(changes, mkChange(s.path, s.preText, newText))
 		default: // wholeMessage
 			post, err := json.Marshal(chat.Input[i])
 			if err != nil {
-				return body, false
+				res.Body = body
+				return res
 			}
 			if bytes.Equal(post, s.pre) {
 				continue // unmodified — keep the original bytes verbatim (I1)
@@ -253,7 +287,8 @@ func BodyFull(ctx context.Context, pipe *components.Pipeline, st store.Store, pr
 				continue
 			}
 			if out, err = sjson.SetRawBytes(out, s.path, post); err != nil {
-				return body, false
+				res.Body = body
+				return res
 			}
 			changed = true
 			var pm bschemas.ChatMessage
@@ -274,7 +309,8 @@ func BodyFull(ctx context.Context, pipe *components.Pipeline, st store.Store, pr
 			"breakpoints", n, "inbound", c.ExistingBreakpoints,
 			"cap", maxWireBreakpoints, "session", c.Session)
 	}
-	return out, changed
+	res.Body, res.Changed = out, changed
+	return res
 }
 
 // resolveCacheAware decides whether cache-aware compaction is active for this

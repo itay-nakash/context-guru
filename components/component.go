@@ -19,6 +19,7 @@ package components
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/maximhq/bifrost/core/schemas"
@@ -97,6 +98,38 @@ func (m ModelSpec) For(source string) Model {
 	return m.Static
 }
 
+// Mode is context-guru's operating mode for one request. The host sets it explicitly
+// (proxy Options / config `mode:`); it is NEVER inferred.
+//
+//	ModeSync    — compact inline; the caller waits and the compacted request is sent.
+//	              The default, byte-identical to pre-mode behavior.
+//	ModeObserve — the pipeline runs on a copy whose output is discarded. The agent
+//	              receives the untouched original; results land in a strictly separate
+//	              (hypothetical) metric namespace.
+//
+// An async mode — deferring compaction off the request path — is designed and
+// implemented on a separate branch (#31/#35), held back because its measured benefit
+// collapsed once the expensive component stopped running on caching backends. Mode is a
+// closed set here so an unknown value fails loudly rather than silently meaning sync.
+type Mode string
+
+// The operating modes. See Mode.
+const (
+	ModeSync    Mode = "sync"
+	ModeObserve Mode = "observe"
+)
+
+// ParseMode validates a configured mode string; empty means sync.
+func ParseMode(s string) (Mode, error) {
+	switch Mode(s) {
+	case "", ModeSync:
+		return ModeSync, nil
+	case ModeObserve:
+		return ModeObserve, nil
+	}
+	return ModeSync, fmt.Errorf("mode must be sync|observe, got %q", s)
+}
+
 // Ctx is the per-request runtime handed to every component.
 type Ctx struct {
 	Ctx     context.Context
@@ -137,6 +170,18 @@ type Ctx struct {
 	// enough to put 6 on the wire and take a 400 (issue #32). The host fills it from
 	// the raw body; 0 means "unknown, fall back to what you can see".
 	ExistingBreakpoints int
+	// Mode is the operating mode this request runs under. Components that behave
+	// differently off the request path read this rather than inferring anything.
+	Mode Mode
+}
+
+// effMode is Ctx.Mode with the zero value normalized to sync, so a Ctx built by older
+// code (or a test) reports the default rather than an empty mode string.
+func (c *Ctx) effMode() Mode {
+	if c == nil || c.Mode == "" {
+		return ModeSync
+	}
+	return c.Mode
 }
 
 // FilterStatsSink records cmdfilter's per-filter/per-family ledger. metrics.Aggregator
@@ -188,6 +233,10 @@ type Report struct {
 	// then silently discarded looked identical to one that works, which is how issue
 	// #32 survived two benchmark studies.
 	Discarded int
+	// Mode is the operating mode the run happened under, stamped by the pipeline from
+	// Ctx.Mode. Emitters MUST branch on it: an observe-mode report is a HYPOTHETICAL and
+	// may never be summed into enforced savings.
+	Mode Mode
 }
 
 // Saved returns non-negative tokens saved by this component.
@@ -205,6 +254,8 @@ type RunReport struct {
 	TokensAfter  int
 	DurationMs   float64
 	Components   []Report
+	// Mode is the operating mode this run happened under (see Report.Mode).
+	Mode Mode
 }
 
 // Saved returns the net tokens saved across the run.
