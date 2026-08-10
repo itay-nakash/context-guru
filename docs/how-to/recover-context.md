@@ -48,6 +48,40 @@ original resolves to an explicit placeholder rather than being omitted — the p
 `tool_result` per `tool_call_id`. A store miss silently turns a lossless offload lossy: the known
 TTL edge.
 
+### Streaming (SSE): what actually happens
+
+The loop reasons over a complete assistant message, but a streaming response arrives as events, so
+on SSE the proxy makes a per-request choice from the request bytes:
+
+- **No marker in `messages`/`system`** → the model has nothing to expand, so the response is
+  streamed straight through, byte for byte, with no added latency.
+- **A marker is present** → the response is read in full, reconstructed with `expand.AggregateSSE`,
+  and inspected. If it is a lone expand call the loop runs; otherwise the buffered bytes are
+  replayed to the client verbatim.
+
+Buffering costs the client its streaming for that request (time-to-first-byte becomes
+time-to-last-byte), which is why the marker test is narrow. It scans **only** `messages` and
+`system` — the model-visible content. It used to scan the whole request body, which also matched the
+`context_guru_expand` tool description we inject ourselves ("…replaced by a `<<cg:HASH>>` marker"),
+so it was always true and **every** stream was silently buffered (issue #26).
+
+`/stats` reports this directly: `sse_streamed`, `sse_buffered`, `sse_buffered_pct`,
+`sse_ttfb_ms_avg` and `sse_ttfb_ms_avg_buffered`. On traffic that never offloads, `sse_buffered`
+should be 0.
+
+!!! note "Markers arrive HTML-escaped"
+    A marker the model reads as `<<cg:HASH>>` travels on the wire as `<<cg:HASH>>`:
+    Go's `encoding/json` always escapes `<`, and `sjson` escapes it whenever the value contains a
+    newline — and markers are appended after a newline. Any check matching markers against raw
+    request bytes must accept both spellings; `expand.rawMarkerRe` does, deliberately.
+
+!!! warning "Streaming restoration is Anthropic-only"
+    `expand.AggregateSSE` reconstructs the Anthropic Messages event stream only. A marker-bearing
+    **OpenAI** streaming response cannot be reconstructed, so it is replayed raw (fail-open) and
+    restoration does not fire on that request. Non-streaming OpenAI restoration works normally, as
+    does streaming Anthropic. Every streaming coding agent in scope speaks the Anthropic dialect;
+    OpenAI SSE aggregation will be added when a real agent needs it.
+
 ### 3. `GET /expand?id=`
 The proxy exposes `GET /expand?id=<hash>` to recover an offloaded original directly, out of band
 from the model loop.

@@ -84,6 +84,15 @@ type Aggregator struct {
 	upstreamMsByp float64 // upstream latency on bypassed (baseline) requests
 	upstreamN     int64
 	upstreamNByp  int64
+	// SSE time-to-first-byte accounting: how long after the upstream call started the
+	// client got its first response byte, split by whether we had to buffer the whole
+	// stream to inspect it for an expand call. Buffering is the only thing that stops a
+	// stream being a stream, so counting it makes that cost visible instead of inferred
+	// (it used to be unconditional and unmeasured — issue #26).
+	sseTTFBMs    float64
+	sseTTFBMsBuf float64
+	sseStreamed  int64
+	sseBuffered  int64
 }
 
 type compStat struct {
@@ -183,6 +192,21 @@ func (a *Aggregator) RecordUpstreamLatency(ms float64, bypassed bool) {
 	a.mu.Unlock()
 }
 
+// RecordSSE notes one streaming response: ms from issuing the upstream request to
+// the first byte handed to the client, and whether the stream had to be fully
+// buffered first (which turns TTFB into total-response time).
+func (a *Aggregator) RecordSSE(ttfbMs float64, buffered bool) {
+	a.mu.Lock()
+	if buffered {
+		a.sseTTFBMsBuf += ttfbMs
+		a.sseBuffered++
+	} else {
+		a.sseTTFBMs += ttfbMs
+		a.sseStreamed++
+	}
+	a.mu.Unlock()
+}
+
 func (a *Aggregator) Run(r components.RunReport) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -219,6 +243,15 @@ type Snapshot struct {
 	AddedLatencyMsAvg     float64 `json:"cg_added_ms_avg"`
 	UpstreamMsAvg         float64 `json:"upstream_ms_avg"`
 	UpstreamMsAvgBypassed float64 `json:"upstream_ms_avg_bypassed"`
+	// SSE streaming health (#26). SSEBuffered counts streams context-guru had to read
+	// in full before the client saw a byte (to look for an expand tool call); those
+	// requests lose streaming entirely, so their TTFB is reported separately. A high
+	// buffered share on traffic that never expands is the regression to watch.
+	SSEStreamed     int64   `json:"sse_streamed"`
+	SSEBuffered     int64   `json:"sse_buffered"`
+	SSETTFBMsAvg    float64 `json:"sse_ttfb_ms_avg"`          // streamed-through responses
+	SSETTFBMsAvgBuf float64 `json:"sse_ttfb_ms_avg_buffered"` // buffered-for-inspection responses
+	SSEBufferedPct  float64 `json:"sse_buffered_pct"`
 }
 
 // Snapshot returns a point-in-time copy of the rollups.
@@ -257,11 +290,23 @@ func (a *Aggregator) Snapshot() Snapshot {
 	if a.upstreamNByp > 0 {
 		upAvgByp = a.upstreamMsByp / float64(a.upstreamNByp)
 	}
+	ttfb, ttfbBuf, bufPct := 0.0, 0.0, 0.0
+	if a.sseStreamed > 0 {
+		ttfb = a.sseTTFBMs / float64(a.sseStreamed)
+	}
+	if a.sseBuffered > 0 {
+		ttfbBuf = a.sseTTFBMsBuf / float64(a.sseBuffered)
+	}
+	if n := a.sseStreamed + a.sseBuffered; n > 0 {
+		bufPct = float64(a.sseBuffered) / float64(n) * 100
+	}
 	return Snapshot{
 		Requests: a.requests, TokensBefore: a.before, TokensAfter: a.after,
 		SavedTokens: saved, SavingsPct: pct,
 		WastedTokens: a.wasted, Bounces: a.bounces, AdjustedSaved: saved - a.wasted,
 		Components: comps, TopPassthrough: passthrough,
 		AddedLatencyMsAvg: addedAvg, UpstreamMsAvg: upAvg, UpstreamMsAvgBypassed: upAvgByp,
+		SSEStreamed: a.sseStreamed, SSEBuffered: a.sseBuffered,
+		SSETTFBMsAvg: ttfb, SSETTFBMsAvgBuf: ttfbBuf, SSEBufferedPct: bufPct,
 	}
 }

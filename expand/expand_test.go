@@ -1,9 +1,11 @@
 package expand
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/rossoctl/context-guru/store"
+	"github.com/tidwall/sjson"
 )
 
 func TestToolDefShape(t *testing.T) {
@@ -31,6 +33,75 @@ func TestParseMarkersDistinctInOrder(t *testing.T) {
 	}
 	if ParseMarkers("no markers here") != nil {
 		t.Fatal("text without markers must return nil")
+	}
+}
+
+// escLT / escGT are the JSON \uXXXX escapes Go's encoders emit for "<" and ">".
+// Built from the code points rather than written literally so the test fixtures
+// cannot drift from what encoding/json and sjson actually produce.
+var (
+	escLT = `\u` + "003c"
+	escGT = `\u` + "003e"
+)
+
+// TestHasMarkersInMessagesIgnoresOwnInjectedTool is the regression guard for the
+// tautology of issue #26: the injected expand tool's own description quotes the
+// marker syntax, so a whole-body marker check was always true and every streaming
+// response got buffered. The check must look only at model-visible content.
+func TestHasMarkersInMessagesIgnoresOwnInjectedTool(t *testing.T) {
+	for _, provider := range []string{"anthropic", "openai"} {
+		body := []byte(`{"messages":[{"role":"user","content":"hello"}],"tools":[]}`)
+		injected, ok := Inject(provider, InjectAlways, body, true)
+		if !ok {
+			t.Fatalf("%s: Inject should have fired", provider)
+		}
+		// The escaped marker shape IS in the injected bytes — that is exactly what used
+		// to make the old whole-body check unconditionally true.
+		if !strings.Contains(string(injected), escLT+escLT+"cg:") {
+			t.Fatalf("%s: expected the tool description to carry an escaped marker: %s", provider, injected)
+		}
+		if HasMarkersInMessages(injected) {
+			t.Fatalf("%s: our own injected tool must not count as a marker: %s", provider, injected)
+		}
+	}
+}
+
+// TestHasMarkersInMessagesEscapedForm pins the load-bearing accident: markers reach
+// the wire HTML-escaped whenever the value they were appended to contains a newline
+// (sjson/encoding/json escape "<"). Both spellings must be found.
+func TestHasMarkersInMessagesEscapedForm(t *testing.T) {
+	escMarker := escLT + escLT + "cg:ABC" + escGT + escGT
+	cases := map[string]string{
+		"plain":                   `{"messages":[{"role":"user","content":"see <<cg:ABC>>"}]}`,
+		"escaped":                 `{"messages":[{"role":"user","content":"see ` + escMarker + `"}]}`,
+		"escaped after a newline": `{"messages":[{"role":"user","content":"line1\nline2 ` + escMarker + `"}]}`,
+		"summary sentinel":        `{"messages":[{"role":"user","content":"` + SummaryMarker + ` compacted"}]}`,
+		"in the system prompt":    `{"system":"context: ` + escMarker + `","messages":[]}`,
+		"escaped in tool_result":  `{"messages":[{"role":"user","content":[{"type":"tool_result","content":"out\n` + escMarker + `"}]}]}`,
+	}
+	for name, body := range cases {
+		if !HasMarkersInMessages([]byte(body)) {
+			t.Errorf("%s: marker not found in %s", name, body)
+		}
+	}
+	// Real sjson output, not a hand-written string: prove the escaping happens exactly
+	// as offload triggers it (marker appended after a newline).
+	sjsonBody, _ := sjson.SetBytes([]byte(`{"messages":[{"role":"user","content":""}]}`),
+		"messages.0.content", "line1\nline2 "+Marker("XYZ"))
+	if !strings.Contains(string(sjsonBody), escLT+escLT+"cg:XYZ") {
+		t.Fatalf("expected sjson to escape the marker after a newline: %s", sjsonBody)
+	}
+	if !HasMarkersInMessages(sjsonBody) {
+		t.Fatalf("sjson-escaped marker must be found: %s", sjsonBody)
+	}
+
+	for name, body := range map[string]string{
+		"no markers":                   `{"messages":[{"role":"user","content":"nothing here"}]}`,
+		"prefix only but not a marker": `{"messages":[{"role":"user","content":"cg: and ` + escLT + `cg:"}]}`,
+	} {
+		if HasMarkersInMessages([]byte(body)) {
+			t.Errorf("%s: false positive on %s", name, body)
+		}
 	}
 }
 

@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/rossoctl/context-guru/store"
+	"github.com/tidwall/gjson"
 )
 
 // ToolName is the model-callable tool that retrieves offloaded content.
@@ -44,6 +45,39 @@ func Marker(key string) string { return "<<cg:" + key + ">>" }
 // same bytes (provider prefix-cache stays warm).
 func HasPlaceholder(s string) bool {
 	return strings.Contains(s, SummaryMarker) || markerRe.MatchString(s)
+}
+
+// rawMarkerRe matches a full <<cg:HASH>> marker in RAW, un-decoded request bytes,
+// where the angle brackets may arrive HTML-escaped as < / >.
+//
+// BOTH spellings are load-bearing, and the escaped one is the COMMON case, not an
+// exotic client quirk: Go's encoding/json HTML-escapes "<" unconditionally, and sjson
+// escapes it whenever the value being set contains a newline — and every Offload
+// marker is appended after a newline. So a marker the MODEL reads as <<cg:HASH>>
+// exists in the bytes on the wire only as <<cg:HASH>>. Any check
+// that matches markers against a raw body must accept both forms deliberately.
+var rawMarkerRe = regexp.MustCompile(`(?:<|\\u003c){2}cg:([A-Za-z0-9_-]{1,64})(?:>|\\u003e){2}`)
+
+// HasMarkersInMessages reports whether a request body carries a context-guru
+// placeholder in content the MODEL can see and reference — the messages array and
+// the system prompt.
+//
+// It deliberately does NOT scan the whole body. The `tools` array holds our own
+// injected expand tool, whose description quotes the marker syntax ("…replaced by a
+// <<cg:HASH>> marker"), HTML-escaped by encoding/json. A whole-body substring check
+// therefore matched the tool we had just injected and was a tautology: every request
+// looked marker-bearing, so every streaming response was fully buffered and the
+// documented zero-added-latency fast path never engaged. Requiring the full marker
+// shape is not sufficient on its own — the tool description contains the full shape
+// too. Scoping to model-visible content is what fixes it.
+func HasMarkersInMessages(body []byte) bool {
+	for _, field := range [...]string{"messages", "system"} {
+		if r := gjson.GetBytes(body, field); r.Exists() &&
+			(rawMarkerRe.MatchString(r.Raw) || strings.Contains(r.Raw, SummaryMarker)) {
+			return true
+		}
+	}
+	return false
 }
 
 // ParseMarkers returns the distinct store keys referenced by any markers in s,
