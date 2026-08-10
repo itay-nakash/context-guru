@@ -333,3 +333,31 @@ func TestUnknownFieldsNotDropped(t *testing.T) {
 			gjson.GetBytes(got, "system").Raw[:200])
 	}
 }
+
+// A Bedrock/Vertex system block can carry `cachePoint` where Anthropic writes
+// `cache_control`. The split COPIES the block, so deleting only one spelling leaves the
+// other on BOTH halves and turns one breakpoint into two. wireBreakpoints counts both
+// spellings, so that silently eats a slot from the provider's cap of four — and from a
+// request already at the cap it pushes the wire to five and takes a 400.
+func TestSplitDoesNotDuplicateBedrockCachePoint(t *testing.T) {
+	full, _, _ := blockWithGitTail(6000)
+	block := map[string]any{"type": "text", "text": full, "cachePoint": map[string]any{"type": "default"}}
+	in := sysBody(block)
+
+	before := wireBreakpoints(in)
+	got, split := splitVolatileTail(in, bschemas.Bedrock)
+	if !split {
+		t.Fatal("expected the git-tail block to split")
+	}
+	if after := wireBreakpoints(got); after != before {
+		t.Fatalf("split changed the wire breakpoint count %d -> %d; a copied cachePoint "+
+			"burns a slot from the provider's cap of four", before, after)
+	}
+	// and the churning half must not carry a breakpoint at all
+	for _, b := range gjson.GetBytes(got, "system").Array() {
+		if strings.Contains(b.Get("text").String(), "Recent commits:") &&
+			(b.Get("cachePoint").Exists() || b.Get("cache_control").Exists()) {
+			t.Fatal("the volatile half kept a breakpoint — the churn is back inside a hashed prefix")
+		}
+	}
+}

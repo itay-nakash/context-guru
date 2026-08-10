@@ -114,8 +114,14 @@ func splitVolatileTail(body []byte, provider bschemas.ModelProvider) ([]byte, bo
 		stable["text"] = txt[:at]
 		volatile["text"] = txt[at:]
 		// The breakpoint belongs on the stable half only; leaving one on the volatile
-		// half would put the churn back inside a hashed prefix.
+		// half would put the churn back inside a hashed prefix. BOTH spellings must go:
+		// Bedrock/Vertex write `cachePoint` where Anthropic writes `cache_control`, and
+		// wireBreakpoints counts both (metawrite.go). Deleting only one DUPLICATES the
+		// other — the split copies the block, so a system block carrying an inline
+		// cachePoint turns 1 breakpoint into 2 and can push the wire past the provider's
+		// cap of four (measured: 4 inbound -> 5 on the wire -> 400).
 		delete(volatile, "cache_control")
+		delete(volatile, "cachePoint")
 		sb, err1 := json.Marshal(stable)
 		vb, err2 := json.Marshal(volatile)
 		if err1 != nil || err2 != nil {
