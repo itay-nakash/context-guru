@@ -96,13 +96,13 @@ func (f *Cmdfilter) Offload(req *schemas.BifrostChatRequest, rep *components.Rep
 		key := selectorKey(content)
 		filt := f.reg.Match(key)
 		if filt == nil {
-			if c.FilterStats != nil {
+			if fs := c.Stats(); fs != nil {
 				// The miss ledger: it turns "which filter to write next" into data
 				// instead of guesswork (after rtk's parse_failures table). Log only the
 				// FIRST line — the selector is multi-line, and keying the bounded ledger
 				// on whole multi-line blobs would make almost every entry unique and
 				// exhaust the cap on noise instead of ranking real shapes.
-				c.FilterStats.FilterMiss(firstLine(key))
+				fs.FilterMiss(firstLine(key))
 			}
 			continue
 		}
@@ -141,8 +141,8 @@ func (f *Cmdfilter) Offload(req *schemas.BifrostChatRequest, rep *components.Rep
 			rep.Irreversible = true
 		}
 		schema.SetMessageText(m, newText)
-		if c.FilterStats != nil {
-			c.FilterStats.FilterAct(filt.Family(), filt.Name, stashKey, before-after)
+		if fs := c.Stats(); fs != nil {
+			fs.FilterAct(filt.Family(), filt.Name, stashKey, before-after)
 		}
 		changed++
 	}
