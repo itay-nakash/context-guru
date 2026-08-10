@@ -213,6 +213,94 @@ func TestRedactContentScrubsKnownSecrets(t *testing.T) {
 	}
 }
 
+// TestRedactContentAgainstRealisticCredentialShapes is the table this mechanism
+// should have shipped with. A review threw 22 realistic credential shapes at
+// RedactContent and 11 of them passed straight through — including
+// `Authorization: Bearer <token>`, where the pattern matched `\S+` after the colon,
+// redacted the word "Bearer", and left the credential sitting in the diff view.
+//
+// Every case names the marker that must NOT survive. The marker is embedded in a
+// synthetic value so no real credential is ever in this repo, and the assertion is on
+// the marker rather than the whole value so a partial redaction still fails.
+//
+// The honest caveat, stated because a table like this invites the opposite reading:
+// passing 22/22 does not make a denylist complete. Content is arbitrary agent output
+// and cannot be allowlisted, which is why content capture is opt-in.
+func TestRedactContentAgainstRealisticCredentialShapes(t *testing.T) {
+	const m = "CANARYVALUE"
+	long := m + "0123456789abcdefXYZ"
+
+	cases := []struct{ name, text string }{
+		// --- The shapes the review found leaking ---
+		{"authorization bearer", "Authorization: Bearer " + long},
+		{"authorization bearer lowercase", "authorization: bearer " + long},
+		{"proxy-authorization basic", "Proxy-Authorization: Basic " + long},
+		{"json api_key", `{"api_key": "` + long + `"}`},
+		{"json apiKey camel", `{"apiKey":"` + long + `"}`},
+		{"json private_key_id gcp", `{"private_key_id": "` + long + `", "type": "service_account"}`},
+		{"basic auth url https", "cloning https://user:" + long + "@github.com/org/repo.git"},
+		{"basic auth url postgres", "DSN is postgres://admin:" + long + "@db.internal:5432/app"},
+		{"azure connection string", "DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=" + long + ";EndpointSuffix=core.windows.net"},
+		{"gitlab pat", "token: glpat-" + long},
+		{"stripe live key", "using sk_live_" + long},
+		{"huggingface token", "export HF_TOKEN=hf_" + long},
+
+		// --- The shapes that already worked; they must keep working ---
+		{"anthropic key", "ANTHROPIC_API_KEY=" + fakeKey(m)},
+		{"openai project key", "OPENAI_API_KEY=sk-proj-" + long},
+		{"github pat", "ghp_" + m + "0123456789abcdefghij"},
+		{"github fine-grained pat", "github_pat_11" + m + "_0123456789abcdefghijklmnop"},
+		{"aws access key id", "AKIA" + "IOSFODNN7" + m[:7]},
+		{"slack bot token", "xoxb-123456789012-" + long},
+		{"jwt", "eyJ" + m + "abcdef.eyJhbGciOiJIUzI1NiIs.SflKxwRJSMeKKF2QT4"},
+		{"env var named secret", "MY_SERVICE_SECRET=" + long},
+		{"password assignment", "password = '" + long + "'"},
+		{"pem private key", "-----BEGIN RSA PRIVATE KEY-----\n" + long + "\n-----END RSA PRIVATE KEY-----"},
+	}
+	if len(cases) != 22 {
+		t.Fatalf("the table has %d cases; the reviewed set is 22", len(cases))
+	}
+
+	leaked := 0
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := RedactContent(tc.text, 0)
+			if strings.Contains(got, m) {
+				leaked++
+				t.Errorf("credential survived redaction\n  in:  %s\n  out: %s", tc.text, got)
+			}
+		})
+	}
+	if leaked > 0 {
+		t.Logf("%d of %d shapes leaked", leaked, len(cases))
+	}
+}
+
+// TestRedactConfigChecksAllowlistedValuesForEmbeddedCredentials closes the other half
+// of the reviewed gap: `anthropic_upstream` is allowlisted BY NAME, so its value was
+// passed through verbatim — and an upstream URL is exactly where a `user:password@`
+// credential lives. Allowlisting the key must not mean trusting the value.
+func TestRedactConfigChecksAllowlistedValuesForEmbeddedCredentials(t *testing.T) {
+	const m = "URLCANARY"
+	out := RedactConfig(map[string]any{
+		"anthropic_upstream": "https://svc:" + m + "0123456789@api.anthropic.com",
+		"openai_upstream":    "https://api.openai.com", // no credential: must survive intact
+		"components": map[string]any{
+			"summarize": map[string]any{
+				"source": "postgres://admin:" + m + "0123456789@db.internal/app",
+			},
+		},
+	}).(map[string]any)
+
+	if flat := sprintDeep(out); strings.Contains(flat, m) {
+		t.Errorf("a credential embedded in an allowlisted VALUE survived: %s", flat)
+	}
+	if out["openai_upstream"] != "https://api.openai.com" {
+		t.Errorf("a credential-free allowlisted URL was redacted: %v; the config view must stay useful",
+			out["openai_upstream"])
+	}
+}
+
 func TestRedactContentKeepsOrdinaryCode(t *testing.T) {
 	code := `func Fib(n int) int {
 	if n < 2 { return n }
@@ -273,12 +361,12 @@ func TestNoSecretReachesTheDatabase(t *testing.T) {
 		Before: "ANTHROPIC_API_KEY=" + secret + "\nsome more tool output\n",
 		After:  "ANTHROPIC_API_KEY=" + secret,
 	}}
-	// The proxy redacts before Record; do the same here so the test exercises the
-	// documented contract rather than an internal shortcut.
-	for i := range e.Content {
-		e.Content[i].Before = RedactContent(e.Content[i].Before, 1<<20)
-		e.Content[i].After = RedactContent(e.Content[i].After, 1<<20)
-	}
+	// Record the event RAW — no pre-redaction. That is the contract now: the writer
+	// goroutine redacts immediately before the INSERT, so the secret is handed to the
+	// pipeline in the clear and must still never reach a column. This is the stronger
+	// version of the test: it fails if redaction is skipped anywhere on the write path,
+	// whereas scrubbing here first would only have proved RedactContent works.
+	e.ContentCap = 1 << 20
 	rec.Record(e)
 	if err := rec.Close(); err != nil {
 		t.Fatal(err)

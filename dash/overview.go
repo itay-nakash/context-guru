@@ -242,12 +242,15 @@ func (o *Overview) waterfall() []WaterfallStep {
 	steps := []WaterfallStep{
 		{Key: "baseline", Label: "Baseline cost (no context-guru)", DeltaUSD: o.BaselineCostUSD, Total: true,
 			Description: "What this window's requests would have cost with nothing removed: the " +
-				"billed cost plus the removed tokens priced at the cache-WRITE rate they would " +
-				"have entered as."},
+				"billed cost, plus the UNIQUE removed tokens priced at the cache-WRITE rate they " +
+				"would have entered as, plus the re-sent remainder priced at the cache-READ rate " +
+				"the provider would have served it from."},
 		{Key: "compaction", Label: "Compaction savings", DeltaUSD: -compactionSaving,
-			Description: "Cost avoided because content never reached the provider. Priced at the " +
-				"cache-write rate, which on a prompt-caching backend is ~11.5x a cache read — " +
-				"the reason token-count savings and dollar savings diverge so sharply here."},
+			Description: "Cost avoided because content never reached the provider. Only the UNIQUE " +
+				"saving earns the cache-write rate (~11.5x a read on a prompt-caching backend); the " +
+				"re-sent remainder earns the read rate, because that is all it would ever have been " +
+				"billed at. Pricing gross savings as writes is how a dashboard overstates itself by " +
+				"its own overcount_ratio."},
 		{Key: "cg_llm", Label: "context-guru's own LLM cost", DeltaUSD: o.CGLLMCostUSD,
 			Description: "What context-guru's own model calls (extract_llm, summarize) cost. Paid " +
 				"out of the savings above; a component whose spend exceeds its saving is " +

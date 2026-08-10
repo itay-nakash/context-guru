@@ -115,6 +115,16 @@ func (d *DB) IngestBenchDir(dir string) (tasks int, err error) {
 			tasks++
 		}
 	}
+	// Commit the run row ONLY if it actually gained tasks. Committing first and then
+	// returning tasks=0 is how the log line ("ingested benchmark runs runs=17") came to
+	// disagree with the API (42 rows, 25 of them with no arms at all): the callers below
+	// count a run only when tasks>0, but the row was already committed, so the
+	// Benchmarks tab filled up with contentless shells. The deferred Rollback discards
+	// it, which also means a directory that stops parsing does not silently replace a
+	// previously-good run with an empty one.
+	if tasks == 0 {
+		return 0, nil
+	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}

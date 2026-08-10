@@ -95,6 +95,29 @@ type Event struct {
 
 	Components []CompRow    `json:"components,omitempty"`
 	Content    []ContentRow `json:"content,omitempty"`
+
+	// ContentCap is the per-blob byte cap Redact applies. Set at the capture site and
+	// consumed by the writer goroutine; not persisted (a knob, not a fact about the
+	// request).
+	ContentCap int `json:"-"`
+}
+
+// Redact scrubs credential shapes from captured content and applies the size cap. The
+// WRITER goroutine calls it immediately before the INSERT — never the request
+// goroutine, where nine regexes over dozens of 16 KiB blobs cost ~53 ms, paid by the
+// next request on a keep-alive connection.
+//
+// The placement is the whole security property: redaction happens before anything
+// reaches the database, so a secret is never on disk and there is no redact-on-read
+// filter to forget. Running it here rather than at the capture site changes WHICH
+// GOROUTINE pays, not whether it runs.
+//
+// Idempotent, so a double call cannot corrupt a row.
+func (e *Event) Redact() {
+	for i := range e.Content {
+		e.Content[i].Before = RedactContent(e.Content[i].Before, e.ContentCap)
+		e.Content[i].After = RedactContent(e.Content[i].After, e.ContentCap)
+	}
 }
 
 // Saved is this request's gross content-token saving.
@@ -212,9 +235,22 @@ func uncompressedReason(e *Event, tr apply.Trace) string {
 // token tiers plus a baseline counterfactual.
 //
 // The baseline is what the SAME request would have cost had context-guru not
-// removed anything: the tokens we removed would have entered the provider as new
-// content, so they are priced at the cache-WRITE rate (11.5x a read on Anthropic
-// — this workload's whole economic story) and added to what was actually billed.
+// removed anything. Getting this right is the whole point of the dashboard, and
+// there are two ways to get it wrong, both of which inflate it:
+//
+//   - Pricing GROSS savings. `Saved()` is tokens_before − tokens_after for THIS
+//     turn, and the agent re-sends its whole transcript every turn, so the same
+//     compaction is re-counted once per remaining turn. On a real 63-request
+//     window that is a 13.1x overcount — a factor this dashboard computes and
+//     displays as `overcount_ratio` right beside the dollar figure. Only
+//     SavedUnique is content that genuinely never reached the provider.
+//   - Pricing everything at the cache-WRITE rate. That rate (11.5x a read) is
+//     right for content entering the prompt for the first time. The re-sent
+//     remainder would have been served from the provider's cache, so the most it
+//     could have been billed at is the cache-READ rate. Pricing it as a write
+//     multiplies the overcount by another ~11.5.
+//
+// So: unique savings at the write rate, the re-sent remainder at the read rate.
 // Restored (expanded) content is content we removed and then had to serve back,
 // so it is added to the ACTUAL cost side, never subtracted from baseline.
 //
@@ -231,8 +267,25 @@ func (e *Event) Price(p modelinfo.Price, accountingComplete bool) {
 	}
 	e.TokenAccounting = AccountingComplete
 	e.CostUSD = p.Cost(e.FreshInput, e.CacheRead, e.CacheWrite, e.OutputTokens)
-	// Removed content would have been new input this turn => cache-write priced.
-	e.BaselineCostUSD = e.CostUSD + float64(e.Saved())*p.CacheWrite
+	e.BaselineCostUSD = e.CostUSD + e.baselineDeltaUSD(p)
+}
+
+// baselineDeltaUSD is what the removed content would have cost had it been sent:
+// the unique part as new input (cache-write rate), the re-sent remainder as a
+// cache read.
+func (e *Event) baselineDeltaUSD(p modelinfo.Price) float64 {
+	unique := e.SavedUnique
+	gross := e.Saved()
+	// SavedUnique is attributed per component and can exceed the request's own
+	// gross saving when several components stash the same content key; clamp it, so
+	// the repeat term can never go negative and inflate the baseline.
+	if unique > gross {
+		unique = gross
+	}
+	if unique < 0 {
+		unique = 0
+	}
+	return float64(unique)*p.CacheWrite + float64(gross-unique)*p.CacheRead
 }
 
 // AttributeCache buckets this request's cache behavior. seenSession/seenModel say

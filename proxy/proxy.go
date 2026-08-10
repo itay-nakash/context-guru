@@ -171,6 +171,18 @@ func New(pipe *components.Pipeline, st store.Store, agg *metrics.Aggregator, opt
 	}
 	if h.rec != nil {
 		h.api = dash.NewAPI(h.rec)
+		// Publish the off-path pool's counters to the dashboard, the same layering /stats
+		// uses: the pool lives in `modes`, which sits above both `metrics` and `dash`, so
+		// the host is the only place that can join them. Read at serve time, not captured
+		// now, and left unset in sync mode so the UI shows no phantom queue.
+		if h.pool != nil {
+			pool := h.pool
+			h.rec.SetObserveQueue(func() dash.QueueStats {
+				q := pool.Stats()
+				return dash.QueueStats{Queued: q.Queued, Pending: q.Pending,
+					Processed: q.Processed, Dropped: q.Dropped, Errors: q.Errors}
+			})
+		}
 	}
 	return h
 }

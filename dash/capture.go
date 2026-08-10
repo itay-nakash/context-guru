@@ -36,9 +36,13 @@ type Options struct {
 	// effective configuration. Loopback is always allowed. Aggregates are open to
 	// everyone (a proxy people bind to 0.0.0.0 still wants its numbers visible).
 	TrustedCIDRs []string
-	// Preset / Mode label captured rows so the UI can filter by configuration.
-	Preset string
-	Mode   string
+	// Mode is the proxy's operating mode ("active" | "observe"), served on /api/capture
+	// so the UI can render the observe banner. Empty means active.
+	//
+	// There is deliberately no Preset field here: per-row preset labelling comes from
+	// proxy.Options.Preset at the capture site (proxy/dashcapture.go), and a second copy
+	// of the same value in a second Options struct is a copy that goes stale.
+	Mode string
 	// Effective is the resolved, already-structured configuration to serve at
 	// /api/config. It is redacted before serving; nothing sensitive should be in
 	// here in the first place.
@@ -104,6 +108,10 @@ type Recorder struct {
 	dropped  atomic.Int64
 	written  atomic.Int64
 	errors   atomic.Int64
+
+	// observeQueue is the host's accessor for its off-path pool counters, or nil in
+	// sync mode. A func rather than a value so the counters are read at serve time.
+	observeQueue atomic.Pointer[func() QueueStats]
 
 	// Cache-attribution state: the last time we saw each session and whether we
 	// have seen each model, so a cold start is never reported as a bust.
@@ -194,6 +202,35 @@ type Stats struct {
 	Clients  int    `json:"sse_clients"`
 	DBPath   string `json:"db_path"`
 	DBBytes  int64  `json:"db_bytes"`
+	// Mode is the proxy's operating mode ("active" | "observe"). The UI renders an
+	// unmissable banner in observe mode: every request was forwarded UNTOUCHED, so a
+	// reader who mistakes these figures for enforced savings has drawn exactly the wrong
+	// conclusion. That is worth a banner rather than a field on a detail tab.
+	Mode string `json:"mode"`
+	// ObserveQueue is the off-path measurement pool's counters, supplied by the host
+	// (the pool lives in `modes`, above this package). Omitted when no pool is running,
+	// so a sync deployment shows no phantom queue. Its `dropped` matters most: a drop is
+	// an observation given up, so the projection UNDERSTATES what compaction would save.
+	ObserveQueue *QueueStats `json:"observe_queue,omitempty"`
+}
+
+// QueueStats mirrors metrics.QueueStats / modes.Stats. Declared here rather than
+// imported because the dependency runs the other way.
+type QueueStats struct {
+	Queued    int64 `json:"queued"`
+	Pending   int64 `json:"pending"`
+	Processed int64 `json:"processed"`
+	Dropped   int64 `json:"dropped"`
+	Errors    int64 `json:"errors"`
+}
+
+// SetObserveQueue lets the host publish its off-path pool's counters. Safe from any
+// goroutine and safe to call on a nil Recorder.
+func (r *Recorder) SetObserveQueue(fn func() QueueStats) {
+	if r == nil {
+		return
+	}
+	r.observeQueue.Store(&fn)
 }
 
 // Stats snapshots the pipeline counters.
@@ -202,12 +239,21 @@ func (r *Recorder) Stats() Stats {
 		return Stats{}
 	}
 	size, _ := r.db.sizeBytes()
-	return Stats{
+	s := Stats{
 		Captured: r.captured.Load(), Written: r.written.Load(),
 		Dropped: r.dropped.Load(), Errors: r.errors.Load(),
 		Queued: len(r.ch), QueueCap: cap(r.ch),
 		Clients: r.hub.Clients(), DBPath: r.db.Path(), DBBytes: size,
+		Mode: r.opts.Mode,
 	}
+	if s.Mode == "" {
+		s.Mode = ModeActive
+	}
+	if fn := r.observeQueue.Load(); fn != nil {
+		q := (*fn)()
+		s.ObserveQueue = &q
+	}
+	return s
 }
 
 // run is the single writer goroutine: batch, insert in one transaction, fan out,
@@ -223,6 +269,16 @@ func (r *Recorder) run() {
 	write := func() {
 		if len(batch) == 0 {
 			return
+		}
+		// Redact on THIS goroutine, before the insert. This is the expensive half of
+		// capture (nine regexes over up to ContentMaxPerRequest x 2 blobs) and it lives
+		// here rather than at the capture site deliberately: `finish` is called from the
+		// handler's defer, which runs before the handler returns, so redacting there makes
+		// a keep-alive client's next request wait on it (~53 ms measured, ~25% of a
+		// request). Nothing reaches the database unredacted either way — the security
+		// property is the ordering against the INSERT, which this preserves.
+		for _, e := range batch {
+			e.Redact()
 		}
 		if err := r.db.insertBatch(batch); err != nil {
 			r.errors.Add(int64(len(batch)))

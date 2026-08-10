@@ -208,14 +208,36 @@ path already computed and hands it to a buffered channel with a `default:` branc
 the channel is full the event is **dropped and counted** — never queued into a growing
 backlog, never blocking. Observability cannot add latency to, or fail, a request.
 
-**Measured overhead: ~175 ns per request** (`go test -bench BenchmarkRecord ./dash`), a
-rounding error against this workload's multi-second upstream round trip. A regression
-test fails if it ever exceeds 50 µs, so moving I/O onto the capture path breaks CI.
+**Measured overhead: no detectable per-request cost, content capture included.** Driving
+the real handler over one keep-alive connection with a 24-tool-result transcript and
+content capture ON, median of 40 paired requests against the same fake upstream: the
+dashboard-on figure lands within noise of dashboard-off (repeatedly a shade *below* it).
+The channel send itself is ~175 ns (`go test -bench BenchmarkRecord ./dash`).
+
+That second number used to be the only one published, and on its own it was misleading.
+`finish` is called from the handler's `defer`, which runs **before the handler returns** —
+so work placed there is paid by the next request on a keep-alive connection, i.e. by
+every real agent. Content redaction sat there and cost **~53 ms/request**, ~25% of a
+request, while the documented figure was "0.000002%". A benchmark that calls `Record`
+directly cannot see that, so the guard is now an end-to-end handler-latency test with
+content capture on (`TestDashboardAddsNoRequestLatencyWithContentCapture`, budget 5 ms);
+putting redaction back on the request goroutine measures +87 ms and fails it.
 
 **Redaction happens before the database, never on read.** Headers are blanket-redacted by
-key against a short allowlist; config keys are allowlisted; captured content is scrubbed
-of credential-shaped strings and size-capped. A secret that reaches disk is a secret
-forever, and a redact-on-read filter is one forgotten code path from leaking it.
+key against a short allowlist; config keys are allowlisted, and an allowlisted key's
+*value* is still checked for an embedded `user:password@` credential; captured content is
+scrubbed of credential-shaped strings and size-capped. All of it runs on the writer
+goroutine, immediately before the INSERT — off the request path, but still before anything
+touches disk. A secret that reaches disk is a secret forever, and a redact-on-read filter
+is one forgotten code path from leaking it.
+
+Content is the one surface that **cannot** be allowlisted, because it is arbitrary agent
+output. It gets pattern scrubbing, and a pattern denylist is structurally always behind
+reality: a review of 22 realistic credential shapes found 11 passing through, the worst
+being `Authorization: Bearer <token>`, where the pattern matched the scheme and left the
+token in the diff view. Those are fixed and pinned by a table-driven test — but 22/22
+passing does not prove completeness, which is why **content capture is opt-in**
+(`--dashboard-content`, default off) rather than opt-out.
 
 **Percentages at read time, cost at write time.** Every ratio is derived when queried, so
 a filter change needs no rebuild; every cost is computed when the row is written, so

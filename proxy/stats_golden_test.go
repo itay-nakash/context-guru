@@ -37,6 +37,7 @@ var statsGoldenTopLevel = []string{
 	"llm_calls",
 	"llm_input_tokens",
 	"llm_output_tokens",
+
 	"mode",
 	"observe_hypothetical_requests",
 	"output_tokens",
@@ -69,6 +70,7 @@ var statsGoldenTopLevel = []string{
 // by name.
 var statsGoldenComponent = []string{
 	"acted",
+	"discarded_changes",
 	"duration_ms",
 	"mutated",
 	"overcount_ratio",

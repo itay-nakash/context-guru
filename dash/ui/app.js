@@ -1043,7 +1043,7 @@ async function loadConfig() {
   }
 }
 
-// ── capture-drop banner ────────────────────────────────────────────────────
+// ── capture-drop + observe-mode banners ────────────────────────────────────
 async function checkCapture() {
   try {
     const { capture: c } = await api('capture');
@@ -1053,7 +1053,29 @@ async function checkCapture() {
         'the figures below under-report. Requests were never delayed; observability was. Raise the queue size.';
       b.hidden = false;
     } else b.hidden = true;
-  } catch (_) { /* the banner is best-effort */ }
+
+    // Observe mode has to be unmissable. Every request was forwarded UNTOUCHED, so
+    // reading these figures as achieved savings is exactly the wrong conclusion — and it
+    // is the conclusion a dashboard invites unless it says otherwise.
+    const o = $('#observe-banner');
+    if (c.mode === 'observe') {
+      const q = c.observe_queue;
+      let text = 'You are currently in OBSERVE mode. context-guru did not modify any request: ' +
+        'every request above was forwarded to the provider untouched, and the pipeline ran ' +
+        'off-path on a copy. Savings shown here are what compaction WOULD have achieved, ' +
+        'not what it did.';
+      if (q) {
+        text += ` Off-path queue: ${num(q.processed)} measured, ${num(q.pending)} in flight`;
+        // Drops matter more than depth: a dropped observation never happened, so the
+        // projection understates. Say which direction the error runs.
+        text += q.dropped > 0
+          ? `, ${num(q.dropped)} DROPPED — the projection under-reports by whatever those would have saved.`
+          : ', 0 dropped.';
+      }
+      o.textContent = text;
+      o.hidden = false;
+    } else o.hidden = true;
+  } catch (_) { /* the banners are best-effort */ }
 }
 
 // ── views + filters ────────────────────────────────────────────────────────

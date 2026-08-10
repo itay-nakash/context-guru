@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -340,6 +342,148 @@ func TestDisabledDashboardChangesNothing(t *testing.T) {
 	}
 	if snap["requests"] == nil {
 		t.Error("/stats broken with the dashboard off")
+	}
+}
+
+// manyToolResultsRequest builds a transcript shaped like a real agent's mid-session
+// turn: many large tool results, not one. The shape is the point — content capture
+// redacts up to ContentMaxPerRequest x (before+after) blobs, so a body with a single
+// tool result exercises 1/24th of the work and would let a regression through. The
+// blobs are log-shaped (KEY=value lines, paths, a URL) because that is the text the
+// credential regexes are slowest over.
+func manyToolResultsRequest(model string, results int) []byte {
+	msgs := []any{map[string]any{"role": "user", "content": "please fix the failing test"}}
+	var logish strings.Builder
+	for i := 0; i < 120; i++ {
+		logish.WriteString("2026-08-09T12:00:00Z INFO  worker=7 path=/repo/pkg/mod/thing.py status=ok\n")
+		logish.WriteString("  DATABASE_URL=postgres://localhost:5432/app RETRIES=3 TIMEOUT_MS=2500\n")
+		logish.WriteString("  File \"/repo/pkg/mod/thing.py\", line 42, in handler\n    result = compute(x, y)\n")
+	}
+	blob := logish.String()
+	for i := 0; i < results; i++ {
+		id := "tu_" + strconv.Itoa(i)
+		msgs = append(msgs,
+			map[string]any{"role": "assistant", "content": []any{
+				map[string]any{"type": "tool_use", "id": id, "name": "bash",
+					"input": map[string]any{"command": "pytest -k case" + strconv.Itoa(i)}},
+			}},
+			map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "tool_result", "tool_use_id": id, "content": blob},
+			}})
+	}
+	b, _ := json.Marshal(map[string]any{
+		"model": model, "max_tokens": 64, "messages": msgs,
+	})
+	return b
+}
+
+// TestDashboardAddsNoRequestLatencyWithContentCapture is the regression test the
+// original overhead claim was missing.
+//
+// dash.BenchmarkRecord measures a channel send (~175 ns) and is honest about that,
+// but it is not the dashboard's per-request cost: `finish` is called from serve's
+// `defer`, which runs BEFORE the handler returns, so anything expensive there is paid
+// by the next request on a keep-alive connection — every real agent. Content
+// redaction (nine regexes over up to ContentMaxPerRequest x 2 blobs) sat there and
+// cost ~53 ms/request, ~25% of a real request, while the documented figure was
+// ~0.000002%. A benchmark that calls Record directly can never catch that.
+//
+// So this drives the REAL handler over ONE keep-alive connection with content capture
+// ON — the path a client actually pays for — and compares against the same handler
+// with the dashboard off. It fails if the dashboard adds a perceptible cost.
+func TestDashboardAddsNoRequestLatencyWithContentCapture(t *testing.T) {
+	up := fakeUpstream(t)
+	defer up.Close()
+
+	cfg, err := config.LoadBytes([]byte("preset: codesafe\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	offAgg := metrics.NewAggregator()
+	offPipe, err := cfg.Build(offAgg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	offH := New(offPipe, store.NewMemory(store.Options{}), offAgg,
+		Options{AnthropicUpstream: up.URL, Prices: fixedPricer{}})
+	// Content capture ON: the configuration with the most work to do per request is
+	// the one worth guarding.
+	onH, _ := dashHandler(t, up.URL, dash.Options{
+		CaptureContent: true, ContentCap: 16 << 10, ContentMaxPerRequest: 24,
+	})
+
+	// 24 tool results = ContentMaxPerRequest, so the capture path does the full amount
+	// of work it is ever allowed to do on one request. A body with a single tool result
+	// exercises 1/24th of it and lets a regression through.
+	body := string(manyToolResultsRequest("m", 24))
+
+	// One connection per handler, reused, so a cost paid in the handler's defer shows
+	// up as latency on the NEXT request rather than being hidden by a fresh dial.
+	newClient := func(h *Handler) (*http.Client, string, func()) {
+		srv := httptest.NewServer(h.Mux())
+		c := &http.Client{Transport: &http.Transport{MaxIdleConnsPerHost: 1}}
+		return c, srv.URL + "/anthropic/v1/messages", func() {
+			c.CloseIdleConnections()
+			srv.Close()
+		}
+	}
+	one := func(c *http.Client, url string) time.Duration {
+		start := time.Now()
+		resp, err := c.Post(url, "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, resp.Body) // drain, or the connection is not reusable
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("upstream returned %d", resp.StatusCode)
+		}
+		return time.Since(start)
+	}
+
+	offClient, offURL, closeOff := newClient(offH)
+	defer closeOff()
+	onClient, onURL, closeOn := newClient(onH)
+	defer closeOn()
+
+	// PAIRED and INTERLEAVED, then compared on the MEDIAN. Measuring all the off
+	// requests and then all the on requests attributes any drift in machine load to the
+	// dashboard: consecutive runs of that shape disagreed by 4x (+3 ms to +12 ms) on an
+	// idle box, which is not a usable gate. Alternating and taking medians cancels drift
+	// and discards the outliers a shared CI box produces.
+	const warmup, iters = 5, 40
+	for i := 0; i < warmup; i++ {
+		one(offClient, offURL)
+		one(onClient, onURL)
+	}
+	offs := make([]time.Duration, 0, iters)
+	ons := make([]time.Duration, 0, iters)
+	for i := 0; i < iters; i++ {
+		if i%2 == 0 { // alternate which one goes first, so ordering cannot bias either
+			offs = append(offs, one(offClient, offURL))
+			ons = append(ons, one(onClient, onURL))
+			continue
+		}
+		ons = append(ons, one(onClient, onURL))
+		offs = append(offs, one(offClient, offURL))
+	}
+	median := func(ds []time.Duration) time.Duration {
+		slices.Sort(ds)
+		return ds[len(ds)/2]
+	}
+	off, on := median(offs), median(ons)
+
+	added := on - off
+	t.Logf("median per-request latency over %d paired requests: dashboard off %v, "+
+		"on with content ON %v (added %v)", iters, off, on, added)
+
+	// The budget is loose in absolute terms (a fake-upstream request still moves by a
+	// millisecond or two under load) but an order of magnitude below the ~53 ms the
+	// regression cost. Anything that puts redaction, gzip or an insert back on the
+	// request goroutine blows straight through it.
+	if added > 5*time.Millisecond {
+		t.Errorf("the dashboard added %v per request with content capture on; "+
+			"something expensive is back on the request goroutine (budget 5ms)", added)
 	}
 }
 

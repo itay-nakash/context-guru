@@ -36,6 +36,46 @@ func openTestDB(t *testing.T) *DB {
 	return db
 }
 
+// TestInMemoryDatabasesAreIsolated pins the fix for a latent collision: Open(":memory:")
+// used the DSN `file::memory:?cache=shared`, and under cache=shared the NAME identifies
+// the database — so every in-memory dashboard in the process was the SAME database.
+// Production opens one, so it was not a live bug, but it silently merged the history of
+// two proxies both falling back to :memory:, and it leaked rows between :memory: tests,
+// which is the flakiest class of failure there is.
+func TestInMemoryDatabasesAreIsolated(t *testing.T) {
+	a, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	if err := a.insertBatch([]*Event{mkEvent(1000, "only-in-a", "m", 100, 90)}); err != nil {
+		t.Fatal(err)
+	}
+	page, err := b.Requests(Filter{}, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 0 {
+		t.Errorf("the second in-memory DB sees %d rows from the first; they are the same database", page.Total)
+	}
+	// And the first must still hold its own row — a per-connection private database
+	// would isolate them by losing the data instead.
+	pa, err := a.Requests(Filter{}, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pa.Total != 1 {
+		t.Errorf("the first in-memory DB holds %d rows; want the 1 just inserted "+
+			"(a pooled connection must still see the write)", pa.Total)
+	}
+}
+
 func TestSchemaMigrationIsIdempotent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "d.db")
 	db, err := Open(path)

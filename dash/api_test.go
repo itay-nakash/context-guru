@@ -76,6 +76,42 @@ func TestAPIRoutesServeJSON(t *testing.T) {
 	}
 }
 
+// TestCaptureReportsModeAndObserveQueue covers what the observe banner reads. The
+// issue required "You are currently in observe mode…" to be unmistakable, and the mode
+// was previously hardcoded to "active" in main.go with dash.Options.Mode set and never
+// read — so the banner could not have fired however the proxy was configured.
+func TestCaptureReportsModeAndObserveQueue(t *testing.T) {
+	// Default: active, and no queue at all (a sync deployment must show no phantom one).
+	a, _ := newTestAPI(t, Options{})
+	_, body := get(t, a, "/api/capture", "127.0.0.1:1")
+	c, _ := body["capture"].(map[string]any)
+	if c["mode"] != ModeActive {
+		t.Errorf("mode = %v; want %q", c["mode"], ModeActive)
+	}
+	if _, ok := c["observe_queue"]; ok {
+		t.Error("observe_queue is present with no pool running; the UI would render an empty queue")
+	}
+
+	// Observe, with the host publishing its pool counters.
+	ao, reco := newTestAPI(t, Options{Mode: ModeObserve})
+	reco.SetObserveQueue(func() QueueStats {
+		return QueueStats{Queued: 7, Pending: 2, Processed: 40, Dropped: 3, Errors: 1}
+	})
+	_, body = get(t, ao, "/api/capture", "127.0.0.1:1")
+	c, _ = body["capture"].(map[string]any)
+	if c["mode"] != ModeObserve {
+		t.Errorf("mode = %v; want %q", c["mode"], ModeObserve)
+	}
+	q, ok := c["observe_queue"].(map[string]any)
+	if !ok {
+		t.Fatalf("observe_queue missing: %v", c)
+	}
+	// dropped is the counter that changes a reader's conclusion, so assert it explicitly.
+	if q["dropped"] != float64(3) || q["processed"] != float64(40) {
+		t.Errorf("observe_queue = %v; want processed=40 dropped=3", q)
+	}
+}
+
 func TestAPIRequestDetailGating(t *testing.T) {
 	a, rec := newTestAPI(t, Options{CaptureContent: true, TrustedCIDRs: []string{"10.1.0.0/16"}})
 	e := mkEvent(time.Now().UnixMilli(), "sess-1", "m", 1000, 800)
@@ -277,7 +313,8 @@ func TestUIHasTestIDsForEveryStatTile(t *testing.T) {
 		"chart-volume", "chart-components", "components-table", "sessions-table",
 		"requests-table", "requests-page", "requests-next", "requests-prev",
 		"bench-list", "bench-run", "bench-scatter", "bench-tasks",
-		"config-body", "capture-body", "capture-warning", "drawer-body", "diff-block",
+		"config-body", "capture-body", "capture-warning", "observe-banner",
+		"drawer-body", "diff-block",
 		"detail-summary", "detail-components", "live-table", "live-indicator",
 		"theme-toggle", "tab-overview", "tab-components", "tab-sessions", "tab-requests",
 		"tab-benchmarks", "tab-config", "filter-q", "filter-range", "filter-model",
@@ -287,6 +324,57 @@ func TestUIHasTestIDsForEveryStatTile(t *testing.T) {
 	} {
 		if !strings.Contains(source, `"`+id+`"`) && !strings.Contains(source, "'"+id+"'") {
 			t.Errorf("data-testid %q is not produced by the UI; a check or screenshot depends on it", id)
+		}
+	}
+}
+
+// TestBenchIngestCommitsNothingForARunWithNoTasks pins the counter/table agreement.
+// IngestBenchDir used to INSERT the bench_runs row before it knew whether any rows-*
+// file parsed, then return tasks=0 — so IngestBenchRoots did not count the run but the
+// row was already committed. A real jobs root produced "runs=17" in the log and 42 rows
+// from the API, 25 of them with no arms, padding the Benchmarks tab with empty shells
+// and making the PR's own "42 runs ingested" claim wrong.
+func TestBenchIngestCommitsNothingForARunWithNoTasks(t *testing.T) {
+	dir := t.TempDir()
+	write := func(sub, name, body string) {
+		if err := os.MkdirAll(filepath.Join(dir, sub), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, sub, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A summary with no rows files at all: the shape of an abandoned or in-progress run.
+	write("smoke-hd", "summary.json", `{"model":"m","dataset":"d"}`)
+	// A summary whose only rows file is truncated, so nothing parses.
+	write("dbg1", "summary.json", `{"model":"m","dataset":"d"}`)
+	write("dbg1", "rows-off.json", `[{"task":"t1",`)
+	// And one good run, so this proves selectivity rather than a blanket refusal.
+	write("real", "summary.json", `{"model":"m","dataset":"d"}`)
+	write("real", "rows-off.json", `[{"task":"t1","reward":1.0,"steps":3,"agent_cost":0.1}]`)
+
+	db := openTestDB(t)
+	runs, tasks := db.IngestBenchRoots([]string{dir})
+	if runs != 1 || tasks != 1 {
+		t.Errorf("ingested %d runs / %d tasks; want 1/1 (the two contentless dirs must not count)", runs, tasks)
+	}
+
+	got, err := db.BenchRuns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The assertion that actually failed before: the API's row count must EQUAL the
+	// counter the log reports.
+	if len(got) != runs {
+		names := make([]string, len(got))
+		for i, r := range got {
+			names[i] = r.Name
+		}
+		t.Errorf("BenchRuns returned %d rows but the ingest counted %d runs: %v", len(got), runs, names)
+	}
+	for _, r := range got {
+		if len(r.Arms) == 0 {
+			t.Errorf("run %q was committed with no arms; the UI would render an empty row", r.Name)
 		}
 	}
 }

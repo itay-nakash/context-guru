@@ -11,10 +11,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite" // pure-Go driver: no extra C toolchain for the dashboard
 )
+
+// memSeq names in-memory databases uniquely. See Open.
+var memSeq atomic.Uint64
 
 // DB is the dashboard's durable store. All writes go through one goroutine (see
 // capture.go), so the only concurrency here is reads racing that writer, which
@@ -34,7 +38,17 @@ type DB struct {
 // view, so discarding history beats refusing to boot, and renaming beats deleting.
 func Open(path string) (*DB, error) {
 	if path == "" || path == ":memory:" {
-		return openDSN("file::memory:?cache=shared", "")
+		// A UNIQUE name per Open, not a bare `file::memory:`.
+		//
+		// `cache=shared` is required: database/sql keeps a connection POOL and a private
+		// in-memory database exists per connection, so every pooled connection would
+		// otherwise see its own empty database. But under `cache=shared` the NAME
+		// identifies the database, and `file::memory:` is a single name — so every
+		// in-memory dashboard in the process WAS the same database. Two proxies falling
+		// back to :memory: silently merged their history, and :memory: tests leaked rows
+		// into each other (the flakiest possible failure). A per-instance name keeps the
+		// pooling behaviour and removes the collision.
+		return openDSN(fmt.Sprintf("file:dashmem%d?mode=memory&cache=shared", memSeq.Add(1)), "")
 	}
 	if dir := filepath.Dir(path); dir != "" {
 		if err := os.MkdirAll(dir, 0o700); err != nil {

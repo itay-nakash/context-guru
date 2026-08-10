@@ -149,15 +149,23 @@ func (c *capture) finish(usage Usage, usageOK bool, captureContent bool, content
 	if !captureContent {
 		e.Content = nil
 	} else {
+		// Truncate here (a slice reslice, free), but do NOT redact here.
+		//
+		// finish is called from serve's defer, which runs before the handler RETURNS —
+		// not merely after the response body is written. So anything expensive on this
+		// line is paid by the next request on a keep-alive connection, i.e. by every real
+		// agent. Redaction is nine regexes over up to contentMax x 2 blobs, measured at
+		// ~53 ms/request (~25% of a request), against the ~175 ns the channel send costs.
+		// It therefore belongs on the writer goroutine, which already owns the event and
+		// is already off the hot path.
+		//
+		// Secrets still never reach disk: the writer redacts BEFORE the INSERT (see
+		// Event.Redact, called from Recorder.run). What changed is which goroutine pays,
+		// not whether redaction happens.
 		if len(e.Content) > contentMax {
 			e.Content = e.Content[:contentMax]
 		}
-		// Redaction BEFORE the database. Runs on the writer's caller — this goroutine,
-		// after the response is out — never on the client's critical path.
-		for i := range e.Content {
-			e.Content[i].Before = dash.RedactContent(e.Content[i].Before, contentCap)
-			e.Content[i].After = dash.RedactContent(e.Content[i].After, contentCap)
-		}
+		e.ContentCap = contentCap
 	}
 	c.rec.Record(e)
 }

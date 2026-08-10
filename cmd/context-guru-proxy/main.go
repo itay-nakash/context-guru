@@ -108,9 +108,11 @@ func main() {
 			QueueSize:      *dashQueue,
 			TrustedCIDRs:   splitComma(*dashCIDRs),
 			BenchDirs:      splitComma(*dashBench),
-			Preset:         cfg.Preset,
-			Mode:           dash.ModeActive,
-			Effective:      effectiveConfig(cfg, addr, *openai, *anthropic, *bob, *dashDB, *dashContent, *dashCIDRs),
+			// The REAL mode, not a hardcoded "active". In observe mode nothing context-guru
+			// computed was ever enforced, so the dashboard must say so unmissably rather than
+			// present projections as achieved savings.
+			Mode:      dashMode(mode),
+			Effective: effectiveConfig(cfg, addr, *openai, *anthropic, *bob, *dashDB, *dashContent, *dashCIDRs),
 		}
 		// A negative retention means "no limit"; a zero means "use the default". Map
 		// an explicit 0 from the flag to "no limit", which is what a user typing 0 means.
@@ -284,6 +286,17 @@ func parseBool(s string) (v, ok bool) {
 		return false, true
 	}
 	return false, false
+}
+
+// dashMode maps the operating mode onto the dashboard's own label. Two vocabularies
+// exist because they answer different questions: `components.Mode` is "what does the
+// pipeline do", while the dashboard's per-row mode also has to express `bypass`, which
+// is a property of one request rather than of the deployment.
+func dashMode(m components.Mode) string {
+	if m == components.ModeObserve {
+		return dash.ModeObserve
+	}
+	return dash.ModeActive
 }
 
 // modelWindows builds the dynamic context-window resolver used for fraction-based
