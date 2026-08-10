@@ -84,6 +84,63 @@ type Aggregator struct {
 	upstreamMsByp float64 // upstream latency on bypassed (baseline) requests
 	upstreamN     int64
 	upstreamNByp  int64
+	// Mode dimension (#31). Enforced requests are split by mode so a run can tell
+	// which path produced the savings above; observe-mode results are kept in
+	// PHYSICALLY separate fields with their own serialized names, so no query over the
+	// enforced rollups can accidentally include a hypothetical.
+	mode            components.Mode // the configured mode, for the /stats banner
+	syncRequests    int64
+	asyncRequests   int64
+	deferredRuns    int64   // off-path async compactions that produced a committed result
+	deferredMs      float64 // wall time spent off the request path
+	realizedSaved   int64   // tokens saved on-path by replaying a previously deferred compaction
+	potentialRuns   int64
+	potentialBefore int64
+	potentialAfter  int64
+	potentialMs     float64
+	potentialComp   map[string]*compStat
+	// asyncStats is a snapshot function for the pool's counter tuple, injected by the
+	// host so metrics keeps no dependency on the modes package's lifecycle.
+	asyncStats func() any
+}
+
+// SetMode records the configured operating mode so /stats can label itself — the
+// observe-mode banner has to be unmistakable, and a consumer needs to know from the
+// payload alone whether the numbers were enforced.
+func (a *Aggregator) SetMode(m components.Mode) {
+	a.mu.Lock()
+	a.mode = m
+	a.mu.Unlock()
+}
+
+// SetAsyncStats installs a snapshot function for the async queue counters.
+func (a *Aggregator) SetAsyncStats(fn func() any) {
+	a.mu.Lock()
+	a.asyncStats = fn
+	a.mu.Unlock()
+}
+
+// RecordDeferred notes one completed off-path compaction: whether its result was
+// committed, and how long it took (time NOT charged to any request).
+func (a *Aggregator) RecordDeferred(ms float64, committed bool) {
+	a.mu.Lock()
+	a.deferredMs += ms
+	if committed {
+		a.deferredRuns++
+	}
+	a.mu.Unlock()
+}
+
+// RecordRealized notes tokens saved on the request path by replaying a compaction an
+// EARLIER turn computed off-path. This is async's "savings realized on turn N+k"
+// figure: without it the deferred value looks like it never arrived.
+func (a *Aggregator) RecordRealized(tokens int) {
+	if tokens <= 0 {
+		return
+	}
+	a.mu.Lock()
+	a.realizedSaved += int64(tokens)
+	a.mu.Unlock()
 }
 
 type compStat struct {
@@ -107,6 +164,15 @@ func NewAggregator() *Aggregator { return &Aggregator{perComp: map[string]*compS
 func (a *Aggregator) Component(r components.Report) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	// Observe mode is a HYPOTHETICAL: nothing was applied to any request. Its numbers
+	// live in a physically separate map with its own vocabulary, so no aggregate over
+	// the enforced rollups can reach them. Mixing them would silently inflate the
+	// product's headline savings claim, which is why this is a correctness boundary
+	// rather than a presentation choice (#31).
+	if r.Mode == components.ModeObserve {
+		a.observeComp(r)
+		return
+	}
 	cs := a.perComp[r.Component]
 	if cs == nil {
 		cs = &compStat{}
@@ -143,6 +209,50 @@ func (a *Aggregator) Component(r components.Report) {
 	}
 	if !r.Reverted && !r.Skipped {
 		cs.Mutated++ // did something, even if it saved no content tokens
+	}
+	if r.Saved() > 0 && !r.Reverted && !r.Skipped {
+		cs.Acted++
+	}
+}
+
+// observeComp accumulates one observe-mode component report into the hypothetical
+// namespace. Caller holds the lock.
+func (a *Aggregator) observeComp(r components.Report) {
+	if a.potentialComp == nil {
+		a.potentialComp = map[string]*compStat{}
+	}
+	cs := a.potentialComp[r.Component]
+	if cs == nil {
+		cs = &compStat{}
+		a.potentialComp[r.Component] = cs
+	}
+	cs.Runs++
+	cs.Saved += int64(r.Saved())
+	cs.DurationMs += r.DurationMs
+	if saved := int64(r.Saved()); saved > 0 && !r.Reverted && !r.Skipped {
+		if cs.seenKeys == nil {
+			cs.seenKeys = map[string]struct{}{}
+		}
+		if len(r.CacheKeys) == 0 {
+			cs.SavedUnique += saved
+		} else {
+			newKeys := 0
+			for _, k := range r.CacheKeys {
+				if _, seen := cs.seenKeys[k]; !seen {
+					cs.seenKeys[k] = struct{}{}
+					newKeys++
+				}
+			}
+			if newKeys > 0 {
+				cs.SavedUnique += saved * int64(newKeys) / int64(len(r.CacheKeys))
+			}
+		}
+	}
+	if r.Reverted {
+		cs.Reverted++
+	}
+	if !r.Reverted && !r.Skipped {
+		cs.Mutated++
 	}
 	if r.Saved() > 0 && !r.Reverted && !r.Skipped {
 		cs.Acted++
@@ -186,9 +296,24 @@ func (a *Aggregator) RecordUpstreamLatency(ms float64, bypassed bool) {
 func (a *Aggregator) Run(r components.RunReport) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	// Observe: hypothetical. Separate counters, separate JSON keys (potential_* /
+	// projected_*), never added to requests/before/after.
+	if r.Mode == components.ModeObserve {
+		a.potentialRuns++
+		a.potentialBefore += int64(r.TokensBefore)
+		a.potentialAfter += int64(r.TokensAfter)
+		a.potentialMs += r.DurationMs
+		return
+	}
 	a.requests++
 	a.before += int64(r.TokensBefore)
 	a.after += int64(r.TokensAfter)
+	switch r.Mode {
+	case components.ModeAsync:
+		a.asyncRequests++
+	default:
+		a.syncRequests++
+	}
 }
 
 // Snapshot is the JSON served at /stats. It reports both gross savings and the
@@ -219,7 +344,47 @@ type Snapshot struct {
 	AddedLatencyMsAvg     float64 `json:"cg_added_ms_avg"`
 	UpstreamMsAvg         float64 `json:"upstream_ms_avg"`
 	UpstreamMsAvgBypassed float64 `json:"upstream_ms_avg_bypassed"`
+
+	// --- Operating mode (#31). Everything below is ADDITIVE: no existing key was
+	// renamed or removed, because deploy/harbor/*.py parses this payload. ---
+
+	// Mode is the configured operating mode ("sync" | "async" | "observe").
+	Mode string `json:"mode"`
+	// Enforced counts requests whose forwarded body context-guru actually shaped,
+	// split by which mode produced it. In observe mode both are 0 BY CONSTRUCTION —
+	// that is the machine-readable form of "context-guru did not modify requests".
+	SyncEnforced  int64 `json:"sync_enforced"`
+	AsyncEnforced int64 `json:"async_enforced"`
+
+	// Async: the full queue counter tuple (queued/pending/processed/dropped/errors/
+	// stale_discarded) plus the deferred-work accounting. `dropped` and
+	// `stale_discarded` are the "we silently gave up savings" counters and are
+	// surfaced deliberately — headroom exposes only `queued`, which hides them.
+	AsyncQueue          any     `json:"async_queue,omitempty"`
+	DeferredRuns        int64   `json:"async_deferred_runs"`
+	DeferredMsTotal     float64 `json:"async_deferred_ms_total"`
+	RealizedSavedTokens int64   `json:"async_realized_saved_tokens"`
+
+	// Observe mode: HYPOTHETICALS. Distinct keys (potential_* / projected_*) that
+	// never share a name with an enforced metric, so a consumer cannot sum a
+	// hypothetical into a real saving even by accident. All zero outside observe mode.
+	ObserveNotice            string              `json:"observe_notice,omitempty"`
+	ObserveRequests          int64               `json:"observe_hypothetical_requests"`
+	ActualBaselineTokens     int64               `json:"actual_baseline_tokens"`     // what the agent really sent
+	ProjectedOptimizedTokens int64               `json:"projected_optimized_tokens"` // what it would have sent
+	PotentialSavedTokens     int64               `json:"potential_saved_tokens"`
+	PotentialSavingsPct      float64             `json:"potential_savings_pct"`
+	PotentialComponents      map[string]compStat `json:"potential_components,omitempty"`
+	// PotentialOverheadMsAvg is the mean wall time a compaction WOULD have added to
+	// each request had this mode been enforcing — measured off-path, so it is what
+	// sync would cost, not what observe costs.
+	PotentialOverheadMsAvg float64 `json:"potential_overhead_ms_avg"`
 }
+
+// observeNotice is the machine- and human-readable banner: in observe mode nothing
+// was applied, and every number prefixed potential_/projected_ is a hypothetical.
+const observeNotice = "OBSERVE MODE: context-guru did not modify any request. " +
+	"Every potential_*/projected_* field is a hypothetical, not a realized saving."
 
 // Snapshot returns a point-in-time copy of the rollups.
 func (a *Aggregator) Snapshot() Snapshot {
@@ -257,11 +422,49 @@ func (a *Aggregator) Snapshot() Snapshot {
 	if a.upstreamNByp > 0 {
 		upAvgByp = a.upstreamMsByp / float64(a.upstreamNByp)
 	}
-	return Snapshot{
+	mode := a.mode
+	if mode == "" {
+		mode = components.ModeSync
+	}
+	snap := Snapshot{
 		Requests: a.requests, TokensBefore: a.before, TokensAfter: a.after,
 		SavedTokens: saved, SavingsPct: pct,
 		WastedTokens: a.wasted, Bounces: a.bounces, AdjustedSaved: saved - a.wasted,
 		Components: comps, TopPassthrough: passthrough,
 		AddedLatencyMsAvg: addedAvg, UpstreamMsAvg: upAvg, UpstreamMsAvgBypassed: upAvgByp,
+		Mode:          string(mode),
+		SyncEnforced:  a.syncRequests,
+		AsyncEnforced: a.asyncRequests,
+		DeferredRuns:  a.deferredRuns, DeferredMsTotal: a.deferredMs,
+		RealizedSavedTokens: a.realizedSaved,
 	}
+	if a.asyncStats != nil {
+		snap.AsyncQueue = a.asyncStats()
+	}
+	if a.potentialRuns > 0 || mode == components.ModeObserve {
+		snap.ObserveNotice = observeNotice
+		snap.ObserveRequests = a.potentialRuns
+		snap.ActualBaselineTokens = a.potentialBefore
+		snap.ProjectedOptimizedTokens = a.potentialAfter
+		snap.PotentialSavedTokens = a.potentialBefore - a.potentialAfter
+		if a.potentialBefore > 0 {
+			snap.PotentialSavingsPct = float64(a.potentialBefore-a.potentialAfter) / float64(a.potentialBefore) * 100
+		}
+		if a.potentialRuns > 0 {
+			snap.PotentialOverheadMsAvg = a.potentialMs / float64(a.potentialRuns)
+		}
+		if len(a.potentialComp) > 0 {
+			pc := make(map[string]compStat, len(a.potentialComp))
+			for k, v := range a.potentialComp {
+				cs := *v
+				if cs.SavedUnique > 0 {
+					cs.OvercountRatio = float64(cs.Saved) / float64(cs.SavedUnique)
+				}
+				cs.seenKeys = nil
+				pc[k] = cs
+			}
+			snap.PotentialComponents = pc
+		}
+	}
+	return snap
 }

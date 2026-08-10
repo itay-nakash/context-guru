@@ -140,6 +140,24 @@ func (ci Cacheinject) Reformat(req *schemas.BifrostChatRequest, rep *components.
 		want[i] = struct{}{}
 	}
 
+	// Async cache policy (#31). While a compaction is queued but not yet landed, the
+	// tail it is going to REPLACE must not be committed to the provider cache: a
+	// breakpoint at or beyond it turns what would have been a 0.1x read next turn into
+	// a 1.25x write of that same span — 11.5x the cost. That is exactly the failure
+	// that tripled headroom's cache-write on Terminal-Bench. So drop every wanted
+	// position inside the doomed tail and put one at the highest index below it, which
+	// still writes the whole stable prefix.
+	if c.TailCachePending {
+		for i := range want {
+			if c.CacheBlocked(i) {
+				delete(want, i)
+			}
+		}
+		if last := c.NoCacheAtOrAfter - 1; last >= 0 && last < len(req.Input) {
+			want[last] = struct{}{}
+		}
+	}
+
 	applied := 0
 	// Count breakpoints the caller already set: they occupy provider slots, and an
 	// agent that sets its own (claude-code does) is already at the optimum.

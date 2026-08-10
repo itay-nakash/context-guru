@@ -281,3 +281,85 @@ func TestTTLConfig(t *testing.T) {
 		t.Fatal("an unsupported ttl must be rejected, not silently accepted")
 	}
 }
+
+// --- Async cache policy (#31) ------------------------------------------------
+
+// With the safe default (cache_uncompacted_tail: false), no breakpoint may land at or
+// beyond the tail a pending async compaction is going to replace. Committing bytes
+// there converts next turn's 0.1x read into a 1.25x write of the same span — 11.5x the
+// cost, which makes async strictly worse than sync.
+func TestNoBreakpointAtOrBeyondUncompactedTail(t *testing.T) {
+	const n, boundary = 30, 22
+	c := ctx()
+	c.Mode = components.ModeAsync
+	c.CacheAware = true
+	c.MaxCachedIdx = boundary - 1
+	c.TailCachePending = true
+	c.NoCacheAtOrAfter = boundary
+
+	idxs, rep := run(t, c, convo(n))
+	if rep.Skipped {
+		t.Fatal("placed nothing at all: the stable prefix must still be written")
+	}
+	for _, i := range idxs {
+		if i >= boundary {
+			t.Fatalf("breakpoint at %d is inside the un-compacted tail (>= %d): %v", i, boundary, idxs)
+		}
+	}
+	if len(idxs) == 0 {
+		t.Fatal("no breakpoint survived; the whole prefix would bill at 1.0x")
+	}
+	// The highest safe index carries it, so the longest possible stable prefix is written.
+	if top := idxs[len(idxs)-1]; top != boundary-1 {
+		t.Fatalf("top breakpoint is %d, want %d (the highest safe index)", top, boundary-1)
+	}
+}
+
+// A boundary of 0 means the whole request is doomed tail. Nothing may be written —
+// there is no stable prefix to protect and a breakpoint anywhere would be rewritten.
+func TestWholeRequestPendingPlacesNothing(t *testing.T) {
+	c := ctx()
+	c.Mode = components.ModeAsync
+	c.TailCachePending = true
+	c.NoCacheAtOrAfter = 0
+
+	idxs, rep := run(t, c, convo(10))
+	if len(idxs) != 0 {
+		t.Fatalf("wrote breakpoints over a fully-pending request: %v", idxs)
+	}
+	if !rep.Skipped {
+		t.Fatal("placing nothing should report skipped")
+	}
+}
+
+// The escape hatch (cache_uncompacted_tail: true) restores normal placement, for a
+// backend confirmed not to cache, where the protection costs a slot and buys nothing.
+func TestTailCacheProtectionOffRestoresNormalPlacement(t *testing.T) {
+	msgs := convo(30)
+	base, _ := run(t, ctx(), msgs)
+
+	c := ctx()
+	c.Mode = components.ModeAsync // protection NOT enabled (CacheUncompactedTail: true upstream)
+	off, _ := run(t, c, convo(30))
+
+	if len(off) != len(base) {
+		t.Fatalf("unprotected async placement differs from sync: %v vs %v", off, base)
+	}
+	for i := range off {
+		if off[i] != base[i] {
+			t.Fatalf("unprotected async placement differs from sync: %v vs %v", off, base)
+		}
+	}
+}
+
+// Sync mode must be entirely unaffected: TailCachePending false is the default, so a
+// Ctx that never heard of modes places exactly what it always did.
+func TestSyncPlacementUnaffectedByTheNewFields(t *testing.T) {
+	base, _ := run(t, ctx(), convo(30))
+	c := ctx()
+	c.Mode = components.ModeSync
+	sync, _ := run(t, c, convo(30))
+	if len(base) != len(sync) {
+		t.Fatalf("sync placement changed: %v vs %v", base, sync)
+	}
+}
