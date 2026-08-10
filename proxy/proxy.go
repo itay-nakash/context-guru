@@ -277,12 +277,28 @@ func (h *Handler) compact(w http.ResponseWriter, r *http.Request) {
 			window = w
 		}
 	}
-	out, _ := apply.BodyFull(
-		r.Context(), pipe, h.store, provider, body,
-		r.Header.Get("x-context-guru-session"),
-		strings.EqualFold(r.Header.Get("x-context-guru-bypass"), "true"),
-		models, window, cacheMode,
-	)
+	// Use the SAME boundary tracker as the chat path. /compact used to fall through to
+	// apply's legacy store-backed prevLen, which the chat path had already moved off, so this
+	// endpoint kept two properties the chat path had shed: concurrent turns of one session
+	// race on a read-then-deferred-write, and the boundary lives in a store key (`cg:len:`)
+	// that competes for the pin budget instead of in memory.
+	//
+	// The motivation is measurement rather than a live cache regression: /compact is the
+	// offline replay/eval endpoint, so a boundary derived differently from production means
+	// eval measures a different component than the one that ships. That is the same class of
+	// divergence as the window this handler used to hard-code as unknown, a few lines above —
+	// and it went unnoticed for the same reason, because both are silent.
+	res := apply.BodyOpts(r.Context(), pipe, h.store, apply.Opts{
+		Provider:  provider,
+		Body:      body,
+		Session:   r.Header.Get("x-context-guru-session"),
+		Bypass:    strings.EqualFold(r.Header.Get("x-context-guru-bypass"), "true"),
+		Models:    models,
+		Window:    window,
+		CacheMode: cacheMode,
+		Tracker:   h.tracker,
+	})
+	out := res.Body
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(out)
 }
