@@ -110,15 +110,11 @@ func TestChainAndStaticFallback(t *testing.T) {
 	}
 }
 
-// dirtySample mirrors what the real LiteLLM document actually contains: a
-// `sample_spec` entry whose numeric fields hold prose, and models that spell an
-// integer as a float. A strict whole-map decode fails on the first of these and
-// yields NOTHING — the bug that left every window and price unresolved in
-// production. Per-entry decode must skip the bad rows and keep the good ones.
-const dirtySample = `{
+// priceSample carries the four billed tiers plus a model with no published cache
+// rates, on top of the malformed-entry shapes litellm_decode_test.go pins.
+const priceSample = `{
   "sample_spec": {"max_input_tokens": "max input tokens, if the provider specifies it",
-                  "max_tokens": "LEGACY parameter", "input_cost_per_token": "the cost"},
-  "float-window-model": {"max_input_tokens": 128000.0, "input_cost_per_token": 1e-06},
+                  "input_cost_per_token": "the cost"},
   "aws/claude-sonnet-5": {"max_input_tokens": 1000000, "input_cost_per_token": 2e-06,
                           "output_cost_per_token": 1e-05,
                           "cache_read_input_token_cost": 2e-07,
@@ -126,28 +122,20 @@ const dirtySample = `{
   "no-cache-model": {"max_input_tokens": 8192, "input_cost_per_token": 4e-06, "output_cost_per_token": 8e-06}
 }`
 
-func TestLiteLLMSkipsMalformedEntries(t *testing.T) {
+func TestLiteLLMPrices(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Write([]byte(dirtySample))
+		w.Write([]byte(priceSample))
 	}))
 	defer srv.Close()
 	l := NewLiteLLM(srv.URL, srv.Client(), time.Hour)
 	ctx := context.Background()
 	for i := 0; i < 400; i++ {
-		if _, ok := l.Window(ctx, "float-window-model"); ok {
+		if _, ok := l.Price(ctx, "aws/claude-sonnet-5"); ok {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	// The prose-filled sample_spec must not have poisoned the whole map.
-	if w, ok := l.Window(ctx, "aws/claude-sonnet-5"); !ok || w != 1000000 {
-		t.Fatalf("window for aws/claude-sonnet-5 = %d,%v; want 1000000,true (a malformed sibling entry poisoned the decode)", w, ok)
-	}
-	// A float-spelled integer must still resolve.
-	if w, ok := l.Window(ctx, "float-window-model"); !ok || w != 128000 {
-		t.Errorf("float-spelled window = %d,%v; want 128000,true", w, ok)
-	}
 	// Prices must resolve, with the four tiers intact.
 	p, ok := l.Price(ctx, "aws/claude-sonnet-5")
 	if !ok {
@@ -193,7 +181,7 @@ func TestPriceCostAndZero(t *testing.T) {
 
 func TestChainPriceSkipsNonPricers(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Write([]byte(dirtySample))
+		w.Write([]byte(priceSample))
 	}))
 	defer srv.Close()
 	l := NewLiteLLM(srv.URL, srv.Client(), time.Hour)
