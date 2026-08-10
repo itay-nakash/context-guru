@@ -153,11 +153,11 @@ func (h *Handler) enqueueAsync(r *httpReqInfo, inline apply.Result) {
 	})
 }
 
-// enqueueObserve runs the pipeline off-path on a COPY of the request, against a store
-// Buffer that is never committed, and records the result into the hypothetical metric
-// namespace. Two independent reasons the enforced request cannot be affected: it was
-// already forwarded from the untouched original, and every state write this run makes
-// is thrown away with the buffer.
+// enqueueObserve runs the pipeline off-path on a COPY of the request, against observe's
+// own disjoint store, and records the result into the hypothetical metric namespace.
+// Two independent reasons the enforced request cannot be affected: it was already
+// forwarded from the untouched original, and this run touches no state the live path
+// reads.
 func (h *Handler) enqueueObserve(r *httpReqInfo) {
 	if h.pool == nil {
 		return
@@ -172,7 +172,7 @@ func (h *Handler) enqueueObserve(r *httpReqInfo) {
 	key := "observe:" + strconv.FormatUint(h.observeSeq.Add(1), 10)
 
 	h.pool.Enqueue(key, func(ctx context.Context) {
-		apply.BodyOpts(ctx, h.pipe, store.NewBuffer(h.store), apply.Opts{
+		apply.BodyOpts(ctx, h.pipe, h.shadow, apply.Opts{
 			Provider: info.provider, Body: info.body, Session: info.session,
 			Models: info.models, Window: info.window, CacheMode: h.opts.CacheMode,
 			Mode: components.ModeObserve,
@@ -192,5 +192,10 @@ func (h *Handler) enqueueObserve(r *httpReqInfo) {
 		// Aggregator routes anything stamped observe into the potential_* namespace. No
 		// separate recording call here, which is what keeps the two namespaces from
 		// drifting apart.
+		//
+		// h.shadow, not the live store and not a discarded buffer: see Handler.shadow.
+		// The live store must stay clean (a real request must never replay a decision
+		// that was never enforced), but the frozen decisions still have to accumulate
+		// across turns or the projection under-reports what enforcing would achieve.
 	})
 }

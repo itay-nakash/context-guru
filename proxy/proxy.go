@@ -131,6 +131,16 @@ type Handler struct {
 	// observe run never commits, so its generation never advances and cannot serve as
 	// the dedup key on its own).
 	observeSeq atomic.Uint64
+	// shadow is observe mode's own state store, separate from the live one. Observe must
+	// not write into the live store — a real request would then replay a decision that
+	// was never enforced — but it also cannot simply discard its writes: offloaders
+	// FREEZE a decision and replay it on every later turn, which is where most of the
+	// sustained saving comes from. Throwing that away each turn makes observe see only
+	// the current tail and UNDER-project by ~3x against what sync achieves.
+	//
+	// So observe gets a store of its own: as persistent as the live one, and completely
+	// disjoint from it.
+	shadow store.Store
 }
 
 // New builds the proxy handler. agg may be nil (no /stats rollups).
@@ -142,6 +152,9 @@ func New(pipe *components.Pipeline, st store.Store, agg *metrics.Aggregator, opt
 	h := &Handler{pipe: pipe, store: st, agg: agg, opts: opts, client: c, tracker: modes.NewTracker(0)}
 	if h.mode() != components.ModeSync {
 		h.pool = modes.NewPool(opts.Async.MaxQueue, opts.Async.Workers)
+	}
+	if h.mode() == components.ModeObserve {
+		h.shadow = store.NewMemory(store.Options{})
 	}
 	if agg != nil {
 		agg.SetMode(h.mode())

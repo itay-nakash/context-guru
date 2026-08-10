@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,6 +26,14 @@ import (
 // aggregator so a test can read the mode-partitioned rollups.
 func modeHandler(t *testing.T, yaml, upstream string, mode components.Mode) (*proxy.Handler, *metrics.Aggregator) {
 	t.Helper()
+	return newModeHandler(t, yaml, upstream, mode, "")
+}
+
+// newModeHandler is modeHandler with an explicit cache mode. "on" forces
+// cache-awareness even on the OpenAI route, which is what makes the tail gate (and so
+// MaxCachedIdx) actually participate — several mode behaviors are only observable then.
+func newModeHandler(t *testing.T, yaml, upstream string, mode components.Mode, cacheMode string) (*proxy.Handler, *metrics.Aggregator) {
+	t.Helper()
 	cfg, err := config.LoadBytes([]byte(yaml))
 	if err != nil {
 		t.Fatal(err)
@@ -35,7 +44,7 @@ func modeHandler(t *testing.T, yaml, upstream string, mode components.Mode) (*pr
 		t.Fatal(err)
 	}
 	h := proxy.New(pipe, store.NewMemory(store.Options{}), agg, proxy.Options{
-		OpenAIUpstream: upstream, AnthropicUpstream: upstream, Mode: mode,
+		OpenAIUpstream: upstream, AnthropicUpstream: upstream, Mode: mode, CacheMode: cacheMode,
 	})
 	t.Cleanup(h.Close)
 	return h, agg
@@ -453,4 +462,143 @@ func TestAsyncSavingsArriveOnALaterTurn(t *testing.T) {
 	if len(got()) != 5 {
 		t.Fatalf("forwarded %d of 5 turns", len(got()))
 	}
+}
+
+// TestObserveProjectionAgreesWithSyncActuals is the check that validates the whole
+// mode: run the SAME turns under sync and under observe, and observe's projected
+// saving must match what sync actually achieved. It caught a real overstatement —
+// without the shared cache boundary, observe's tail gate never fired and it projected
+// savings on messages sync would never touch.
+func TestObserveProjectionAgreesWithSyncActuals(t *testing.T) {
+	dump := strings.Repeat("a long stale tool output worth offloading\n", 80)
+	turns := func() [][]byte {
+		var out [][]byte
+		// Each turn appends SEVERAL tool outputs, so more than one lands beyond the
+		// previous turn's boundary. That matters: with only one new tool output per turn
+		// it is always the one mask keeps, nothing is eligible in the tail, and both arms
+		// trivially save zero — which would hide the very disagreement this test exists for.
+		for n := 1; n <= 5; n++ {
+			msgs := []map[string]any{{"role": "user", "content": "go"}}
+			for i := 0; i < n*4; i++ {
+				msgs = append(msgs,
+					map[string]any{"role": "assistant", "content": "step " + strconv.Itoa(i)},
+					map[string]any{"role": "tool", "tool_call_id": "t" + strconv.Itoa(i), "content": dump + strconv.Itoa(i)})
+			}
+			out = append(out, openAIBody(msgs...))
+		}
+		return out
+	}()
+
+	// keep_last: 1 so each turn's growth pushes the previous tool output out of the
+	// keep window and into mask's range, giving both arms something to act on inside
+	// the uncached tail (which is where cache-awareness permits acting at all).
+	yaml := "pipeline: [mask]\ncomponents:\n  mask:\n    keep_last: 1\n"
+	drive := func(mode components.Mode) metrics.Snapshot {
+		up, _ := captureUpstream(t)
+		// cache=on so cache-awareness (and therefore the tail gate) is live: that gate is
+		// exactly what observe used to ignore, and without it the two arms agree trivially.
+		h, agg := newModeHandler(t, yaml, up.URL, mode, "on")
+		srv := httptest.NewServer(h.Mux())
+		defer srv.Close()
+		for _, b := range turns {
+			req, _ := http.NewRequest(http.MethodPost, srv.URL+"/openai/v1/chat/completions", bytes.NewReader(b))
+			req.Header.Set("x-context-guru-session", "agree")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+		if mode == components.ModeObserve {
+			return awaitSnapshot(t, agg, func(s metrics.Snapshot) bool { return s.ObserveRequests >= int64(len(turns)) })
+		}
+		return agg.Snapshot()
+	}
+
+	sync := drive(components.ModeSync)
+	obs := drive(components.ModeObserve)
+
+	t.Logf("sync: before=%d saved=%d (%.2f%%)", sync.TokensBefore, sync.SavedTokens, sync.SavingsPct)
+	t.Logf("observe: baseline=%d potential=%d (%.2f%%) reqs=%d",
+		obs.ActualBaselineTokens, obs.PotentialSavedTokens, obs.PotentialSavingsPct, obs.ObserveRequests)
+
+	if sync.SavedTokens == 0 || obs.PotentialSavedTokens == 0 {
+		t.Fatalf("one side saved nothing; the agreement check is vacuous (sync=%d observe=%d)",
+			sync.SavedTokens, obs.PotentialSavedTokens)
+	}
+	// Both saw the same traffic under the same boundary, so the projection must track
+	// the actual closely. A generous band still catches the class of bug this found
+	// (observe was 11x sync before the shared-tracker fix).
+	ratio := float64(obs.PotentialSavedTokens) / float64(sync.SavedTokens)
+	if ratio < 0.75 || ratio > 1.33 {
+		t.Fatalf("observe's projection disagrees with sync's actual: %d vs %d (ratio %.2f)",
+			obs.PotentialSavedTokens, sync.SavedTokens, ratio)
+	}
+}
+
+// TestObserveNeverWritesTheLiveStore: observe gets a store of its own so its frozen
+// decisions accumulate across turns (without that it under-projects by ~3x), but the
+// live store must stay pristine — otherwise a later real request would replay a
+// decision that was never enforced, which is a request modification arriving by the
+// back door.
+func TestObserveNeverWritesTheLiveStore(t *testing.T) {
+	up, _ := captureUpstream(t)
+	cfg, err := config.LoadBytes([]byte("pipeline: [mask]\ncomponents:\n  mask:\n    keep_last: 1\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	agg := metrics.NewAggregator()
+	pipe, err := cfg.Build(agg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	live := &countingStore{Store: store.NewMemory(store.Options{})}
+	h := proxy.New(pipe, live, agg, proxy.Options{
+		OpenAIUpstream: up.URL, Mode: components.ModeObserve, CacheMode: "on",
+	})
+	t.Cleanup(h.Close)
+	srv := httptest.NewServer(h.Mux())
+	defer srv.Close()
+
+	dump := strings.Repeat("a long stale tool output worth offloading\n", 80)
+	for n := 1; n <= 4; n++ {
+		msgs := []map[string]any{{"role": "user", "content": "go"}}
+		for i := 0; i < n*4; i++ {
+			msgs = append(msgs,
+				map[string]any{"role": "assistant", "content": "step " + strconv.Itoa(i)},
+				map[string]any{"role": "tool", "tool_call_id": "t" + strconv.Itoa(i), "content": dump + strconv.Itoa(i)})
+		}
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/openai/v1/chat/completions", bytes.NewReader(openAIBody(msgs...)))
+		req.Header.Set("x-context-guru-session", "isolated")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+	snap := awaitSnapshot(t, agg, func(s metrics.Snapshot) bool { return s.PotentialSavedTokens > 0 })
+	if snap.PotentialSavedTokens == 0 {
+		t.Fatal("observe recorded no savings; the isolation check is vacuous")
+	}
+	if n := live.puts.Load(); n != 0 {
+		t.Fatalf("observe mode wrote %d entries into the LIVE store", n)
+	}
+}
+
+// countingStore counts writes so a test can assert none happened.
+type countingStore struct {
+	store.Store
+	puts atomic.Int64
+}
+
+func (c *countingStore) Put(key string, payload []byte) {
+	c.puts.Add(1)
+	c.Store.Put(key, payload)
+}
+
+func (c *countingStore) MarkSticky(session, id string) {
+	c.puts.Add(1)
+	c.Store.MarkSticky(session, id)
 }

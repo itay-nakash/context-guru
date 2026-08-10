@@ -284,7 +284,26 @@ than a wrong request, which is the opposite of `MaxCachedIdx`'s `-1` (see #25).
 
 The request path does **not** run the pipeline, and skips `expand.Inject` too — a tool
 declaration is a modification. Byte-identity is therefore structural, not a property of
-careful copying. A copy runs off-path against a `store.Buffer` that is never committed.
+careful copying.
+
+The off-path copy runs against `Handler.shadow`, observe's OWN store: as persistent as
+the live one and completely disjoint from it. Both halves of that are load-bearing, and
+both were found by comparing observe's projection against sync's actuals rather than by
+reading the code:
+
+- **Persistent**, because offloaders freeze a decision and replay it on every later
+  turn — that replay is where most of the sustained saving lives. Running observe
+  against a discarded buffer makes it see only the current tail and under-project by
+  ~3x.
+- **Disjoint**, because a decision observe made must never be replayable by a real
+  request. That would be a request modification arriving by the back door.
+
+Observe also shares the `Tracker`, so the projection is gated by the same
+cached-prefix boundary an enforcing mode would use. Without it MaxCachedIdx is -1, the
+tail gate never fires, and the projection overstates savings by the amount
+cache-awareness costs (9.5% projected vs 0.8% enforced, measured). Sharing it is safe
+off-path: `prevLen` only grows, so a late job cannot move the boundary backwards, and
+observe never commits, so the generation stays put.
 
 ### Fail-open per mode
 

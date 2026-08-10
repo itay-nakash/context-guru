@@ -149,6 +149,27 @@ inflates a savings claim. The separation is therefore structural — two physica
 separate accumulators with disjoint serialized names — and a test asserts that no
 enforced aggregate can reach an observe result.
 
+### Why observe's numbers should match sync's
+
+The projection is measured under the **same** conditions an enforcing mode would run
+under, because that agreement is what validates the mode. Two things are required and
+neither is obvious:
+
+- **The same cached-prefix boundary.** Observe shares the per-session boundary the
+  enforced path uses. Without it, cache-awareness never gates anything, every message
+  in the transcript looks compactable, and the projection overstates savings by exactly
+  the amount cache-awareness costs — measured at 9.5% projected against 0.8% actually
+  achieved on the same SWE-bench tasks.
+- **State that accumulates across turns.** Offloaders *freeze* a decision and replay it
+  on every later turn, which is where most of the sustained saving comes from. So
+  observe keeps a store of its own — as persistent as the live one, and completely
+  disjoint from it. Discarding its state each turn instead makes it see only the
+  current tail and **under**-project by ~3x.
+
+The live store stays pristine either way: observe never writes a byte into it, or a
+later real request could replay a decision that was never enforced — a request
+modification arriving by the back door. Both properties are asserted by tests.
+
 ### What observe cannot tell you
 
 - **Cache effects are projected, not measured.** The forwarded request is the
