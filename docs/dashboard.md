@@ -71,11 +71,22 @@ removed is unfalsifiable:
 
 ![Cost chart with a tooltip](img/dashboard/02-savings-cost-graph-tooltip.jpg)
 
-The shaded band between the lines is money saved. Baseline prices the tokens we removed
-at the **cache-write** rate they would have entered as — on a prompt-caching backend
-that is ~11.5× a cache read, which is the whole reason token savings and dollar savings
-diverge so sharply on this workload (see
+The shaded band between the lines is money saved. Baseline prices the **unique** tokens we
+removed at the **cache-write** rate they would have entered as — on a prompt-caching
+backend that is ~11.5× a cache read — and the re-sent remainder at the **cache-read** rate
+the provider would have served it from. That split is the whole reason token savings and
+dollar savings diverge so sharply on this workload (see
 [the SWE-bench comparison](results/comparison.md)).
+
+Both halves matter, and getting either wrong inflates the headline. `saved_tokens` is
+gross: the agent re-sends its transcript every turn, so one compaction is re-counted once
+per remaining turn — a 4.7× overcount on the 63-request replay above, and 13.1× on a
+longer one. Only `saved_unique` is content that genuinely never reached the provider, and
+only that part can be priced as a cache write; the re-sent remainder would have come from
+the provider's cache at 1/11.5 the rate. The dashboard shows the correction factor as
+`overcount_ratio` right beside the dollar figure — an earlier version of this page
+described pricing gross savings as writes, which overstated net savings by ~9× on the
+same data.
 
 Beneath it, the **honest savings waterfall**: baseline → compaction savings →
 context-guru's own LLM cost → net cost → net savings. If context-guru cost more than it

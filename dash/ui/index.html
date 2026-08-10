@@ -83,10 +83,12 @@
 
   <div class="panel">
     <h2>Cumulative cost: without context-guru vs with</h2>
-    <p class="note">The shaded area between the lines is money saved. Baseline prices the tokens
-      we removed at the <strong>cache-write</strong> rate they would have entered as — on a
-      prompt-caching backend that is ~11.5&times; a cache read, which is why dollar savings and
-      token savings diverge so sharply on this workload.</p>
+    <p class="note">The shaded area between the lines is money saved. Baseline prices the
+      <strong>unique</strong> tokens we removed at the cache-write rate they would have entered
+      as (~11.5&times; a cache read on a prompt-caching backend), and the re-sent remainder at
+      the cache-read rate the provider would have served it from. Pricing gross savings as
+      writes is how a dashboard overstates itself by its own overcount ratio — which is why
+      dollar savings and token savings diverge so sharply on this workload.</p>
     <div id="chart-cost" class="chart" data-testid="chart-cost"></div>
   </div>
 
