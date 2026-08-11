@@ -73,6 +73,11 @@ const (
 	// Anthropic tool_result block; a change rewrites only that block's `content`
 	// string field, which is byte-lossless for the rest of the message.
 	anthropicToolText
+	// embeddedToolText: norm message is a synthetic role=tool extracted from terminal
+	// output embedded in a user message's text (see embedded.go). A change rewrites
+	// only the marked span of that string, so the surrounding instruction prose —
+	// and the rest of the message — stays byte-identical.
+	embeddedToolText
 )
 
 // slot records how one normalized message writes back to the raw body.
@@ -80,8 +85,11 @@ type slot struct {
 	kind     slotKind
 	path     string // sjson path: "messages.<i>" (whole) or "messages.<i>.content.<b>.content" (tool text)
 	pre      []byte // wholeMessage: canonical marshal of the original message
-	preText  string // anthropicToolText: original tool-output text (change detection)
+	preText  string // anthropicToolText/embeddedToolText: original tool-output text (change detection)
 	lossless bool   // wholeMessage: does bifrost round-trip this message without dropping fields
+	// embeddedToolText: the untouched prefix/suffix around the extracted span, so the
+	// full string field can be rebuilt as prefix + rewritten + suffix.
+	preSpan, postSpan string
 }
 
 // Trace is the per-request record of what BodyFull actually did: the resolved
@@ -302,6 +310,20 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 			}
 			var err error
 			if out, err = sjson.SetBytes(out, s.path, newText); err != nil {
+				res.Body = body
+				return res
+			}
+			changed = true
+			changes = append(changes, mkChange(s.path, s.preText, newText))
+		case embeddedToolText:
+			newText := schema.MessageText(chat.Input[i])
+			if newText == s.preText {
+				continue
+			}
+			// Rebuild the whole string field: untouched preamble + rewritten output +
+			// untouched trailing instructions.
+			var err error
+			if out, err = sjson.SetBytes(out, s.path, s.preSpan+newText+s.postSpan); err != nil {
 				res.Body = body
 				return res
 			}
@@ -547,6 +569,25 @@ func normalize(provider bschemas.ModelProvider, arr []gjson.Result) (norm []bsch
 			}
 			if handled {
 				continue // this user message contributed its tool_result blocks; body carries the rest
+			}
+		}
+		// Terminal-style agents (harbor's terminus-2 and friends) embed tool output in
+		// the TEXT of a user message behind a known preamble marker, with no tools array
+		// and no role=tool anywhere. Extract that span as a synthetic tool message so the
+		// components see it; the marker line and any trailing instructions stay put.
+		if c := m.Get("content"); c.Type == gjson.String &&
+			m.Get("role").String() == string(bschemas.ChatMessageRoleUser) {
+			text := c.String()
+			if s, e, ok := embeddedSpan(text); ok {
+				norm = append(norm, toolMessage(text[s:e], ""))
+				slots = append(slots, slot{
+					kind:     embeddedToolText,
+					path:     "messages." + strconv.Itoa(i) + ".content",
+					preText:  text[s:e],
+					preSpan:  text[:s],
+					postSpan: text[e:],
+				})
+				continue
 			}
 		}
 		// Default: whole-message slot. Unmarshal via bifrost and record whether that

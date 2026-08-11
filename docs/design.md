@@ -127,6 +127,21 @@ Non-string tool_result content is skipped (never lose non-text). A whole-message
 spliced back if bifrost round-trips that message losslessly (`jsonEqual`); otherwise the change
 is discarded — correctness over the marginal saving.
 
+**Embedded tool output.** A third shape exists: terminal-style agents (Harbor's `terminus-2`)
+run a plain chat loop with *no* tools array and feed tool output back as the **text of the next
+user message**, behind a template preamble (`New Terminal Output:`, `Current terminal state:`,
+…). Every component begins by skipping non-`role=tool` messages, so such traffic was passing
+through untouched — measured on a 50-task terminal-bench run: 2,245 requests, 20,205 component
+invocations, `acted=0`, `tokens_before == tokens_after`. Not a threshold problem: median final
+context was 14,095 tokens, so no floor was the obstacle — no component ever looked at the bytes.
+`apply` now extracts the marked span as a synthetic `role:tool` message and splices a rewrite
+back into exactly that span, so the preamble and any trailing instruction prose stay
+byte-identical. Matching is deliberately narrow (marker at a line start, minimum span length,
+innermost marker wins) so ordinary prose — including the agent's own system prompt, which
+*quotes these very strings* while describing the output format — is never mistaken for tool
+output. These agents declare no tools, so they cannot call `context_guru_expand`; pair this with
+`marker_mode: summary` for a self-contained marker. See `apply/embedded.go`.
+
 **The metadata exception.** That guard has one deliberate hole, and it exists because the guard
 alone made `cacheinject` a no-op. bifrost drops `tool_use.id/name/input` on unmarshal, so every
 Anthropic assistant turn carrying a `tool_use` is non-round-trippable — and those are exactly the
