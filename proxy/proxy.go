@@ -796,6 +796,11 @@ func (h *Handler) stats(w http.ResponseWriter, _ *http.Request) {
 	snap.SummarizeTimeouts = offload.SummarizeTimeouts()
 	snap.SummarizeErrors = offload.SummarizeErrors()
 	snap.SummarizeCallTimeoutMs = offload.SummarizeCallTimeout().Milliseconds()
+	// agentdiet owns a third budget (a window of steps, between one tool output and a
+	// whole span), and runs in its own arm — so it reports its own counters too.
+	snap.AgentDietTimeouts = offload.AgentDietTimeouts()
+	snap.AgentDietErrors = offload.AgentDietErrors()
+	snap.AgentDietCallTimeoutMs = offload.AgentDietCallTimeout().Milliseconds()
 	// Freeze-replay health, same layering: the counters live with the code that owns
 	// them (offload for the replay path, the store for dropped/repaired decisions).
 	snap.FrozenHits, snap.FrozenMisses = offload.FrozenStats()

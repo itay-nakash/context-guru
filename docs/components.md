@@ -23,6 +23,7 @@ messages (`role:"tool"`; for Anthropic, `tool_result` blocks normalized to that 
 | `smartcrush` | Offload | middle items of a JSON array | via expand | JSON-array tool output | `min_items` (5), `min_tokens` (200), `keep_first` (3), `keep_last` (2) |
 | `mask` | Offload | older tool outputs (age-based) | via expand | more than `keep_recent` outputs | `keep_recent` (3), `min_tokens` (100), `keep_head_chars` (96) |
 | `summarize` | Offload (LLM) | the middle of the transcript → one summary | via expand | long trajectories | `summary_level` (regular), `keep_last` (3), `min_tokens` (500), `resummarize_tokens` (6000), `model.source`, `trigger` |
+| [`agentdiet`](components/agentdiet.md) | Offload (LLM) | useless/redundant/**expired** content in the step that just aged past the delay | via expand | a step above `min_step_tokens`, `delay_steps` turns back | `delay_steps` (2), `context_steps` (1), `min_step_tokens` (500), `min_saved_tokens` (400), `max_keep_ratio` (0.8), `model.source` |
 
 Presets (`config/config.go`), verbatim: **`codesmart`** (the proxy default)
 `[format, dedup, failed_run, cmdfilter, extract_llm, extract, cachesplit]` · **`codesafe`**
@@ -39,7 +40,9 @@ sessions; `mask` is the biggest lever there (~27–30% content-token savings, no
 shrinkers (`toon`/`cmdfilter`/`collapse`) that cost nothing when they don't fire. `balanced` is
 **not** recommended for agentic traffic — it omits `mask`, so it barely helps (6% vs 31% in the
 Terminal-Bench replay) ·
-`summarize` `[summarize]` (run alone — it restructures the whole transcript).
+`summarize` `[summarize]` (run alone — it restructures the whole transcript) ·
+`agentdiet` `[format, agentdiet, cachesplit]` (a published-method **baseline** for A/B, run without
+our own offloaders so its effect is attributable — see [agentdiet](components/agentdiet.md)).
 
 Every preset that touches caching carries `cachesplit`, never `cacheinject` — see
 [Presets](reference/presets.md).
@@ -57,11 +60,12 @@ store persists), so Offload markers are genuinely recoverable — not just descr
 offloader also applies a **marker-inclusive** never-worse check per message, so a rewrite never grows a
 message by the marker's tokens.
 
-**LLM-based components** (`extract_llm`, and `summarize`) call a model, chosen by
+**LLM-based components** (`extract_llm`, `summarize`, `agentdiet`) call a model, chosen by
 `model.source`: `incoming` (default — reuse the proxied request's own model + key) or `config` (a dedicated
 cheap model set via `CHEAP_MODEL*` env / the gateway's `CheapModel`). When no model is available they
 degrade — `extract_llm` to a no-op (the deterministic `extract` beside it in every preset does the
-cheap pass), `summarize` to a no-op. `extract` itself never calls a model. See
+cheap pass), `summarize` to a no-op, `agentdiet` to replaying only what it already froze.
+`extract` itself never calls a model. See
 [design.md](design.md#llm-components).
 
 Common gates every Offload respects: skip non-text (`Rewritable`) messages, skip content already

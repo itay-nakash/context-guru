@@ -151,6 +151,13 @@ var presets = map[string][]string{
 	// summarize restructures the whole transcript (changes the message count) — run
 	// it alone so no other component's in-place edits race apply's rebuild.
 	"summarize": {"summarize"},
+	// agentdiet reproduces the published AgentDiet baseline (arXiv:2509.23586, FSE
+	// 2026) so it can be A/B'd against our own reducers on the same traffic. Its
+	// tuned thresholds live in presetConfigs; it runs with `format` only, because
+	// the method's whole claim is what ONE age-targeted LLM reflection achieves —
+	// stacking our offloaders beside it would reduce the same tool outputs first and
+	// there would be nothing left to attribute.
+	"agentdiet": {"format", "agentdiet", "cachesplit"},
 	// codesmart / codesafe are the SWE-bench study's winning configs, shipped as the
 	// recommended defaults (codesmart is the proxy default). Their tuned per-component
 	// settings live in presetConfigs; the name-lists here keep PresetPipeline (used by
@@ -189,6 +196,23 @@ components:
 components:
   collapse:
     max_tokens: 3000`,
+	// agentdiet: the published AgentDiet baseline at the paper's tuned hyperparameters
+	// (a=2, b=1, θ=500) and the authors' artifact apply-gate (saved >= 400 || keep <
+	// 0.8). Routed to the CHEAP model because the method's economics depend on the
+	// reflection model being much cheaper than the agent's — the paper's own choice was
+	// GPT-5 mini against Claude 4 Sonnet, ~12x cheaper. With no cheap model configured
+	// the component replays what it already froze and reduces nothing new, which is a
+	// visible no-op rather than a silent one (/stats reports zero agentdiet activity).
+	"agentdiet": `pipeline: [format, agentdiet, cachesplit]
+components:
+  agentdiet:
+    delay_steps: 2
+    context_steps: 1
+    min_step_tokens: 500
+    min_saved_tokens: 400
+    max_keep_ratio: 0.8
+    model:
+      source: config`,
 }
 
 // PresetPipeline returns the default pipeline (ordered component names) for a

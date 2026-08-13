@@ -1,8 +1,10 @@
 package config
 
 import (
+	"strings"
 	"testing"
 
+	"github.com/rossoctl/context-guru/components"
 	_ "github.com/rossoctl/context-guru/components/all"
 )
 
@@ -33,6 +35,65 @@ func TestBuildMarshalsComponentBlock(t *testing.T) {
 	}
 	if _, err := c.Build(nil); err != nil {
 		t.Fatalf("build with a component config block failed: %v", err)
+	}
+}
+
+// buildTagged names components that only register under a build tag, so a default
+// pure-Go build legitimately does not have them. `skeleton` needs `cg_skeleton`
+// (tree-sitter), and neither the Makefile nor CI passes that tag — so a preset naming
+// it cannot build here. That is the tag, not a typo, which is why the test below skips
+// such a preset instead of failing it.
+var buildTagged = map[string]bool{"skeleton": true}
+
+// Every preset must actually BUILD. A name-list is only a promise until the registry
+// resolves it, and a rich preset's embedded YAML doc is only valid until something
+// decodes it — both fail at BOOT in production, so a typo in either is otherwise found
+// by a deployment that dies on startup rather than by CI.
+func TestEveryPresetBuilds(t *testing.T) {
+	registered := map[string]bool{}
+	for _, n := range components.Names() {
+		registered[n] = true
+	}
+	for name := range presets {
+		t.Run(name, func(t *testing.T) {
+			pipeline, _ := PresetPipeline(name)
+			for _, comp := range pipeline {
+				if buildTagged[comp] && !registered[comp] {
+					t.Skipf("preset %q needs %q, which is behind a build tag absent from this build",
+						name, comp)
+				}
+			}
+			c, err := LoadBytes([]byte("preset: " + name + "\n"))
+			if err != nil {
+				t.Fatalf("LoadBytes(preset: %s): %v", name, err)
+			}
+			if _, err := c.Build(nil); err != nil {
+				t.Fatalf("Build(preset: %s): %v", name, err)
+			}
+		})
+	}
+}
+
+// A rich preset carries tuned per-component settings, but /compact?preset= resolves
+// names through PresetPipeline, which reads the plain `presets` map. So every rich
+// preset needs an entry there too, and the two pipelines must agree — otherwise the
+// same preset name means one thing in a config file and another over HTTP.
+func TestRichPresetsAgreeWithTheNameList(t *testing.T) {
+	for name, doc := range presetConfigs {
+		listed, ok := PresetPipeline(name)
+		if !ok {
+			t.Errorf("rich preset %q has no `presets` entry, so ?preset=%s will not resolve", name, name)
+			continue
+		}
+		c, err := LoadBytes([]byte(doc))
+		if err != nil {
+			t.Errorf("rich preset %q does not parse: %v", name, err)
+			continue
+		}
+		if strings.Join(c.Pipeline, ",") != strings.Join(listed, ",") {
+			t.Errorf("preset %q disagrees with itself: rich doc %v vs name-list %v",
+				name, c.Pipeline, listed)
+		}
 	}
 }
 

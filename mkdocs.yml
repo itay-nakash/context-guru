@@ -131,6 +131,7 @@ nav:
           - smartcrush: components/smartcrush.md
           - mask: components/mask.md
           - summarize: components/summarize.md
+          - agentdiet: components/agentdiet.md
       - The DSL filter engine: components/dsl.md
   - How-to Guides:
       - Use with Claude Code: how-to/use-with-claude-code.md
