@@ -51,6 +51,7 @@ recovered via `context_guru_expand` / `GET /expand`.
 | `resummarize_tokens` | 6000 | Tail growth that triggers rolling the checkpoint forward. |
 | `model.source` | `incoming` | LLM source: `incoming` (proxied model+key) or `config` (cheap model). |
 | `trigger` | — | Gates the first summary: `min_request_tokens`, `min_messages`. |
+| `marker_mode` | `full` | `full` (stash + resolvable marker) / `summary` / `off`. |
 
 ## When it shines
 

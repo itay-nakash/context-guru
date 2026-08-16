@@ -53,6 +53,7 @@ Lossy but reversible — superseded runs are stashed and recovered via `context_
 | Key | Default | Meaning |
 |---|---|---|
 | `min_tokens` | 100 | Skip runs smaller than this token count. |
+| `marker_mode` | `full` | `full` (stash + resolvable marker) / `summary` / `off`. |
 
 ## When it shines
 

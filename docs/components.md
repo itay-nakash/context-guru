@@ -166,7 +166,7 @@ before:  func Add(a, b int) int {          after:  func Add(a, b int) int { … 
          }                                          <<cg:9f2a…>> [full source: call context_guru_expand]
 ```
 
-- **Config:** `min_tokens` (80, per body). Grammars: go, python, js/ts/tsx, rust, java, c/cpp,
+- **Config:** `min_tokens` (80, per body), `marker_mode`. Grammars: go, python, js/ts/tsx, rust, java, c/cpp,
   ruby, php, c#, kotlin, swift, scala. **Shines:** the `coding` preset — the agent reads big
   source files but mostly needs the shape. **Inert:** no fenced blocks, unfenced file reads,
   unknown language, skeleton not smaller than the body.
@@ -184,7 +184,7 @@ before:  <big config dump>  … (later, identical) <same big config dump>
 after:   <big config dump>  … [identical to an earlier tool output] <<cg:1c8e…>>
 ```
 
-- **Config:** `min_tokens` (100). **Shines:** agents that re-read the same file/command output
+- **Config:** `min_tokens` (100), `marker_mode`. **Shines:** agents that re-read the same file/command output
   repeatedly. **Inert:** no exact repeats, small outputs.
 
 ### `collapse`
@@ -199,7 +199,8 @@ after:   <first 20 lines>
          <last 20 lines>
 ```
 
-- **Config:** `max_tokens` (2000 threshold), `head_lines` (20), `tail_lines` (20). **Shines:** a
+- **Config:** `max_tokens` (2000 threshold), `max_frac` (fraction of the context window; wins when
+  known), `head_lines` (20), `tail_lines` (20), `marker_mode`. **Shines:** a
   catch-all last stage for huge outputs. **Inert:** output ≤ `max_tokens`, or too few lines for
   head/tail to help.
 
@@ -213,7 +214,7 @@ before:  [run 1] 3 failed, 5 passed …   [run 2 after fix] 8 passed
 after:   [superseded by a later run] <<cg:7d1c…>> [full output: …]   [run 2] 8 passed
 ```
 
-- **Config:** `min_tokens` (100). Needs ≥2 run-like outputs. **Shines:** iterative fix→re-run
+- **Config:** `min_tokens` (100), `marker_mode`. Needs ≥2 run-like outputs. **Shines:** iterative fix→re-run
   loops. **Inert:** <2 runs detected, small outputs. False positives cost only an expand
   round-trip, never data.
 
@@ -295,7 +296,7 @@ before:  [ {…}, {…}, … 200 items … ]
 after:   [ item0, item1, item2, item198, item199 ] [5 of 200 items shown; full array: call …] <<cg:…>>
 ```
 
-- **Config:** `min_items` (5), `min_tokens` (200), `keep_first` (3), `keep_last` (2). **Shines:**
+- **Config:** `min_items` (5), `min_tokens` (200), `keep_first` (3), `keep_last` (2), `marker_mode`. **Shines:**
   long homogeneous JSON arrays (list endpoints, search hits) — the `mcp` preset. **Inert:**
   non-array output, fewer than `min_items`, nothing to drop. v1 uses fixed anchors (headroom's
   Kneedle adaptive-K is a documented refinement).
@@ -308,7 +309,7 @@ ones (≥ `min_tokens`) with a short marker + stash. Complementary to the conten
 after (older):  [older tool output masked; starts: 700 701 def __rmul__(self, m): 702 …] <<cg:…>> [full output: call context_guru_expand]
 ```
 
-- **Config:** `keep_recent` (3), `min_tokens` (100), `keep_head_chars` (96). **Shines:** long agent
+- **Config:** `keep_recent` (3), `min_tokens` (100), `keep_head_chars` (96), `marker_mode`. **Shines:** long agent
   trajectories where old tool results are unlikely to matter (top lever on terminal/code traffic: 27.5%
   on Terminal-Bench, 12.5% on SWE-bench; scales down to ~4% on small structured customer-service outputs).
   **Inert:** ≤ `keep_recent` tool outputs, small outputs.
@@ -333,7 +334,7 @@ The summarizer is grounded in the **current task** (first user turn + recent tur
 
 - **Config:** `summary_level` (`concise`|`regular`|`highly_detailed`), `keep_last` (3),
   `min_tokens` (500 — span floor), `include_tool_calls` (false → tool outputs masked in the
-  trajectory), `model.source`, `trigger`, `resummarize_tokens` (6000).
+  trajectory), `model.source`, `trigger`, `resummarize_tokens` (6000), `marker_mode`.
 - **Gating + reuse:** a `trigger` (`min_request_tokens`, `min_messages`; legacy `start_from_message`
   folds into `min_messages`) gates the first summary so it fires only on a large/deep transcript.
   After that, the summary is **checkpointed per session** and **reused verbatim** (no model call, and

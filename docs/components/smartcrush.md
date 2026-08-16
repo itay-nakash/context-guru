@@ -30,6 +30,7 @@ Lossy but reversible — the full original array is stashed and recovered via `c
 | `min_tokens` | 200 | Output floor before crushing. |
 | `keep_first` | 3 | Leading items kept verbatim. |
 | `keep_last` | 2 | Trailing items kept verbatim. |
+| `marker_mode` | `full` | `full` (stash + resolvable marker) / `summary` / `off`. |
 
 ## When it shines
 
