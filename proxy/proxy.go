@@ -14,10 +14,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -29,6 +31,7 @@ import (
 	"github.com/rossoctl/context-guru/dash"
 	"github.com/rossoctl/context-guru/expand"
 	"github.com/rossoctl/context-guru/internal/cheapmodel"
+	"github.com/rossoctl/context-guru/internal/logging"
 	"github.com/rossoctl/context-guru/internal/modelinfo"
 	"github.com/rossoctl/context-guru/metrics"
 	"github.com/rossoctl/context-guru/modes"
@@ -40,11 +43,13 @@ import (
 )
 
 // Options configures upstreams and credential injection. Each upstream is a base
-// URL the matching route forwards to (the incoming path is appended). When a key
-// is set it replaces the client's auth on forward — this is the eval-containers
-// gateway model, where the agent holds only a placeholder key and the real
-// provider key lives in the gateway env. Leave keys empty to pass the incoming
-// auth through unchanged (local/dev use).
+// URL the matching route forwards to (the incoming path is appended).
+//
+// Credentials: by DEFAULT the caller's own auth header is forwarded unchanged, so
+// each user's traffic is billed to their own provider account. Setting a key here
+// replaces it — the eval-containers gateway model, where the agent holds only a
+// placeholder and the real provider key lives in the gateway env. That is an explicit
+// single-tenant/local fallback, never the hosted default.
 type Options struct {
 	OpenAIUpstream    string // e.g. https://api.openai.com
 	AnthropicUpstream string
@@ -54,8 +59,8 @@ type Options struct {
 	// /admin/v1/profile, /inference/v1/model/info, …) is proxied through verbatim
 	// so the CLI boots and authenticates. Point Bob's CUSTOM_BASE_URL at this proxy.
 	BobUpstream  string // e.g. https://api.us-east.bob.ibm.com
-	OpenAIKey    string // injected as Authorization: Bearer <key>
-	AnthropicKey string // injected as x-api-key: <key>
+	OpenAIKey    string // when set, REPLACES the caller's Authorization: Bearer
+	AnthropicKey string // when set, REPLACES the caller's x-api-key
 	// ForceModel, when set, overwrites the request's "model" field. eval-containers
 	// uses this to pin every call to EVAL_MODEL regardless of what the agent asked for.
 	ForceModel string
@@ -119,8 +124,9 @@ type Options struct {
 	// Zero values disable each bound. Ignored in single-tenant mode, where there is
 	// nobody to protect anyone from.
 	Limits Limits
-	// Spend reports a tenant's month-to-date cost, for the monthly cap. nil disables
-	// cap enforcement — which is only safe when the upstream credential is not shared.
+	// Spend reports a tenant's month-to-date cost, for DISPLAY on the settings page.
+	// nil = no figure shown. There is no cap: every tenant spends their own provider
+	// credential, so there is no shared budget to guard.
 	Spend SpendChecker
 	// PresetNames and ComponentNames are what the settings page may offer. Supplied by
 	// the host because the registries live in `config` and `components`, and this
@@ -203,9 +209,17 @@ type Handler struct {
 	// limiter because its keys are IPs rather than tenant ids, and its bound is a
 	// fixed property of what registration is, not an operator setting.
 	regLim *Limiter
-	// spend memoises month-to-date cost lookups so the cap costs one query a minute
-	// per tenant rather than one per request.
-	spend *spendCache
+	// authLim bounds FAILED proxy authentications per client address — the control on the
+	// agent-key oracle, see authenticate. Anonymous like regLim: its keys are client
+	// addresses, so its refusals are counted process-wide only.
+	authLim *Limiter
+	// pwLim and codeLim bound sign-in attempts: password checks and emailed-code
+	// submissions. Anonymous like regLim (their keys are an email or a client address,
+	// never a tenant id) and separate from each other because their budgets differ —
+	// see passwordAttemptsPerMinute and codeAttemptsPerMinute. Without these the
+	// 6-digit code is not a second factor and the argon2 verify is an amplifier.
+	pwLim   *Limiter
+	codeLim *Limiter
 	// promCache memoises the Prometheus body for a scrape interval; the per-tenant
 	// series cost a SQL query and Grafana scrapes every few seconds.
 	promCache promCache
@@ -230,7 +244,9 @@ func New(pipe *components.Pipeline, st store.Store, agg *metrics.Aggregator, opt
 		Shadow: h.shadow, Mode: h.mode()}
 	h.limiter = NewLimiter(opts.Limits)
 	h.regLim = newAnonLimiter(Limits{RequestsPerMinute: registrationsPerMinute})
-	h.spend = newSpendCache(0)
+	h.authLim = newAnonLimiter(Limits{RequestsPerMinute: authFailuresPerMinute})
+	h.pwLim = newAnonLimiter(Limits{RequestsPerMinute: passwordAttemptsPerMinute})
+	h.codeLim = newAnonLimiter(Limits{RequestsPerMinute: codeAttemptsPerMinute})
 	if agg != nil {
 		agg.SetMode(h.mode())
 	}
@@ -325,13 +341,20 @@ func (h *Handler) passthrough(base string) http.HandlerFunc {
 		// the real credential. Without this, the catch-all would be an open forwarder
 		// AND would send the caller's header — our token — to Bob.
 		if h.opts.Tenants != nil {
-			tn, err := h.tenancyFor(r)
+			tn, err := h.authenticate(r)
 			if err != nil {
-				failAuth(w, err)
+				h.refuse(w, r, err)
 				return
 			}
-			if up, err = h.upstreamFor(tn, pickBob, upstream{}); err != nil {
-				failAuth(w, err)
+			// Metered like every other authenticated route: this one forwards arbitrary
+			// methods and paths, so unmetered it was the cheapest way to spend the box.
+			release, ok := h.meter(w, r, tn)
+			defer release()
+			if !ok {
+				return
+			}
+			if up, err = h.upstreamFor(r, tn, pickBob, upstream{}); err != nil {
+				h.refuseRoute(w, r, tn, err)
 				return
 			}
 		}
@@ -352,11 +375,10 @@ func (h *Handler) passthrough(base string) http.HandlerFunc {
 			return
 		}
 		copyHeaders(req.Header, r.Header)
-		if up.setKey != nil {
-			for _, hd := range tokenHeaders {
-				req.Header.Del(hd)
-			}
-			up.setKey(req.Header)
+		setUpstreamAuth(req.Header, up)
+		if isBobProfile(r) {
+			// We have to read this one response, so do not let it arrive compressed.
+			req.Header.Del("Accept-Encoding")
 		}
 		resp, err := h.client.Do(req)
 		if err != nil {
@@ -367,8 +389,81 @@ func (h *Handler) passthrough(base string) http.HandlerFunc {
 			http.Error(w, "upstream request failed", http.StatusBadGateway)
 			return
 		}
+		if isBobProfile(r) && h.forwardBobProfile(w, resp) {
+			return
+		}
 		h.stream(w, resp)
 	}
+}
+
+// bobProfilePath is the profile route Bob's CLI calls before anything else, and the
+// one response the catch-all does not forward verbatim. See forwardBobProfile.
+const bobProfilePath = "/admin/v1/profile"
+
+func isBobProfile(r *http.Request) bool {
+	return r.Method == http.MethodGet && strings.EqualFold(r.URL.Path, bobProfilePath)
+}
+
+// forwardBobProfile forwards Bob's profile with the per-instance REGION fields removed,
+// and reports whether it answered the request.
+//
+// Bob's client does not keep the base URL it was configured with. Having fetched the
+// profile, `Pc.resolveBaseUrl` (bobshell 1.0.6) replaces the HOSTNAME of that URL with
+// `api.<region_domain>` from the profile — keeping the scheme and, fatally, the PORT.
+// Pointed at a context-guru instance on 127.0.0.1:4111, its very next call goes to
+// http://api.us-east.bob.ibm.com:4111, where nothing listens: observed live as
+// "Request failed after 6 attempts: fetch failed", with not one model request ever
+// reaching the proxy while the profile call itself succeeded — the confusing shape,
+// because the proxy looks half-working and its log is empty.
+//
+// The rewrite is skipped when the instance carries no region (`hasRegion` false), so
+// dropping those two fields is all it takes for the client to keep talking to the
+// endpoint its operator configured. Nothing else in the document is touched, and a
+// body we cannot parse is passed through unchanged rather than mangled.
+func (h *Handler) forwardBobProfile(w http.ResponseWriter, resp *http.Response) bool {
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxRequestBytes))
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	out, ok := stripProfileRegion(body)
+	if !ok {
+		out = body
+	}
+	copyHeaders(w.Header(), resp.Header)
+	w.Header().Set("Content-Length", strconv.Itoa(len(out)))
+	w.WriteHeader(resp.StatusCode)
+	w.Write(out)
+	return true
+}
+
+// stripProfileRegion removes region/region_domain from every instance in a Bob profile
+// document, reporting false when the body is not one (then it must be forwarded as-is).
+func stripProfileRegion(b []byte) ([]byte, bool) {
+	var doc map[string]any
+	if err := json.Unmarshal(b, &doc); err != nil {
+		return nil, false
+	}
+	insts, ok := doc["instances"].([]any)
+	if !ok {
+		return nil, false
+	}
+	for _, it := range insts {
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		delete(m, "region")
+		delete(m, "region_domain")
+	}
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return nil, false
+	}
+	return out, true
 }
 
 // compact runs the pipeline over the request body's messages and returns the
@@ -382,13 +477,19 @@ func (h *Handler) passthrough(base string) http.HandlerFunc {
 // overrides (when Options.PipelineFor is set): ?preset=<name> or header
 // x-context-guru-pipeline: comp1,comp2. Session/bypass honor the usual headers.
 func (h *Handler) compact(w http.ResponseWriter, r *http.Request) {
-	// Hosted mode authenticates this endpoint too. It runs the pipeline over a
-	// caller-supplied transcript and can invoke the cheap model, so leaving it open
-	// would be both an unmetered compute endpoint and a way to write into whichever
-	// state store it happened to reach.
-	tn, err := h.tenancyFor(r)
+	// Hosted mode authenticates AND METERS this endpoint too. It runs the pipeline over a
+	// caller-supplied transcript and can invoke the cheap model, so leaving it open would
+	// be both an unmetered compute endpoint and a way to write into whichever state store
+	// it happened to reach — and authenticating without metering left the second half of
+	// that: the most expensive route on the box was the only one with no rate limit.
+	tn, err := h.authenticate(r)
 	if err != nil {
-		failAuth(w, err)
+		h.refuse(w, r, err)
+		return
+	}
+	release, ok := h.meter(w, r, tn)
+	defer release()
+	if !ok {
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
@@ -419,7 +520,7 @@ func (h *Handler) compact(w http.ResponseWriter, r *http.Request) {
 
 	// No upstream here, so there is no "incoming" model; only the static
 	// "config"-source client (and any endpoint pinned in a component's model: block).
-	models := components.ModelSpec{Static: h.opts.CheapModel}
+	models := components.ModelSpec{Static: h.staticModel()}
 	// Honor the same cache-aware behavior as the live chat path so /compact (used by
 	// offline replay/eval) reflects production. ?cache=on|off|auto overrides for A/B.
 	cacheMode := h.opts.CacheMode
@@ -451,7 +552,9 @@ func (h *Handler) compact(w http.ResponseWriter, r *http.Request) {
 	cp := h.newCapture(r, string(provider), "/compact", tn)
 	cp.noteModel(gjson.GetBytes(body, "model").String())
 	start := time.Now()
-	res := apply.BodyOpts(r.Context(), pipe, tn.Store, apply.Opts{
+	// cp.llmCtx: our own compaction-model spend under this context is charged to THIS
+	// request's row, not to whichever tenant is in flight when the call returns.
+	res := apply.BodyOpts(cp.llmCtx(r.Context()), pipe, tn.Store, apply.Opts{
 		Provider:  provider,
 		Body:      body,
 		Session:   r.Header.Get("x-context-guru-session"),
@@ -497,10 +600,29 @@ func headerKey(name, key string) func(http.Header) {
 }
 
 // incomingModel builds an LLM client that reuses the proxied request's own model
-// and the route's upstream + credential, so a NeedsModel component can call the
-// same backend the request targets. Prefers the gateway's injected key (gateway
-// mode); falls back to the client's own auth header (pass-through). Returns nil
-// when no upstream/model/key is resolvable, and the component degrades.
+// and the route's upstream, so a NeedsModel component can call the same backend the
+// request targets.
+//
+// It is the SECOND way a credential leaves this box, and it must agree with the first.
+// setUpstreamAuth resolved that once, for this route, and the answer is `up.setKey`:
+//
+//   - setKey == nil — the caller's own provider credential is what goes upstream, so the
+//     component spends the caller's key too. That is the hosted default and the point of
+//     it: a component that calls an LLM spends money, and spending a server-held key here
+//     would bill one account for every user's compaction.
+//   - setKey != nil — gateway mode. setUpstreamAuth DELETES the caller's auth slots and
+//     injects the server's key, because the caller holds only a placeholder. So the
+//     caller's value must not travel via this client either, to the very same up.base.
+//     The injector holds its key in a closure that cannot be read back, so the only
+//     server key reachable here is the statically configured one — which is exactly the
+//     single-tenant gateway this branch is for. Hosted mode degrades instead, for the
+//     same reason staticModel is withheld there.
+//
+// Reading up.setKey rather than re-deriving the credential is the fix and the invariant:
+// there is one decision, and both exits read it.
+//
+// FAIL OPEN: no credential, no upstream or no model name returns nil, and the
+// component degrades to its deterministic path. It never errors the request.
 func (h *Handler) incomingModel(provider bschemas.ModelProvider, up upstream, body []byte, r *http.Request) components.Model {
 	if up.base == "" {
 		return nil
@@ -509,23 +631,22 @@ func (h *Handler) incomingModel(provider bschemas.ModelProvider, up upstream, bo
 	if model == "" {
 		return nil
 	}
+	key := CallerKey(r)
+	if up.setKey != nil {
+		key = ""
+	}
 	switch provider {
 	case bschemas.Anthropic:
-		key := h.opts.AnthropicKey
 		if key == "" {
-			key = r.Header.Get("x-api-key")
-		}
-		if key == "" {
-			key = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+			key = h.serverKey(h.opts.AnthropicKey)
 		}
 		if key == "" {
 			return nil
 		}
 		return cheapmodel.Anthropic{BaseURL: up.base, Model: model, APIKey: key, Client: h.client}
 	case bschemas.OpenAI:
-		key := h.opts.OpenAIKey
 		if key == "" {
-			key = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+			key = h.serverKey(h.opts.OpenAIKey)
 		}
 		if key == "" {
 			return nil
@@ -533,6 +654,27 @@ func (h *Handler) incomingModel(provider bschemas.ModelProvider, up upstream, bo
 		return cheapmodel.OpenAI{BaseURL: up.base, Model: model, APIKey: key, Client: h.client}
 	}
 	return nil
+}
+
+// serverKey returns a statically configured gateway credential, and nothing at all in
+// hosted mode — where a server-held key must not fund a tenant's compaction. Same rule
+// as staticModel, one line, so the two cannot drift.
+func (h *Handler) serverKey(key string) string {
+	if h.opts.Tenants != nil {
+		return ""
+	}
+	return key
+}
+
+// staticModel is the "config"-source cheap-model client — nil in hosted mode. It
+// authenticates with a SERVER credential (CHEAP_MODEL_KEY), so offering it to a
+// tenant's pipeline would bill that server account for their compaction. Components
+// that find no model degrade (fail open); they never error.
+func (h *Handler) staticModel() components.Model {
+	if h.opts.Tenants != nil {
+		return nil
+	}
+	return h.opts.CheapModel
 }
 
 // capturePath, when set (CONTEXT_GURU_CAPTURE), names a JSONL file the proxy
@@ -565,30 +707,171 @@ func pickAnthropic(t *Tenancy) string { return t.UpAnthropic }
 func pickOpenAI(t *Tenancy) string    { return t.UpOpenAI }
 func pickBob(t *Tenancy) string       { return t.UpBob }
 
+// authFailuresPerMinute bounds how fast ONE client address may fail proxy authentication.
+//
+// 10, in the same spirit as passwordAttemptsPerMinute: enough that a human whose token has
+// gone stale, or an agent retrying a bad configuration, sees an honest 401 rather than a
+// throttle, and few enough that guessing is not a strategy. A rolling window rather than a
+// lockout, deliberately — see passwordAttemptsPerMinute for why a sticky lockout is a
+// denial-of-service anyone can aim at a colleague.
+const authFailuresPerMinute = 10
+
+// authenticate resolves the caller's tenancy, and THROTTLES failures per client address.
+//
+// The throttle is the point. An agent that can set no header of ours is identified by the
+// sha256 of the provider key it already sends (Resolve → ResolveAgentKey), so the
+// difference between errUnboundKey and a request that proceeds answers "is this string a
+// bound agent key" — and a hit is not merely confirmation, it IS impersonation: the caller
+// becomes that tenant, spends against that account's routes and, with content capture on,
+// reads that account's transcripts. Unmetered, that oracle is grindable at whatever rate
+// the front end allows (30 r/s per address here). The key-length floor in tenant/ removes
+// the most guessable strings; only a limit removes the oracle.
+//
+// Charged on FAILURE only, so a working credential is never billed for someone else's
+// guessing — which is also what keeps a busy legitimate agent out of the bucket entirely.
+//
+// Keyed by regBucket(registrantIP(r)): the same bucket registration and sign-in attempts
+// use, inheriting both its IPv6 /64 granularity (per-address is meaningless against a /64)
+// and its rule that X-Forwarded-For is trusted from a loopback peer only, last element
+// first — which is the one nginx wrote.
+//
+// Counted exactly once. The anon limiter records its own refusal with NO key, because a
+// client address is attacker-supplied and must never become a metric label, and failAuth
+// counts no 429s. The message is ours rather than the limiter's, whose "for this account"
+// would be both wrong for an address bucket and a hint that a credential resolved.
+func (h *Handler) authenticate(r *http.Request) (*Tenancy, error) {
+	tn, err := h.tenancyFor(r)
+	if err == nil {
+		return tn, nil
+	}
+	if _, lErr := h.authLim.Acquire(regBucket(registrantIP(r))); lErr != nil {
+		return nil, statusError{http.StatusTooManyRequests,
+			"too many failed authentications from this address; wait a minute and try again"}
+	}
+	return nil, err
+}
+
+// meter takes this tenant's slot against Options.Limits, refusing the request if it is
+// over one. Called by EVERY authenticated entry point, right after authenticate:
+//
+//	release, ok := h.meter(w, r, tn)
+//	defer release()
+//	if !ok {
+//		return
+//	}
+//
+// It exists because TENANT_RPM and TENANT_CONCURRENT used to be enforced in chat() and
+// nowhere else, while two other authenticated routes ran the same box for free —
+// /compact drives the whole pipeline (tokenisation, tree-sitter, several passes) over a
+// body up to 32 MiB, and the Bob catch-all forwards arbitrary methods and paths. With the
+// limiter at one request a minute, chat refused the second call while /compact served
+// twenty of twenty. One guard, three call sites, smaller than three copies of it.
+//
+// release is never nil, so `defer release()` is correct on the refusal path too. The 429
+// accounting is unchanged and NOT doubled: the limiter counts its own refusals (limits.go,
+// the only place that knows WHICH limit was hit) and failAuth deliberately counts no 429s.
+func (h *Handler) meter(w http.ResponseWriter, r *http.Request, tn *Tenancy) (release func(), ok bool) {
+	release, err := h.limiter.Acquire(tn.ID)
+	if err != nil {
+		h.refuse(w, r, err)
+		return release, false
+	}
+	return release, true
+}
+
+// refuseRoute refuses a route-resolution failure for a caller who IS authenticated.
+//
+// It exists for one refusal in particular: errNoProviderKey — "your account is fine, but
+// you sent no provider credential of your own". failAuth maps every 401 to reason=auth,
+// which is right for an unknown token and useless for this one, and this one is about to
+// become the DOMINANT refusal: the moment a deployment stops injecting a server-held
+// upstream key, every user who has not yet added their own hits it. Collapsed into `auth`,
+// the blast radius of that change is invisible in the metrics exactly when it has to be
+// measured and the affected users told.
+//
+// The tenant is known here — it authenticated, only its credential is missing — so the
+// count carries the tenant label failAuth cannot supply, which is what turns "N users
+// broke" into "these users broke".
+//
+// Everything else goes to h.refuse unchanged.
+func (h *Handler) refuseRoute(w http.ResponseWriter, r *http.Request, tn *Tenancy, err error) {
+	if !errors.Is(err, errNoProviderKey) {
+		h.refuse(w, r, err)
+		return
+	}
+	// The same WARN refuse writes, for the same reason: this is a turn-away a user will
+	// report, and it has to be findable by tenant (the logger in the context carries it).
+	code, msg := statusOf(err)
+	logging.From(r.Context()).Warn("cg.refused", "status", code, "reason", msg,
+		"path", r.URL.Path, "client", clientIP(r))
+	failAuthAs(w, err, refuseNoProviderKey, tn.ID)
+}
+
+// failAuthAs writes a refusal exactly as failAuth does, but counts it under the reason
+// GIVEN rather than the one inferred from the status code.
+//
+// ONE refusal, ONE count — which is why this exists rather than simply counting the new
+// reason alongside failAuth's. The SLO dashboard divides sum(cg_refused_requests_total),
+// UNLABELLED, by refusals + requests (deploy/grafana/dashboards/context-guru-slo.json), so
+// a request counted under two reasons inflates the HTTP error-rate SLI by one — on exactly
+// the metric a credential migration is judged by, in exactly the period it matters.
+//
+// The response must stay byte-identical to failAuth's; the reason it is duplicated here at
+// all is that failAuth lives in tenancy.go, which another agent owns this cycle. Once that
+// settles, this collapses into failAuth's switch (one `errors.Is` case) and disappears.
+// TestFailAuthAsMatchesFailAuth fails if the two drift in the meantime.
+func failAuthAs(w http.ResponseWriter, err error, reason refusalReason, tenantID string) {
+	code, msg := statusOf(err)
+	recordRefusal(reason, tenantID)
+	w.Header().Set("Content-Type", "application/json")
+	if code == http.StatusUnauthorized {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="context-guru"`)
+	}
+	w.WriteHeader(code)
+	fmt.Fprintf(w, "{\"error\":%q}\n", msg)
+}
+
 func (h *Handler) chat(provider bschemas.ModelProvider, static upstream, pick func(*Tenancy) string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Authenticate FIRST, before reading a body or doing any work. In hosted mode
 		// an unauthenticated caller must not be able to make the proxy buffer 32 MiB.
-		tn, err := h.tenancyFor(r)
+		tn, err := h.authenticate(r)
 		if err != nil {
-			failAuth(w, err)
+			h.refuse(w, r, err)
 			return
 		}
-		up, err := h.upstreamFor(tn, pick, static)
-		if err != nil {
-			failAuth(w, err)
-			return
-		}
-		// Limits and the spend cap, before the body is read. Refusing a request that
-		// would exceed a bound must not first cost us 32 MiB of buffering.
-		release, err := h.limiter.Acquire(tn.ID)
+		// The per-request logger. Every line this request produces — here, inside the
+		// pipeline, inside a component — carries the same tenant, so one LogQL selector
+		// is the whole investigation. The tenant ID only: the token it was resolved from
+		// never appears in a log line, and the scrubber would replace it if it did.
+		//
+		// It goes in the CONTEXT because apply and the components already receive one and
+		// nothing else would have to change; the session is added below, once apply has
+		// resolved it (it is derived from the body, so it is not knowable yet).
+		//
+		// Attached HERE, before anything below can refuse the request, because refuse()
+		// reads its logger out of the context: with this block below the two refusals that
+		// follow, every rate-limit and every "no provider credential of your own" came out
+		// as a cg.refused line with NO tenant on it, while the tenant sat in hand three
+		// lines up. Those are the two refusals a user actually reports, and refuse's own
+		// contract is that they are findable by tenant.
+		//
+		// route is static.path rather than up.path so it is known before the upstream is
+		// resolved. They are the same string by construction: upstreamFor carries
+		// static.path over verbatim (it substitutes the BASE, never the route).
+		lg := slog.Default().With("tenant", tenantLabel(tn.ID), "route", static.path,
+			"provider", string(provider))
+		r = r.WithContext(logging.With(r.Context(), lg))
+		// Limits, before the body is read. Refusing a request that would exceed a bound
+		// must not first cost us 32 MiB of buffering.
+		release, ok := h.meter(w, r, tn)
 		defer release()
-		if err != nil {
-			failAuth(w, err)
+		if !ok {
 			return
 		}
-		if err := h.checkSpend(tn); err != nil {
-			failAuth(w, err)
+		up, err := h.upstreamFor(r, tn, pick, static)
+		if err != nil {
+			h.refuseRoute(w, r, tn, err)
 			return
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
@@ -614,7 +897,7 @@ func (h *Handler) chat(provider bschemas.ModelProvider, static upstream, pick fu
 		// model) and the static "config" cheap model.
 		models := components.ModelSpec{
 			Incoming: h.incomingModel(provider, up, body, r),
-			Static:   h.opts.CheapModel,
+			Static:   h.staticModel(),
 		}
 		// Resolve the model's context window (dynamic, cached) so fraction-based
 		// triggers scale with the model; 0 when unknown (absolutes apply).
@@ -638,26 +921,35 @@ func (h *Handler) chat(provider bschemas.ModelProvider, static upstream, pick fu
 				rep.Gate("agent_compaction")
 				h.agg.Component(rep)
 			}
+			// The gate name here is the SAME string /stats reports as
+			// components.bypass.gates.agent_compaction, so the log line and the metric
+			// cannot disagree about what happened.
+			lg.Debug("cg.bypass", "gate", "agent_compaction")
 		}
 		// Start the dashboard capture (nil when the dashboard is off). It only holds
 		// values the request path already computed; nothing here does I/O.
 		cp := h.newCapture(r, string(provider), up.path, tn)
 		cp.noteModel(gjson.GetBytes(body, "model").String())
+		// The request's own metadata (effort, thinking, sampling, tool_choice, shape),
+		// read from the PRISTINE body in one pass before the pipeline touches it.
+		cp.noteMeta(metaFromBody(body))
 		// Fail open around the whole pre-forward rewrite (pipeline + expand injection): a
 		// panic anywhere here must forward the PRISTINE inbound body, never 500 the client.
 		// apply.BodyFull has its own recover; this backstops expand.Inject and anything else.
 		orig := body
+		var tr apply.Trace // hoisted: the lifecycle log line below reads it
 		func() {
 			defer func() {
 				if rec := recover(); rec != nil {
-					slog.Error("context-guru: recovered from panic before forward; sending original", "panic", rec)
+					lg.Error("context-guru: recovered from panic before forward; sending original", "panic", rec)
 					body = orig
 				}
 			}()
 			var added time.Duration
-			var tr apply.Trace
 			body, added, tr = h.applyMode(&reqInfo{
-				ctx:      r.Context(),
+				// cp.llmCtx: context-guru's OWN compaction-model spend under this context
+				// is charged to this request's row, and to no other tenant's.
+				ctx:      cp.llmCtx(r.Context()),
 				provider: provider,
 				body:     body,
 				session:  r.Header.Get("x-context-guru-session"),
@@ -692,8 +984,37 @@ func (h *Handler) chat(provider bschemas.ModelProvider, static upstream, pick fu
 				body, _ = expand.Inject(string(provider), im, body, tn.Store.Persists())
 			}
 		}()
-		h.serve(w, r, provider, up, body, bypassed, cp, tn)
+		// Load the request's one INFO line with everything the pipeline decided. serve
+		// emits it in a defer once the response is finished, so a request produces exactly
+		// one lifecycle line whichever way it ends — and the attrs are built here, once,
+		// rather than on the response path.
+		h.serve(w, r, provider, up, body, bypassed, cp, tn, lifecycleLogger(lg, tr, bypassed))
 	}
+}
+
+// tenantLabel is the tenant id as a log label. Single-tenant deployments have no
+// tenant id at all, and an empty label is DROPPED by promtail — which would leave the
+// logs dashboard's tenant selector empty for every local proxy, i.e. for most users.
+// "local" says the true thing (there is one tenant, it is this deployment) and makes
+// the same dashboard work in both modes.
+func tenantLabel(id string) string {
+	if id == "" {
+		return "local"
+	}
+	return id
+}
+
+// lifecycleLogger returns the request logger with this request's pipeline outcome
+// attached: the resolved session (so every line of this request correlates, including
+// the ones apply wrote), and the token accounting.
+func lifecycleLogger(lg *slog.Logger, tr apply.Trace, bypassed bool) *slog.Logger {
+	lg = lg.With("session", tr.Session, "messages", tr.Messages, "bypassed", bypassed,
+		"cache_aware", tr.CacheAware, "frozen_tokens", tr.FrozenTokens)
+	if tr.Run != nil {
+		lg = lg.With("tokens_before", tr.Run.TokensBefore, "tokens_after", tr.Run.TokensAfter,
+			"saved", tr.Run.Saved(), "cg_ms", tr.Run.DurationMs)
+	}
+	return lg
 }
 
 // API exposes the dashboard's HTTP surface so the host can attach an authenticator.
@@ -732,7 +1053,7 @@ var errNoUpstream = errors.New("no upstream configured")
 // → /stats sse_streamed / sse_buffered). It previously matched the expand tool
 // description this proxy injects itself, so it was unconditionally true and the
 // zero-added-latency promise above never held for any request (issue #26).
-func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschemas.ModelProvider, up upstream, body []byte, bypassed bool, cp *capture, tn *Tenancy) {
+func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschemas.ModelProvider, up upstream, body []byte, bypassed bool, cp *capture, tn *Tenancy, lg *slog.Logger) {
 	// ONE condition governs both halves of the loop: the tool is intercepted exactly when
 	// it is advertised on the outgoing request. Those used to be different conditions —
 	// advertised when the request had tools, intercepted (for SSE) when it had markers —
@@ -757,6 +1078,10 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 	// can never delay or fail a request.
 	var usage Usage
 	var usageOK bool
+	// status/rounds/expanded exist for the lifecycle log line: the upstream status is
+	// the one fact about a request an operator asks for first, and until now it reached
+	// the dashboard row and nothing else.
+	status, rounds, expanded := 0, 0, 0
 	defer func() {
 		if sse && h.agg != nil {
 			h.agg.RecordSSE(msSince(reqStart, sseFirstByte), sseBuffered)
@@ -765,8 +1090,19 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 			h.agg.RecordUsage(usage.FreshInput, usage.CacheRead, usage.CacheWrite, usage.Output)
 		}
 		cp.finish(usage, usageOK, h.captureContentFor(tn), h.contentCap(), h.contentMax())
+		// THE one line per request. In a defer so every terminal path emits it exactly
+		// once — stream-through, buffered replay, the round-cap exit, an upstream failure
+		// (which also logged its own WARN with the reason).
+		// serve_ms, not total_ms: reqStart is taken here, AFTER the pipeline ran, so this
+		// is the forward-and-respond half. cg_ms above is the other half, and keeping them
+		// separate is the point — one is the upstream's latency and one is ours.
+		lg.Info("cg.request", "status", status, "serve_ms", msSince(reqStart, time.Time{}),
+			"upstream_rounds", rounds, "expands", expanded, "sse", sse, "sse_buffered", sseBuffered,
+			"fresh_input", usage.FreshInput, "cache_read", usage.CacheRead,
+			"cache_write", usage.CacheWrite, "output", usage.Output, "usage_reported", usageOK)
 	}()
 	for round := 0; ; round++ {
+		rounds = round + 1
 		upStart := time.Now()
 		resp, err := h.doUpstream(r, up, body)
 		if err != nil {
@@ -775,8 +1111,9 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 			// — no log line, and a dashboard row with status 0 that reads as "unknown"
 			// rather than "the upstream refused". On a shared service that is the
 			// difference between debugging a report and disbelieving it.
-			slog.Warn("context-guru: upstream call failed", "tenant", tn.ID,
-				"route", up.path, "upstream", up.base, "round", round, "err", err)
+			lg.Warn("context-guru: upstream call failed", "upstream", up.base,
+				"round", round, "err", err)
+			status = http.StatusBadGateway
 			cp.noteUpstream(float64(time.Since(upStart).Microseconds())/1000.0,
 				http.StatusBadGateway)
 			// And count it: this path does not go through failAuth, so without this the
@@ -794,11 +1131,14 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 			return
 		}
 		upMs := float64(time.Since(upStart).Microseconds()) / 1000.0
+		status = resp.StatusCode
 		cp.noteUpstream(upMs, resp.StatusCode)
 		if h.agg != nil {
 			h.agg.RecordUpstreamLatency(upMs, bypassed)
 		}
 		isSSE := strings.Contains(resp.Header.Get("Content-Type"), "event-stream")
+		lg.Debug("cg.upstream", "round", round, "status", resp.StatusCode,
+			"upstream_ms", upMs, "sse", isSSE, "expand_advertised", advertised)
 		// Inspect for a lone expand call when the tool is actually advertised and we haven't
 		// hit the round cap. Nothing else can produce a call to it, so this is both the
 		// necessary and the sufficient condition — and for SSE it is what decides whether we
@@ -816,6 +1156,11 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 			}
 			if ok {
 				usage, usageOK = u, true
+			} else {
+				// No billed tiers, but the response may still have said WHY it stopped. The
+				// two facts are independent (see Usage.StopReason), and dropping the reason
+				// here would blank stop_reason for exactly the rows already marked partial.
+				usage.StopReason = u.StopReason
 			}
 			return
 		}
@@ -825,9 +1170,16 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 			// Buffered: the client sees nothing until the whole stream has arrived, so its
 			// first byte lands no earlier than the write on whichever path we return from.
 			sse, sseBuffered, sseFirstByte = true, true, time.Time{}
+			// The one decision on this path that costs a user something they can feel — a
+			// stream stopped being a stream — so it says WHY: the expand tool is advertised
+			// on the outgoing request, so a lone expand call has to be intercepted.
+			lg.Debug("cg.sse_buffered", "round", round, "reason", "expand_tool_advertised",
+				"bytes", len(respBody))
 		}
 		if u, ok := responseUsage(resp.Header.Get("Content-Type"), respBody); ok {
 			usage, usageOK = u, true
+		} else {
+			usage.StopReason = u.StopReason // same reasoning as the stream path above
 		}
 
 		// Reconstruct the message the loop reasons over. For SSE, aggregate the events;
@@ -868,6 +1220,13 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 				resolved[c.CallID] = "[expand: original for id " + c.HashID + " is no longer available]"
 			}
 		}
+		expanded += got
+		// The reversibility loop is the hardest thing here to diagnose after the fact:
+		// a model calls expand, an id has aged out of the store, and the symptom is a
+		// confused agent rather than an error. So log what it asked for against what came
+		// back — `unresolved > 0` is the tell.
+		lg.Debug("cg.expand", "round", round, "calls", len(calls),
+			"resolved", got, "unresolved", len(calls)-got)
 		next, ok := expand.Continuation(string(provider), body, msg, resolved)
 		if got == 0 || !ok {
 			writeRaw(w, resp, respBody) // nothing recovered; return the model's own call
@@ -897,18 +1256,36 @@ func (h *Handler) doUpstream(r *http.Request, up upstream, body []byte) (*http.R
 		return nil, err
 	}
 	copyHeaders(req.Header, r.Header)
-	if up.setKey != nil {
-		// Gateway mode: drop the client's placeholder auth, inject the real key. Every
-		// slot the tenant resolver reads a token from is dropped, not just the two
-		// providers use — a slot we accept a credential in is a slot that must never
-		// reach an upstream, and in a hosted deployment that credential is the token
-		// WE minted.
-		for _, hd := range tokenHeaders {
-			req.Header.Del(hd)
-		}
-		up.setKey(req.Header)
-	}
+	setUpstreamAuth(req.Header, up)
 	return h.client.Do(req)
+}
+
+// setUpstreamAuth applies the route's credential decision to the FORWARDED request.
+//
+// Default (no server-held key): the caller's own provider credential goes upstream
+// untouched — their key, their bill. Only our own token is scrubbed out of the auth
+// slots, because a token is not a provider credential and must never leave.
+//
+// Gateway mode (a server key IS configured): every auth slot is dropped and the
+// server key injected, because the caller holds only a placeholder.
+//
+// It is not the only place a credential leaves the box, and the comment here used to
+// claim it was. A NeedsModel component with `model.source: incoming` calls the same
+// upstream through its own client (incomingModel), which is a second exit for a second
+// credential — and while the comment said otherwise, the two disagreed in gateway mode:
+// this function injected the server's key while that client carried the caller's to the
+// same host. There is one DECISION, `up.setKey`, and both exits now read it; that is the
+// invariant, and it holds because neither side derives it independently.
+func setUpstreamAuth(dst http.Header, up upstream) {
+	if up.setKey == nil {
+		scrubToken(dst)
+		return
+	}
+	for _, hd := range authHeaders {
+		dst.Del(hd)
+	}
+	dst.Del(TokenHeader)
+	up.setKey(dst)
 }
 
 // stream copies an upstream response through with flushing (SSE-friendly), while
@@ -1100,9 +1477,9 @@ func (h *Handler) expand(w http.ResponseWriter, r *http.Request) {
 	// store served one deployment; with a store per tenant, resolving against the
 	// caller's own store means a guessed id cannot even name a stash belonging to
 	// someone else.
-	tn, err := h.tenancyFor(r)
+	tn, err := h.authenticate(r)
 	if err != nil {
-		failAuth(w, err)
+		h.refuse(w, r, err)
 		return
 	}
 	id := r.URL.Query().Get("id")
@@ -1138,6 +1515,18 @@ func (h *Handler) expand(w http.ResponseWriter, r *http.Request) {
 
 // copyHeaders copies headers except hop-by-hop ones; the caller's provider auth
 // (Authorization / x-api-key) passes straight through to the upstream.
+//
+// Cookie is dropped, which is the request direction only and therefore safe here even
+// though this function is also used response→client (writeRaw, stream): Set-Cookie is a
+// different header and is untouched. The reason is the Bob catch-all — it forwards
+// verbatim, so a client that presented both a context-guru token and its cg_dash
+// DASHBOARD cookie shipped a live browser session to a third-party host. Observed:
+// the upstream received `Cookie: cg_dash=<session>`. A browser session is not an upstream
+// credential, and no upstream has any use for one.
+//
+// It belongs here rather than in setUpstreamAuth because setUpstreamAuth's gateway branch
+// deletes only the auth slots — and gateway mode is what the hosted deployment runs. Every
+// forward path goes through this function; that is the property that makes one line enough.
 func copyHeaders(dst, src http.Header) {
 	for k, vs := range src {
 		switch http.CanonicalHeaderKey(k) {
@@ -1149,4 +1538,5 @@ func copyHeaders(dst, src http.Header) {
 		}
 		dst[k] = append([]string(nil), vs...)
 	}
+	dst.Del("Cookie") // a browser session is not an upstream credential
 }

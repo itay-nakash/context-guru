@@ -387,6 +387,11 @@ func (r *Recorder) run() {
 			slog.Warn("dash: dropping a batch of captured requests", "n", len(batch), "err", err)
 		} else {
 			r.written.Add(int64(len(batch)))
+			// The capture path is asynchronous, so "my request is not on the dashboard" has
+			// three possible answers: never captured, dropped by a full channel (counted, and
+			// WARNed above), or still sitting in this batch. This line is the third one.
+			slog.Debug("dash: wrote a batch of captured requests", "n", len(batch),
+				"written_total", r.written.Load(), "dropped_total", r.dropped.Load())
 			for _, e := range batch {
 				r.hub.Publish(e)
 			}
@@ -404,13 +409,7 @@ func (r *Recorder) run() {
 		case <-flush.C:
 			write()
 		case <-prune.C:
-			if n, err := r.db.Prune(time.Now(), r.opts.RetentionAge, r.opts.RetentionBytes); err != nil {
-				slog.Warn("dash: retention prune failed", "err", err)
-			} else if n > 0 {
-				slog.Info("dash: pruned old dashboard rows", "requests", n)
-			}
-			r.enforceQuotas()
-			r.relieveDiskPressure()
+			r.janitorPass()
 		case <-r.done:
 			// Drain whatever is queued so a clean shutdown does not lose the tail.
 			for {

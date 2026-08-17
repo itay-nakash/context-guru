@@ -208,6 +208,7 @@ table above is unchanged and every path below returns 404.
 | `GET /api/archive` | The local, permanent cold-storage index (`limit`). Also reports `remote` (the **configured** destination name, `""` when none) and `reachable` as separate fields, so "not configured" and "configured but down right now" cannot be rendered as the same thing. |
 | `GET /api/archive/{session}` | Fetches one session back out of cold storage. The only route that does a network round trip, and **read-only** — it does not reinsert the rows. `404` for "never archived", `503` for "the remote is down". |
 | `GET /api/components` | Per-component economics: runs, acted, reverted, unique/gross savings, `overcount_ratio`, total and mean own-latency, errors. |
+| `GET /api/breakdown?dim=<name>` | Requests, tokens and **spent vs saved** grouped by one dimension: `model`, `provider`, `agent`, `preset`, `mode`, `reasoning_effort`, `thinking_mode`, `stop_reason`, `tool_choice`, `cache_miss_reason`, `cache_breakpoints`, `stream`. `spent_usd` is billed cost plus context-guru's own model spend; `saved_usd` is the baseline counterfactual minus that. `incomplete_rows` counts rows the provider reported no usage for, so a group with no priced rows renders as **unknown** rather than as zero. The dimension is an **allowlist**: an unknown one is a `400` naming the valid set, never a chart of some other dimension's numbers. Defaults to `model`. Per-**day** usage bars need no route of their own — they are `/api/series?bucket=86400000`, since bucketing happens in SQL at query time. |
 | `GET /api/facets` | The distinct values present for each filter dimension, so a UI shows only what the data contains. |
 | `GET /api/config` | **This proxy process's** effective (resolved, key-allowlisted) configuration, wrapped in a scope envelope — see [below](#the-config-route-serves-the-servers-configuration-not-yours). Access-gated; **manager-only** in hosted mode. |
 | `GET /api/benchmarks` | Ingested harness runs with per-arm aggregates. `?refresh=1` re-scans the configured run directories. **Manager-only** in hosted mode — the runs are the operator's own eval history, and `?refresh=1` walks the filesystem and inserts rows. |
@@ -264,9 +265,10 @@ content capture, and they answer different questions:
 | `content_captured` | The **effective** decision for the tenant whose rows these are: the operator's service-wide gate **and** that tenant's own consent, both read per request. It is not the process flag. |
 | `capture_blocked_by` | `"operator"` \| `"tenant"` \| `""` — which party's gate is the closed one, so a message can name someone who can actually act. `""` when nothing is blocking, and `""` for a manager viewing the whole service, who is not a party whose consent there is to report. |
 
-Capture therefore needs **both** yeses, and the consequence bites in exactly one direction:
-**a tenant who opts in still gets nothing until the operator sets `--dashboard-content` /
-`DASHBOARD_CONTENT`.** In that state `content_captured` is `false` and
+Capture therefore needs **both** yeses, and only the operator's is off by default — a hosted
+account is registered with its own `capture_content` already on. So the consequence bites in
+exactly one direction: **a tenant whose own switch is on still gets nothing until the operator
+sets `--dashboard-content` / `DASHBOARD_CONTENT`.** In that state `content_captured` is `false` and
 `capture_blocked_by` is `"operator"` — which is the whole point of the field, because the
 dashboard used to read the process flag and tell such a user to switch on a setting they had
 already switched on. In single-tenant mode there is no second gate, so the operator flag is
@@ -275,7 +277,8 @@ the entire decision and `capture_blocked_by` is `"operator"` or `""`.
 ### Filter parameters
 
 Accepted by `/api/stats`, `/api/series`, `/api/requests`, `/api/sessions`,
-`/api/components` and `/api/facets`. All filtering happens in SQL, server-side.
+`/api/components`, `/api/breakdown` and `/api/facets`. All filtering happens in SQL,
+server-side.
 
 | Parameter | Matches |
 |---|---|
@@ -284,6 +287,7 @@ Accepted by `/api/stats`, `/api/series`, `/api/requests`, `/api/sessions`,
 | `component` | Requests on which that component ran. |
 | `reason` | The uncompressed-reason bucket (`bypassed`, `below_trigger`, `cache_frozen`, `found_nothing`, `reverted`, `no_messages`), or `compacted` for requests we did compact. |
 | `accounting` | `complete` \| `partial` \| `missing`. |
+| `effort` · `thinking` · `stop_reason` | Captured request metadata: the reasoning effort (`low`…`max`) and thinking mode (`adaptive` \| `enabled` \| `disabled`) the client asked for, and the provider's terminal stop reason. Exact match; the drill-down from a `/api/breakdown` bar into the rows behind it. |
 | `q` | Free-text match against session id, model and agent. |
 | `limit` · `before` · `offset` | Page size; keyset cursor (`/api/requests`); offset (`/api/sessions`). |
 
@@ -325,11 +329,21 @@ See [Hosted service](../hosted.md).
 | `POST /api/login` · `POST /api/logout` | Exchange a token for a session cookie, and drop it. |
 | `GET /api/me` · `PUT /api/me` | The caller's own account and configuration. |
 | `POST /api/me/tokens` · `DELETE /api/me/tokens/{prefix}` | Mint and revoke the caller's own tokens. |
+| `POST /api/me/agent-key` · `DELETE /api/me/agent-key` | Bind (and unbind) the **sha256** of the caller's own provider key, so an agent that can send no `x-context-guru-token` header is still identified. The key is sent in `Authorization` / `x-api-key` — the same slot the agent uses — and is hashed on arrival: never stored, echoed or logged. Two refusals, both the caller's to fix: a key under **20 characters** is a `400`, because identity here *is* the digest and a guessable key is a guessable account; a digest already bound to **another** account is a `403` and is never moved, because binding a digest someone else had bound used to transfer their traffic — and, with `capture_content` on, their captured transcripts — to whoever bound it. A real transfer is the owner's `DELETE` followed by a fresh bind. `DELETE` drops all of the caller's, because a digest is not displayable and "which one" is not answerable. |
 | `GET /api/me/audit` | The caller's configuration-change history. |
 | `GET /api/options` | Which upstreams the operator allows, and which presets and components are registered — so the settings page cannot offer something the server would reject. Names no base URL and no credential env var. |
+| `POST /api/me/password` | Change the caller's own password. The **current** one is required — a stolen session cookie must not convert into permanent ownership of the account — and every *other* signed-in machine is signed out. |
+| `POST /api/password-reset` · `POST /api/password-reset/verify` | Self-service recovery, unauthenticated by necessity: the person who needs it cannot sign in. Phase one mails a code and answers **identically** whether or not the address has an account; phase two spends the code together with the new password. The code's purpose is fixed by the route, so a login code cannot be spent here and a reset code is not a second factor. |
 | `GET /api/tenants` | Manager only: the roster. |
-| `PATCH /api/tenants/{id}` | Manager only: cap, disable, row quota. |
+| `PATCH /api/tenants/{id}` | Manager only: the whole account — label, role, variant, quota, upstreams, capture consent, `disabled` + `disabled_reason`, and `config_yaml`, which is validated by the same strict loader the proxy builds with (a typo is a `400` naming the key, and nothing is partially applied). There is **no spend cap** to set — each account bills its own provider credential. |
 | `POST /api/tenants/{id}/tokens` | Manager only: reissue a token for a tenant that **already exists**. There is no manager-side create. |
+| `POST /api/tenants/{id}/password-reset` | Manager only: mail that account a reset code. The manager **cannot see the code and cannot set the password** — a manager who could set one could sign in as the user and read their transcripts. The account's current password keeps working until its owner finishes. |
+| `POST /api/tenants/{id}/purge` | Manager only, **irreversible**: erase that tenant's requests, component rows, stored transcripts, monthly spend rollup and archived objects. The account keeps working. Requires `{"confirm": "<their email or id>"}` and writes an audit row. |
+| `DELETE /api/tenants/{id}` | Manager only, **irreversible**: the purge above, then the account — tokens, sessions, agent keys and pending codes go with it by cascade. Same confirmation; the audit row outlives the account. A manager cannot delete themselves. |
+| `GET /api/variants` | Manager only: per-variant rollup of the metrics that already exist, folded from each account's own aggregates, plus the `caveats` that say what the comparison cannot show. Accepts `since`/`until`. |
+| `POST /api/feedback` | One feedback submission from the signed-in account: 1–5 stars per question plus a comment of **at least 50 characters of real text**, enforced here and not only in the form (whitespace is collapsed before counting, so 50 spaces is not 50 characters). The tenant is taken from the cookie, never from the body. `422` names the rule that was broken. Stored in the **control** database, then mailed to the manager off the request path — a slow or unconfigured relay cannot fail or delay a submission, and `mailed_at = 0` records a notification that never got out. |
+| `GET /api/authz/grafana` | **Manager only**, and not a route a browser calls: it is nginx's `auth_request` target for `/grafana/`. `204` for a manager's `cg_dash` session, `401`/`403` for anyone else, with no body either way — nginx reads only the status, and a body would describe what is behind the gate to somebody who did not get through it. Cookie only, like every route here, so a proxy token cannot open the dashboards. It ships alongside `deploy/service/nginx.conf` but only takes effect when the proxy restarts; until then the front end refuses `/grafana/` for everyone, managers included. |
+| `GET /api/feedback` | **Manager only** — including the aggregate. Returns every submission, per-question mean and 1–5 distribution, the NPS split on the recommend question, and the daily trend. A plain account gets `403` for every form of this, its own rows included: "you said 2, the average is 4.4" is a disclosure about other people's answers. A manager may narrow with `?tenant=<id>`. |
 
 ### The tenant view's configuration fields
 
@@ -361,9 +375,19 @@ ever recorded), and a guess that hits would delete a configuration somebody chos
 
 | Header | Effect |
 |---|---|
+| `x-context-guru-token: cg_live_…` | **Hosted mode:** identifies the calling account. Read from this header first; an auth slot is accepted as a fallback, but only for a value shaped like one of our tokens (`cg_live_` + 26 characters), so a provider key is never looked up as a token. Prefer the header — the auth slot has to stay free for the caller's own provider credential, and it cannot hold both. |
 | `x-context-guru-session: <id>` | Sets the session key explicitly. Otherwise a stable content hash (`sha256(system + firstUser)`) keys the session. |
 | `x-context-guru-bypass: true` | Skips the pipeline entirely for this request (tokens unchanged). |
 | `x-context-guru-pipeline: <a,b,c>` | Runs exactly these components, in order, for this request. |
+
+Every `x-context-guru-*` header is stripped before the request is forwarded, so none of them
+can reach an upstream — which is what makes the token safe to carry in one.
+
+The auth slots (`Authorization`, `x-api-key`, `x-goog-api-key`) are **not** ours: they carry the
+caller's own provider key and are forwarded unchanged, unless the operator configured a
+server-held key for that upstream or the slot turned out to hold one of our tokens, which is
+scrubbed. A request with no provider credential of its own is refused **401** and is never
+served on the operator's credential.
 
 See [Config & environment](config.md) for flags and env vars, and
 [Presets](presets.md) for the built-in pipelines.

@@ -127,7 +127,7 @@ The [dashboard](../dashboard.md) is **off by default**. Enabling it adds `/dashb
 | `--dashboard-db` / `DASHBOARD_DB` | `./context-guru-dashboard.db` | SQLite path. `:memory:` keeps history in RAM only (the no-persistence mode). An unwritable path falls back to in-memory with a warning rather than failing to start. |
 | `--dashboard-retention` / `DASHBOARD_RETENTION` | `168h` (7 days) | Drop rows older than this. `0` disables the age rule. |
 | `--dashboard-max-bytes` / `DASHBOARD_MAX_BYTES` | `536870912` (512 MiB) | Cap the database size, dropping the oldest requests first. `0` disables the size rule. |
-| `--dashboard-content` / `DASHBOARD_CONTENT` | `false` | Capture before/after message text for the diff view. **Opt-in**: it stores arbitrary agent output on disk, scrubbed of known credential shapes and size-capped **before** storage — but content cannot be allowlisted the way headers and config keys are, so the safe default is off. |
+| `--dashboard-content` / `DASHBOARD_CONTENT` | `false` | Capture before/after message text for the diff view. It stores arbitrary agent output on disk, scrubbed of known credential shapes and size-capped **before** storage — but content cannot be allowlisted the way headers and config keys are, so the safe default is off. In hosted mode this is only the **operator's** half of the decision: a tenant is registered with its own `capture_content` already **on**, so this flag is what keeps a new account's transcripts off disk. |
 | `--dashboard-content-cap` / `DASHBOARD_CONTENT_CAP` | `16384` | Maximum bytes stored per captured before/after blob. |
 | `--dashboard-queue` / `DASHBOARD_QUEUE` | `4096` | Capture-channel depth. A full channel **drops** events (counted, and shown in the UI) rather than delaying a request. |
 | `--dashboard-trusted-cidrs` / `DASHBOARD_TRUSTED_CIDRS` | — | Comma-separated CIDRs allowed to view per-request **content** and the effective config. Loopback always is; aggregates are open to everyone. |
@@ -163,18 +163,17 @@ without it, except the disk and cold-storage rules, which apply to any dashboard
 
 | Flag / env | Default | Purpose |
 |---|---|---|
-| `--upstreams` / `UPSTREAMS` | — | Path to the upstream allow-list YAML. **Setting it enables hosted multi-tenant mode.** The loader refuses to start if any named `key_env` is unset. |
+| `--upstreams` / `UPSTREAMS` | — | Path to the upstream allow-list YAML. **Setting it enables hosted multi-tenant mode.** `key_env` is optional (omit it and the caller’s own provider key is forwarded); if an entry names one, the loader refuses to start while it is unset. |
 | `--control-db` / `CONTROL_DB` | `./context-guru-control.db` | Tenants, tokens, per-tenant config. Kept separate from the dashboard DB, which is a derived view that may be rebuilt or pruned. |
 | `--manager-email` / `MANAGER_EMAIL` | — | The email that becomes the manager account **at registration**, matched case-insensitively. Must be set *before* the first account registers. |
 | `--register-domains` / `REGISTER_DOMAINS` | — | Comma-separated email domains allowed to self-register (exact-domain or a subdomain of it). Applies only when `CG_REGISTER` is `open` or `invite`; the address itself is **unverified**. |
 | `CG_REGISTER` | `closed` | Registration mode: `closed` \| `invite` \| `open`. Re-read **per request**, so switching needs no restart. Anything unrecognised normalises to `closed`. |
 | `CG_REGISTER_CODE` | — | The invite code `invite` mode compares against. Empty in `invite` mode refuses everyone rather than falling through to open. |
 | `--max-tenancies` / `MAX_TENANCIES` | `256` | How many tenants keep live pipelines and compaction state in memory. Evicting one costs it a cold cache on its next turn. |
-| `--tenant-monthly-cap-usd` / `TENANT_MONTHLY_CAP_USD` | `50` | Default monthly spend cap per tenant against the shared credential. Over it returns **402**, not 429. |
 | `--tenant-rpm` / `TENANT_RPM` | `0` (unlimited) | Requests per minute, per tenant. |
 | `--tenant-concurrent` / `TENANT_CONCURRENT` | `0` (unlimited) | In-flight requests, per tenant. |
 | `--metrics-token` / `METRICS_TOKEN` | — | Bearer token letting a remote Prometheus scrape `/metrics`. Loopback never needs one; `/metrics` carries per-tenant cost. |
-| `--dashboard-max-rows-per-tenant` / `DASHBOARD_MAX_ROWS_PER_TENANT` | `0` (no cap) | Server-wide cap on one tenant's retained request rows, trimmed **before** the disk rule so a heavy user cannot evict everyone else. A per-tenant value a manager sets overrides it. |
+| `--dashboard-max-rows-per-tenant` / `DASHBOARD_MAX_ROWS_PER_TENANT` | `100000` | Server-wide cap on one tenant's retained request rows. The janitor runs **quota first**, then the age and byte rules, then the disk rule — so a heavy user is trimmed to its own quota before anyone else's history is touched. Set `0` and one tenant can fill the database, after which the byte rule deletes the oldest rows in the whole table: the offender keeps its recent history and the quiet tenants lose theirs. A per-tenant value a manager sets overrides it. |
 
 ### Cold storage (Box via rclone)
 
@@ -206,10 +205,43 @@ shared box is mostly filled by other things.
 | `--dashboard-disk-low` / `DASHBOARD_DISK_LOW` | `0.85` | Stop evicting once usage falls to this. The gap from the high watermark is what stops the janitor grinding when the host is full for other reasons. |
 | `--dashboard-min-keep-bytes` / `DASHBOARD_MIN_KEEP_BYTES` | `1073741824` (1 GiB) | Never shrink the dashboard database below this under disk pressure — below it the pressure is not ours to relieve, and a blank dashboard would hide the real problem. |
 
+## Logging
+
+Levels mean the same thing everywhere: **ERROR** we failed, **WARN** we degraded but kept
+serving (fell open, reverted, refused, evicted), **INFO** the request lifecycle — one line
+per request — plus startup facts, **DEBUG** per-component decisions: which gate declined a
+component and on what numbers.
+
+| Env | Default | Effect |
+|---|---|---|
+| `CG_LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error`. `debug` is about 8x the volume of `info` (measured: 337 lines against 40 on the same agent traffic, 8-component pipeline); it is the level to investigate at, not to leave on. |
+| `CG_LOG_FORMAT` | `text`, or `json` when `CG_LOG_FILE` is set | `text` for a human, `json` for a log shipper. |
+| `CG_LOG_FILE` | unset | Also write every record as JSON to this file, for promtail/Loki. **This is the only thing that lets logs leave the box**, and even then only once promtail exists — the proxy never talks to Loki itself. |
+| `CG_LOG_PLAIN` | unset | Opt out: a plain `log/slog` text handler on stderr, no file sink. Also **disables credential scrubbing**, which is what "use the standard logger instead" means. |
+
+Every line of one request's lifecycle carries the tenant id — never its token — and, from
+the point the session is resolved, the session id. See
+[deploy/grafana/README.md](https://github.com/rossoctl/context-guru/blob/main/deploy/grafana/README.md)
+for the Loki setup, the LogQL recipes, and the exact command to turn DEBUG on for a
+deployed service.
+
+Credentials are scrubbed on the way **out**, in the handler, rather than at each call site:
+a rule that every caller must remember holds only until someone who has not read it adds a
+line. Attribute values (including those baked in by `Logger.With`), attribute keys that
+*name* a credential, and the message itself all go through the same patterns `dash` uses
+before writing a captured request to disk.
+
 ## Diagnostics
 
 | Env | Effect |
 |---|---|
-| `CONTEXT_GURU_DEBUG=1` | Logs each tool output's token count + first line. |
+| `CONTEXT_GURU_DEBUG=1` | Legacy alias for `CG_LOG_LEVEL=debug`. Turns on the per-tool-output and per-candidate DEBUG lines it always did, now at DEBUG rather than INFO. |
 | `CONTEXT_GURU_DUMP=<file>` | Appends a before → after JSON record per rewritten message. The [dashboard](../dashboard.md) captures the same material into a queryable store with a diff view. |
 | `CONTEXT_GURU_CAPTURE=<file>` | Appends each pristine inbound request as one JSONL record, for offline replay through `/compact`. |
+
+!!! warning "Both are refused in hosted mode"
+    With `--upstreams` set, either variable makes the process **exit at startup**, naming
+    the one it found. Both append to a single process-wide file with no tenant column and
+    without running the redactor, so on a shared instance they are a plaintext transcript of
+    every tenant's source code, written whether or not that tenant consented to capture.
+    Unset it, or drop `--upstreams` to run single-tenant.

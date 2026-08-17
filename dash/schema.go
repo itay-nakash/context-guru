@@ -40,7 +40,7 @@ import (
 // monthly spend rollup — so Open carries them across from the preserved file (see
 // carryNonDerived in store.go, and the comments on those two tables below). Adding
 // another table that traffic cannot rebuild means adding it to nonDerivedTables.
-const schemaVersion = 5
+const schemaVersion = 6
 
 // ddl is the whole schema. Timestamps are epoch MILLISECONDS everywhere — never
 // a formatted locale string, which cannot be range-queried, sorted portably, or
@@ -91,7 +91,34 @@ CREATE TABLE IF NOT EXISTS requests (
   reverts            INTEGER NOT NULL DEFAULT 0,
   token_accounting   TEXT    NOT NULL DEFAULT 'missing', -- complete|partial|missing
   cache_miss_reason  TEXT    NOT NULL DEFAULT '',        -- cold_start|ttl_expiry|prefix_change|unknown|hit
-  uncompressed_reason TEXT   NOT NULL DEFAULT ''         -- why we did not compact: '' = we did
+  uncompressed_reason TEXT   NOT NULL DEFAULT '',        -- why we did not compact: '' = we did
+  -- Request metadata: the knobs the CLIENT chose, normalized across the Anthropic and
+  -- OpenAI dialects at the capture site, plus the provider's terminal stop reason. Real
+  -- columns rather than one JSON blob because every one of them is GROUPED BY in an
+  -- aggregate or shown on the row — see the Meta type in event.go for the full argument.
+  -- Every TEXT column here is client-supplied and is passed through metaEnum BEFORE the
+  -- insert (dash/redact.go), never on read.
+  reasoning_effort   TEXT    NOT NULL DEFAULT '',        -- output_config.effort | reasoning_effort
+  thinking_mode      TEXT    NOT NULL DEFAULT '',        -- thinking.type: adaptive|enabled|disabled
+  thinking_budget    INTEGER NOT NULL DEFAULT 0,         -- thinking.budget_tokens
+  -- NULLABLE, unlike every other column in this table: "unset" and "0" are different
+  -- facts for a sampling parameter, and 0 is a legitimate value, so no sentinel can mean
+  -- absent. NULL is the only honest encoding.
+  temperature        REAL,
+  top_p              REAL,
+  max_tokens         INTEGER NOT NULL DEFAULT 0,
+  stream             INTEGER NOT NULL DEFAULT 0,
+  tool_choice        TEXT    NOT NULL DEFAULT '',        -- auto|any|none|required|tool
+  tools              INTEGER NOT NULL DEFAULT 0,         -- declared tool count
+  system_blocks      INTEGER NOT NULL DEFAULT 0,         -- blocks in the top-level system array
+  -- Prompt-cache breakpoints on arrival, BY LOCATION. The tools and system arrays render
+  -- ahead of messages, so where a breakpoint sits decides how much prefix it protects; a
+  -- single total cannot distinguish good placement from bad. Sum = the provider's cap of 4.
+  cache_bp_system    INTEGER NOT NULL DEFAULT 0,
+  cache_bp_tools     INTEGER NOT NULL DEFAULT 0,
+  cache_bp_messages  INTEGER NOT NULL DEFAULT 0,
+  cache_bp_blocks    INTEGER NOT NULL DEFAULT 0,
+  stop_reason        TEXT    NOT NULL DEFAULT ''         -- end_turn|max_tokens|tool_use|refusal|…
 );
 CREATE INDEX IF NOT EXISTS idx_requests_ts       ON requests(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_requests_session  ON requests(session_id, ts);
@@ -176,8 +203,10 @@ CREATE INDEX IF NOT EXISTS idx_content_request ON request_content(request_id);
 -- losing it resets every tenant's month-to-date spend to zero.
 -- The one rollup table in this schema (see the package comment), and it
 -- earns its place for a reason that is not performance: a SUM over the requests table
--- is a spend figure the tenant can RESET by generating enough traffic to evict its own
--- oldest rows, which turns the monthly cap into a cap on concurrent history.
+-- silently SHRINKS as retention evicts history, so a tenant that generates enough
+-- traffic to evict its own oldest rows would watch its month-to-date spend fall. The
+-- figure is reported, never enforced — there is no spend cap — and a reported number
+-- that goes down while money goes up is the kind of number nobody trusts again.
 CREATE TABLE IF NOT EXISTS tenant_spend (
   tenant_id TEXT NOT NULL,
   month     TEXT NOT NULL,             -- 'YYYY-MM', UTC, matching the calendar invoice

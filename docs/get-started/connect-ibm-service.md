@@ -16,8 +16,9 @@ your agent ──▶ https://contextguru.vpc.cloud9.ibm.com ──▶ the model 
 | Host | `contextguru.vpc.cloud9.ibm.com`, **HTTPS on 443 only** |
 | Reachable from | IBM-internal networks (`9.0.0.0/8`) |
 | Credential | one service-issued token, `cg_live_` + 26 characters |
-| Your provider key | **not needed, and never asked for** — the upstream credential is held server-side |
-| Cost control | a monthly spend cap per account, **$50** by default |
+| Your provider key | **stays yours** — your agent keeps sending it, and the proxy forwards it upstream unchanged |
+| Cost control | none needed: every account's traffic is billed to that account's own provider credential |
+| Transcript capture | your account consents **on registration** — [what that means, and the off switch](#three-things-worth-knowing-before-you-rely-on-it) |
 | Default pipeline | `[format, toon, dedup, failed_run, cmdfilter, extract, cachesplit]`, `mode: sync` |
 
 The default pipeline is **fully deterministic** — no cheap-model calls anywhere in it. That
@@ -26,17 +27,19 @@ model budget, and puts near-zero latency on your agent turn.
 
 !!! warning "There is no port 80, on purpose"
     A mistyped `http://contextguru.vpc.cloud9.ibm.com` **fails to connect**, and that is the
-    designed behaviour rather than a gap. Every request carries your `cg_live_…` token in a
-    header; a `301` to `https://` arrives *after* the client has already put that token on
-    the wire in cleartext, and a redirect cannot retract a credential that has been sent.
-    Failing loudly is the only outcome that keeps the token off the network.
+    designed behaviour rather than a gap. Every request carries your `cg_live_…` token AND
+    your own provider key in headers; a `301` to `https://` arrives *after* the client has
+    already put both on the wire in cleartext, and a redirect cannot retract a credential
+    that has been sent. Failing loudly is the only outcome that keeps them off the network.
 
 ## 1. Register
 
 Open **<https://contextguru.vpc.cloud9.ibm.com/dashboard/>**, register with your IBM email
-address and a label for the token.
+address, a password of at least 8 characters, and a label for the token. We mail a 6-digit
+code to that address; entering it within 5 minutes is what creates the account. Signing in
+later is that same password plus a fresh mailed code.
 
-The token is shown **once**. The server keeps only `sha256(token)` and its first 8
+The token is shown **once**, after the code. The server keeps only `sha256(token)` and its first 8
 characters (for display and revocation), so there is no code path that can print it back to
 you and a lost token has to be reissued, not recovered. Copy it somewhere safe now.
 
@@ -44,7 +47,7 @@ you and a lost token has to be reissued, not recovered. Copy it somewhere safe n
     Self-registration has three modes, and the operator picks one. A `403` means it is
     `closed` (ask the operator to reissue you an account) or `invite` (ask for the invite
     code and enter it in the form). See
-    [Choose how accounts are created](../hosted.md#3-choose-how-accounts-are-created).
+    [Choose how accounts are created](../hosted.md#4-choose-how-accounts-are-created).
 
 ## 2. Make sure your machine trusts the certificate
 
@@ -103,24 +106,33 @@ Install the root CA system-wide:
 One token, three dialects. The path carries the dialect; your account's settings decide
 which upstream each dialect goes to.
 
+**Leave your provider key exactly where it is.** The service forwards it, so your traffic
+is billed to your own account. The context-guru token travels in its own header,
+`x-context-guru-token`, so it never competes for the slot your key occupies.
+
 ```bash
-# Claude Code
+# Claude Code — ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN stay YOUR key
 export ANTHROPIC_BASE_URL=https://contextguru.vpc.cloud9.ibm.com/anthropic
-export ANTHROPIC_AUTH_TOKEN=cg_live_…
+export ANTHROPIC_CUSTOM_HEADERS="x-context-guru-token: cg_live_…"
 
-# Bob
-export CUSTOM_BASE_URL=https://contextguru.vpc.cloud9.ibm.com
-export BOBSHELL_API_KEY=cg_live_…
-
-# OpenAI-dialect tools
+# OpenAI-dialect tools — OPENAI_API_KEY stays your key; send the header
+#   x-context-guru-token: cg_live_…
 export OPENAI_BASE_URL=https://contextguru.vpc.cloud9.ibm.com/openai/v1
-export OPENAI_API_KEY=cg_live_…
+
+# Bob — BOBSHELL_API_KEY stays your key, and Bob can send no header of ours, so bind
+# that key to your account once (sha256 only; the key itself is never stored)
+export CUSTOM_BASE_URL=https://contextguru.vpc.cloud9.ibm.com
+curl -sS -XPOST https://contextguru.vpc.cloud9.ibm.com/api/me/agent-key \
+  -H "Authorization: Bearer $BOBSHELL_API_KEY" -b "cg_dash=<your dashboard cookie>"
 ```
 
-The token is accepted in `Authorization`, `x-api-key` or `x-goog-api-key`, whichever slot
-your tool happens to use, and every one of those slots is **stripped** before the request is
-forwarded upstream. Bob may also need `BOBSHELL_DEFAULT_AUTH_TYPE=custom` for it to use
-`BOBSHELL_API_KEY` at all — see [Host adapters](../integrations.md#use-it-with-an-agent-bob-bobshell).
+The token is read from `x-context-guru-token` first. It is still accepted in
+`Authorization`, `x-api-key` or `x-goog-api-key` for tools that have nowhere else to put
+it — recognised by its `cg_live_` shape, and scrubbed out before the request is forwarded —
+but a slot holding the token cannot also hold your provider key, so prefer the header.
+
+Bob may also need `BOBSHELL_DEFAULT_AUTH_TYPE=custom` for it to use `BOBSHELL_API_KEY` at
+all — see [Host adapters](../integrations.md#use-it-with-an-agent-bob-bobshell).
 
 !!! warning "An `export` is not proof the traffic arrives"
     For Claude Code an `env` block in `~/.claude/settings.json` **silently overrides the
@@ -137,9 +149,9 @@ another terminal, another repo and another agent are untouched.
 ### Claude Code
 
 ```sh
-# One command, one session.
+# One command, one session. Your own key stays in ANTHROPIC_API_KEY.
 ANTHROPIC_BASE_URL=https://contextguru.vpc.cloud9.ibm.com/anthropic \
-ANTHROPIC_AUTH_TOKEN=cg_live_… \
+ANTHROPIC_CUSTOM_HEADERS='x-context-guru-token: cg_live_…' \
   claude
 ```
 
@@ -151,7 +163,7 @@ touching it:
 ```sh
 claude --settings '{"env":{
   "ANTHROPIC_BASE_URL":"https://contextguru.vpc.cloud9.ibm.com/anthropic",
-  "ANTHROPIC_AUTH_TOKEN":"cg_live_…"}}'
+  "ANTHROPIC_CUSTOM_HEADERS":"x-context-guru-token: cg_live_…"}}'
 ```
 
 Verified on Claude Code 2.1.215: with a global `env` block present, the `--settings` form
@@ -161,10 +173,12 @@ sent `POST /v1/messages` to the URL named there, and the exported variable alone
 
 ```sh
 CUSTOM_BASE_URL=https://contextguru.vpc.cloud9.ibm.com \
-BOBSHELL_DEFAULT_AUTH_TYPE=custom \
-BOBSHELL_API_KEY=cg_live_… \
   bob "your task"
 ```
+
+Bob keeps its own `BOBSHELL_API_KEY`. Because it can carry no header of ours, it is
+identified by the sha256 of that key — bind it once with the `curl` above, and rebind
+whenever you rotate the key.
 
 Bob's base URL is the **host**; Bob appends its own `/inference/…` and `/admin/…` paths, and
 the proxy passes its control-plane calls through verbatim so the CLI still boots.
@@ -173,12 +187,9 @@ the proxy passes its control-plane calls through verbatim so the CLI still boots
 
 ```sh
 cg-on()  { export ANTHROPIC_BASE_URL=https://contextguru.vpc.cloud9.ibm.com/anthropic \
-                  ANTHROPIC_AUTH_TOKEN="$CG_TOKEN" \
-                  CUSTOM_BASE_URL=https://contextguru.vpc.cloud9.ibm.com \
-                  BOBSHELL_DEFAULT_AUTH_TYPE=custom \
-                  BOBSHELL_API_KEY="$CG_TOKEN"; }
-cg-off() { unset ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN CUSTOM_BASE_URL \
-                 BOBSHELL_DEFAULT_AUTH_TYPE BOBSHELL_API_KEY; }
+                  ANTHROPIC_CUSTOM_HEADERS="x-context-guru-token: $CG_TOKEN" \
+                  CUSTOM_BASE_URL=https://contextguru.vpc.cloud9.ibm.com; }
+cg-off() { unset ANTHROPIC_BASE_URL ANTHROPIC_CUSTOM_HEADERS CUSTOM_BASE_URL; }
 ```
 
 Keep `CG_TOKEN` in your own secret store, not in `.bashrc`. These are a convenience over
@@ -189,10 +200,10 @@ a machine whose `settings.json` sets `ANTHROPIC_BASE_URL`.
 
 ```sh
 # Claude Code — straight to whatever provider your normal config uses.
-env -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN claude
+env -u ANTHROPIC_BASE_URL -u ANTHROPIC_CUSTOM_HEADERS claude
 
-# Bob — back to its own endpoint and its own key.
-env -u CUSTOM_BASE_URL -u BOBSHELL_DEFAULT_AUTH_TYPE -u BOBSHELL_API_KEY bob "your task"
+# Bob — back to its own endpoint.
+env -u CUSTOM_BASE_URL bob "your task"
 ```
 
 `env -u` only removes an *environment* variable. If Claude Code is routed through the
@@ -216,17 +227,21 @@ through the same host, the same TLS, the same nginx and the same account — so 
 survives a bypass, compaction was never the cause.
 
 ```sh
-# Claude Code — verified on 2.1.215: this header reaches the wire.
-ANTHROPIC_CUSTOM_HEADERS='x-context-guru-bypass: true' \
+# Claude Code — verified on 2.1.215: these headers reach the wire. Several pairs are
+# newline-separated, which is how the token and the bypass travel together.
+ANTHROPIC_CUSTOM_HEADERS='x-context-guru-token: cg_live_…
+x-context-guru-bypass: true' \
 ANTHROPIC_BASE_URL=https://contextguru.vpc.cloud9.ibm.com/anthropic \
-ANTHROPIC_AUTH_TOKEN=cg_live_… \
   claude
 ```
 
 !!! note "No equivalent for Bob"
-    Bob 1.0.6 exposes no environment variable for extra request headers — the only
-    header-ish knobs in its bundle are `CUSTOM_BASE_URL`, `CUSTOM_TIMEOUT` and the
-    `BOBSHELL_*` auth set. So for Bob, use
+    Bob 1.0.6 exposes no environment variable for extra request headers — its client
+    builds `Content-Type`, `User-Agent`, `Authorization`, `x-instance-id` and `x-team-id`
+    itself, its `headers` setting applies to MCP servers only, and the header-ish knobs in
+    its bundle are `CUSTOM_BASE_URL`, `CUSTOM_TIMEOUT` and the `BOBSHELL_*` auth set. That
+    is also why Bob is identified by its key digest rather than a token header. So for Bob,
+    use
     [turn it off for one session](#turn-it-off-for-one-session-only) instead, and accept
     that you lose the metrics row for those requests.
 
@@ -299,7 +314,7 @@ Because the silent-override failure looks identical to success, the honest test 
     ```
 
     Then use the `--settings` form above. Full diagnosis and both fixes:
-    [Use with Claude Code](../how-to/use-with-claude-code.md#the-one-liner).
+    [Use with Claude Code](../how-to/use-with-claude-code.md#steps).
 
 === "Bob"
 
@@ -316,14 +331,32 @@ a full agent turn means the traffic never arrived, whatever your shell says.
 
 | Status | What happened |
 |---|---|
-| **401** | No token, or an unknown/revoked one. Nothing is treated as an anonymous account. |
+| **401** | No token (or an unknown/revoked one), **or no provider credential of your own**. The service never falls back to somebody else's key. Nothing is treated as an anonymous account. |
 | **403** | The account is disabled, or self-registration is closed. |
-| **402** | Your monthly spend cap is reached, and the body names the figures. Retrying will not help — ask a manager to raise the cap, or wait for the month to turn over. |
 | **429** | A per-tenant rate or in-flight limit. This one *is* worth retrying. |
 | **502** | No upstream configured for that route, or the provider failed. The operator's problem. |
 | connection refused on `http://` | You used port 80. There deliberately isn't one — see the warning at the top of this page. |
 
-## Two things worth knowing before you rely on it
+## Three things worth knowing before you rely on it
+
+**Your account consents to transcript capture the moment it is created.** Two independent
+switches decide whether your message content is stored, and only one of them starts closed:
+the operator's service-wide switch, and your account's own consent — which registration turns
+**on** for you. So if the operator has capture enabled, then from your very first request the
+before/after text of your messages — agent output, tool results, source code — is written to
+the service's database, scrubbed of known credential shapes and capped at 16 KB per message.
+It is what makes the diff view work, and only your own account can read yours: a manager sees
+everyone's metrics and nobody's transcripts. The scrubber is a pattern denylist, so treat this
+as storage you have agreed to, not a guarantee.
+
+**Check which state you are in, and turn it off if you do not want it.** Open a request in the
+dashboard: `content_captured` is the effective answer for your account, and
+`capture_blocked_by` names whichever switch is closed (`"operator"`, `"tenant"`, or `""` when
+nothing is blocking and your content *is* being stored). To turn it off for yourself, clear the
+transcript-capture consent on the **Settings** tab — metrics and savings keep working, you lose
+the diff view. An operator turns it off for everyone with `DASHBOARD_CONTENT=false`. Either
+switch alone stops the writes, neither is retroactive in either direction, and a proxy you run
+yourself from this repository ships with the operator's switch **off**.
 
 **It fails open.** Any component error or panic reverts that component only, and the
 original request is always forwarded as a valid fallback. Compaction going wrong costs you

@@ -94,13 +94,12 @@ dollar savings diverge so sharply on this workload (see
 
 Both halves matter, and getting either wrong inflates the headline. `saved_tokens` is
 gross: the agent re-sends its transcript every turn, so one compaction is re-counted once
-per remaining turn — a 13.1× overcount on the 63-request window that
-`dash/event.go` documents. Only `saved_unique` is content that genuinely never reached the provider, and
+per remaining turn — a 13.1× overcount on the 63-request window that `dash/event.go`
+documents. Only `saved_unique` is content that genuinely never reached the provider, and
 only that part can be priced as a cache write; the re-sent remainder would have come from
-the provider's cache at 1/11.5 the rate. The dashboard shows the correction factor as
-`overcount_ratio` right beside the dollar figure — an earlier version of this page
-described pricing gross savings as writes, which overstated net savings by ~9× on the
-same data.
+the provider's cache at 1/11.5 the rate. Pricing gross savings as cache writes overstates
+net savings by ~9× on the same data, which is why the dashboard puts `overcount_ratio`
+right beside the dollar figure.
 
 Beneath it, the **honest savings waterfall**: baseline → compaction savings →
 context-guru's own LLM cost → net cost → net savings. If context-guru cost more than it
@@ -201,8 +200,9 @@ the first cannot say who has to act:
 | `content_captured` | The **effective** decision for the tenant whose rows these are — the operator's service-wide gate **and** that tenant's own consent, read fresh per request. It is no longer the process flag. |
 | `capture_blocked_by` | `"operator"`, `"tenant"`, or `""` when nothing is blocking. `""` also for a manager looking at the whole service, who is not a party whose consent there is to report. |
 
-The consequence worth knowing before you debug an empty panel: **capture needs both gates, so
-a tenant who has opted in still gets nothing until the operator sets `--dashboard-content` /
+The consequence worth knowing before you debug an empty panel: **capture needs both gates, and
+only the operator's is off by default — so a tenant whose own switch is on (the registration
+default) still gets nothing until the operator sets `--dashboard-content` /
 `DASHBOARD_CONTENT`.** That state reads `content_captured: false` with
 `capture_blocked_by: "operator"`, and the UI says so instead of pointing at a setting the
 reader has already switched on — which is the bug the field was added to fix. In
@@ -294,7 +294,7 @@ flowchart LR
   Q --> W[writer goroutine<br/>batched tx]
   W --> DB[(SQLite<br/>requests · components · content)]
   W --> H[SSE hub]
-  DB --> API[/api/*]
+  DB --> API["/api/*"]
   H --> API
   API --> UI[embedded UI]
 ```
@@ -312,18 +312,16 @@ content capture ON, median of 40 paired requests against the same fake upstream:
 dashboard-on figure lands within noise of dashboard-off (repeatedly a shade *below* it).
 The channel send itself is ~175 ns (`go test -bench BenchmarkRecord ./dash`).
 
-That second number used to be the only one published, and on its own it was misleading.
-`finish` is called from the handler's `defer`, which runs **before the handler returns** —
-so work placed there is paid by the next request on a keep-alive connection, i.e. by
-every real agent. Content redaction sat there and cost **~53 ms/request**, ~25% of a
-request, while the documented figure was "0.000002%". A benchmark that calls `Record`
-directly cannot see that, so the guard is now an end-to-end handler-latency test with
-content capture on (`TestDashboardAddsNoRequestLatencyWithContentCapture`, budget 5 ms);
-putting redaction back on the request goroutine measures +87 ms and fails it.
+The channel-send figure alone would be misleading, so it is not the guard. `finish` is
+called from the handler's `defer`, which runs **before the handler returns**, so work placed
+there is paid by the next request on a keep-alive connection — by every real agent. The
+guard is therefore an end-to-end handler-latency test with content capture on
+(`TestDashboardAddsNoRequestLatencyWithContentCapture`, budget 5 ms); moving redaction back
+onto the request goroutine measures +87 ms and fails it.
 
-**Redaction happens before the database, never on read.** Headers are blanket-redacted by
-key against a short allowlist; config keys are allowlisted, and an allowlisted key's
-*value* is still checked for an embedded `user:password@` credential; captured content is
+**Redaction happens before the database, never on read.** Request headers are never
+captured at all, so nothing redacts them; config keys are allowlisted, and an allowlisted
+key's *value* is still checked for an embedded `user:password@` credential; captured content is
 scrubbed of credential-shaped strings and size-capped. All of it runs on the writer
 goroutine, immediately before the INSERT — off the request path, but still before anything
 touches disk. A secret that reaches disk is a secret forever, and a redact-on-read filter
@@ -334,8 +332,11 @@ output. It gets pattern scrubbing, and a pattern denylist is structurally always
 reality: a review of 22 realistic credential shapes found 11 passing through, the worst
 being `Authorization: Bearer <token>`, where the pattern matched the scheme and left the
 token in the diff view. Those are fixed and pinned by a table-driven test — but 22/22
-passing does not prove completeness, which is why **content capture is opt-in**
-(`--dashboard-content`, default off) rather than opt-out.
+passing does not prove completeness, which is why the capture is gated. Two switches, and
+they default differently: the **operator's** `--dashboard-content` is process-wide and
+defaults **off**, while the **per-tenant** switch behind it is created **on** (a hosted
+account is registered with `capture_content: true`). So it is the operator's gate, not the
+tenant's, that keeps a new account's source code off disk.
 
 **Percentages at read time, cost at write time.** Every ratio is derived when queried, so
 a filter change needs no rebuild; every cost is computed when the row is written, so
@@ -352,11 +353,11 @@ already requires), in WAL mode.
 
 | Table | Holds |
 |---|---|
-| `requests` | one row per proxied request: identity, all four token tiers, costs, latencies, attribution |
+| `requests` | one row per proxied request: identity, all four token tiers, costs, latencies, attribution, and the request's own **metadata** — reasoning effort, thinking mode and budget, sampling parameters (nullable, so "unset" stays distinct from `0`), `max_tokens`, streaming, `tool_choice`, tool and system-block counts, `cache_control` breakpoints **by location**, and the provider's stop reason. Every client-supplied text field among them passes through the redactor's shape check **before** the insert, like all other captured input |
 | `request_components` | one row per component per request — the "which components earn their place" data |
 | `request_content` | before/after text, gzip-compressed and size-capped; skippable entirely |
 | `archived_sessions` | the cold-storage index — one small row per archived session, local and permanent, so the session list works while the remote is unreachable |
-| `tenant_spend` | the month-to-date spend rollup the per-tenant cap is enforced against; retention and archiving never touch it, so archiving inside the calendar month cannot make the cap under-count |
+| `tenant_spend` | the month-to-date spend rollup Settings and the manager's roster display; retention and archiving never touch it, so evicting request rows inside the calendar month cannot make the figure under-count. Reported only — each account bills its own provider credential, so there is nothing to cap |
 | `bench_runs` / `bench_tasks` | ingested harness runs and their per-task rows |
 
 Timestamps are **epoch milliseconds** everywhere. A formatted locale string cannot be
@@ -404,17 +405,25 @@ answer should not be asked with an error.
 | Tab | Adds |
 |---|---|
 | **Setup** | The copy-paste base-URL/token blocks, with this deployment's real base URL. |
-| **Settings** | Mode, upstream per dialect, component toggles, transcript-capture consent, spend against cap, tokens. |
+| **Settings** | Mode, upstream per dialect, component toggles, transcript-capture consent, month-to-date spend (reported, never capped), bound agent keys, tokens. |
 | **Archive** | What has moved to cold storage, from the local index; opening one fetches it back read-only. |
-| **Tenants** | Manager only: every account with spend against cap, set a cap, disable, reissue a token. |
+| **Tenants** | Manager only: every account with its month-to-date spend, effective configuration and transcript state; read its metrics, disable it, reissue a lost token. No cap to set — each account bills its own provider credential. |
 
 Two access rules differ from the local case, and both are enforced server-side:
 
-- **Transcript capture needs two independent yeses.** The operator's `--dashboard-content`
-  *and* the tenant's own consent, per tenant, **off by default**. The honest reason is the
-  one above: the redactor is a best-effort denylist, and a review of 22 realistic credential
-  shapes found **11 passing through it**. 22-of-22 now passing does not prove completeness,
-  so this is consent, not a feature flag.
+- **Transcript capture has two independent switches, and they default differently.** The
+  operator's `--dashboard-content` is process-wide and defaults **off**; the per-tenant
+  switch behind it is created **on** — a hosted account is registered with
+  `capture_content: true`. Either one alone stops the writes, so on a stock install the
+  operator's switch is the one holding the line, and opening it starts capturing every account
+  that has not turned its own switch off. A tenant clears their consent on **Settings**; an
+  operator sets `DASHBOARD_CONTENT=false` for everyone. Whether the operator switch is open on
+  a given deployment is a fact about that deployment rather than about this default, so check
+  it rather than inferring it from the shipped `false` — `capture_blocked_by` answers it per
+  request, from the reader's own side.
+  The honest reason it matters is the one above: the redactor is a best-effort denylist, and a
+  review of 22 realistic credential shapes found **11 passing through it**. 22-of-22 now
+  passing does not prove completeness.
 - **A manager sees everyone's metrics and nobody's transcripts.** Reading another user's
   source code is not an administrative need, and the consent they gave was for their own
   view. The archive route applies the same rule, so it is not a way around it.
