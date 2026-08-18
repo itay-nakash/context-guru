@@ -1,12 +1,12 @@
 # Connect to the IBM service
 
-There is a context-guru instance running for IBM engineers. You do not build anything, you
-do not run a proxy, and you do not hand it a provider key — you register once, get a token,
-and set two environment variables per agent.
+There is a context-guru instance running for IBM engineers. You do not build anything and
+you do not run a proxy — you register once, get a token, and add two settings to Claude
+Code. Your own provider key stays yours and is forwarded unchanged.
 
 ```
 your agent ──▶ https://contextguru.vpc.cloud9.ibm.com ──▶ the model gateway
-                (rewrites `messages`, then forwards)        (the operator's credential)
+                (rewrites `messages`, then forwards)        (your own credential)
                         │
                         └──▶ your own dashboard: savings, sessions, before/after diffs
 ```
@@ -39,9 +39,11 @@ address, a password of at least 8 characters, and a label for the token. We mail
 code to that address; entering it within 5 minutes is what creates the account. Signing in
 later is that same password plus a fresh mailed code.
 
-The token is shown **once**, after the code. The server keeps only `sha256(token)` and its first 8
-characters (for display and revocation), so there is no code path that can print it back to
-you and a lost token has to be reissued, not recovered. Copy it somewhere safe now.
+The token is shown **once**, on the screen straight after the code, with a copy button and
+the setup steps below it already filled in with your token. The server keeps only
+`sha256(token)` and its first 8 characters (for display and revocation), so there is no
+code path that can print it back to you and a lost token has to be reissued, not
+recovered. Copy it somewhere safe before you leave that screen.
 
 !!! note "If registration is refused"
     Self-registration has three modes, and the operator picks one. A `403` means it is
@@ -52,18 +54,41 @@ you and a lost token has to be reissued, not recovered. Copy it somewhere safe n
 ## 2. Make sure your machine trusts the certificate
 
 The certificate is issued by the **IBM INTERNAL INTERMEDIATE CA**, chaining to the **IBM
-Internal Root CA**. Any IBM-managed machine already trusts that root and there is nothing
-to do. A container, a fresh VM, or a CI runner usually does not — and this is the most
-common first-run failure, so check before anything else:
+Internal Root CA**. This is the most common first-run failure, so check before anything
+else — and check **once per runtime**, because they do not share a trust store:
 
 ```sh
+# The OS trust store (curl, Python, Go).
 curl -sS -o /dev/null -w '%{http_code}\n' https://contextguru.vpc.cloud9.ibm.com/healthz
+
+# Node's own trust store (Bob, Gemini CLI, anything on `fetch`). NOT the same answer.
+node -e 'fetch("https://contextguru.vpc.cloud9.ibm.com/healthz").then(r=>r.text()).then(console.log).catch(e=>console.log("FAIL",e.cause?.code))'
 ```
 
-`200` means you are fine. A certificate-verification error means the trust store is missing
-the IBM root, and every agent on that machine will fail the same way — usually with a
-message about a self-signed certificate in the chain, which is misleading: the chain is
-fine, your machine simply does not know the root.
+Both must print a success line: `200` from curl, `ok` from Node.
+
+!!! danger "`curl` passing does not mean Node passes — this is the trap"
+    **Node ships its own bundled CA list and ignores the operating system's entirely.** So
+    on an IBM-managed machine, whose OS trust store *does* have the IBM root, the `curl`
+    check returns `200` while every Node agent still fails. Bob reports that as:
+
+    ```
+    Request failed after 6 attempts: fetch failed
+    ```
+
+    …with **no request in the service's log**, because the connection never got that far.
+    The message names nothing, so it reads as "the proxy is down". It is not: the real error
+    is `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`, visible only from the `node -e` check above.
+    Observed on a machine where `curl` returned `200` (context-guru 2026-08-17).
+
+    The fix is `NODE_EXTRA_CA_CERTS` — see the **One tool only** tab below. Installing the
+    root system-wide does **not** help Node on its own; that variable is what makes Node
+    read it.
+
+A certificate-verification error from `curl` means the OS trust store is missing the IBM
+root — usually reported as a self-signed certificate in the chain, which is misleading: the
+chain is fine (the service serves the intermediate), your machine simply does not know the
+root.
 
 Install the root CA system-wide:
 
@@ -84,6 +109,10 @@ Install the root CA system-wide:
 === "One tool only"
 
     ```sh
+    # Node ignores the OS trust store, so this one is REQUIRED even on a machine where
+    # curl already works. It also accepts the OS bundle itself, which saves finding the
+    # single PEM: /etc/pki/tls/certs/ca-bundle.crt (RHEL) or
+    # /etc/ssl/certs/ca-certificates.crt (Debian).
     export NODE_EXTRA_CA_CERTS=/path/to/ibm-internal-root-ca.pem   # Claude Code, Bob (Node)
     export SSL_CERT_FILE=/path/to/ibm-internal-root-ca.pem         # Python / OpenSSL
     export REQUESTS_CA_BUNDLE=/path/to/ibm-internal-root-ca.pem    # python-requests
@@ -101,45 +130,91 @@ Install the root CA system-wide:
     [`deploy/service/tls-smoke.sh`](https://github.com/rossoctl/context-guru/blob/main/deploy/service/tls-smoke.sh)
     defaults to.
 
-## 3. Point your agent at it
+## 3. Point Claude Code at it
+
+Four steps. Go through them in order and do nothing else.
+
+**1. Open your Claude Code settings file.**
+
+```
+~/.claude/settings.json
+```
+
+No such file? Create it — an empty file is fine.
+
+**2. Put this in it,** with your own token in place of `cg_live_YOUR_TOKEN_HERE`. This is
+the **whole** file, not a diff:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://contextguru.vpc.cloud9.ibm.com/anthropic",
+    "ANTHROPIC_CUSTOM_HEADERS": "x-context-guru-token: cg_live_YOUR_TOKEN_HERE"
+  }
+}
+```
+
+Already have an `env` block? Add just those two lines inside it and leave every other key
+alone.
+
+**3. Keep your own key exactly where it is.** `ANTHROPIC_API_KEY` (or
+`ANTHROPIC_AUTH_TOKEN`) stays yours: we forward it, so your traffic is billed to you, and a
+request with no provider credential of its own answers **401**. The context-guru token
+travels in its own header, so it never competes for that slot.
+
+**4. Restart Claude Code and ask it anything.** Your request appears on the
+[dashboard](https://contextguru.vpc.cloud9.ibm.com/dashboard/) Overview within a second.
+Zero requests after a full turn means the traffic never arrived — see
+[Is it actually on?](#is-it-actually-on).
+
+!!! warning "Put it in that file, not in your shell"
+    An `env` block in `~/.claude/settings.json` **silently overrides an exported
+    `ANTHROPIC_BASE_URL`**. The failure looks exactly like success: Claude Code answers
+    normally, nothing errors, and the only symptom is an empty dashboard and zero savings.
+    This has already caught us on this deployment — so if you exported the variable and see
+    nothing, look in that file first.
+
+<details markdown="1">
+<summary>Other agents, and where else the token is accepted</summary>
 
 One token, three dialects. The path carries the dialect; your account's settings decide
-which upstream each dialect goes to.
-
-**Leave your provider key exactly where it is.** The service forwards it, so your traffic
-is billed to your own account. The context-guru token travels in its own header,
-`x-context-guru-token`, so it never competes for the slot your key occupies.
+which upstream each dialect goes to. Neither of these reads `~/.claude/settings.json`, so
+they are still shell variables:
 
 ```bash
-# Claude Code — ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN stay YOUR key
-export ANTHROPIC_BASE_URL=https://contextguru.vpc.cloud9.ibm.com/anthropic
-export ANTHROPIC_CUSTOM_HEADERS="x-context-guru-token: cg_live_…"
-
 # OpenAI-dialect tools — OPENAI_API_KEY stays your key; send the header
-#   x-context-guru-token: cg_live_…
+#   x-context-guru-token: cg_live_YOUR_TOKEN_HERE
 export OPENAI_BASE_URL=https://contextguru.vpc.cloud9.ibm.com/openai/v1
 
-# Bob — BOBSHELL_API_KEY stays your key, and Bob can send no header of ours, so bind
-# that key to your account once (sha256 only; the key itself is never stored)
-export CUSTOM_BASE_URL=https://contextguru.vpc.cloud9.ibm.com
-curl -sS -XPOST https://contextguru.vpc.cloud9.ibm.com/api/me/agent-key \
-  -H "Authorization: Bearer $BOBSHELL_API_KEY" -b "cg_dash=<your dashboard cookie>"
+# Bob — your Bob key stays your own, and Bob can send no header of ours, so bind
+# that key to your account once on the Settings tab (sha256 only; never stored)
+export BOB_GATEWAY_URL=https://contextguru.vpc.cloud9.ibm.com   # bobshell 2.x
+export CUSTOM_BASE_URL=https://contextguru.vpc.cloud9.ibm.com   # older builds
+export NODE_EXTRA_CA_CERTS=/etc/pki/tls/certs/ca-bundle.crt     # step 2 — Bob is Node
 ```
+
+**Which base-URL variable is version-dependent, and guessing wrong is silent** — Bob
+just talks to its own default gateway and nothing shows up in your dashboard. Check with
+`bob --version`: the 2.x bundle reads `BOB_GATEWAY_URL` and contains no reference to
+`CUSTOM_BASE_URL` at all; older builds read `CUSTOM_BASE_URL`. Exporting both is harmless.
+
+Then bind the key, **in the dashboard** — Settings → *Bound agent keys* → paste the key
+your Bob sends (`BOB_API_KEY`, or the older `BOBSHELL_API_KEY`) → **Bind this key**. Only
+its sha256 is kept. Rebind whenever you rotate the key. There is no need to copy a cookie
+into a `curl` line: your browser is already signed in, which is the whole reason the field
+is there.
+
+Bob's key must be a **real Bob credential**, because the service forwards it upstream
+unchanged — you are billed by IBM, not by us. And it must be an **API key, not SSO**: the
+identity here is the digest of a stable credential, and an SSO bearer token is reissued on
+every login, so it would need rebinding each time.
 
 The token is read from `x-context-guru-token` first. It is still accepted in
 `Authorization`, `x-api-key` or `x-goog-api-key` for tools that have nowhere else to put
 it — recognised by its `cg_live_` shape, and scrubbed out before the request is forwarded —
 but a slot holding the token cannot also hold your provider key, so prefer the header.
 
-Bob may also need `BOBSHELL_DEFAULT_AUTH_TYPE=custom` for it to use `BOBSHELL_API_KEY` at
-all — see [Host adapters](../integrations.md#use-it-with-an-agent-bob-bobshell).
-
-!!! warning "An `export` is not proof the traffic arrives"
-    For Claude Code an `env` block in `~/.claude/settings.json` **silently overrides the
-    variable you exported**. The failure looks exactly like success: Claude Code answers
-    normally, nothing errors, and the only symptom is an empty dashboard and zero savings,
-    because nothing ever reached the service. This has already caught us on this deployment.
-    Run the check in [Is it actually on?](#is-it-actually-on) before you trust a number.
+</details>
 
 ## Turn it on for one session only
 
@@ -151,19 +226,19 @@ another terminal, another repo and another agent are untouched.
 ```sh
 # One command, one session. Your own key stays in ANTHROPIC_API_KEY.
 ANTHROPIC_BASE_URL=https://contextguru.vpc.cloud9.ibm.com/anthropic \
-ANTHROPIC_CUSTOM_HEADERS='x-context-guru-token: cg_live_…' \
+ANTHROPIC_CUSTOM_HEADERS='x-context-guru-token: cg_live_YOUR_TOKEN_HERE' \
   claude
 ```
 
-If `~/.claude/settings.json` has an `env` block, the line above does **nothing** — the
-settings file wins. `--settings` takes a JSON string as well as a path, and it is read as
-*additional* settings for this invocation only, so it overrides the global file without
-touching it:
+If `~/.claude/settings.json` has an `env` block, the line above does **nothing** — the same
+override as in step 2, and the settings file wins. `--settings` takes a JSON string as well
+as a path, read as *additional* settings for this invocation only, so it beats the global
+file without touching it:
 
 ```sh
 claude --settings '{"env":{
   "ANTHROPIC_BASE_URL":"https://contextguru.vpc.cloud9.ibm.com/anthropic",
-  "ANTHROPIC_CUSTOM_HEADERS":"x-context-guru-token: cg_live_…"}}'
+  "ANTHROPIC_CUSTOM_HEADERS":"x-context-guru-token: cg_live_YOUR_TOKEN_HERE"}}'
 ```
 
 Verified on Claude Code 2.1.215: with a global `env` block present, the `--settings` form
@@ -172,13 +247,22 @@ sent `POST /v1/messages` to the URL named there, and the exported variable alone
 ### Bob
 
 ```sh
+BOB_GATEWAY_URL=https://contextguru.vpc.cloud9.ibm.com \
 CUSTOM_BASE_URL=https://contextguru.vpc.cloud9.ibm.com \
+NODE_EXTRA_CA_CERTS=/etc/pki/tls/certs/ca-bundle.crt \
   bob "your task"
 ```
 
-Bob keeps its own `BOBSHELL_API_KEY`. Because it can carry no header of ours, it is
-identified by the sha256 of that key — bind it once with the `curl` above, and rebind
-whenever you rotate the key.
+Bob keeps its own key. Because it can carry no header of ours, it is identified by the
+sha256 of that key — bind it once on the Settings tab, and rebind whenever you rotate it.
+
+`NODE_EXTRA_CA_CERTS` is needed because Bob is a Node program and Node reads its own CA
+list rather than the system store; without it the session ends in `Request failed after 6
+attempts: fetch failed` — see [step 2](#2-make-sure-your-machine-trusts-the-certificate).
+Recent Bob **on recent Node** no longer needs it: bobshell 2.0.1 merges the system store
+via `tls.getCACertificates`, which exists from Node v22.15, and prints `unable to auto
+setup system certificates` when it does not. Setting it anyway costs nothing and covers
+both cases.
 
 Bob's base URL is the **host**; Bob appends its own `/inference/…` and `/admin/…` paths, and
 the proxy passes its control-plane calls through verbatim so the CLI still boots.
@@ -188,8 +272,9 @@ the proxy passes its control-plane calls through verbatim so the CLI still boots
 ```sh
 cg-on()  { export ANTHROPIC_BASE_URL=https://contextguru.vpc.cloud9.ibm.com/anthropic \
                   ANTHROPIC_CUSTOM_HEADERS="x-context-guru-token: $CG_TOKEN" \
+                  BOB_GATEWAY_URL=https://contextguru.vpc.cloud9.ibm.com \
                   CUSTOM_BASE_URL=https://contextguru.vpc.cloud9.ibm.com; }
-cg-off() { unset ANTHROPIC_BASE_URL ANTHROPIC_CUSTOM_HEADERS CUSTOM_BASE_URL; }
+cg-off() { unset ANTHROPIC_BASE_URL ANTHROPIC_CUSTOM_HEADERS BOB_GATEWAY_URL CUSTOM_BASE_URL; }
 ```
 
 Keep `CG_TOKEN` in your own secret store, not in `.bashrc`. These are a convenience over
@@ -203,7 +288,7 @@ a machine whose `settings.json` sets `ANTHROPIC_BASE_URL`.
 env -u ANTHROPIC_BASE_URL -u ANTHROPIC_CUSTOM_HEADERS claude
 
 # Bob — back to its own endpoint.
-env -u CUSTOM_BASE_URL bob "your task"
+env -u BOB_GATEWAY_URL -u CUSTOM_BASE_URL bob "your task"
 ```
 
 `env -u` only removes an *environment* variable. If Claude Code is routed through the
@@ -229,7 +314,7 @@ survives a bypass, compaction was never the cause.
 ```sh
 # Claude Code — verified on 2.1.215: these headers reach the wire. Several pairs are
 # newline-separated, which is how the token and the bypass travel together.
-ANTHROPIC_CUSTOM_HEADERS='x-context-guru-token: cg_live_…
+ANTHROPIC_CUSTOM_HEADERS='x-context-guru-token: cg_live_YOUR_TOKEN_HERE
 x-context-guru-bypass: true' \
 ANTHROPIC_BASE_URL=https://contextguru.vpc.cloud9.ibm.com/anthropic \
   claude
@@ -336,6 +421,10 @@ a full agent turn means the traffic never arrived, whatever your shell says.
 | **429** | A per-tenant rate or in-flight limit. This one *is* worth retrying. |
 | **502** | No upstream configured for that route, or the provider failed. The operator's problem. |
 | connection refused on `http://` | You used port 80. There deliberately isn't one — see the warning at the top of this page. |
+| **`fetch failed`** (Bob, or any Node agent), and **nothing in the service's log** | Node does not trust the IBM root CA. The request never left your machine, which is why there is nothing to see on our side. Set `NODE_EXTRA_CA_CERTS` — [step 2](#2-make-sure-your-machine-trusts-the-certificate). A passing `curl` does **not** rule this out. |
+| **401 "this provider key is not bound to an account"** (Bob) | Expected until you bind. Bob can send no header of ours, so it is identified by the sha256 of its own API key: Settings → *Bound agent keys* → paste it → **Bind this key**. Rebind after you rotate the key. |
+| **Bob works, but nothing appears in your dashboard** | Your Bob never reached us — the base-URL variable is version-dependent. bobshell 2.x reads `BOB_GATEWAY_URL`; older builds read `CUSTOM_BASE_URL`. Export both, then check `bob --version`. |
+| **"no context-guru token; send it in x-context-guru-token"** from `/api/me/…` | That route authenticates with your **browser session**, not the token — the message names the agent header because the same wording serves the proxy routes. Use the dashboard instead of `curl`; a `cg_live_` token in a `cg_dash` cookie is not a session and fails exactly this way. |
 
 ## Three things worth knowing before you rely on it
 
@@ -345,9 +434,9 @@ the operator's service-wide switch, and your account's own consent — which reg
 **on** for you. So if the operator has capture enabled, then from your very first request the
 before/after text of your messages — agent output, tool results, source code — is written to
 the service's database, scrubbed of known credential shapes and capped at 16 KB per message.
-It is what makes the diff view work, and only your own account can read yours: a manager sees
-everyone's metrics and nobody's transcripts. The scrubber is a pattern denylist, so treat this
-as storage you have agreed to, not a guarantee.
+It is what makes the diff view work, and two parties can read it: your own account, and the
+service manager. The scrubber is a pattern denylist, so treat this as storage you have agreed
+to, not a guarantee.
 
 **Check which state you are in, and turn it off if you do not want it.** Open a request in the
 dashboard: `content_captured` is the effective answer for your account, and

@@ -1633,10 +1633,9 @@ function contentBlockedState(host, state, opts = {}) {
       box.className = 'state blocked';
       b.appendChild(el('strong', { text: 'Transcripts are not yours to read' }));
       b.appendChild(el('span', { text:
-        'Metrics for this traffic are visible; its content is not. On a hosted deployment only ' +
-        'the owning account can read its own transcripts — a manager cannot, because reading ' +
-        "someone else's source code is not an administrative need. On a single-tenant proxy, " +
-        'content is served to loopback or a configured trusted CIDR only.' }));
+        'Metrics for this traffic are visible; its content is not. On a hosted deployment the ' +
+        'owning account and the manager can read it. On a single-tenant proxy, content is ' +
+        'served to loopback or a configured trusted CIDR only.' }));
       break;
     case 'not_captured':
       // WHOSE gate is shut decides what to say. Storing a transcript needs the operator's
@@ -3098,30 +3097,47 @@ async function loadOptions() {
 }
 
 // ── setup ──────────────────────────────────────────────────────────────────
+// TOKEN_SLOT is what stands in for a real token in every block on this page when we do
+// not have the plaintext. A NAMED slot rather than the account's real prefix plus an
+// ellipsis: these blocks exist to be pasted, and a credential fragment in one produces a
+// line that silently cannot work.
+const TOKEN_SLOT = 'cg_live_YOUR_TOKEN_HERE';
+
+/** claudeSettings is the WHOLE env block a Claude Code user ends up with — not a diff.
+ *  A beginner cannot apply a diff, and the two keys are the entire change. */
+function claudeSettings(base, tok) {
+  return [
+    '{',
+    '  "env": {',
+    `    "ANTHROPIC_BASE_URL": "${base}/anthropic",`,
+    `    "ANTHROPIC_CUSTOM_HEADERS": "x-context-guru-token: ${tok}"`,
+    '  }',
+    '}',
+  ];
+}
+
+// AGENTS covers the agents that are NOT Claude Code — those two are still shell exports,
+// because neither reads ~/.claude/settings.json. Claude Code has the numbered walkthrough
+// above them instead.
 const AGENTS = [
-  {
-    name: 'Claude Code',
-    path: '/anthropic',
-    // The auth slot keeps YOUR OWN Anthropic key — it is forwarded upstream, so your
-    // traffic is billed to your account. The context-guru token rides its own header.
-    lines: (base, tok) => [
-      `export ANTHROPIC_BASE_URL=${base}/anthropic`,
-      `export ANTHROPIC_CUSTOM_HEADERS="x-context-guru-token: ${tok}"`,
-      '# ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN) stays your own provider key',
-    ],
-  },
   {
     name: 'Bob (BobShell)',
     path: '/',
     // Bob's client builds every request header itself and offers no hook for another
     // one, so it cannot carry the token. Instead it is recognised by the sha256 of the
-    // key it already sends — bound once, below, and never stored in plaintext.
+    // key it already sends — bound once on the Settings tab, never stored in plaintext.
+    //
+    // The variable name is version-dependent, and getting it wrong is silent: Bob simply
+    // talks to its default gateway and nothing appears here. bobshell 2.x reads
+    // BOB_GATEWAY_URL (checked against the 2.0.1 bundle, where CUSTOM_BASE_URL does not
+    // appear at all); the older build read CUSTOM_BASE_URL. Both are listed, because a
+    // spare export costs nothing and a missing one costs an afternoon.
     lines: (base, tok) => [
-      `export CUSTOM_BASE_URL=${base}`,
-      '# BOBSHELL_API_KEY stays your own key. Bob cannot send a custom header, so',
-      '# bind it to this account once (hashed; the key is never stored):',
-      `curl -sS -XPOST ${base}/api/me/agent-key \\`,
-      '  -H "Authorization: Bearer $BOBSHELL_API_KEY" -b "cg_dash=<your dashboard cookie>"',
+      `export BOB_GATEWAY_URL=${base}    # bobshell 2.x — check with: bob --version`,
+      `export CUSTOM_BASE_URL=${base}    # older builds read this one instead`,
+      '# Your Bob key stays your own (BOB_API_KEY; BOBSHELL_API_KEY still works).',
+      '# Bob can send no header of ours, so bind that key once on the Settings tab:',
+      '#   Settings → Bound agent keys → paste the key → Bind this key',
     ],
   },
   {
@@ -3204,30 +3220,83 @@ function logQueryBlock(session, tenant) {
       [sel + ' | json | session="' + session + '"'], 'logs-session-query'));
 }
 
+/** step is one numbered instruction: the number, the sentence, and whatever it needs
+ *  pasted underneath. Short on purpose — a step that needs a paragraph is two steps. */
+function step(n, title, ...body) {
+  return el('div', { class: 'setup-step', 'data-testid': 'setup-step-' + n },
+    el('div', { class: 'setup-step-n' }, String(n)),
+    el('div', { class: 'setup-step-body' }, el('h3', {}, title), ...body));
+}
+
+/** revealToken is the one-time reveal: the plaintext, big, with a copy button and a
+ *  warning that cannot be scrolled past. Rendered only when we actually hold the
+ *  plaintext, which is only ever the reply to registration or to minting. */
+function revealToken(tok) {
+  return el('div', { class: 'token-reveal', 'data-testid': 'token-reveal' },
+    el('div', { class: 'setup-head' },
+      el('h3', {}, 'Your context-guru token'),
+      copyButton(tok)),
+    el('pre', { class: 'code token-plain', 'data-testid': 'token-plain' }, tok),
+    el('p', { class: 'warn-text', 'data-testid': 'token-once' },
+      'Shown once. We store only its hash, so nobody — including us — can show it again. '
+      + 'Copy it somewhere safe now; if you lose it, mint a new one on Settings.'));
+}
+
 function loadSetup() {
   const host = clear($('#setup-blocks'));
   const base = account.baseURL || location.origin;
-  // The plaintext only exists at mint time, so a returning user gets a placeholder. It is
-  // a NAMED slot rather than their real token's prefix plus an ellipsis: that version put
-  // a credential fragment in a block whose whole purpose is being pasted and shared, and
-  // copying it produced an export line that could not work.
-  const tok = account.freshToken || 'cg_live_YOUR_TOKEN';
+  // The plaintext only exists at mint time, so a returning user gets the named slot.
+  const tok = account.freshToken || TOKEN_SLOT;
+  const settings = claudeSettings(base, tok);
+
+  if (account.freshToken) host.appendChild(revealToken(account.freshToken));
+
+  host.appendChild(el('div', { class: 'setup-steps' },
+    step(1, 'Open your Claude Code settings file',
+      el('pre', { class: 'code' }, '~/.claude/settings.json'),
+      el('p', { class: 'hint' }, 'No such file? Create it — an empty file is fine.')),
+    step(2, 'Put this in it',
+      el('div', { class: 'setup-head' }, el('span', { class: 'hint' },
+        'Your token is already filled in.'), copyButton(settings.join('\n'))),
+      el('pre', { class: 'code', 'data-testid': 'setup-claude' }, settings.join('\n')),
+      el('p', { class: 'hint' },
+        'Already have an "env" block? Add just those two lines inside it. Leave every '
+        + 'other key alone.')),
+    step(3, 'Keep your own key where it is',
+      el('p', { class: 'hint' },
+        'ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN stays yours: we forward it, so your '
+        + 'traffic is billed to you. Without it every request answers 401.')),
+    step(4, 'Restart Claude Code, then check this dashboard',
+      el('p', { class: 'hint' },
+        'Ask it anything. Requests appear on Overview within a second.'))));
+
+  host.appendChild(el('div', { class: 'banner warn', 'data-testid': 'setup-trap' },
+    el('div', {}, el('strong', {}, 'Empty dashboard after exporting the variable? '),
+      'An "env" block in ~/.claude/settings.json silently overrides an exported '
+      + 'ANTHROPIC_BASE_URL. Claude Code answers normally and nothing reaches us. '
+      + 'Put the block in that file — step 2 — rather than in your shell.')));
+
+  const others = el('details', { class: 'setup-others' },
+    el('summary', {}, 'Other agents (Bob, OpenAI-dialect tools)'));
   for (const a of AGENTS) {
     const lines = a.lines(base, tok);
-    const block = el('div', { class: 'setup-block' },
+    others.appendChild(el('div', { class: 'setup-block' },
       el('div', { class: 'setup-head' },
         el('h3', { text: a.name }),
         copyButton(lines.join('\n'))),
-      el('pre', { class: 'code' }, lines.join('\n')));
-    host.appendChild(block);
+      el('pre', { class: 'code' }, lines.join('\n'))));
   }
+  host.appendChild(others);
+
+  // The banner above the blocks stays for the returning user's benefit — it is the only
+  // thing on the page that explains why step 2 shows a placeholder instead of a token.
   const banner = $('#setup-token-banner');
-  if (account.freshToken) {
+  banner.hidden = !!account.freshToken;
+  if (!account.freshToken) {
+    banner.className = 'banner';
     banner.hidden = false;
-    banner.textContent = 'Your new token is filled in below. It is shown once and cannot ' +
-      'be recovered — copy it somewhere safe now.';
-  } else {
-    banner.hidden = true;
+    banner.textContent = 'Paste your own token over ' + TOKEN_SLOT + ' below. Tokens are '
+      + 'shown once, at creation; mint a new one on Settings if you no longer have it.';
   }
 }
 
@@ -3265,8 +3334,21 @@ function loadSettings() {
       el('p', { class: 'hint' }, 'Billed to your own provider account, not to us.')));
 
     // Agent keys. Only relevant to agents that cannot send x-context-guru-token.
+    //
+    // The paste field exists because the alternative was a curl line carrying the
+    // cg_dash cookie, and every part of that went wrong in practice: the cookie is not
+    // displayed anywhere, so it meant a devtools detour, and the natural guess — pasting
+    // the cg_live_ token into the cookie — fails with "no context-guru token", which
+    // names a header this route does not even read. The browser already holds the
+    // cookie. So the key is pasted HERE and sent in the Authorization slot by the same
+    // fetch, which is the only step the person could not do for themselves.
+    const keyIn = el('input', {
+      type: 'password', id: 'agent-key', autocomplete: 'off', spellcheck: 'false',
+      placeholder: 'paste your Bob API key', 'data-testid': 'agent-key-input',
+    });
+    const keyMsg = el('p', { class: 'hint', role: 'status', 'data-testid': 'agent-key-status' });
     host.appendChild(el('div', { class: 'field' },
-      el('label', {}, 'Bound agent keys'),
+      el('label', { for: 'agent-key' }, 'Bound agent keys'),
       el('div', { 'data-testid': 'agent-keys' },
         t.agent_keys > 0
           ? `${t.agent_keys} provider key${t.agent_keys === 1 ? '' : 's'} bound to this account.`
@@ -3274,10 +3356,35 @@ function loadSettings() {
       whyBlock('Why an agent needs one',
         'For agents that cannot send a custom header (Bob/BobShell): the proxy recognises ' +
         'them by the sha256 of the provider key they already send. Only the digest is ' +
-        'stored. Bind one with the curl line on the Setup tab. Keys under 20 characters ' +
+        'stored — never the key, and it is not sent on anywhere. Keys under 20 characters ' +
         'are refused — the digest is the identity, so a short key would be a guessable ' +
         'account. A key already bound to another account is refused too, never moved: ' +
         'its owner unbinds it first.'),
+      keyIn,
+      el('div', { class: 'actions' }, el('button', {
+        class: 'primary small', 'data-testid': 'agent-key-bind',
+        onclick: async () => {
+          const key = keyIn.value.trim();
+          keyMsg.className = 'hint';
+          if (!key) { keyMsg.textContent = 'Paste the key your agent sends first.'; return; }
+          keyMsg.textContent = 'binding…';
+          try {
+            await ctl('/api/me/agent-key', {
+              method: 'POST', headers: { authorization: `Bearer ${key}` },
+            });
+            // Cleared on success, so the key does not sit in a form field afterwards.
+            keyIn.value = '';
+            keyMsg.className = 'hint ok';
+            keyMsg.textContent = 'Bound. Your agent is recognised by this key from now on.';
+            await probeAccount();
+            loadSettings();
+          } catch (e) {
+            keyMsg.className = 'hint warn-text';
+            keyMsg.textContent = e.message;
+          }
+        },
+      }, 'Bind this key')),
+      keyMsg,
       t.agent_keys > 0
         ? el('button', {
           class: 'ghost small', 'data-testid': 'agent-keys-clear',
@@ -3289,8 +3396,20 @@ function loadSettings() {
         }, 'Unbind all')
         : null));
 
+    // Who may shape the compaction itself. A plain account keeps its own settings — the
+    // upstreams it sends to, its capture consent, its tokens — but the pipeline is the
+    // manager's to set, on this page and in PUT /api/me. Drawing a component grid that
+    // the server answers 403 to would be a form that lies.
+    const mgr = isManager();
+    if (!mgr) {
+      host.appendChild(el('div', { class: 'cfg-state', 'data-testid': 'cfg-state-managed' },
+        el('div', {},
+          el('strong', {}, 'Your manager sets the compaction.'),
+          ' Ask them for a change; everything else on this page is yours.')));
+    }
+
     // Which configuration is in force, and how to change that.
-    host.appendChild(inherited
+    if (mgr) host.appendChild(inherited
       ? el('div', { class: 'cfg-state', 'data-testid': 'cfg-state-inherited' },
         el('div', {},
           el('strong', {}, 'Following the server default.'),
@@ -3326,10 +3445,12 @@ function loadSettings() {
       el('option', { value: 'observe' }, 'observe — measure only, requests untouched (Mode "observe")'));
     modeSel.value = /^mode:\s*observe/m.test(effective) ? 'observe' : 'sync';
     modeSel.disabled = inherited;
-    host.appendChild(el('div', { class: 'field' },
-      el('label', { for: 'set-mode' }, 'Mode'), modeSel,
-      el('p', { class: 'hint' },
-        'observe is the safe way to try a configuration: nothing is rewritten.')));
+    if (mgr) {
+      host.appendChild(el('div', { class: 'field' },
+        el('label', { for: 'set-mode' }, 'Mode'), modeSel,
+        el('p', { class: 'hint' },
+          'observe is the safe way to try a configuration: nothing is rewritten.')));
+    }
 
     // Upstreams, one per dialect, from the operator's allow-list.
     const ups = (opts && opts.upstreams) || [];
@@ -3358,7 +3479,7 @@ function loadSettings() {
         el('span', { class: 'comp-name' }, name),
         warn ? el('span', { class: 'comp-warn' }, warn) : null));
     }
-    host.appendChild(el('div', { class: 'field' },
+    if (mgr) host.appendChild(el('div', { class: 'field' },
       el('label', {}, 'Pipeline components'), grid,
       el('p', { class: 'hint' }, 'What runs. Run order comes from the YAML below.'),
       whyBlock('What saving changes',
@@ -3375,11 +3496,12 @@ function loadSettings() {
       el('label', { class: 'comp', for: 'set-capture' }, cap,
         el('span', { class: 'comp-name' }, 'Store my transcripts for the diff view')),
       el('p', { class: 'hint warn-text' },
-        'Writes your agent output to disk. The redactor is best-effort, not a guarantee.'),
+        'Writes your agent output to disk. The manager can read what is stored. The ' +
+        'redactor is best-effort, not a guarantee.'),
       whyBlock('What "best-effort" means here',
         'Source code and tool results are stored behind a redactor whose own review found ' +
-        '11 of 22 realistic credential shapes passing through it. Only you can read them; ' +
-        'a manager cannot. Off by default.')));
+        '11 of 22 realistic credential shapes passing through it. The manager can read ' +
+        'whatever this stores. Off by default.')));
 
     // Raw YAML, for anything the toggles do not cover.
     const ta = el('textarea', {
@@ -3388,7 +3510,7 @@ function loadSettings() {
     });
     ta.value = effective;
     ta.disabled = inherited;
-    host.appendChild(el('details', { class: 'field' },
+    if (mgr) host.appendChild(el('details', { class: 'field' },
       el('summary', {}, 'Full configuration (YAML)'), ta,
       el('p', { class: 'hint' }, inherited
         ? 'The server default, read-only. Customise above to edit it as your own.'
@@ -3547,7 +3669,7 @@ async function saveSettings() {
   // The textarea wins when the user edited it; otherwise rebuild the pipeline line from
   // the checkboxes. Two sources for one field, so the precedence has to be explicit —
   // and "what you typed beats what you clicked" is the order that never surprises.
-  let yaml = $('#set-yaml').value;
+  let yaml = isManager() ? $('#set-yaml').value : '';
   const inherited = !!account.tenant.config_inherited;
   const original = account.tenant.effective_config_yaml || '';
   if (yaml.trim() === original.trim()) {
@@ -3574,7 +3696,10 @@ async function saveSettings() {
   // Omitted while the configuration is inherited: sending it would store a copy of
   // today's default, which is exactly the freeze this page exists to undo. Customise is
   // the deliberate way to start owning one.
-  if (!inherited) body.config_yaml = yaml;
+  // Never sent by a plain account: the pipeline is the manager's field, and PUT /api/me
+  // answers 403 to anyone else — sending it would fail the whole save, upstreams and
+  // capture consent included.
+  if (!inherited && isManager()) body.config_yaml = yaml;
   try {
     const out = await ctl('/api/me', { method: 'PUT', body: JSON.stringify(body) });
     account.tenant = out.tenant;
@@ -3812,14 +3937,14 @@ function renderTenantEditor(host, t) {
       kv('Password', t.has_password ? 'set' : 'never set'),
       kv('Status', t.disabled ? 'disabled' : 'active'))));
 
-  // Stated as a boundary rather than left as a missing feature: a manager reading this
-  // panel is exactly the person who would otherwise go looking for the diff view.
+  // Says where the transcripts are rather than leaving a manager to hunt: the drawer and
+  // diff viewer are the tenant's own, reached by pointing the account selector here.
   host.appendChild(el('div', { class: 'state blocked' },
     el('div', { class: 'state-body' },
-      el('strong', { text: 'You cannot read this account’s transcripts' }),
+      el('strong', { text: 'You can read this account’s transcripts' }),
       el('span', {
-        text: 'Metrics and configuration for everyone, transcript text for nobody but its '
-          + 'owner. You can purge or delete what they captured; you cannot open it.',
+        text: 'Pick this account in the selector, then open any request or session diff. '
+          + 'Only what they consented to capture exists to read.',
       }))));
 
   const fields = el('div');
@@ -4371,36 +4496,20 @@ function initAccounts() {
 const STAR_WORDS = ['bad', 'poor', 'okay', 'good', 'excellent'];
 
 /**
- * FEEDBACK_QUESTIONS is the form, in order. The keys are the server's dimension keys
- * (tenant.FeedbackDimensions) — a key this list invents would be refused with a 422,
- * which is the right failure but a pointless one, so they are kept in step deliberately.
+ * The questions and the agent selector come from the SERVER, keys AND wording:
+ * tenant.FeedbackQuestions and tenant.FeedbackAgents. A key invented here would be
+ * refused with a 422, and wording invented here would label a row with a different
+ * question from the one the manager's email reports — so neither is written down twice.
  *
- * The wording is a question, not a noun: "Latency" tells somebody what the row is
- * about, and nothing about which end of five stars is the good end.
+ * Filled from /api/me for the form, and from /api/feedback for the manager's view, which
+ * is also what lets that view label a key it is only reading.
  */
-const FEEDBACK_QUESTIONS = [
-  ['overall', 'Overall, how is it going?',
-    'The general feel. One number you would give the whole thing.'],
-  ['as_good_as_before', 'Does your agent still work as well as it did before?',
-    'Five stars means as good as before or better; one star means compaction has made it worse.'],
-  ['components', 'Do the compaction components remove the right things?',
-    'Whether what gets dropped is the stuff you did not need — not whether a lot gets dropped.'],
-  ['latency', 'How is the added latency?',
-    'context-guru sits on the hot path. Five stars means you cannot feel it.'],
-  ['observability', 'Is this dashboard actually useful?',
-    'Does it answer the questions you have about your own traffic.'],
-  ['ease', 'How easy was it to set up and use?',
-    'Pointing your agent at it, the token, the settings page.'],
-  ['recommend', 'Would you recommend it to a colleague?',
-    'Five stars means you would recommend it unprompted.'],
-];
+const feedbackForm = { questions: [], agents: [] };
 
-/** Labels for the agent names dash records. Anything unrecognised is shown verbatim. */
-const AGENT_LABELS = {
-  'claude-code': 'Claude Code', 'claude-cli': 'Claude CLI', bob: 'Bob (BobShell)',
-  codex: 'Codex', cursor: 'Cursor', cline: 'Cline', aider: 'Aider', 'gemini-cli': 'Gemini CLI',
-};
-const agentLabel = (a) => AGENT_LABELS[a] || a;
+const labelOf = (list, key) => (list.find((x) => x.key === key) || {}).label || key;
+/** dimLabel prints a question key the way the form asked it. */
+const dimLabel = (key) => labelOf(feedbackForm.questions, key);
+const agentLabel = (key) => (key ? labelOf(feedbackForm.agents, key) : 'not stated');
 
 /**
  * meaningfulLen counts the characters a reader would see, collapsing every run of
@@ -4470,46 +4579,49 @@ function fieldError(node, msg) {
 /**
  * loadFeedback draws the form, and — for a manager — the aggregate below it.
  *
- * The per-agent questions come from /api/facets, which is already tenant-scoped by the
- * server: the agent list is this account's own traffic, so a Claude Code user is never
- * asked to rate Bob. No agents recorded yet means no per-agent question, rather than a
- * row of stars about software they have not run.
+ * The questions and the two agents come from /api/me, so this file never guesses at a key
+ * the server validates or at wording the server's email prints.
  */
 async function loadFeedback() {
   const form = $('#feedback-form');
   if (!form.dataset.built) {
-    let agents = [];
     try {
-      const facets = await ctl('/api/facets');
-      agents = (facets.agent || []).filter(Boolean).slice(0, 6);
-    } catch (_) { /* no agent list = no per-agent questions; the rest of the form stands */ }
-    buildFeedbackForm(form, agents);
+      const me = await ctl('/api/me');
+      feedbackForm.questions = me.feedback_questions || [];
+      feedbackForm.agents = me.feedback_agents || [];
+    } catch (e) {
+      // No questions means no form: drawing an empty one would collect nothing the server
+      // would accept. The loader must not reject, so this is reported in place.
+      errorState(clear(form), 'Could not load the feedback form', e);
+      return;
+    }
+    buildFeedbackForm(form);
     form.dataset.built = '1';
   }
   if (isManager()) loadFeedbackAdmin();
 }
 
-function buildFeedbackForm(form, agents) {
+function buildFeedbackForm(form) {
   clear(form);
-  for (const [key, q, help] of FEEDBACK_QUESTIONS) form.appendChild(starField(key, q, help));
-  for (const a of agents) {
-    form.appendChild(starField('agent:' + a, `How is ${agentLabel(a)} behaving?`,
-      `Asked because this account has sent ${agentLabel(a)} traffic through the proxy.`));
-  }
 
-  const wanted = el('textarea', {
-    id: 'fb-wanted', rows: '3', maxlength: '4000', 'data-testid': 'fb-wanted',
-    placeholder: 'A per-repository view; an alert when savings drop; …',
-  });
-  form.appendChild(el('div', { class: 'field' },
-    el('label', { for: 'fb-wanted' }, 'What should be added or shown that is not here?'),
-    el('p', { class: 'hint' }, 'Optional. If nothing comes to mind, leave it empty.'),
-    wanted));
+  // Which agent first: the same seven questions follow either way, and the answer is
+  // stored so the manager can read Claude Code and Bob apart. A native select, so the
+  // keyboard, the screen reader and the mobile picker all come for free.
+  const agent = el('select', { id: 'fb-agent', 'data-testid': 'fb-agent' },
+    el('option', { value: '' }, 'Choose one…'),
+    ...feedbackForm.agents.map((a) => el('option', { value: a.key }, a.label)));
+  const agentField = el('div', { class: 'field' },
+    el('label', { for: 'fb-agent' }, 'Which agent is this about? (required)'),
+    agent,
+    el('p', { class: 'field-error', role: 'alert', hidden: true, 'data-testid': 'err-agent' }));
+  form.appendChild(agentField);
+
+  for (const q of feedbackForm.questions) form.appendChild(starField(q.key, q.label));
 
   const comment = el('textarea', {
     id: 'fb-comment', rows: '6', maxlength: '4000', required: 'required',
     'aria-describedby': 'fb-comment-count', 'data-testid': 'fb-comment',
-    placeholder: 'What is working, what is not, and what you would change first.',
+    placeholder: 'How it feels, what to add or improve, any bugs.',
   });
   // ONE element carries both the live count and the validation message for this field.
   //
@@ -4525,9 +4637,8 @@ function buildFeedbackForm(form, agents) {
     class: 'hint', id: 'fb-comment-count', 'data-testid': 'fb-count', 'aria-live': 'polite',
   });
   const commentField = el('div', { class: 'field' },
-    el('label', { for: 'fb-comment' }, 'Anything else? (required)'),
-    el('p', { class: 'hint' }, 'At least 50 characters of real text — the server checks this ' +
-      'too, and whitespace does not count.'),
+    el('label', { for: 'fb-comment' }, 'General feeling, things to add or improve, bugs (required)'),
+    el('p', { class: 'hint' }, 'At least 50 characters of real text; whitespace does not count.'),
     comment, count);
   form.appendChild(commentField);
 
@@ -4556,6 +4667,12 @@ function buildFeedbackForm(form, agents) {
     status.hidden = true;
     const scores = {};
     let firstBad = null;
+    if (!agent.value) {
+      fieldError(agentField, 'Please say which agent this is about.');
+      firstBad = agentField;
+    } else {
+      fieldError(agentField, '');
+    }
     for (const fs of $$('.stars-field', form)) {
       const chosen = fs.querySelector('input:checked');
       if (!chosen) {
@@ -4569,7 +4686,7 @@ function buildFeedbackForm(form, agents) {
     if (tally(true) < 50 && !firstBad) firstBad = commentField;
     if (firstBad) {
       // Move to the first problem rather than reporting all of them at the bottom.
-      const focusable = firstBad.querySelector('input,textarea');
+      const focusable = firstBad.querySelector('input,textarea,select');
       if (focusable) focusable.focus();
       firstBad.scrollIntoView({ block: 'center', behavior: 'smooth' });
       return;
@@ -4580,7 +4697,7 @@ function buildFeedbackForm(form, agents) {
     try {
       await ctl('/api/feedback', {
         method: 'POST',
-        body: JSON.stringify({ scores, wanted: wanted.value, comment: comment.value }),
+        body: JSON.stringify({ agent: agent.value, scores, comment: comment.value }),
       });
       feedbackThanks(form);
       if (isManager()) loadFeedbackAdmin();
@@ -4609,17 +4726,6 @@ function feedbackThanks(form) {
 }
 
 // ── the manager's aggregate ────────────────────────────────────────────────
-
-/** dimLabel prints a dimension key the way the form asked it, in short. */
-const DIM_SHORT = {
-  overall: 'Overall', as_good_as_before: 'Still as good as before', components: 'Component choices',
-  latency: 'Added latency', observability: 'Dashboard usefulness', ease: 'Ease of setup and use',
-  recommend: 'Would recommend',
-};
-function dimLabel(key) {
-  if (DIM_SHORT[key]) return DIM_SHORT[key];
-  return key.startsWith('agent:') ? agentLabel(key.slice(6)) + ' behaviour' : key;
-}
 
 /**
  * distBars is a five-bucket histogram of one question's answers, one hue.
@@ -4701,8 +4807,13 @@ async function loadFeedbackAdmin() {
   try {
     const q = state.filter.tenant ? '?tenant=' + encodeURIComponent(state.filter.tenant) : '';
     const out = await ctl('/api/feedback' + q);
+    // The wording for a stored key comes with the data, so this view labels a question the
+    // way it was asked even before anybody has opened the form.
+    feedbackForm.questions = out.questions || feedbackForm.questions;
+    feedbackForm.agents = out.agents || feedbackForm.agents;
     const sum = out.summary || {};
     renderFeedbackTiles(sum);
+    renderFeedbackAgents(sum);
     $('#feedback-count').textContent = `${sum.n || 0} submission${sum.n === 1 ? '' : 's'}` +
       (state.filter.tenant ? ' from the selected account' : '');
 
@@ -4755,6 +4866,38 @@ function renderFeedbackTiles(sum) {
 }
 
 /**
+ * renderFeedbackAgents is the reason the form asks which agent it is about: the same
+ * headline numbers, read per agent, so "compaction is fine" and "compaction is not fine"
+ * do not average each other away.
+ *
+ * The declared agents first, then anything else stored (rows from before the selector
+ * existed carry no agent at all), so the order does not move as the numbers do.
+ */
+function renderFeedbackAgents(sum) {
+  const body = clear($('#feedback-agents-body'));
+  const by = sum.by_agent || {};
+  const keys = feedbackForm.agents.map((a) => a.key).filter((k) => by[k])
+    .concat(Object.keys(by).filter((k) => !feedbackForm.agents.some((a) => a.key === k)).sort());
+  if (!keys.length) {
+    tableMessage(body, 4, 'No feedback yet', 'The form above is what fills this in.');
+    return;
+  }
+  for (const k of keys) {
+    const s = by[k];
+    const overall = (s.dimensions || []).find((d) => d.dimension === 'overall');
+    const nps = s.nps || {};
+    body.appendChild(el('tr', { 'data-testid': 'agent-' + (k || 'none') },
+      el('td', {}, agentLabel(k)),
+      el('td', { class: 'num', text: String(s.n || 0) }),
+      el('td', {}, overall ? meanBar(overall.mean) : el('span', { class: 'muted', text: '—' })),
+      el('td', {
+        class: 'num',
+        text: nps.n ? (nps.score > 0 ? '+' : '') + nps.score.toFixed(0) : '—',
+      })));
+  }
+}
+
+/**
  * renderFeedbackAnswers lists every submission verbatim.
  *
  * Every string here was typed by a user, so every one of them lands through el() and
@@ -4770,19 +4913,21 @@ function renderFeedbackAnswers(host, rows) {
   }
   for (const fb of rows) {
     const scores = fb.scores || {};
-    const chips = Object.keys(scores).sort().map((k) => el('span', { class: 'score-chip' },
-      el('span', { class: 'score-dim', text: dimLabel(k) }), starText(scores[k])));
+    // Asked-order, not alphabetical: the chips read like the form somebody filled in.
+    const chips = feedbackForm.questions.filter((q) => scores[q.key])
+      .map((q) => el('span', { class: 'score-chip' },
+        el('span', { class: 'score-dim', text: q.label }), starText(scores[q.key])));
     host.appendChild(el('article', { class: 'answer', 'data-testid': 'answer-' + fb.id },
       el('header', { class: 'answer-head' },
         el('strong', { text: fb.email || 'unknown account' }),
         fb.label ? el('span', { class: 'muted small', text: fb.label }) : null,
+        el('span', { class: 'pill', 'data-testid': 'answer-agent-' + fb.id },
+          agentLabel(fb.agent)),
         el('span', { class: 'muted small', text: when(fb.created_at) }),
         fb.mailed_at
           ? el('span', { class: 'pill complete' }, 'emailed')
           : el('span', { class: 'pill missing' }, 'not emailed')),
       el('div', { class: 'score-chips' }, ...chips),
-      fb.wanted ? el('div', { class: 'answer-block' },
-        el('h4', {}, 'Wants added'), el('p', { text: fb.wanted })) : null,
       el('div', { class: 'answer-block' },
         el('h4', {}, 'Comment'), el('p', { text: fb.comment }))));
   }

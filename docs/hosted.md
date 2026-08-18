@@ -512,11 +512,9 @@ export ANTHROPIC_CUSTOM_HEADERS="x-context-guru-token: cg_live_xxxxxxxx"
 export OPENAI_BASE_URL=https://cg.<host>/openai/v1
 
 # Bob — its client sets every header itself and cannot carry ours, so bind the key
-# it already sends (stored as sha256 only, never in plaintext). One-time, from the
-# Setup tab, with your dashboard cookie:
-export CUSTOM_BASE_URL=https://cg.<host>
-curl -sS -XPOST https://cg.<host>/api/me/agent-key \
-  -H "Authorization: Bearer $BOBSHELL_API_KEY" -b "cg_dash=<your dashboard cookie>"
+# it already sends, once, on the Settings tab: Bound agent keys → paste → Bind.
+# Stored as sha256 only, never in plaintext.
+export BOB_GATEWAY_URL=https://cg.<host>   # bobshell 2.x; older builds: CUSTOM_BASE_URL
 ```
 
 ### How each agent identifies itself
@@ -525,7 +523,7 @@ curl -sS -XPOST https://cg.<host>/api/me/agent-key \
 |---|---|---|
 | Claude Code | `ANTHROPIC_CUSTOM_HEADERS="x-context-guru-token: …"` (or the same pair in `~/.claude/settings.json` `env`) | Documented `Name: Value`, newline-separated for several. Leaves `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` free for your own key. |
 | OpenAI-dialect tools | `x-context-guru-token` header, however your tool sets extra headers | Same slot rule; `OPENAI_API_KEY` stays yours. |
-| Bob (BobShell) | `sha256(BOBSHELL_API_KEY)`, bound once via `POST /api/me/agent-key` | Bob's client builds `Content-Type`, `User-Agent`, `Authorization`, `x-instance-id` and `x-team-id` itself and exposes no hook for another header; its `headers` setting applies to MCP servers only. So it is recognised by the credential it already sends. |
+| Bob (BobShell) | `sha256` of its own API key (`BOB_API_KEY`, or the legacy `BOBSHELL_API_KEY` it aliases), bound once from Settings → *Bound agent keys* — `POST /api/me/agent-key` under the hood. An **API key, not SSO**: an SSO bearer is reissued each login, so its digest is not an identity. | Bob's client builds `Content-Type`, `User-Agent`, `Authorization`, `x-instance-id` and `x-team-id` itself and exposes no hook for another header; its `headers` setting applies to MCP servers only. So it is recognised by the credential it already sends. |
 
 **Binding a key: two refusals.** A key under 20 characters is refused `400` — identity here
 *is* the key's digest, so a guessable key would be a guessable account. A digest already
@@ -609,6 +607,13 @@ for the exact shapes:
 one. It is also the only field a settings save writes back, so a round trip through the form
 cannot silently turn tracking into a frozen copy of today's default.
 
+**Who may change it.** The compaction configuration — pipeline, mode, per-component
+settings — belongs to the **manager**, per account, and is edited from the Tenants tab.
+A plain account's Settings page shows its own upstreams, capture consent, spend and tokens,
+and says *Your manager sets the compaction*; `PUT /api/me` answers **403** to a `config_yaml`
+from a non-manager, so hiding the grid is not the only thing stopping it. The states below
+are what the manager sees, on their own page and in each account's editor.
+
 **What Settings shows in each state.** The controls always render the *effective* document,
 because drawing the empty stored one would read as "my configuration is gone":
 
@@ -644,9 +649,12 @@ open); it never borrows the server's.
 
 ## Managing users
 
-A manager sees every account's metrics and configuration, and no account's transcripts.
-That split is the whole shape of this section: everything below is available to a manager,
-and reading somebody's captured source code is not.
+A manager sees every account's metrics, configuration and transcripts. Pointing the
+dashboard's account selector at a tenant gives a manager that tenant's own request drawer
+and compaction-diff view, over whatever that tenant consented to capture.
+
+The one thing a manager never gets is a tenant's password — see
+[Passwords](#passwords-what-a-manager-can-and-cannot-do).
 
 The Tenants tab is the console. Per account it offers the full configuration (pipeline,
 per-component settings, mode, upstreams, row quota, capture consent, role), an A/B variant
@@ -655,8 +663,10 @@ and — behind a disclosure — purge and delete.
 
 ### Editing somebody else's configuration
 
-`PATCH /api/tenants/{id}` writes the same fields a tenant can write for themselves, plus
-the manager-only ones (`role`, `max_rows`, `disabled`, `disabled_reason`, `variant`).
+`PATCH /api/tenants/{id}` writes the fields a tenant can write for themselves (`label`,
+upstreams, `capture_content`), plus the manager-only ones (`config_yaml`, `role`, `max_rows`,
+`disabled`, `disabled_reason`, `variant`). This is the **only** way a compaction
+configuration changes for somebody who is not a manager.
 `config_yaml` goes through the **same strict loader the proxy builds with**, so a typo is a
 `400` naming the offending key rather than a surprise at request time, and a rejected
 document leaves the stored one untouched.
@@ -673,6 +683,17 @@ Two behaviours to know:
 
 Config resolution still fails **open**: an account whose stored document somehow does not
 build is forwarded uncompacted (logged loudly), never refused.
+
+### Roles, and the door that must not close
+
+`role` on the same PATCH promotes a user to manager or demotes them; the change is audited
+with the actor. The promoted account has manager scope on its **next request** — the registry
+cache is cleared on every write, so nothing has to be re-signed-in.
+
+The **last manager cannot be demoted or disabled** — a `400` whose message says so:
+only a manager can hand the role out, so the dashboard would have nobody left who can, and
+the database would be the only way back. Promote a second manager first. Disabled managers do
+not count as a way back — they cannot sign in.
 
 ### A/B testing
 
@@ -760,9 +781,10 @@ target.
 | `POST /api/password-reset` → `/verify` | anyone with the mailbox | Self-service recovery. Phase one answers identically for an unknown address; phase two spends the code plus the new password and ends every session. Opens **no** session: signing in still wants the password and a fresh code. |
 | `POST /api/tenants/{id}/password-reset` | a manager | Mails **that account** a code. The manager never sees it and cannot set a password; the old password keeps working until its owner finishes. Audited. |
 
-A manager who could set a password could sign in as that user and read their transcripts,
-which is the one boundary this service promises its users. So the recovery path a manager
-gets is "start it", never "do it".
+A manager who could set a password could sign in AS that user — sending requests on their
+credential, reading their mail-bound recovery, acting in their name. That is the boundary
+this service still promises, so the recovery path a manager gets is "start it", never
+"do it".
 
 ## Storage
 
@@ -920,8 +942,10 @@ ssh -L 3000:127.0.0.1:3000 <the host>
 
 The front end publishes Grafana at `/grafana/` behind an nginx `auth_request` that only a
 context-guru **manager**'s browser session satisfies — Grafana never sees a request that
-fails it, not even to show its login page. Its own login is the second door.
-Prometheus (9090) and Loki (3100) are not published at all.
+fails it, not even to show its login page. That gate is also the sign-in: it names the
+manager in a header Grafana's auth-proxy trusts from the loopback peer only, so a manager
+lands in Grafana as an **Admin with no second password to hold**. Prometheus (9090) and Loki
+(3100) are not published at all.
 
 Containers rather than packages because Prometheus is in no RHEL 9 repository, so the
 alternative is a packaged Grafana beside a tarball Prometheus with two unrelated sets of
@@ -930,9 +954,11 @@ paths to keep straight. Either podman or docker is used, whichever is present.
 **Both bind loopback only**, which is why the `ssh -L` line is part of the procedure and
 not a suggestion: `/metrics` is a service-wide view carrying every tenant's spend, and
 Grafana's session cookie is as good as its admin password. Neither belongs on a shared
-box's LAN interface. The admin password is generated on the **first** run only, printed
-once, and written nowhere — after that it lives in Grafana's own database. `grafana-remove`
-drops the containers and deliberately **keeps** the metrics history.
+box's LAN interface. The built-in `admin` account is break-glass only — a first install
+seeds it with a random value that is neither printed nor saved, because Grafana's default
+when it is unset is `admin/admin`; set one yourself if you want that door, with the one
+command in `deploy/grafana/README.md`. `grafana-remove` drops the containers and
+deliberately **keeps** the metrics history.
 
 The full procedure, the by-hand equivalent, password rotation, scraping a proxy on another
 host, and the panel-by-panel reading guide live in
@@ -1019,8 +1045,9 @@ thing to keep in step with the server.
 |---|---|
 | Sign in / Register | Registration takes an email, a password, a token label, and an invite code if the deployment is in `invite` mode; entering the [mailed 6-digit code](#the-sign-in-flow) verifies the address, returns the token **once**, and signs you in — so registration flows straight to Setup with the token already substituted into the snippets. On a `closed` deployment the attempt is refused — see [step 4](#4-choose-how-accounts-are-created). Signing in later is password + a fresh mailed code, and an account created before passwords existed can still sign in with its token. Either way the browser only ever holds the session cookie. |
 | Setup | The three copy-paste blocks, with your own token and this deployment's real base URL (derived from the request, so it is correct behind nginx and on loopback alike). Your provider key stays where it already is; the blocks only add the base URL and the `x-context-guru-token` header — or, for Bob, the one-time key-binding curl. |
-| Settings | Mode, upstream per dialect, component toggles, content-capture consent, raw YAML, month-to-date spend, bound agent keys, token management, signed-in machines, and your own configuration-change history. Read-only while you are [tracking the server default](#tenants-track-the-default-they-are-not-stamped-with-a-copy-of-it), with **Customise** to take ownership. |
+| Settings | Upstream per dialect, content-capture consent, month-to-date spend, bound agent keys, token management, signed-in machines, and your own configuration-change history. Mode, component toggles and raw YAML are the **manager's**, per account; a plain account is told so and asks them. For a manager, they are read-only while [tracking the server default](#tenants-track-the-default-they-are-not-stamped-with-a-copy-of-it), with **Customise** to take ownership. |
 | Archive | What has moved to cold storage, from the local index. Opening one fetches it back read-only. |
+| Components | Manager only on a hosted deployment, since the pipeline it exists to tune is the manager's. Still there on a single-tenant proxy, where the operator is the only user of their own box. |
 | Tenants | Manager only: every account with its month-to-date spend, disable an account, reissue a lost token. |
 
 ![Setup immediately after registering: a green banner reads "Your new token is filled in
@@ -1088,11 +1115,13 @@ the very first request after a restart is recorded as `partial` and unpriced.
   redactor in front of the write is a best-effort denylist — a review of 22 realistic
   credential shapes found 11 passing through it — so this is a decision about real source
   code landing on disk.
-- **A manager sees everyone's metrics and nobody's transcripts.** Reading another
-  user's source code is not an administrative need, and the consent they gave was for
-  their own view. A manager may *withdraw* that consent, *purge* what it produced and
-  *delete* the account, and may start a password reset — but cannot set a password, which
-  is what would otherwise let them sign in as a user and read it all anyway. See
+- **A manager sees everyone's metrics *and* everyone's transcripts.** An explicit owner
+  decision: whoever runs the service can open any account's request drawer and compaction
+  diff via the account selector, over whatever that account consented to capture. Tell
+  users, because it is what their consent now means; the Settings consent screen says it
+  too. A manager may also *withdraw* that consent, *purge* what it produced and *delete*
+  the account, and may start a password reset — but still cannot set a password, so a
+  manager cannot act as a user against an upstream. See
   [Managing users](#managing-users).
 - **Hosted mode refuses to start with `CONTEXT_GURU_DUMP` or `CONTEXT_GURU_CAPTURE` set.**
   Either one appends every tenant's pristine request bodies to a single process-wide file:

@@ -106,14 +106,34 @@ func (h *Handler) ctlRoutes() []ctlRoute {
 		// so the front end asks this before it proxies: 204 lets the request through, and
 		// gate's 401/403 is what nginx turns into a refusal. Cookie only, like every route
 		// in this table — a proxy token cannot open the dashboards.
-		{"GET /api/authz/grafana", ctlManager, ctlNoContent},
+		{"GET /api/authz/grafana", ctlManager, h.ctlAuthzGrafana},
 	}
 }
 
-// ctlNoContent is an authorization answer with nothing to say. The whole decision is its
-// route's declared scope, enforced by gate before this runs, and a body would only
-// describe what is behind the gate to somebody who did not get through it.
-func ctlNoContent(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }
+// grafanaUserHeader carries the authorized manager's address from this endpoint to
+// Grafana's auth-proxy, via nginx's auth_request_set. It is an AUTHENTICATION, so nginx
+// must set it unconditionally on every request it proxies to Grafana and never forward a
+// client's own value — see deploy/service/nginx.conf, and the whitelist that stops
+// anything but the nginx peer from claiming it.
+const grafanaUserHeader = "X-Cg-Grafana-User"
+
+// ctlAuthzGrafana is nginx's auth_request answer for /grafana/: 204 with no body, plus
+// the address of the manager whose cookie satisfied the gate.
+//
+// The whole authorization decision is the route's declared scope, enforced by gate before
+// this runs; the principal is re-resolved here only for its address, which nginx copies
+// onto the proxied request so Grafana signs the same person in without a second password.
+// A body would describe what is behind the gate to somebody who did not get through it,
+// so there still is none — nginx reads the status and this one header.
+//
+// The address needs no escaping: checkEmail rejects whitespace and control characters on
+// every write, and net/http will not emit a header value containing a newline regardless.
+func (h *Handler) ctlAuthzGrafana(w http.ResponseWriter, r *http.Request) {
+	if t, err := h.webPrincipal(r); err == nil && t.Email != "" {
+		w.Header().Set(grafanaUserHeader, t.Email)
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
 
 // MountControl registers the control-plane routes. Called only in hosted mode; without
 // a tenant registry there are no accounts to manage.
@@ -211,14 +231,16 @@ func (h *Handler) DashAuth() dash.Authenticator {
 // into a CI environment could also read that account's transcripts and rewrite its
 // settings — a token is for spending money on inference, not for administering an
 // account.
+// Every refusal here is errNoSession rather than errNoToken: see that variable for why
+// naming the agent header on a cookie-authenticated route actively misdirects.
 func (h *Handler) webPrincipal(r *http.Request) (*tenant.Tenant, error) {
 	reg := h.registry()
 	if reg == nil {
-		return nil, errNoToken
+		return nil, errNoSession
 	}
 	c, err := r.Cookie(dashCookie)
 	if err != nil || c.Value == "" {
-		return nil, errNoToken
+		return nil, errNoSession
 	}
 	t, err := reg.WebSession(c.Value)
 	if err != nil {
@@ -227,7 +249,7 @@ func (h *Handler) webPrincipal(r *http.Request) (*tenant.Tenant, error) {
 			// here first, and "disabled" with no why is a support ticket.
 			return nil, tenantOff(err)
 		}
-		return nil, errNoToken
+		return nil, errNoSession
 	}
 	return t, nil
 }
@@ -1096,6 +1118,11 @@ func (h *Handler) ctlMe(w http.ResponseWriter, r *http.Request) {
 		// configured, so it is right behind nginx, right on loopback, and right if the
 		// hostname changes — one fewer thing to keep in step with reality.
 		"base_url": externalBase(r),
+		// The feedback form's questions and its agent selector, keys and wording both.
+		// Served here because a plain account gets 403 from GET /api/feedback, and the form
+		// must not carry a second copy of a list Go validates against.
+		"feedback_questions": tenant.FeedbackQuestions,
+		"feedback_agents":    tenant.FeedbackAgents,
 	})
 }
 
@@ -1159,6 +1186,20 @@ func (h *Handler) ctlUpdateMe(w http.ResponseWriter, r *http.Request) {
 	if err := h.checkUpstreams(in.UpAnthropic, in.UpOpenAI, in.UpBob); err != nil {
 		code, msg := statusOf(err)
 		ctlErr(w, code, msg)
+		return
+	}
+	// The compaction configuration is the MANAGER's field, set on the user's behalf
+	// through PATCH /api/tenants/{id}. Field by field, what is left is what a user owns:
+	// label names their own machine, the upstream selects pick among names the operator
+	// already allow-listed and carry the user's own credential, and capture_content is
+	// their privacy decision about their own transcripts — a manager cannot read those, so
+	// consenting to store them cannot be a manager's call to make. config_yaml is the only
+	// one of them that decides what runs on the traffic.
+	//
+	// Enforced here and not only by hiding the grid in the dashboard: a hidden control is
+	// not a permission, and this route is one curl away.
+	if in.ConfigYAML != nil && !t.IsManager() {
+		ctlErr(w, http.StatusForbidden, "a manager sets the compaction configuration")
 		return
 	}
 	patch := tenant.Patch{Label: in.Label, ConfigYAML: in.ConfigYAML,
@@ -1491,11 +1532,13 @@ func (h *Handler) ctlManagerMintToken(w http.ResponseWriter, r *http.Request) {
 // account deletion across both databases and cold storage, and the ability to START a
 // password reset.
 //
-// What a manager never gets: a tenant's captured transcript text (dash's request and
-// archive routes strip Content for anyone who is not the row's owner), and a tenant's
-// password. The reset route mails the OWNER a code and returns nothing — a manager who
-// could set a password could read that account's transcripts by signing in as them, which
-// is the boundary this whole design exists to keep.
+// A manager also reads any account's captured transcript text through dash's request,
+// transcript and archive routes — an explicit owner decision. Everyone else still sees
+// only their own.
+//
+// What a manager never gets: a tenant's password. The reset route mails the OWNER a code
+// and returns nothing, so the account's own credential is never in a manager's hands and
+// a manager can never act AS that user against an upstream.
 
 // disabledMsg renders the sign-in refusal for a disabled account, with the manager's
 // reason when there is one. Shares tenantOff's wording so an agent's 403 and a browser's
@@ -1664,8 +1707,8 @@ func (h *Handler) ctlCompleteReset(w http.ResponseWriter, r *http.Request) {
 // nothing: the code goes to the account's own address, and only its owner can finish.
 //
 // This is the recovery path a manager actually needs — "I cannot sign in" — without
-// becoming the ability to sign in AS a user, which would hand a manager that account's
-// transcripts and defeat the one boundary this service promises its users.
+// becoming the ability to sign in AS a user — spending on their credential and acting in
+// their name, which is the boundary this service still promises its users.
 func (h *Handler) ctlManagerReset(w http.ResponseWriter, r *http.Request) {
 	actor, err := h.webPrincipal(r)
 	if err != nil {

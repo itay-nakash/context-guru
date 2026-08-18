@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"regexp"
 	"strconv"
@@ -217,27 +218,61 @@ func TestManagerEditsAnyTenantsFullConfiguration(t *testing.T) {
 	}
 }
 
-// The boundary that must not move: a manager reads everyone's metrics and nobody's
-// transcripts. Checked through the REAL control-plane authenticator rather than a stub, and
-// on every surface a manager can reach — including the new A/B rollup.
-func TestManagerCannotReadAnotherTenantsTranscripts(t *testing.T) {
+// NEW RULE, replacing "a manager reads nobody's transcripts": a manager reads any account's
+// request diffs and session transcripts, and nobody else reads anyone's but their own.
+// Checked through the REAL control-plane authenticator rather than a stub.
+func TestManagerReadsAnotherTenantsTranscripts(t *testing.T) {
 	f := newMgrFixture(t)
 	mgrJar, _ := f.signUpJar(t, "boss@ibm.com")
 	_, userID := f.signUpJar(t, "a@ibm.com")
+	otherJar, _ := f.signUpJar(t, "b@ibm.com")
 	const secret = "SECRET-SOURCE-CODE-OF-A"
 	id := f.record(t, userID, "sess-a", &dash.Event{
 		Model: "m", TokensBefore: 100, TokensAfter: 60,
 		Content: []dash.ContentRow{{Path: "0", Before: secret, After: "x"}},
 	})
+	reqPath := "/api/requests/" + strconv.FormatInt(id, 10)
 
 	for _, path := range []string{
-		"/api/requests/" + strconv.FormatInt(id, 10),
-		"/api/requests?tenant=" + userID,
-		"/api/requests?tenant=*",
+		reqPath,
 		"/api/sessions/sess-a/transcript?tenant=" + userID,
 		"/api/sessions/sess-a/transcript?tenant=*",
-		"/api/tenants",
-		"/api/variants",
+	} {
+		w, _ := f.do(t, "GET", path, "", mgrJar)
+		if w.Code != http.StatusOK {
+			t.Errorf("%s for a manager = %d %s", path, w.Code, w.Body)
+			continue
+		}
+		if !strings.Contains(w.Body.String(), secret) {
+			t.Errorf("a manager could not read another tenant's transcript via %s", path)
+		}
+	}
+	// The transcript route reports the content as present, so the manager's drawer renders
+	// the diff instead of an explanation of why it is empty.
+	w, out := f.do(t, "GET", "/api/sessions/sess-a/transcript?tenant="+userID, "", mgrJar)
+	if w.Code != http.StatusOK || out["state"] != dash.TranscriptHot {
+		t.Errorf("manager transcript state = %v (%d), want %q", out["state"], w.Code, dash.TranscriptHot)
+	}
+	// Only the manager branch widened. Another plain account gets nothing for the same
+	// request id or session, and is refused rather than shown an empty diff.
+	for _, path := range []string{
+		reqPath,
+		"/api/sessions/sess-a/transcript?tenant=" + userID,
+		"/api/sessions/sess-a/transcript?tenant=*",
+	} {
+		w, _ := f.do(t, "GET", path, "", otherJar)
+		if w.Code != http.StatusNotFound {
+			t.Errorf("%s for another plain account = %d, want 404: %s", path, w.Code, w.Body)
+		}
+		if strings.Contains(w.Body.String(), secret) {
+			t.Errorf("a plain account read someone else's transcript via %s", path)
+		}
+	}
+	// The list and rollup surfaces stay metrics-only for everyone: they carry no content
+	// column at all, and a manager who wants the text opens one request.
+	for _, path := range []string{
+		"/api/requests?tenant=" + userID, "/api/requests?tenant=*",
+		"/api/tenants", "/api/variants",
 	} {
 		w, _ := f.do(t, "GET", path, "", mgrJar)
 		if w.Code != http.StatusOK {
@@ -245,18 +280,9 @@ func TestManagerCannotReadAnotherTenantsTranscripts(t *testing.T) {
 			continue
 		}
 		if strings.Contains(w.Body.String(), secret) {
-			t.Errorf("a manager read another tenant's transcript via %s", path)
+			t.Errorf("%s grew a content field:\n%s", path, w.Body)
 		}
 	}
-	// And the transcript route says WHY it is empty, so this stays a deliberate refusal
-	// rather than looking like a tenant with nothing captured.
-	w, out := f.do(t, "GET", "/api/sessions/sess-a/transcript?tenant="+userID, "", mgrJar)
-	if w.Code != http.StatusOK || out["state"] != dash.TranscriptNotPermitted {
-		t.Errorf("manager transcript state = %v (%d), want %q", out["state"], w.Code, dash.TranscriptNotPermitted)
-	}
-	// The owner still sees their own.
-	// (Their jar comes from the same signUp; re-reading through the user proves the
-	// refusal above is about the MANAGER, not about a broken capture.)
 }
 
 // Deleting a tenant has to clear BOTH databases. The control database cascades; the metrics
@@ -492,8 +518,9 @@ func TestPasswordChangeReplacesTheOldPassword(t *testing.T) {
 
 // A manager may START a reset and nothing more: they cannot learn the password, cannot set
 // one, and the account keeps working until its owner finishes. A manager who could set a
-// password could sign in as that user and read their transcripts, which is the one boundary
-// this service promises.
+// password could sign in AS that user and act in their name, which is the boundary this
+// service still promises — a manager READING transcripts is now allowed, impersonating an
+// account is not.
 func TestManagerResetNeitherSetsNorRevealsAPassword(t *testing.T) {
 	f := newMgrFixture(t)
 	mgrJar, _ := f.signUpJar(t, "boss@ibm.com")
@@ -706,6 +733,185 @@ func TestUserCannotSetManagerOnlyFields(t *testing.T) {
 		}
 		if w, _ := f.do(t, "PATCH", "/api/tenants/"+id, body, jar); w.Code != http.StatusForbidden {
 			t.Errorf("PATCH own tenant %s = %d, want 403", body, w.Code)
+		}
+	}
+}
+
+// The compaction configuration is the manager's, per user. A user's own PUT /api/me is
+// refused for config_yaml and for nothing else: the fields they legitimately own — their
+// machine label, their upstreams, their capture consent — still save in the same request
+// shape the settings page sends.
+func TestUserCannotSetTheirOwnCompaction(t *testing.T) {
+	f := newMgrFixture(t)
+	mgrJar, _ := f.signUpJar(t, "boss@ibm.com")
+	userJar, userID := f.signUpJar(t, "a@ibm.com")
+
+	// A manager parks a configuration on them first, so the refusal below is provably a
+	// refusal to CHANGE something rather than a refusal to write to an empty field.
+	const managed = "pipeline: [format]\nmode: observe\n"
+	if w, _ := f.do(t, "PATCH", "/api/tenants/"+userID,
+		mustJSON(t, map[string]any{"config_yaml": managed}), mgrJar); w.Code != http.StatusOK {
+		t.Fatalf("manager could not set the config: %d %s", w.Code, w.Body)
+	}
+	// And it is audited, with the manager as the actor — this is the path that replaces
+	// the user's own editing, so "who changed my pipeline" has to have an answer.
+	entries, err := f.reg.Audit(userID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var audited bool
+	for _, e := range entries {
+		if e.Field == "config_yaml" && e.Actor != userID && e.After == managed {
+			audited = true
+		}
+	}
+	if !audited {
+		t.Errorf("the manager's config edit was not audited: %+v", entries)
+	}
+
+	w, out := f.do(t, "PUT", "/api/me", `{"config_yaml":"pipeline: [dedup]\n"}`, userJar)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("user PUT /api/me config_yaml = %d, want 403: %s", w.Code, w.Body)
+	}
+	if msg, _ := out["error"].(string); !strings.Contains(msg, "manager") {
+		t.Errorf("the refusal does not say who sets it: %q", msg)
+	}
+	after, err := f.reg.Get(userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.ConfigYAML != managed {
+		t.Errorf("the refused write changed the stored config: %q", after.ConfigYAML)
+	}
+
+	// What is theirs still saves.
+	if w, _ := f.do(t, "PUT", "/api/me",
+		`{"label":"desktop","capture_content":true,"up_anthropic":"up"}`, userJar); w.Code != http.StatusOK {
+		t.Fatalf("user PUT /api/me own fields = %d, want 200: %s", w.Code, w.Body)
+	}
+	if after, _ = f.reg.Get(userID); !after.CaptureContent || after.Label != "desktop" {
+		t.Errorf("the user's own fields did not save: %+v", after)
+	}
+
+	// A manager's own settings page is unchanged.
+	if w, _ := f.do(t, "PUT", "/api/me", `{"config_yaml":"mode: observe\n"}`, mgrJar); w.Code != http.StatusOK {
+		t.Fatalf("manager PUT /api/me config_yaml = %d, want 200: %s", w.Code, w.Body)
+	}
+}
+
+// Promotion through the dashboard, end to end: the role reaches the registry, is audited,
+// and the promoted account's very next request carries manager scope.
+func TestPromotingAUserGrantsManagerScope(t *testing.T) {
+	f := newMgrFixture(t)
+	mgrJar, mgrID := f.signUpJar(t, "boss@ibm.com")
+	userJar, userID := f.signUpJar(t, "a@ibm.com")
+
+	if w, _ := f.do(t, "GET", "/api/tenants", "", userJar); w.Code != http.StatusForbidden {
+		t.Fatalf("a plain user reached the roster: %d", w.Code)
+	}
+	if w, _ := f.do(t, "PATCH", "/api/tenants/"+userID, `{"role":"manager"}`, mgrJar); w.Code != http.StatusOK {
+		t.Fatalf("promotion = %d %s", w.Code, w.Body)
+	}
+	if w, _ := f.do(t, "GET", "/api/tenants", "", userJar); w.Code != http.StatusOK {
+		t.Fatalf("the promoted account still has no manager scope: %d %s", w.Code, w.Body)
+	}
+	entries, err := f.reg.Audit(userID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, e := range entries {
+		if e.Field == "role" && e.Actor == mgrID && e.Before == "user" && e.After == "manager" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the promotion was not audited: %+v", entries)
+	}
+	// And back down, which is only allowed because the promoter is still a manager.
+	if w, _ := f.do(t, "PATCH", "/api/tenants/"+userID, `{"role":"user"}`, mgrJar); w.Code != http.StatusOK {
+		t.Fatalf("demotion of a second manager = %d %s", w.Code, w.Body)
+	}
+}
+
+// The lockout guard: the LAST manager may not be demoted or disabled, because only a
+// manager can hand the role out again and the dashboard is the only place it happens.
+func TestLastManagerCannotBeDemotedOrDisabled(t *testing.T) {
+	f := newMgrFixture(t)
+	mgrJar, mgrID := f.signUpJar(t, "boss@ibm.com")
+	f.signUpJar(t, "a@ibm.com")
+
+	for _, body := range []string{`{"role":"user"}`, `{"disabled":true,"disabled_reason":"oops"}`} {
+		w, out := f.do(t, "PATCH", "/api/tenants/"+mgrID, body, mgrJar)
+		if w.Code == http.StatusOK {
+			t.Fatalf("PATCH self %s was allowed; the deployment has no manager left", body)
+		}
+		if msg, _ := out["error"].(string); !strings.Contains(msg, "last manager") {
+			t.Errorf("the refusal does not explain itself: %q", msg)
+		}
+	}
+	if still, err := f.reg.Get(mgrID); err != nil || !still.IsManager() || still.Disabled {
+		t.Fatalf("the last manager was changed anyway: %+v %v", still, err)
+	}
+
+	// With a second manager in place, both are allowed again.
+	_, otherID := f.signUpJar(t, "b@ibm.com")
+	if w, _ := f.do(t, "PATCH", "/api/tenants/"+otherID, `{"role":"manager"}`, mgrJar); w.Code != http.StatusOK {
+		t.Fatalf("promotion = %d %s", w.Code, w.Body)
+	}
+	if w, _ := f.do(t, "PATCH", "/api/tenants/"+mgrID, `{"role":"user"}`, mgrJar); w.Code != http.StatusOK {
+		t.Fatalf("demotion with a spare manager = %d %s", w.Code, w.Body)
+	}
+}
+
+// The Grafana gate names the owner of the SESSION, never whoever the request claims to be.
+//
+// Grafana signs in whoever X-Cg-Grafana-User names, so that header is a complete
+// authentication and this endpoint is where its value is decided. Two properties, and the
+// second is the one an attacker goes for: a refusal carries no identity at all, and a
+// forged header on the request never becomes the identity on the response — nginx copies
+// onto the proxied request only what comes back from here (see nginx.conf), so a client
+// value that survived this would be an admin bypass.
+func TestGrafanaAuthzNamesTheSessionOwnerNotTheRequestsHeader(t *testing.T) {
+	f := newMgrFixture(t)
+	mgrJar, _ := f.signUpJar(t, "boss@ibm.com") // matches the fixture's ManagerEmail
+	userJar, _ := f.signUpJar(t, "a@ibm.com")
+
+	for _, tc := range []struct {
+		name    string
+		cookies []*http.Cookie
+		forge   bool
+		code    int
+		want    string // the identity the answer may carry; "" for none at all
+	}{
+		{"anonymous", nil, false, http.StatusUnauthorized, ""},
+		{"anonymous, forged header", nil, true, http.StatusUnauthorized, ""},
+		{"plain user", userJar, false, http.StatusForbidden, ""},
+		{"plain user, forged header", userJar, true, http.StatusForbidden, ""},
+		{"manager", mgrJar, false, http.StatusNoContent, "boss@ibm.com"},
+		{"manager, forged header", mgrJar, true, http.StatusNoContent, "boss@ibm.com"},
+	} {
+		r := httptest.NewRequest("GET", "/api/authz/grafana", nil)
+		for _, c := range tc.cookies {
+			r.AddCookie(c)
+		}
+		if tc.forge {
+			r.Header.Set(grafanaUserHeader, "attacker@ibm.com")
+		}
+		w := httptest.NewRecorder()
+		f.mux.ServeHTTP(w, r)
+
+		if w.Code != tc.code {
+			t.Errorf("%s: %d, want %d", tc.name, w.Code, tc.code)
+		}
+		if got := w.Header().Get(grafanaUserHeader); got != tc.want {
+			t.Errorf("%s: %s = %q, want %q", tc.name, grafanaUserHeader, got, tc.want)
+		}
+		// An authorization carries nothing but the identity: a body here would describe
+		// what is behind the gate. (A REFUSAL keeps the control plane's own error body,
+		// which nginx discards — it reads the status only.)
+		if tc.code == http.StatusNoContent && w.Body.Len() != 0 {
+			t.Errorf("%s: the gate answered with a body: %s", tc.name, w.Body)
 		}
 	}
 }
