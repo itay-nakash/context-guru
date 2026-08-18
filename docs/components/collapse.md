@@ -30,6 +30,8 @@ Lossy but reversible — the full original is stashed and recovered via `context
 | `max_tokens` | 2000 | Threshold above which an output is collapsed. |
 | `head_lines` | 20 | Lines kept from the start. |
 | `tail_lines` | 20 | Lines kept from the end. |
+| `max_frac` | 0 (off) | Threshold as a **fraction of the model's context window**. When the window is known this wins over `max_tokens`. |
+| `marker_mode` | `full` | `full` (stash + resolvable marker) / `summary` / `off`. |
 
 ## When it shines
 

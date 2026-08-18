@@ -50,6 +50,7 @@ Lossy but reversible — the full original message is stashed in the Store and r
 | Key | Default | Meaning |
 |---|---|---|
 | `min_tokens` | 80 | Minimum body size (per body) before it is skeletonized. |
+| `marker_mode` | `full` | `full` (stash + resolvable marker) / `summary` / `off`. |
 
 ## When it shines
 
