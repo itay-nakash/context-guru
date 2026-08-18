@@ -569,6 +569,14 @@ type Snapshot struct {
 	SummarizeTimeouts      int64 `json:"summarize_timeouts"`
 	SummarizeErrors        int64 `json:"summarize_errors"`
 	SummarizeCallTimeoutMs int64 `json:"summarize_call_timeout_ms"`
+	// AgentDiet* are the same three figures for the `agentdiet` baseline, which owns a
+	// third budget: its prompt is a window of b+1+a serialized steps, so it sits
+	// between extract_llm's single tool output and summarize's whole span. Reported
+	// separately for the same reason as summarize — it runs in its own arm, so folding
+	// it into LLM* would show llm_timeouts 0 while every reflection call expired.
+	AgentDietTimeouts      int64 `json:"agentdiet_timeouts"`
+	AgentDietErrors        int64 `json:"agentdiet_errors"`
+	AgentDietCallTimeoutMs int64 `json:"agentdiet_call_timeout_ms"`
 	// Extract is extract_llm's own economics (#28 part F), including NET savings after
 	// its LLM cost — the honest headline for the one component that spends to save.
 	// Purely ADDITIVE: no field above was renamed or removed, so deploy/harbor/*.py

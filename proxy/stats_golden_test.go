@@ -20,6 +20,14 @@ import (
 var statsGoldenTopLevel = []string{
 	"actual_baseline_tokens",
 	"adjusted_saved",
+	// agentdiet_* are the same three fail-open figures for the `agentdiet` baseline,
+	// which owns its own per-call budget (a window of steps sits between extract_llm's
+	// single tool output and summarize's whole span). Separate keys because it runs in
+	// its own arm: folded into llm_*, an agentdiet arm whose every reflection call
+	// expired would report llm_timeouts 0 and read as having nothing to reduce.
+	"agentdiet_call_timeout_ms",
+	"agentdiet_errors",
+	"agentdiet_timeouts",
 	"attempted_tokens",
 	"bounces",
 	"cache_read_tokens",

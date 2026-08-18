@@ -114,6 +114,7 @@ nav:
           - smartcrush: components/smartcrush.md
           - mask: components/mask.md
           - summarize: components/summarize.md
+          - agentdiet: components/agentdiet.md
       - The DSL filter engine:
           - Filter language: components/dsl.md
           - Write a custom filter: how-to/custom-dsl-filter.md
