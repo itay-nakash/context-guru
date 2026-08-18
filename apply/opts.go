@@ -1,6 +1,8 @@
 package apply
 
 import (
+	"time"
+
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/components"
 	"github.com/rossoctl/context-guru/modes"
@@ -33,6 +35,12 @@ type Opts struct {
 	Window int
 	// CacheMode is "auto" (default) | "on" | "off" — see resolveCacheAware.
 	CacheMode string
+	// Now is the clock, injected so idle-time reasoning is testable. Zero means time.Now().
+	Now time.Time
+	// SelfRates are the per-token rates of the model a NeedsModel component would call via
+	// `model.source: incoming` — i.e. the request's own model. Supplied by the host, which is
+	// the only layer with a Pricer. Zero means unknown and the component falls back.
+	SelfRates components.TokenRates
 
 	// Mode is the operating mode. Empty means components.ModeSync, so a caller that does
 	// not know about modes gets exactly today's behavior.
@@ -57,4 +65,12 @@ type Result struct {
 	// Changed is false when Body is the untouched input.
 	Changed bool
 	Trace
+}
+
+// nowMs is the request's wall clock in unix milliseconds.
+func (o Opts) nowMs() int64 {
+	if o.Now.IsZero() {
+		return time.Now().UnixMilli()
+	}
+	return o.Now.UnixMilli()
 }

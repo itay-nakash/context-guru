@@ -151,6 +151,31 @@ type Ctx struct {
 	// tail/in-place offloaders (dedup, cmdfilter, extract) are already byte-stable on
 	// the unchanged prefix and ignore this. False = legacy compact-everything.
 	CacheAware bool
+	// ColdCache is true when this session has been idle longer than the provider's prompt
+	// cache TTL, so the cached prefix CacheAware exists to protect is certainly gone.
+	//
+	// It is deliberately INFORMATION, not an automatic lifting of the tail gate. Every
+	// offloader could safely rewrite the whole transcript on such a turn, but flipping
+	// TailOnly here would change what mask, failed_run and collapse do on live traffic the
+	// moment this shipped — including for deployments that asked for none of it. So the
+	// gate stays where it is and a component opts in (see extract_llm's cold_cache).
+	//
+	// False means "warm, or unknown". A new session, an evicted tracker entry and the first
+	// turn after a restart all read false: acting on a fabricated idle time would invalidate
+	// a live cache, which costs a full cache-write of the suffix at 1.25x the fresh rate.
+	ColdCache bool
+	// ModelName is the id of the model this request targets, so a component that reuses it
+	// (model.source: incoming, the default for the LLM components) can say WHICH model it
+	// called instead of recording an empty string.
+	ModelName string
+	// SelfRates are the per-token rates for the model a component would call itself — the
+	// incoming model's, since that is what `source: incoming` uses. Zero when unknown.
+	SelfRates TokenRates
+	// IdleMs is how long this session was idle before this request, in milliseconds; 0 when
+	// there is no previous turn on record. Carried alongside ColdCache so a component can
+	// demand MORE idle time than the provider TTL implies, and so the figure can be
+	// reported rather than re-derived.
+	IdleMs int64
 	// MaxCachedIdx is the highest req.Input index considered already committed to the
 	// provider cache (the messages present on the previous turn of this session).
 	// -1 = unknown/first turn/cache off ⇒ no tail restriction. Only meaningful when
@@ -271,6 +296,88 @@ type Report struct {
 	// sat at zero on a whole workload without anyone being able to say which case each
 	// was in. Filled by the component via Gate(); rolled up into /stats per component.
 	Gates map[string]int
+	// Calls records each LLM call this component made on this request. Empty for every
+	// deterministic component; one entry per model call for the two that make them.
+	//
+	// Assigned SERIALLY by the component, never appended to from a goroutine: a Report is
+	// copied by value all over this codebase (emitters take one), so it cannot carry a lock.
+	// extract_llm fans out into a pre-sized slice and assigns the result once, which is the
+	// same shape its projected-output collection already uses.
+	Calls []ModelCall
+}
+
+// TokenRates are per-token USD rates for the model a component would call ITSELF, so a
+// component that spends money can price its own calls correctly.
+//
+// It exists because the alternative was a constant. extract_llm priced every call it made at
+// claude-haiku rates, while the shipped default routes extraction to the AGENT's model — so a
+// call on a sonnet-class model was recorded, and judged by the economic gate, at roughly a
+// third of what it actually cost. MEASURED on a real session: a call recorded at $0.0276 had
+// really cost about $0.083.
+//
+// Zero means unknown, and a caller must then fall back rather than treat a call as free.
+type TokenRates struct {
+	Input      float64
+	Output     float64
+	CacheRead  float64
+	CacheWrite float64
+}
+
+// Zero reports whether no rate is known.
+func (r TokenRates) Zero() bool {
+	return r.Input == 0 && r.Output == 0 && r.CacheRead == 0 && r.CacheWrite == 0
+}
+
+// Cost prices one call's four token tiers.
+func (r TokenRates) Cost(fresh, output, cacheWrite, cacheRead int64) float64 {
+	return float64(fresh)*r.Input + float64(output)*r.Output +
+		float64(cacheWrite)*r.CacheWrite + float64(cacheRead)*r.CacheRead
+}
+
+// ModelCall is one LLM call a component made, with what it cost and what it bought.
+//
+// It exists because "this component spent money" was previously a single dollar figure per
+// REQUEST, priced at the agent model's rate, with no record of how many calls made it up,
+// which candidate each looked at, whether it was accepted, or what the gate thought. For the
+// one component that can be net-negative, that is the difference between an operator being
+// able to answer "was that worth it?" and having to guess.
+//
+// Before/After hold the candidate's text either side of the call. They are transcript
+// content, so whether they are ever PERSISTED is decided downstream by the same per-account
+// capture consent that governs the diff view — this struct only carries them.
+type ModelCall struct {
+	Component string
+	Model     string
+	Strategy  string
+	// Aggressiveness is the compaction target asked for, so a level's real effect on this
+	// workload can be read off recorded calls instead of inferred.
+	Aggressiveness string
+	// Cold marks a call made during a cold-cache sweep, whose economics differ by ~12.5x.
+	Cold bool
+	// Escalated marks a call that fell back to the agent's own model because the transcript
+	// did not fit the extraction model's window.
+	Escalated       bool
+	CandidateTokens int
+	SavedTokens     int
+	LatencyMs       float64
+	// Token usage of the CALL itself, split by tier, and its cost priced with the extraction
+	// model's rates rather than the agent's.
+	PromptTokens     int64
+	CompletionTokens int64
+	CacheRead        int64
+	CacheWrite       int64
+	CostUSD          float64
+	Accepted         bool
+	// GateReason is what the economic gate concluded, including when it was overridden — the
+	// counterfactual an operator needs to see after choosing to override it.
+	GateReason string
+	// Rejection says why a call produced nothing: no usable reply, a result that was not
+	// smaller, or one the acceptance check refused. Empty on success. Without it every
+	// failure looked identical, and they have opposite fixes.
+	Rejection string
+	Summary   string
+	Before    string
+	After     string
 }
 
 // Gate records that one candidate was declined by the named gate. Names are the

@@ -73,6 +73,16 @@ type tokenValue struct {
 const (
 	agentFreshPerMTok     = 3.00
 	agentCacheReadPerMTok = 0.30 // 0.1x fresh, the standard Anthropic cache-read multiplier
+	// agentCacheWritePerMTok is 1.25x fresh, the standard cache-WRITE multiplier, and it is
+	// what a token is worth on a turn whose cache has expired.
+	//
+	// This is the most valuable token in the system and the component could not previously
+	// see it. MEASURED on this deployment over 1.4 days: turns whose cache had expired were
+	// 4% of requests (219 of 5,596) and 31% of spend ($360 of $1,173) — $1.64 each against
+	// $0.144 for a warm turn, an 11x difference — because all 56.7M of their tokens were
+	// billed as cache_creation_input_tokens. Removing one of those saves 1.25x the fresh
+	// rate, i.e. 12.5x what removing a token from a warm cached prefix saves.
+	agentCacheWritePerMTok = 3.75
 )
 
 // savedTokenValue prices one saved token for THIS request. When the request goes to a
@@ -81,6 +91,13 @@ const (
 // component's economics.
 func savedTokenValue(c *components.Ctx) tokenValue {
 	if c != nil && c.CacheAware {
+		// A cache-aware turn whose cache has EXPIRED is the opposite case to a warm one: the
+		// whole prefix is about to be re-written at 1.25x fresh, so a token removed here is
+		// the most valuable token there is — not the least. Reporting it as `cached` would
+		// hand the gate the 10x haircut that (correctly) suppresses warm-turn calls.
+		if c.ColdCache {
+			return tokenValue{perToken: agentCacheWritePerMTok / 1_000_000, cached: false}
+		}
 		return tokenValue{perToken: agentCacheReadPerMTok / 1_000_000, cached: true}
 	}
 	return tokenValue{perToken: agentFreshPerMTok / 1_000_000, cached: false}
@@ -447,7 +464,14 @@ func growthRate(currentTokens, prevTokens int) float64 {
 //
 // minTokensSet reports whether the operator pinned min_tokens explicitly; when they did,
 // their threshold governs and this stays out of the way.
-func shouldFire(pressure, growth float64, minTokensSet bool) (bool, string) {
+func shouldFire(pressure, growth float64, minTokensSet, fireOnSize bool) (bool, string) {
+	// `fire_on: size` short-circuits everything below: the operator asked for the
+	// candidate's own size to be the whole decision, so context pressure is not consulted
+	// at all. The per-output floor still gates each candidate, and llm_max_per_request /
+	// llm_max_per_session bound how many calls a firing turn may make.
+	if fireOnSize {
+		return true, "size threshold (fire_on: size)"
+	}
 	if minTokensSet {
 		return true, "explicit min_tokens/trigger configured"
 	}

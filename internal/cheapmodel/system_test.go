@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -21,8 +22,11 @@ func TestAnthropicSendsCachedSystemBlock(t *testing.T) {
 	}))
 	defer srv.Close()
 
+	// Long enough to clear the model minimum, so the breakpoint is asked for. A SHORT
+	// preamble deliberately gets no mark — see TestCacheBreakpointOnlyWhenItWouldCache.
+	preamble := strings.Repeat("INVARIANT PREAMBLE. ", 1200)
 	_, err := Anthropic{BaseURL: srv.URL, Model: "m"}.
-		CompleteSystem(context.Background(), "INVARIANT PREAMBLE", "VARIABLE PART")
+		CompleteSystem(context.Background(), preamble, "VARIABLE PART")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,7 +36,7 @@ func TestAnthropicSendsCachedSystemBlock(t *testing.T) {
 		t.Fatalf("expected a 1-block system array, got %#v", body["system"])
 	}
 	blk := sys[0].(map[string]any)
-	if blk["type"] != "text" || blk["text"] != "INVARIANT PREAMBLE" {
+	if blk["type"] != "text" || blk["text"] != preamble {
 		t.Fatalf("system block must carry the preamble as text: %#v", blk)
 	}
 	cc, ok := blk["cache_control"].(map[string]any)
@@ -170,4 +174,207 @@ func resetUsage() {
 	llmOutputTokens.Store(0)
 	llmCacheWrite.Store(0)
 	llmCacheRead.Store(0)
+}
+
+// The breakpoint must be placed only when the provider would actually cache the prefix.
+//
+// This is a MEASURED boundary, not a style choice: a mark below the model's minimum
+// cacheable prefix returns cache_creation_input_tokens: 0 with no error, so the old
+// unconditional mark was inert on haiku-class models — and where it is NOT inert but never
+// read, it is a 1.25x write paid for nothing. An unnameable model gets the conservative
+// (larger) floor so we do not write a cache we cannot verify.
+func TestCacheBreakpointOnlyWhenItWouldCache(t *testing.T) {
+	short := strings.Repeat("word ", 200) // ~200 tokens
+	mid := strings.Repeat("word ", 1500)  // ~1.5k tokens: the extractor's old preamble
+	long := strings.Repeat("word ", 6000) // ~6k tokens: clears every floor
+	for _, tc := range []struct {
+		name, model, system string
+		wantMark            bool
+	}{
+		{"haiku, short prefix", "claude-haiku-4-5", short, false},
+		{"haiku, 1.5k prefix is below its 4096 minimum", "claude-haiku-4-5", mid, false},
+		{"haiku, 6k prefix caches", "claude-haiku-4-5", long, true},
+		{"sonnet, 1.5k prefix clears its 1024 minimum", "aws/claude-sonnet-5", mid, true},
+		{"sonnet, short prefix", "claude-sonnet-5", short, false},
+		{"unnameable model gets the conservative floor", "qwen3-coder-30b", mid, false},
+		{"unnameable model, big prefix", "qwen3-coder-30b", long, true},
+		{"empty model name is treated as unknown", "", mid, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var body map[string]any
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				b, _ := io.ReadAll(r.Body)
+				_ = json.Unmarshal(b, &body)
+				_, _ = io.WriteString(w, `{"content":[{"type":"text","text":"OK"}]}`)
+			}))
+			defer srv.Close()
+			if _, err := (Anthropic{BaseURL: srv.URL, Model: tc.model}).
+				CompleteSystem(context.Background(), tc.system, "VARIABLE"); err != nil {
+				t.Fatal(err)
+			}
+			sys, _ := body["system"].([]any)
+			if len(sys) != 1 {
+				t.Fatalf("expected one system block, got %#v", body["system"])
+			}
+			_, marked := sys[0].(map[string]any)["cache_control"]
+			if marked != tc.wantMark {
+				t.Fatalf("cache_control present = %v, want %v (model %q, ~%d tokens)",
+					marked, tc.wantMark, tc.model, len(tc.system)/5)
+			}
+		})
+	}
+}
+
+// Two ordered blocks must arrive as two blocks, in order, with the single breakpoint on
+// the LAST one — the whole preamble is the prefix worth caching, and a mark in the middle
+// would cache only the first half.
+func TestCompleteBlocksKeepsOrderAndMarksTheLastBlock(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &body)
+		_, _ = io.WriteString(w, `{"content":[{"type":"text","text":"OK"}]}`)
+	}))
+	defer srv.Close()
+
+	general := strings.Repeat("general contract ", 1000)
+	aggro := strings.Repeat("compaction target ", 300)
+	if _, err := (Anthropic{BaseURL: srv.URL, Model: "aws/claude-sonnet-5"}).
+		CompleteBlocks(context.Background(), []string{general, "", aggro}, "VARIABLE"); err != nil {
+		t.Fatal(err)
+	}
+	sys, _ := body["system"].([]any)
+	if len(sys) != 2 {
+		t.Fatalf("expected 2 blocks (the blank one dropped), got %d: %#v", len(sys), body["system"])
+	}
+	if sys[0].(map[string]any)["text"] != general || sys[1].(map[string]any)["text"] != aggro {
+		t.Fatal("block order changed; the shared half must come first or it is not a shared prefix")
+	}
+	if _, marked := sys[0].(map[string]any)["cache_control"]; marked {
+		t.Fatal("the first block must not carry the breakpoint (that caches only half the preamble)")
+	}
+	if _, marked := sys[1].(map[string]any)["cache_control"]; !marked {
+		t.Fatal("the last block must carry the breakpoint")
+	}
+}
+
+// A blank-only system must omit the field entirely, leaving a request byte-identical to
+// one that never had a system prompt (the API rejects an empty text block).
+func TestBlankSystemSendsNoSystemField(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &body)
+		_, _ = io.WriteString(w, `{"content":[{"type":"text","text":"OK"}]}`)
+	}))
+	defer srv.Close()
+	if _, err := (Anthropic{BaseURL: srv.URL, Model: "m"}).
+		CompleteBlocks(context.Background(), []string{"", "   "}, "VARIABLE"); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := body["system"]; present {
+		t.Fatalf("system field present for a blank preamble: %#v", body["system"])
+	}
+}
+
+// A cache entry that is only ever WRITTEN is worse than no breakpoint at all: the write costs
+// 1.25x fresh input and buys nothing. Measured on a live session — two extraction calls in one
+// request ran concurrently, so neither could read what neither had written yet, and both paid:
+// cache_write=5228, cache_read=0.
+//
+// So the first call in flight takes the write slot and marks; its concurrent siblings do not.
+// Once an entry demonstrably exists, every later call marks again, because then the mark is a
+// READ.
+func TestOnlyOneConcurrentCallPaysForTheCacheWrite(t *testing.T) {
+	resetPrefixCache()
+	t.Cleanup(resetPrefixCache)
+	const model = "aws/claude-sonnet-5"
+	prefix := []string{strings.Repeat("stable preamble ", 400)}
+
+	// Nothing written yet: the first claim marks, a concurrent second does not.
+	first, releaseFirst := systemBlocks(prefix, model)
+	second, releaseSecond := systemBlocks(prefix, model)
+	if !marked(first) {
+		t.Fatal("the first call did not ask for the cache, so nothing is ever written")
+	}
+	if marked(second) {
+		t.Fatal("a concurrent sibling also asked for the cache: both pay the 1.25x write " +
+			"premium for the same entry, which is the measured waste this prevents")
+	}
+
+	// The write happened. Now a mark is a READ, so every call should carry one.
+	releaseFirst(true, false)
+	releaseSecond(false, false)
+	third, _ := systemBlocks(prefix, model)
+	if !marked(third) {
+		t.Fatal("no mark after the entry exists, so the write is never amortised by a read")
+	}
+
+	// A DIFFERENT prefix is a different entry and must be claimed separately.
+	other, _ := systemBlocks([]string{strings.Repeat("different preamble ", 400)}, model)
+	if !marked(other) {
+		t.Fatal("a distinct prefix was denied its own first write")
+	}
+}
+
+// A claimed slot must be freed even when the call fails, or one transport error stops the
+// prefix from ever being cached again for the life of the process.
+func TestAFailedCallReleasesTheWriteSlot(t *testing.T) {
+	resetPrefixCache()
+	t.Cleanup(resetPrefixCache)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	sys := strings.Repeat("stable preamble ", 400)
+	if _, err := (Anthropic{BaseURL: srv.URL, Model: "aws/claude-sonnet-5"}).
+		CompleteSystem(context.Background(), sys, "x"); err == nil {
+		t.Fatal("expected the 500 to be an error")
+	}
+	blocks, _ := systemBlocks([]string{sys}, "aws/claude-sonnet-5")
+	if !marked(blocks) {
+		t.Fatal("the write slot was still held after a failed call, so this prefix can " +
+			"never be cached again")
+	}
+}
+
+func marked(blocks []any) bool {
+	if len(blocks) == 0 {
+		return false
+	}
+	_, ok := blocks[len(blocks)-1].(map[string]any)["cache_control"]
+	return ok
+}
+
+// Believing an entry exists must EXPIRE. The provider's ephemeral entry dies after a few
+// minutes unused; a sticky `written` flag meant that after any idle gap every concurrent
+// caller marked and each paid a full creation charge — the waste the protocol prevents,
+// returning on the first burst after every quiet period.
+func TestPrefixBeliefExpires(t *testing.T) {
+	resetPrefixCache()
+	t.Cleanup(resetPrefixCache)
+	const model = "aws/claude-sonnet-5"
+	prefix := []string{strings.Repeat("stable preamble ", 400)}
+
+	first, release := systemBlocks(prefix, model)
+	if !marked(first) {
+		t.Fatal("the first call did not claim the write")
+	}
+	release(true, false) // the entry now exists
+
+	// Age it past the TTL, as the provider would.
+	prefixMu.Lock()
+	for _, st := range prefixCache {
+		st.at = st.at.Add(-2 * prefixEntryTTL)
+	}
+	prefixMu.Unlock()
+
+	a, _ := systemBlocks(prefix, model)
+	b, _ := systemBlocks(prefix, model)
+	if !marked(a) {
+		t.Fatal("no call re-claimed the write after the entry expired, so it is never re-cached")
+	}
+	if marked(b) {
+		t.Fatal("both callers marked after expiry: back to paying twice for one entry")
+	}
 }

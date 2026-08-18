@@ -63,6 +63,25 @@ function compact(v) {
   if (a >= 1e3) return (v / 1e3).toFixed(a >= 1e4 ? 0 : 1) + 'k';
   return nf.format(Math.round(v));
 }
+// netUSD is what one recorded compaction call was worth: the value of the tokens it removed
+// minus what the call cost. The per-token value depends on how the request was billed — a
+// token removed on a cold-cache turn is worth the cache-WRITE rate (1.25x fresh), one removed
+// from a warm cached prefix only the cache-READ rate (0.1x fresh), a ~12.5x spread. Using one
+// rate for both would either flatter warm calls or slander cold ones.
+const AGENT_FRESH_PER_MTOK = 3.0;
+const AGENT_CACHE_READ_PER_MTOK = 0.3;
+const AGENT_CACHE_WRITE_PER_MTOK = 3.75;
+
+function savedTokenUSD(x, cacheAware) {
+  if (x.cold) return AGENT_CACHE_WRITE_PER_MTOK / 1e6;
+  if (cacheAware) return AGENT_CACHE_READ_PER_MTOK / 1e6;
+  return AGENT_FRESH_PER_MTOK / 1e6;
+}
+
+function netUSD(x, cacheAware) {
+  return (x.saved_tokens || 0) * savedTokenUSD(x, cacheAware) - (x.cost_usd || 0);
+}
+
 function usd(v) {
   if (v === null || v === undefined) return '—';
   const a = Math.abs(v);
@@ -783,6 +802,16 @@ function renderSeries(buckets) {
 function verdict(c) {
   if (c.runs === 0) return ['—', 'neutral'];
   if (c.errors > 0) return ['errors', 'missing'];
+  // DOLLARS FIRST, where there are any. A component that makes LLM calls is the only kind
+  // that can be net-negative, and until the per-call records existed this function had no
+  // money to reason with — so it judged the one component that can lose money on tokens and
+  // latency, and could describe a $3 loss as "expensive for its yield".
+  if (c.llm_calls > 0) {
+    const net = componentNetUSD(c);
+    if (net < -0.01) return ['underwater ' + usd(net), 'missing'];
+    if (net <= 0) return ['break-even', 'partial'];
+    return ['net ' + usd(net), 'complete'];
+  }
   // Spent >1s of hot-path time and returned nothing: paid for, unused.
   if (c.saved_unique === 0 && c.duration_ms_total > 1000) return ['costly and inert', 'missing'];
   if (c.mutated === 0) return ['inert here', 'partial'];
@@ -793,6 +822,27 @@ function verdict(c) {
   }
   if (c.act_rate < 0.02) return ['rarely fires', 'partial'];
   return ['earning its place', 'complete'];
+}
+
+/**
+ * componentNetUSD prices a component's own LLM spend against what its calls removed.
+ *
+ * Deliberately uses only what the CALLS saved (llm_saved_tokens), not the component's total
+ * unique savings: most of an extractor's realized value comes from frozen results being
+ * replayed with no call at all — ~93% on measured traffic — and crediting that replay to the
+ * calls would make any amount of spending look profitable.
+ *
+ * Cold-sweep calls are valued at the cache-write rate and warm ones at the cache-read rate,
+ * a ~12.5x spread, so a component whose calls are mostly cold is judged on the right basis.
+ */
+function componentNetUSD(c) {
+  const cold = c.llm_calls_cold || 0;
+  const warm = Math.max(0, (c.llm_calls || 0) - cold);
+  const saved = c.llm_saved_tokens || 0;
+  const total = cold + warm;
+  const perTok = total === 0 ? 0
+    : (cold * AGENT_CACHE_WRITE_PER_MTOK + warm * AGENT_CACHE_READ_PER_MTOK) / total / 1e6;
+  return saved * perTok - (c.llm_cost_usd || 0);
 }
 
 /** DAY_MS is dash.DayMs: per-day bars are the shared time series at a day-wide bucket. */
@@ -886,12 +936,12 @@ function syncDimPicker(dims) {
 
 async function loadComponents() {
   const body = clear($('#components-body'));
-  loadingRows(body, 13);
+  loadingRows(body, 15);
   try {
     const { components } = await api('components');
     clear(body);
     if (!components.length) {
-      tableMessage(body, 13, 'No component runs captured',
+      tableMessage(body, 15, 'No component runs captured',
         'Run some traffic through the proxy with a non-empty pipeline.');
       emptyState($('#chart-comp'), 'No component data',
         'This chart fills in once a component has saved something.');
@@ -911,6 +961,8 @@ async function loadComponents() {
         el('td', { class: 'num', text: c.overcount_ratio ? c.overcount_ratio.toFixed(1) + '×' : '—' }),
         el('td', { class: 'num', text: dur(c.duration_ms_total) }),
         el('td', { class: 'num', text: ms(c.duration_ms_avg) }),
+        el('td', { class: 'num', text: c.llm_calls ? num(c.llm_calls) : '—' }),
+        el('td', { class: 'num', text: c.llm_calls ? usd(c.llm_cost_usd) : '—' }),
         el('td', { class: 'num', text: num(c.errors) }),
         el('td', {}, el('span', { class: 'pill ' + vcls, text: vtext }))));
     }
@@ -928,7 +980,7 @@ async function loadComponents() {
     })), { emptyDetail: 'No component saved any content tokens in this window.' });
   } catch (err) {
     if (aborted(err)) return;
-    tableMessage(body, 13, 'Could not load components', String(err.message || err), { error: true });
+    tableMessage(body, 15, 'Could not load components', String(err.message || err), { error: true });
   }
 }
 
@@ -1560,6 +1612,63 @@ async function openRequest(id, fromURL) {
       });
       tbl.appendChild(tb);
       body.appendChild(el('div', { class: 'tblwrap', tabindex: '0' }, tbl));
+    }
+
+    // Recorded model calls. This is the only place the cost of one extraction call is
+    // visible: the request row carries a single rolled-up dollar figure, and the components
+    // table has no dollars at all, so an expensive component could never be shown to be
+    // underwater on a particular KIND of call.
+    if (e.extractions && e.extractions.length) {
+      body.appendChild(el('h2', { text: 'Compaction model calls' }));
+      const net = e.extractions.reduce((a, x) => a + netUSD(x, e.cache_aware), 0);
+      const spent = e.extractions.reduce((a, x) => a + (x.cost_usd || 0), 0);
+      body.appendChild(el('div', { class: 'note' },
+        `${e.extractions.length} call(s), spent ${usd(spent)}, net `,
+        el('strong', { class: net < 0 ? 'warn-text' : '', text: usd(net) }),
+        net < 0 ? ' — these calls cost more than the tokens they removed were worth.' : '.'));
+      const xt = el('table', { class: 'tbl compact', 'data-testid': 'detail-extractions' },
+        el('thead', {}, el('tr', {},
+          el('th', { text: '#' }), el('th', { text: 'Component' }), el('th', { text: 'Target' }),
+          el('th', { class: 'num', text: 'Candidate' }), el('th', { class: 'num', text: 'Saved' }),
+          el('th', { class: 'num', text: 'Prompt' }), el('th', { class: 'num', text: 'Cost' }),
+          el('th', { class: 'num', text: 'Net' }), el('th', { class: 'num', text: 'Latency' }),
+          el('th', { text: 'Outcome' }))));
+      const xb = el('tbody');
+      e.extractions.forEach((x, i) => {
+        const n = netUSD(x, e.cache_aware);
+        xb.appendChild(el('tr', {},
+          el('td', { text: i + 1 }),
+          el('td', {}, el('code', { text: x.component }),
+            x.cold ? el('span', { class: 'pill complete', text: 'cold sweep' }) : null,
+            x.escalated ? el('span', { class: 'pill neutral', text: 'escalated' }) : null),
+          el('td', { text: x.aggressiveness || '—' }),
+          el('td', { class: 'num', text: compact(x.candidate_tokens) }),
+          el('td', { class: 'num', text: compact(x.saved_tokens) }),
+          el('td', { class: 'num', text: compact(x.prompt_tokens) }),
+          el('td', { class: 'num', text: usd(x.cost_usd) }),
+          el('td', { class: 'num ' + (n < 0 ? 'warn-text' : ''), text: usd(n) }),
+          el('td', { class: 'num', text: ms(x.latency_ms) }),
+          el('td', {},
+            el('span', {
+              class: 'pill ' + (x.accepted ? 'complete' : 'neutral'),
+              text: x.accepted ? 'accepted' : 'no reduction',
+            }),
+            x.summary ? el('div', { class: 's', text: x.summary }) : null,
+            x.rejection ? el('div', { class: 's warn-text', text: x.rejection }) : null,
+            x.gate_reason ? el('div', { class: 's', text: x.gate_reason }) : null)));
+      });
+      xt.appendChild(xb);
+      body.appendChild(el('div', { class: 'tblwrap', tabindex: '0' }, xt));
+      // The before/after of each call, where the account stores transcripts at all.
+      e.extractions.forEach((x, i) => {
+        if (!x.before && !x.after) return;
+        const d = el('details', { class: 'field' },
+          el('summary', { text: `Call ${i + 1}: what the model removed` }));
+        const host = el('div', {});
+        renderDiff(host, x.before || '', x.after || '', 'unified');
+        d.appendChild(host);
+        body.appendChild(d);
+      });
     }
 
     body.appendChild(el('h2', { text: 'What context-guru changed' }));
@@ -3503,6 +3612,9 @@ function loadSettings() {
         '11 of 22 realistic credential shapes passing through it. The manager can read ' +
         'whatever this stores. Off by default.')));
 
+    // The compaction-model form, above the raw YAML it writes into.
+    if (mgr) renderXllmForm(host, effective, inherited);
+
     // Raw YAML, for anything the toggles do not cover.
     const ta = el('textarea', {
       id: 'set-yaml', rows: 10, spellcheck: 'false', 'data-testid': 'set-yaml',
@@ -3663,6 +3775,318 @@ async function setStoredConfig(yaml) {
   setTimeout(() => { status.textContent = ''; }, 3000);
 }
 
+/**
+ * The compaction-model form.
+ *
+ * extract_llm has fourteen knobs and every one of them is reachable only by hand-editing
+ * raw YAML, in a textarea, with no validation until save — and the component's own loader
+ * unmarshals its block NON-strictly, so a misspelled key is silently ignored rather than
+ * rejected. It is also the one component that spends money, so a typo there is not a typo,
+ * it is a bill. Hence a form with the recommended defaults filled in.
+ *
+ * The YAML textarea stays, as Advanced, and still wins when edited: it is the only way to
+ * express anything this form does not cover.
+ */
+const XLLM_DEFAULTS = {
+  per_output: false,
+  size_trigger: false,
+  cold_enabled: true,
+  min_tokens: 2000,
+  max_per_request: 2,
+  max_per_session: 20,
+  aggressiveness: 'medium',
+  context: 'recent',
+  context_messages: 7,
+  cold_min_tokens: 1000,
+};
+
+/** readXllm pulls the current settings out of a YAML document by regex.
+ *
+ *  Regex, not a YAML parser, for the same reason componentPickers uses one: this file ships
+ *  no dependencies. It reads only the keys the form owns and it never WRITES through these
+ *  patterns — writeXllm replaces the whole block — so a document shape it misreads costs a
+ *  wrong default in the form, never a corrupted config. */
+function readXllm(yaml) {
+  const blk = xllmBlock(yaml);
+  const num = (k, d) => {
+    const m = new RegExp('^\\s*' + k + ':\\s*(\\d+)\\s*$', 'm').exec(blk);
+    return m ? parseInt(m[1], 10) : d;
+  };
+  const str = (k, d) => {
+    const m = new RegExp('^\\s*' + k + ':\\s*([a-z_]+)\\s*$', 'm').exec(blk);
+    return m ? m[1] : d;
+  };
+  const bool = (k, d) => {
+    const m = new RegExp('^\\s*' + k + ':\\s*(true|false)\\s*$', 'm').exec(blk);
+    return m ? m[1] === 'true' : d;
+  };
+  // The cold_cache SUB-BLOCK, read separately: `num('min_tokens')` matches the first
+  // occurrence in the whole block, which is the hot-path threshold — so the sweep's floor was
+  // displayed wrong and then overwritten with the hot-path value on save.
+  const sub = coldSubBlock(blk);
+  const subNum = (k, d) => {
+    const m = new RegExp('^\\s*' + k + ':\\s*(\\d+)\\s*$', 'm').exec(sub);
+    return m ? parseInt(m[1], 10) : d;
+  };
+  const subBool = (k, d) => {
+    const m = new RegExp('^\\s*' + k + ':\\s*(true|false)\\s*$', 'm').exec(sub);
+    return m ? m[1] === 'true' : d;
+  };
+  const cold = sub !== '';
+  return {
+    in_pipeline: pipelineList(yaml).includes('extract_llm'),
+    per_output: bool('per_output', true),
+    size_trigger: str('fire_on', 'pressure') === 'size',
+    cold_enabled: cold ? subBool('enabled', false) : false,
+    min_tokens: num('min_tokens', XLLM_DEFAULTS.min_tokens),
+    max_per_request: num('llm_max_per_request', XLLM_DEFAULTS.max_per_request),
+    max_per_session: num('llm_max_per_session', XLLM_DEFAULTS.max_per_session),
+    aggressiveness: str('aggressiveness', XLLM_DEFAULTS.aggressiveness),
+    context: str('context', XLLM_DEFAULTS.context),
+    context_messages: num('context_messages', XLLM_DEFAULTS.context_messages),
+    cold_min_tokens: subNum('min_tokens', XLLM_DEFAULTS.cold_min_tokens),
+    // Keys the form does not manage, preserved verbatim on save (see writeXllm).
+    keep_lines: unmanagedXllmLines(blk),
+  };
+}
+
+/** pipelineList returns the configured component names. */
+function pipelineList(yaml) {
+  return ((/^pipeline:\s*\[(.*?)\]\s*$/m.exec(yaml) || ['', ''])[1])
+    .split(',').map((x) => x.trim()).filter(Boolean);
+}
+
+/** xllmBlock returns the text of the components.extract_llm block, or ''. */
+function xllmBlock(yaml) {
+  const lines = yaml.split('\n');
+  const start = lines.findIndex((l) => /^\s+extract_llm:\s*$/.test(l));
+  if (start < 0) return '';
+  const indent = lines[start].match(/^\s*/)[0].length;
+  let end = start + 1;
+  while (end < lines.length) {
+    const l = lines[end];
+    if (l.trim() !== '' && l.match(/^\s*/)[0].length <= indent) break;
+    end++;
+  }
+  return lines.slice(start, end).join('\n');
+}
+
+/** coldSubBlock returns the text of the cold_cache: sub-block inside an extract_llm block. */
+function coldSubBlock(blk) {
+  const lines = blk.split('\n');
+  const start = lines.findIndex((l) => /^\s*cold_cache:\s*$/.test(l));
+  if (start < 0) return '';
+  const indent = lines[start].match(/^\s*/)[0].length;
+  let end = start + 1;
+  while (end < lines.length) {
+    const l = lines[end];
+    if (l.trim() !== '' && l.match(/^\s*/)[0].length <= indent) break;
+    end++;
+  }
+  return lines.slice(start, end).join('\n');
+}
+
+/** MANAGED_XLLM_KEYS are the keys the form owns and will rewrite. Everything else in the
+ *  block is somebody's deliberate configuration and must survive a save untouched. */
+const MANAGED_XLLM_KEYS = ['per_output', 'fire_on', 'min_tokens', 'llm_max_per_request',
+  'llm_max_per_session', 'aggressiveness', 'context', 'context_messages', 'cold_cache'];
+
+/** unmanagedXllmLines returns the top-level lines of an extract_llm block whose keys the form
+ *  does not manage, with their sub-blocks, so a save preserves them.
+ *
+ *  Without this, any manager settings save rewrote the block from the form's fields alone and
+ *  silently DELETED rewrite, marker_mode, model, economic_gate, trigger, skip_file_reads and
+ *  llm_every_n_requests. Unticking an unrelated component in the grid would have reset
+ *  somebody's deliberate compaction configuration. */
+function unmanagedXllmLines(blk) {
+  const lines = blk.split('\n').slice(1); // drop the "extract_llm:" header
+  const out = [];
+  let skipping = false;
+  let skipIndent = 0;
+  for (const l of lines) {
+    if (l.trim() === '') continue;
+    const indent = l.match(/^\s*/)[0].length;
+    if (skipping && indent > skipIndent) continue;
+    skipping = false;
+    const key = (/^\s*([A-Za-z_][\w]*):/.exec(l) || [])[1];
+    if (!key) { out.push(l); continue; }
+    if (MANAGED_XLLM_KEYS.includes(key)) { skipping = true; skipIndent = indent; continue; }
+    out.push(l);
+  }
+  return out;
+}
+
+/** writeXllm returns the document with components.extract_llm replaced by cfg, and the
+ *  pipeline updated to match whether the component is wanted at all.
+ *
+ *  Whole-block replacement rather than per-key edits: a partial edit has to reason about
+ *  which keys already exist and at what indentation, which is where a hand-rolled YAML
+ *  writer goes wrong. The server validates the result strictly (LoadBytes + a real pipeline
+ *  build) and answers 400 naming the offending key, so a document this mangles is rejected
+ *  rather than stored. */
+function writeXllm(yaml, cfg) {
+  const wanted = cfg.per_output || cfg.cold_enabled;
+  let out = yaml.replace(/\s*$/, '\n');
+
+  // 1. pipeline membership.
+  const names = pipelineList(out);
+  if (wanted && !names.includes('extract_llm')) {
+    // Before the deterministic `extract` where possible: the cheap pass should see whatever
+    // the LLM pass leaves, which is the order every shipped preset uses.
+    const at = names.indexOf('extract');
+    if (at >= 0) names.splice(at, 0, 'extract_llm'); else names.push('extract_llm');
+  } else if (!wanted) {
+    const at = names.indexOf('extract_llm');
+    if (at >= 0) names.splice(at, 1);
+  }
+  const line = `pipeline: [${names.join(', ')}]`;
+  out = /^pipeline:/m.test(out) ? out.replace(/^pipeline:.*$/m, line) : line + '\n' + out;
+
+  // 2. the block itself.
+  const body = [
+    '  extract_llm:',
+    ...(cfg.keep_lines || []),
+    `    per_output: ${cfg.per_output}`,
+    // fire_on comes from an explicit choice, never from per_output being on. Deriving it
+    // meant a plain save turned the economic gate and the caching-backend guard advisory --
+    // i.e. quietly removed the spending brakes -- as a side effect of ticking a checkbox.
+    `    fire_on: ${cfg.size_trigger ? 'size' : 'pressure'}`,
+    `    min_tokens: ${cfg.min_tokens}`,
+    `    llm_max_per_request: ${cfg.max_per_request}`,
+    `    llm_max_per_session: ${cfg.max_per_session}`,
+    `    aggressiveness: ${cfg.aggressiveness}`,
+    `    context: ${cfg.context}`,
+    `    context_messages: ${cfg.context_messages}`,
+    '    cold_cache:',
+    `      enabled: ${cfg.cold_enabled}`,
+    `      min_tokens: ${cfg.cold_min_tokens}`,
+  ].join('\n');
+
+  const lines = out.split('\n');
+  const start = lines.findIndex((l) => /^\s+extract_llm:\s*$/.test(l));
+  if (start >= 0) {
+    const indent = lines[start].match(/^\s*/)[0].length;
+    let end = start + 1;
+    while (end < lines.length) {
+      const l = lines[end];
+      if (l.trim() !== '' && l.match(/^\s*/)[0].length <= indent) break;
+      end++;
+    }
+    if (!wanted) return lines.slice(0, start).concat(lines.slice(end)).join('\n');
+    return lines.slice(0, start).concat(body.split('\n'), lines.slice(end)).join('\n');
+  }
+  if (!wanted) return out;
+  const ci = lines.findIndex((l) => /^components:\s*$/.test(l));
+  if (ci >= 0) return lines.slice(0, ci + 1).concat(body.split('\n'), lines.slice(ci + 1)).join('\n');
+  return out.replace(/\s*$/, '\n') + 'components:\n' + body + '\n';
+}
+
+/** renderXllmForm draws the compaction-model controls. Manager-only, matching the server:
+ *  PUT /api/me answers 403 to anyone else sending config_yaml. */
+function renderXllmForm(host, yaml, disabled) {
+  const cur = readXllm(yaml);
+  const state = {
+    per_output: cur.in_pipeline && cur.per_output,
+    size_trigger: cur.size_trigger,
+    cold_enabled: cur.in_pipeline && cur.cold_enabled,
+    keep_lines: cur.keep_lines,
+    min_tokens: cur.min_tokens,
+    max_per_request: cur.max_per_request,
+    max_per_session: cur.max_per_session,
+    aggressiveness: cur.aggressiveness,
+    context: cur.context,
+    context_messages: cur.context_messages,
+    cold_min_tokens: cur.cold_min_tokens,
+  };
+  xllmState = state;
+
+  const sw = (key, label, hint) => {
+    const cb = el('input', { type: 'checkbox', id: 'x-' + key, 'data-testid': 'x-' + key });
+    cb.checked = !!state[key];
+    cb.disabled = disabled;
+    cb.addEventListener('change', () => { state[key] = cb.checked; });
+    return el('div', { class: 'field' },
+      el('label', { class: 'comp', for: 'x-' + key }, cb, el('span', { class: 'comp-name' }, label)),
+      el('p', { class: 'hint' }, hint));
+  };
+  const numField = (key, label, hint) => {
+    const inp = el('input', { type: 'number', min: '0', id: 'x-' + key, 'data-testid': 'x-' + key });
+    inp.value = String(state[key]);
+    inp.disabled = disabled;
+    inp.addEventListener('change', () => {
+      const v = parseInt(inp.value, 10);
+      state[key] = Number.isFinite(v) && v >= 0 ? v : XLLM_DEFAULTS[key];
+      inp.value = String(state[key]);
+    });
+    return el('div', { class: 'field' },
+      el('label', { for: 'x-' + key }, label), inp, el('p', { class: 'hint' }, hint));
+  };
+  const pick = (key, label, opts, hint) => {
+    const sel = el('select', { id: 'x-' + key, 'data-testid': 'x-' + key },
+      ...opts.map(([v, t]) => el('option', { value: v }, t)));
+    sel.value = state[key];
+    sel.disabled = disabled;
+    sel.addEventListener('change', () => { state[key] = sel.value; });
+    return el('div', { class: 'field' },
+      el('label', { for: 'x-' + key }, label), sel, el('p', { class: 'hint' }, hint));
+  };
+
+  host.appendChild(el('details', { class: 'field', 'data-testid': 'xllm-form' },
+    el('summary', {}, 'Compaction model calls (extract_llm)'),
+    el('p', { class: 'hint warn-text' },
+      'This is the only component that spends money to save money, and it can be net '
+      + 'negative. Both switches are off by default. Every call it makes is recorded with '
+      + 'its cost and its saving — open any request to see them.'),
+    sw('cold_enabled', 'Sweep the transcript when the prompt cache has expired',
+      'Fires only on a turn that resumes after the provider\'s cache TTL, where the whole '
+      + 'transcript is re-billed at 1.25x the fresh rate anyway. Measured on this service: '
+      + 'those turns are 4% of requests and 31% of spend, and nothing touches them today. '
+      + 'This is the half whose economics are unambiguous.'),
+    sw('per_output', 'Also reduce large tool outputs as they arrive',
+      'Runs on ordinary turns. On a warm prompt cache a removed token saves only the '
+      + 'cache-read rate, so measured results here range from break-even to underwater, and '
+      + 'each call adds seconds to the turn. Turn it on deliberately, watch the net figure.'),
+    sw('size_trigger', 'Let size alone decide, and make the economic gate advisory',
+      'Off: the gate blocks a call it expects to lose money on, and on a warm prompt cache '
+      + 'that is most of them. On: the threshold and the caps below are the ONLY brakes — the '
+      + 'gate still records what it would have refused (shown on each call) but no longer '
+      + 'stops it. This is a deliberate licence to spend; set the caps first.'),
+    numField('min_tokens', 'Only consider outputs above (tokens)',
+      'The size threshold: below this an output is never a candidate. Whether size is the '
+      + 'WHOLE trigger depends on the switch above.'),
+    numField('max_per_request', 'Max calls per turn',
+      'Bounds one turn\'s added latency. Calls run concurrently, so a turn costs about one '
+      + 'call\'s wall time.'),
+    numField('max_per_session', 'Max calls per session',
+      'The outer bound on spend. The per-turn cap alone cannot bound a long session: 2 calls '
+      + 'across 300 turns is 600 calls. 0 means unlimited.'),
+    pick('aggressiveness', 'How hard to compact', [
+      ['low', 'low — remove only clear redundancy (~10-25%)'],
+      ['medium', 'medium — recommended (~25-50%)'],
+      ['high', 'high — keep what the goal needs (~50-80%)'],
+    ], 'Taught with worked examples rather than a threshold. It changes what the model is '
+      + 'asked for, never what is accepted: ids, paths, numbers and error lines stay '
+      + 'byte-identical at every level, and the original is always recoverable.'),
+    pick('context', 'Conversation the model is shown', [
+      ['goal', 'goal — the task and the latest turn (cheapest)'],
+      ['recent', 'recent — every user turn plus the last N (recommended)'],
+      ['full', 'full — the whole transcript (expensive per call)'],
+    ], 'More context means better decisions and a bigger prompt on every call. A cold-cache '
+      + 'sweep always uses the full transcript regardless of this.'),
+    numField('context_messages', 'N, for "recent"', 'Messages of recent history to include.'),
+    numField('cold_min_tokens', 'Cold sweep: only outputs above (tokens)',
+      'Lower than the everyday threshold on purpose — on that turn every candidate is being '
+      + 're-billed at the write rate whatever we do.'),
+    whyBlock('What happens when you save',
+      'Saving rebuilds your pipeline and discards frozen compaction decisions, so the next '
+      + 'turn will not be cache-warm. The document this form writes is validated on the '
+      + 'server exactly as hand-written YAML is; a rejected save names the offending key.')));
+}
+
+/** xllmState holds the form's current values between render and save. One variable because
+ *  the form is rendered once per Settings load and read once per save. */
+let xllmState = null;
+
 async function saveSettings() {
   const status = $('#settings-saved');
   status.textContent = 'saving…';
@@ -3686,6 +4110,10 @@ async function saveSettings() {
     yaml = yaml.replace(/^pipeline:.*$/m, `pipeline: [${ordered.join(', ')}]`);
     if (!/^pipeline:/m.test(yaml)) yaml = `pipeline: [${ordered.join(', ')}]\n` + yaml;
     yaml = /^mode:/m.test(yaml) ? yaml.replace(/^mode:.*$/m, `mode: ${mode}`) : yaml + `\nmode: ${mode}\n`;
+    // The form last, so it owns the extract_llm block and the component's presence in the
+    // pipeline — otherwise the checkbox grid and the form would disagree about whether the
+    // component runs, and whichever wrote last would win by accident.
+    if (xllmState) yaml = writeXllm(yaml, xllmState);
   }
   const body = {
     capture_content: $('#set-capture').checked,
