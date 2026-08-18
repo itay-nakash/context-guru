@@ -1,13 +1,19 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/rossoctl/context-guru/components"
+	"github.com/rossoctl/context-guru/dash"
+	"github.com/rossoctl/context-guru/internal/logging"
 	"github.com/rossoctl/context-guru/store"
 	"github.com/rossoctl/context-guru/tenant"
 )
@@ -23,6 +29,56 @@ func ctlFixture(t *testing.T) *hostedFixture {
 	// newHostedFixture builds the mux before this test's assertions; the control routes
 	// are registered by Mux() already, so nothing extra is needed here.
 	return f
+}
+
+// testPassword is the password every fixture account uses. Not a credential: it never
+// leaves this test binary, and the accounts live in an in-memory database discarded
+// when the test ends.
+const testPassword = "fixture-password-1"
+
+// signUp runs the WHOLE two-phase registration: POST /api/register, read the code out
+// of the mail sink, POST /api/verify. It returns the verify response, which is the one
+// carrying the session cookie and the first token — so it is a drop-in for what the
+// old single-step register returned.
+//
+// Reading the code from the sink FILE rather than from the registry is deliberate: it
+// means these tests fail if the mail path stops producing a usable code, which is the
+// half of the flow a test reaching straight into the database would never touch.
+func (f *hostedFixture) signUp(t *testing.T, email, label string) (*httptest.ResponseRecorder, map[string]any) {
+	t.Helper()
+	w, out := f.do(t, "POST", "/api/register",
+		`{"email":"`+email+`","label":"`+label+`","password":"`+testPassword+`"}`, nil)
+	if w.Code != http.StatusCreated {
+		return w, out
+	}
+	return f.do(t, "POST", "/api/verify",
+		`{"email":"`+email+`","code":"`+f.lastCode(t)+`"}`, nil)
+}
+
+// signIn runs the two-phase login for an already-registered account.
+func (f *hostedFixture) signIn(t *testing.T, email string) (*httptest.ResponseRecorder, map[string]any) {
+	t.Helper()
+	w, out := f.do(t, "POST", "/api/login",
+		`{"email":"`+email+`","password":"`+testPassword+`"}`, nil)
+	if w.Code != http.StatusOK {
+		return w, out
+	}
+	return f.do(t, "POST", "/api/verify",
+		`{"email":"`+email+`","code":"`+f.lastCode(t)+`"}`, nil)
+}
+
+// lastCode returns the most recent 6-digit code written to the mail sink.
+func (f *hostedFixture) lastCode(t *testing.T) string {
+	t.Helper()
+	b, err := os.ReadFile(os.Getenv(envMailDevSink))
+	if err != nil {
+		t.Fatalf("mail sink: %v", err)
+	}
+	m := regexp.MustCompile(`\b\d{6}\b`).FindAllString(string(b), -1)
+	if len(m) == 0 {
+		t.Fatalf("no code in the mail sink:\n%s", b)
+	}
+	return m[len(m)-1]
 }
 
 // do issues a control-plane call, carrying cookies through a jar.
@@ -48,7 +104,7 @@ func (f *hostedFixture) do(t *testing.T, method, path, body string, cookies []*h
 
 func TestRegisterIssuesTokenOnceAndSignsIn(t *testing.T) {
 	f := ctlFixture(t)
-	w, out := f.do(t, "POST", "/api/register", `{"email":"a@ibm.com","label":"laptop"}`, nil)
+	w, out := f.signUp(t, "a@ibm.com", "laptop")
 	if w.Code != http.StatusCreated {
 		t.Fatalf("register = %d %s", w.Code, w.Body)
 	}
@@ -111,7 +167,8 @@ func TestControlWritesRequireTheCookieNotAToken(t *testing.T) {
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("a proxy token was accepted for an account write: %d", w.Code)
 	}
-	for _, p := range []string{"/api/me", "/api/me/audit", "/api/options", "/api/tenants"} {
+	for _, p := range []string{"/api/me", "/api/me/audit", "/api/options", "/api/tenants",
+		"/api/feedback"} {
 		w, _ := f.do(t, "GET", p, "", nil)
 		if w.Code != http.StatusUnauthorized {
 			t.Errorf("%s without a cookie = %d, want 401", p, w.Code)
@@ -121,7 +178,9 @@ func TestControlWritesRequireTheCookieNotAToken(t *testing.T) {
 
 func TestSettingsValidationAndUpstreamAllowList(t *testing.T) {
 	f := ctlFixture(t)
-	w, _ := f.do(t, "POST", "/api/register", `{"email":"a@ibm.com","label":"l"}`, nil)
+	// The fixture's ManagerEmail: config_yaml on PUT /api/me is a manager's field, so a
+	// plain account is refused before the validation under test is ever reached.
+	w, _ := f.signUp(t, "boss@ibm.com", "l")
 	jar := w.Result().Cookies()
 
 	// A config that does not build is refused, and the message names the problem.
@@ -154,20 +213,20 @@ func TestSettingsValidationAndUpstreamAllowList(t *testing.T) {
 // A user must not be able to raise their own cap or grant themselves manager.
 func TestSelfEscalationIsRefusedOverHTTP(t *testing.T) {
 	f := ctlFixture(t)
-	w, _ := f.do(t, "POST", "/api/register", `{"email":"a@ibm.com","label":"l"}`, nil)
+	w, _ := f.signUp(t, "a@ibm.com", "l")
 	jar := w.Result().Cookies()
 	me := f.mustMe(t, jar)
 
-	// PUT /api/me has no cap or role field at all, so the strict decoder rejects the
+	// PUT /api/me has no quota or role field at all, so the strict decoder rejects the
 	// attempt outright rather than silently ignoring it.
-	w, _ = f.do(t, "PUT", "/api/me", `{"monthly_cap_usd":999999}`, jar)
+	w, _ = f.do(t, "PUT", "/api/me", `{"max_rows":999999}`, jar)
 	if w.Code != http.StatusBadRequest {
-		t.Errorf("self cap raise via /api/me = %d, want 400", w.Code)
+		t.Errorf("self quota raise via /api/me = %d, want 400", w.Code)
 	}
 	// And the manager route refuses a non-manager.
-	w, _ = f.do(t, "PATCH", "/api/tenants/"+me, `{"monthly_cap_usd":999999}`, jar)
+	w, _ = f.do(t, "PATCH", "/api/tenants/"+me, `{"max_rows":999999}`, jar)
 	if w.Code != http.StatusForbidden {
-		t.Errorf("self cap raise via the manager route = %d, want 403", w.Code)
+		t.Errorf("self quota raise via the manager route = %d, want 403", w.Code)
 	}
 	w, _ = f.do(t, "PATCH", "/api/tenants/"+me, `{"role":"manager"}`, jar)
 	if w.Code != http.StatusForbidden {
@@ -188,9 +247,9 @@ func (f *hostedFixture) mustMe(t *testing.T, jar []*http.Cookie) string {
 
 func TestManagerCanAdministerAndAuditRecordsIt(t *testing.T) {
 	f := ctlFixture(t)
-	w, _ := f.do(t, "POST", "/api/register", `{"email":"boss@ibm.com","label":"l"}`, nil)
+	w, _ := f.signUp(t, "boss@ibm.com", "l")
 	mgrJar := w.Result().Cookies()
-	w, _ = f.do(t, "POST", "/api/register", `{"email":"a@ibm.com","label":"l"}`, nil)
+	w, _ = f.signUp(t, "a@ibm.com", "l")
 	userJar := w.Result().Cookies()
 	target := f.mustMe(t, userJar)
 
@@ -198,12 +257,12 @@ func TestManagerCanAdministerAndAuditRecordsIt(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("manager roster = %d", w.Code)
 	}
-	w, out := f.do(t, "PATCH", "/api/tenants/"+target, `{"monthly_cap_usd":12.5,"disabled":true}`, mgrJar)
+	w, out := f.do(t, "PATCH", "/api/tenants/"+target, `{"max_rows":1250,"disabled":true}`, mgrJar)
 	if w.Code != http.StatusOK {
 		t.Fatalf("manager patch = %d %s", w.Code, w.Body)
 	}
 	tn, _ := out["tenant"].(map[string]any)
-	if tn["monthly_cap_usd"] != 12.5 || tn["disabled"] != true {
+	if tn["max_rows"] != 1250.0 || tn["disabled"] != true {
 		t.Errorf("patch did not apply: %v", tn)
 	}
 	// Disabling must also end the browser session, or a disabled user keeps reading
@@ -227,9 +286,9 @@ func TestManagerCanAdministerAndAuditRecordsIt(t *testing.T) {
 // since tokens are stored hashed.
 func TestManagerCanReissueAToken(t *testing.T) {
 	f := ctlFixture(t)
-	w, _ := f.do(t, "POST", "/api/register", `{"email":"boss@ibm.com","label":"l"}`, nil)
+	w, _ := f.signUp(t, "boss@ibm.com", "l")
 	mgrJar := w.Result().Cookies()
-	w, _ = f.do(t, "POST", "/api/register", `{"email":"a@ibm.com","label":"l"}`, nil)
+	w, _ = f.signUp(t, "a@ibm.com", "l")
 	target := f.mustMe(t, w.Result().Cookies())
 
 	w, out := f.do(t, "POST", "/api/tenants/"+target+"/tokens", `{"label":"reissued"}`, mgrJar)
@@ -248,7 +307,7 @@ func TestManagerCanReissueAToken(t *testing.T) {
 
 func TestLogoutEndsTheSession(t *testing.T) {
 	f := ctlFixture(t)
-	w, _ := f.do(t, "POST", "/api/register", `{"email":"a@ibm.com","label":"l"}`, nil)
+	w, _ := f.signUp(t, "a@ibm.com", "l")
 	jar := w.Result().Cookies()
 	if w2, _ := f.do(t, "GET", "/api/me", "", jar); w2.Code != http.StatusOK {
 		t.Fatalf("pre-logout /api/me = %d", w2.Code)
@@ -265,7 +324,7 @@ func TestLogoutEndsTheSession(t *testing.T) {
 // operator's URLs or credential variable names to a tenant.
 func TestOptionsExposesNamesNotSecrets(t *testing.T) {
 	f := ctlFixture(t)
-	w, _ := f.do(t, "POST", "/api/register", `{"email":"a@ibm.com","label":"l"}`, nil)
+	w, _ := f.signUp(t, "a@ibm.com", "l")
 	jar := w.Result().Cookies()
 	w, out := f.do(t, "GET", "/api/options", "", jar)
 	if w.Code != http.StatusOK {
@@ -289,7 +348,8 @@ func TestControlPlaneAbsentInSingleTenantMode(t *testing.T) {
 	h := New(components.NewPipeline(nil, nil), store.NewMemory(store.Options{}), nil, Options{})
 	defer h.Close()
 	mux := h.Mux()
-	for _, p := range []string{"/api/register", "/api/login", "/api/me", "/api/tenants"} {
+	for _, p := range []string{"/api/register", "/api/login", "/api/me", "/api/tenants",
+		"/api/feedback"} {
 		r := httptest.NewRequest("GET", p, nil)
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, r)
@@ -307,7 +367,9 @@ var _ = tenant.DefaultConfigYAML
 // as "my configuration is gone".
 func TestMeCarriesTheEffectiveConfigAndWhoOwnsIt(t *testing.T) {
 	f := ctlFixture(t)
-	w, _ := f.do(t, "POST", "/api/register", `{"email":"a@ibm.com","label":"l"}`, nil)
+	// A manager, because customising through PUT /api/me is a manager's action now; the
+	// inherited/own distinction it asserts is the same one a user's page reads.
+	w, _ := f.signUp(t, "boss@ibm.com", "l")
 	jar := w.Result().Cookies()
 
 	_, out := f.do(t, "GET", "/api/me", "", jar)
@@ -353,9 +415,9 @@ func TestMeCarriesTheEffectiveConfigAndWhoOwnsIt(t *testing.T) {
 // Configuration column would look like a broken account rather than a tracking one.
 func TestManagerRosterShowsTheEffectiveConfig(t *testing.T) {
 	f := ctlFixture(t)
-	w, _ := f.do(t, "POST", "/api/register", `{"email":"boss@ibm.com","label":"l"}`, nil)
+	w, _ := f.signUp(t, "boss@ibm.com", "l")
 	mgrJar := w.Result().Cookies()
-	f.do(t, "POST", "/api/register", `{"email":"a@ibm.com","label":"l"}`, nil)
+	f.signUp(t, "a@ibm.com", "l")
 
 	w, out := f.do(t, "GET", "/api/tenants", "", mgrJar)
 	if w.Code != http.StatusOK {
@@ -381,7 +443,7 @@ func TestManagerRosterShowsTheEffectiveConfig(t *testing.T) {
 // "never used" render as a date in year 1. Cheap bug, expensive symptom.
 func TestZeroTimesSerialiseAsZero(t *testing.T) {
 	f := ctlFixture(t)
-	w, _ := f.do(t, "POST", "/api/register", `{"email":"a@ibm.com","label":"l"}`, nil)
+	w, _ := f.signUp(t, "a@ibm.com", "l")
 	jar := w.Result().Cookies()
 
 	// /api/me rather than /api/whoami: whoami is mounted by dash.API, which this fixture
@@ -414,8 +476,8 @@ func TestZeroTimesSerialiseAsZero(t *testing.T) {
 func TestDashWhoamiReportsRegistrationMode(t *testing.T) {
 	f := newHostedFixture(t, "up", "anthropic")
 	for _, tc := range []struct{ env, want string }{
-		{"", "closed"},
-		{"nonsense", "closed"},
+		{"", "open"},
+		{"nonsense", "open"},
 		{"closed", "closed"},
 		{"invite", "invite"},
 		{"INVITE", "invite"},
@@ -449,5 +511,69 @@ func TestDashWhoamiNeverLeaksTheInviteCode(t *testing.T) {
 	}
 	if strings.Contains(string(body), "correct-horse-battery-staple") {
 		t.Fatalf("the invite code is in the whoami payload: %s", body)
+	}
+}
+
+// The plaintext token exists for exactly one response, and then only as a hash. This
+// test pins all three halves of that claim at once, because each is a different way for
+// the same secret to escape:
+//
+//  1. every authenticated READ of the account afterwards — none may echo it;
+//  2. captured transcript content — the redactor must scrub the shape;
+//  3. a log record — the logging scrubber must scrub it too, whichever slot it lands in.
+//
+// The reveal on the Setup tab is the reason this matters more than it used to: the UI now
+// renders the plaintext, so a regression that also puts it in a log line would put a live
+// credential in Loki.
+func TestFirstTokenIsRevealedOnceAndNowhereElse(t *testing.T) {
+	f := ctlFixture(t)
+	w, out := f.signUp(t, "reveal@ibm.com", "laptop")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("register = %d %s", w.Code, w.Body)
+	}
+	tok, _ := out["token"].(string)
+	if !tenant.LooksLikeToken(tok) {
+		t.Fatalf("registration did not reveal a token: %v", out)
+	}
+	var jar []*http.Cookie
+	for _, c := range w.Result().Cookies() {
+		if c.Name == dashCookie && c.Value != "" {
+			jar = append(jar, c)
+		}
+	}
+
+	// 1. Every read the account can perform. A later read that returns the plaintext
+	//    would make "shown once" a lie, and the Setup tab's warning a lie with it.
+	for _, path := range []string{"/api/me", "/api/me/sessions", "/api/me/audit", "/api/options"} {
+		rw, _ := f.do(t, "GET", path, "", jar)
+		if rw.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d %s", path, rw.Code, rw.Body)
+		}
+		if strings.Contains(rw.Body.String(), tok) {
+			t.Errorf("GET %s returned the plaintext token", path)
+		}
+	}
+	// Signing in again is the other way a client could ask for it back.
+	rw, again := f.signIn(t, "reveal@ibm.com")
+	if rw.Code != http.StatusOK {
+		t.Fatalf("sign in = %d %s", rw.Code, rw.Body)
+	}
+	if again["token"] != nil {
+		t.Errorf("signing in handed out a token: %v", again["token"])
+	}
+
+	// 2. Captured content. Headers are not recorded at all, but a user who pastes their
+	//    own token into a prompt must not have it stored.
+	if got := dash.RedactContent("run: curl -H 'x-context-guru-token: "+tok+"' https://x", 0); strings.Contains(got, tok) {
+		t.Errorf("the capture redactor stored the token: %s", got)
+	}
+
+	// 3. A log record, in the two shapes a mistake takes: interpolated into the message,
+	//    and passed as an attribute value.
+	var buf bytes.Buffer
+	lg := slog.New(logging.New(&buf, slog.LevelInfo, false))
+	lg.Info("cg.auth token="+tok, "presented", tok)
+	if strings.Contains(buf.String(), tok) {
+		t.Errorf("the log scrubber let the token through: %s", buf.String())
 	}
 }

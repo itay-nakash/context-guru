@@ -57,7 +57,14 @@ func Open(path string) (*DB, error) {
 		// back to :memory: silently merged their history, and :memory: tests leaked rows
 		// into each other (the flakiest possible failure). A per-instance name keeps the
 		// pooling behaviour and removes the collision.
-		return openDSN(fmt.Sprintf("file:dashmem%d?mode=memory&cache=shared", memSeq.Add(1)), "")
+		// foreign_keys(1) here as well as in dsn(): the ON DELETE CASCADE from requests to
+		// request_components / request_content is how retention, eviction and a tenant purge
+		// avoid leaving orphan rows, and the pragma is PER CONNECTION. Without it every
+		// in-memory database in this package — which is every test — quietly kept its child
+		// rows while the file-backed deployment deleted them, so the tests could not see the
+		// bug they were meant to catch.
+		return openDSN(fmt.Sprintf("file:dashmem%d?mode=memory&cache=shared&_pragma=foreign_keys(1)",
+			memSeq.Add(1)), "")
 	}
 	if dir := filepath.Dir(path); dir != "" {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -241,8 +248,12 @@ func (d *DB) insertBatch(evs []*Event) error {
 		messages, tokens_before, tokens_after, attempted_tokens, frozen_tokens, saved_unique,
 		fresh_input, cache_read, cache_write, output_tokens,
 		cost_usd, baseline_cost_usd, cg_llm_cost_usd, cg_latency_ms, upstream_ms,
-		expands, expand_tokens, reverts, token_accounting, cache_miss_reason, uncompressed_reason
-	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+		expands, expand_tokens, reverts, token_accounting, cache_miss_reason, uncompressed_reason,
+		reasoning_effort, thinking_mode, thinking_budget, temperature, top_p, max_tokens, stream,
+		tool_choice, tools, system_blocks,
+		cache_bp_system, cache_bp_tools, cache_bp_messages, cache_bp_blocks, stop_reason
+	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+		?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		return err
 	}
@@ -271,6 +282,9 @@ func (d *DB) insertBatch(evs []*Event) error {
 			e.FreshInput, e.CacheRead, e.CacheWrite, e.OutputTokens,
 			e.CostUSD, e.BaselineCostUSD, e.CGLLMCostUSD, e.CGLatencyMs, e.UpstreamMs,
 			e.Expands, e.ExpandTokens, e.Reverts, e.TokenAccounting, e.CacheMissReason, e.UncompressedReason,
+			e.ReasoningEffort, e.ThinkingMode, e.ThinkingBudget, e.Temperature, e.TopP, e.MaxTokens,
+			boolInt(e.Stream), e.ToolChoice, e.Tools, e.SystemBlocks,
+			e.CacheBPSystem, e.CacheBPTools, e.CacheBPMessages, e.CacheBPBlocks, e.StopReason,
 		)
 		if err != nil {
 			return err
@@ -399,6 +413,12 @@ func (d *DB) Prune(now time.Time, maxAge time.Duration, maxBytes int64) (int64, 
 		if drop < 1 {
 			drop = 1
 		}
+		// No tenant column, and there cannot be one — a byte budget is a property of
+		// the whole file. That is why the per-tenant row quota runs BEFORE this
+		// (Recorder.janitorPass): reached while one tenant's traffic is what put the
+		// database over budget, this statement evicts the QUIET tenants, because
+		// theirs are the oldest rows it selects.
+		//
 		// Row-granular, deliberately, and this is the ONE rule that is. The byte
 		// budget is a hard cap the operator asked to be honoured, and it has to be
 		// satisfiable even when everything in the database belongs to a single

@@ -25,6 +25,7 @@ Lossy but reversible — the duplicated output is stashed and recovered via `con
 | Key | Default | Meaning |
 |---|---|---|
 | `min_tokens` | 100 | Skip outputs smaller than this token count. |
+| `marker_mode` | `full` | `full` (stash + resolvable marker) / `summary` / `off`. |
 
 ## When it shines
 

@@ -139,6 +139,11 @@ const state = {
   sessOffset: 0,
   live: [],
   overview: null,
+  // dim is which dimension the Usage breakdown groups by. Not a FILTER — it selects a
+  // view of the same filtered window, so it is deliberately outside state.filter and
+  // outside the URL: it narrows nothing, and a chip for it would claim it did.
+  // ponytail: not URL-persisted; put it in the query string if sharing a breakdown link matters.
+  dim: 'model',
   // What the drawer is showing, and part of the URL: {req: id} | {diff: session} | null.
   drawer: null,
   // ac aborts every fetch belonging to the PREVIOUS filter state. Without it a slow
@@ -294,7 +299,11 @@ function lineChart(host, series, opts = {}) {
   const xs = live.flatMap((s) => s.points.map((p) => p[0]));
   const ys = live.flatMap((s) => s.points.map((p) => p[1]));
   const xMin = Math.min(...xs), xMax = Math.max(...xs);
-  const yMin = Math.min(0, ...ys), yMax = Math.max(...ys) || 1;
+  // opts.yMax pins the top of the scale when the measure has a KNOWN ceiling: a mean out
+  // of five whose axis stops at the highest observed value draws 4.0 hard against the top
+  // of the plot, which reads as "as good as it gets". Real data above the pin still wins,
+  // so this can only widen the axis and never clips a point.
+  const yMin = Math.min(0, ...ys), yMax = Math.max(opts.yMax || 0, ...ys) || 1;
   const { w, h, pad } = geom(host);
   const px = (x) => pad.l + (xMax === xMin ? 0 : ((x - xMin) / (xMax - xMin)) * (w - pad.l - pad.r));
   const py = (y) => h - pad.b - ((y - yMin) / (yMax - yMin || 1)) * (h - pad.t - pad.b);
@@ -387,7 +396,15 @@ function lineChart(host, series, opts = {}) {
     el('span', {}, el('i', { style: 'background:' + s.color }), s.name))));
 }
 
-/** barRows(host, rows) — rows: [{label, value, display, max, negative, desc}] */
+/**
+ * barRows(host, rows) — rows: [{label, value, display, max, desc, formula, color, available}]
+ *
+ * `formula` stays in the layout; `desc` folds into a disclosure. That split is the point:
+ * five bars each carrying three lines of prose put fifteen lines of documentation between
+ * the reader and the next number — but two ratios that differ ONLY in their divisor must
+ * never look like the same measurement, so the arithmetic stays on screen and only the
+ * explanation becomes opt-in.
+ */
 function barRows(host, rows, opts = {}) {
   clear(host);
   if (!rows.length) { emptyState(host, 'Nothing to show yet', opts.emptyDetail || ''); return; }
@@ -402,10 +419,79 @@ function barRows(host, rows, opts = {}) {
         style: 'width:' + width + '%' + (r.color ? ';background:' + r.color : ''),
       })),
       el('div', { class: 'bar-val' + (r.available === false ? ' na' : ''), text: r.display }));
+    if (r.formula) row.appendChild(el('div', { class: 'bar-formula', text: r.formula }));
     wrap.appendChild(row);
-    if (r.desc) wrap.appendChild(el('div', { class: 'bar-desc', text: r.desc }));
+    if (r.desc) wrap.appendChild(whyBlock('', r.desc, r.descSummary || opts.descSummary || ('Why: ' + r.label)));
   }
   host.appendChild(wrap);
+}
+
+/**
+ * whyBlock is the single disclosure used everywhere a long explanation used to sit
+ * permanently in the layout. Native <details>: focusable and keyboard-operable for free,
+ * no JS, and collapsed by default so the prose costs nothing until it is wanted.
+ *
+ * An empty `summary` draws the glyph-only form (see .bars > details.why), which needs
+ * `label` to carry the accessible name a visible word would otherwise have provided.
+ */
+function whyBlock(summary, text, label) {
+  return el('details', { class: 'why' },
+    el('summary', { text: summary, 'aria-label': label || null, title: label || null }),
+    el('p', { text: text }));
+}
+
+/**
+ * SERIES_SPENT / SERIES_SAVED are the two categorical slots of the spent-against-saved
+ * comparison, taken from the design system's fixed series order (--s1 first, --s3 third)
+ * rather than picked by eye. Validated as a pair against both the light and the dark chart
+ * surface: lightness band, chroma floor, deuteranopia separation (ΔE 19.6 light / 17.5
+ * dark) and 3:1 contrast all pass.
+ *
+ * Blue against green is the one pair tritanopia struggles with (ΔE ~4), which is why every
+ * bar below is DIRECTLY LABELLED with its own value and the legend is always present:
+ * identity never rests on the hue alone.
+ */
+const SERIES_SPENT = SERIES[0];
+const SERIES_SAVED = SERIES[2];
+
+/**
+ * pairedBars(host, rows) draws two bars per row against ONE shared scale.
+ *
+ * One scale, deliberately: both figures are dollars, and a second axis scaled to fit the
+ * smaller series would make a day that saved a tenth of what it spent look like a day that
+ * broke even. Both bars carry their own value as text, so the chart reads correctly with
+ * the colours ignored entirely.
+ *
+ * rows: [{label, a, b, aDisplay, bDisplay, note, unknown}]
+ *   a/b       the two magnitudes (a = spent, b = saved), signed
+ *   unknown   true when the group has no priced rows — drawn as no bars and the word
+ *             "unknown", never as a zero, which would read as "this cost nothing"
+ */
+function pairedBars(host, rows, opts = {}) {
+  clear(host);
+  if (!rows.length) { emptyState(host, opts.empty || 'Nothing to show yet', opts.emptyDetail || ''); return; }
+  const max = Math.max(...rows.flatMap((r) => [Math.abs(r.a || 0), Math.abs(r.b || 0)]), Number.MIN_VALUE);
+  const wrap = el('div', { class: 'bars' });
+  const bar = (v, color) => el('div', { class: 'bar-track' }, el('div', {
+    class: 'bar-fill' + (v < 0 ? ' neg' : ''),
+    style: 'width:' + Math.min(100, (Math.abs(v) / max) * 100) + '%' + (v >= 0 ? ';background:' + color : ''),
+  }));
+  for (const r of rows) {
+    wrap.appendChild(el('div', { class: 'bar-row' },
+      el('div', { class: 'bar-label', text: r.label },
+        r.note ? el('span', { class: 'bar-sub', text: r.note }) : null),
+      r.unknown ? el('div', { class: 'bar-track' }) : el('div', { class: 'bar-pair' },
+        bar(r.a || 0, SERIES_SPENT), bar(r.b || 0, SERIES_SAVED)),
+      el('div', { class: 'bar-val' + (r.unknown ? ' na' : '') },
+        el('div', { text: r.unknown ? 'unknown' : r.aDisplay }),
+        r.unknown ? null : el('div', { class: 'bar-val-b', text: r.bDisplay }))));
+  }
+  host.appendChild(wrap);
+  // A legend for two series is not optional: the swatch is what ties the second, thinner
+  // bar in each row to the word "saved".
+  host.appendChild(el('div', { class: 'legend' },
+    el('span', {}, el('i', { style: 'background:' + SERIES_SPENT }), opts.aLabel || 'Spent'),
+    el('span', {}, el('i', { style: 'background:' + SERIES_SAVED }), opts.bLabel || 'Saved')));
 }
 
 // ── overview ───────────────────────────────────────────────────────────────
@@ -437,52 +523,56 @@ function renderTiles(o) {
   // save money, did it save tokens, and over how much traffic. Everything else is the
   // evidence for those three, so it sits below them in labelled groups rather than
   // beside them at the same weight.
+  // A tile's sub-line is kept only where it carries a FACT the label cannot: a formula, a
+  // second number, or the distinguisher between two tiles that would otherwise read the
+  // same ("gross" vs "unique"). Anything that only restated the label is gone — "Tokens
+  // before / content tokens in" was a caption explaining a caption.
   host.appendChild(tileGroup(null, null, [
     tile('saved-usd', 'Net dollars saved', costKnown ? usd(o.net_saved_usd) : 'unknown',
-      'baseline − actual − our own spend', costKnown ? (o.net_saved_usd < 0 ? 'bad' : 'good') : ''),
+      'baseline − actual − our spend', costKnown ? (o.net_saved_usd < 0 ? 'bad' : 'good') : ''),
     tile('saved-unique', 'Tokens saved (unique)', compact(o.saved_unique),
-      'each compaction counted once', 'accent'),
+      'each compaction once', 'accent'),
     tile('requests', 'Requests', num(o.requests), num(o.sessions) + ' sessions'),
   ], 'headline'));
 
-  host.appendChild(tileGroup('Content tokens', 'what the pipeline removed, three ways of counting it', [
-    tile('tokens-before', 'Tokens before', compact(o.tokens_before), 'content tokens in'),
-    tile('tokens-after', 'Tokens after', compact(o.tokens_after), 'content tokens out'),
+  host.appendChild(tileGroup('Content tokens', 'three ways to count the same removal', [
+    tile('tokens-before', 'Tokens before', compact(o.tokens_before)),
+    tile('tokens-after', 'Tokens after', compact(o.tokens_after)),
     tile('saved-gross', 'Saved (gross)', compact(o.saved_gross), 'recounts re-sent history'),
     // The label has to name the UNIQUE calculation, which dominates this figure, and not
     // only the restore subtraction, which is usually zero: sitting between "Saved (gross)
     // 17k" and "Overcount 1.7×", "Saved (net of restores)" invited reading it as
     // gross-minus-restores and made a 10k number look like an arithmetic error.
-    tile('saved-adjusted', 'Saved (unique, less restores)', compact(o.saved_adjusted),
-      'unique − ' + compact(o.expand_tokens) + ' restored back', o.saved_adjusted < 0 ? 'bad' : ''),
+    tile('saved-adjusted', 'Saved (unique − restores)', compact(o.saved_adjusted),
+      compact(o.expand_tokens) + ' asked back', o.saved_adjusted < 0 ? 'bad' : ''),
     tile('overcount', 'Overcount ratio', o.overcount_ratio ? o.overcount_ratio.toFixed(1) + '×' : '—',
       'gross ÷ unique'),
   ]));
 
   host.appendChild(tileGroup('Cost', costKnown ? 'billed, and the counterfactual' : 'no priced requests in this window', [
     tile('cost-baseline', 'Baseline cost', costKnown ? usd(o.baseline_cost_usd) : 'unknown',
-      costKnown ? 'without context-guru' : 'needs all four token tiers'),
+      costKnown ? 'without context-guru' : 'needs all four tiers'),
     tile('cost-actual', 'Actual cost', costKnown ? usd(o.cost_usd) : 'unknown',
-      costKnown ? 'as billed' : 'needs all four token tiers'),
-    tile('cost-cg', "context-guru's own LLM", costKnown ? usd(o.cg_llm_cost_usd) : 'unknown',
-      'our components’ model spend'),
+      costKnown ? 'as billed' : 'needs all four tiers'),
+    tile('cost-cg', 'Our own LLM cost', costKnown ? usd(o.cg_llm_cost_usd) : 'unknown',
+      'extract_llm, summarize'),
   ]));
 
   host.appendChild(tileGroup('Billed tokens', 'the four tiers the provider charges on', [
-    tile('cache-read', 'Cache reads', compact(o.cache_read), 'billed at the read rate'),
+    tile('cache-read', 'Cache reads', compact(o.cache_read)),
     tile('cache-write', 'Cache writes', compact(o.cache_write), '~11.5× a read'),
-    tile('fresh-input', 'Fresh input', compact(o.fresh_input), 'uncached new tokens'),
-    tile('output', 'Output tokens', compact(o.output_tokens), 'completions'),
+    tile('fresh-input', 'Fresh input', compact(o.fresh_input)),
+    tile('output', 'Output tokens', compact(o.output_tokens)),
   ]));
 
-  host.appendChild(tileGroup('Latency and safety', 'what compaction cost to get', [
+  host.appendChild(tileGroup('Latency and safety', 'the price of compaction', [
     tile('cg-latency', 'context-guru latency', ms(o.cg_latency_ms_avg), 'p95 ' + ms(o.cg_latency_ms_p95)),
     tile('upstream-latency', 'Upstream latency', ms(o.upstream_ms_avg), 'p95 ' + ms(o.upstream_ms_p95)),
     tile('expands', 'Restorations', num(o.expands),
       pct(o.expand_rate * 100) + ' of requests · ' + compact(o.expand_tokens) + ' tok',
       o.expands > 0 ? 'bad' : ''),
-    tile('reverts', 'Reverts', num(o.reverts), 'never-worse guard fired'),
-    tile('passthroughs', 'Not compacted', num(o.passthroughs), 'see reason buckets below'),
+    tile('reverts', 'Reverts', num(o.reverts), 'never-worse guard'),
+    tile('passthroughs', 'Not compacted', num(o.passthroughs)),
   ]));
 }
 
@@ -493,7 +583,13 @@ function renderDenominators(o) {
     max: 100,
     display: d.available ? pct(d.percent, 2) : 'n/a',
     available: d.available,
-    desc: d.description + (d.available ? `  (${compact(d.numerator)} ÷ ${compact(d.denominator)} tokens)` : ''),
+    // The divisor is what makes these four bars four different measurements, so it is the
+    // half that stays visible. The prose folds.
+    formula: d.available
+      ? `${compact(d.numerator)} ÷ ${compact(d.denominator)} tokens`
+      : 'inputs unavailable in this window',
+    desc: d.description,
+    descSummary: 'Why this denominator',
   })), { emptyDetail: 'No requests match the filter.' });
 }
 
@@ -515,7 +611,7 @@ function renderWaterfall(o) {
         class: 'bar-fill', style: `width:${(Math.abs(s.delta_usd) / max) * 100}%;background:${color}`,
       })),
       el('div', { class: 'bar-val', text: (s.delta_usd < 0 ? '−' : s.total ? '' : '+') + usd(Math.abs(s.delta_usd)) })));
-    wrap.appendChild(el('div', { class: 'bar-desc', text: s.description }));
+    wrap.appendChild(whyBlock('', s.description, 'Why: ' + s.label));
   }
   host.appendChild(wrap);
 }
@@ -542,10 +638,11 @@ function renderSafety(o) {
   // the one row that is a genuine PENALTY rather than a price gets the status colour.
   barRows($('#safety'), [
     { label: 'Frozen for cache safety', value: s.frozen_tokens || 0, display: compact(s.frozen_tokens) + ' tok',
+      formula: 'bought ' + compact(o.cache_read) + ' cheap cache reads',
       desc: 'Compaction we deliberately did NOT do on the already-cached prefix. The benefit ' +
             'is the ' + compact(o.cache_read) + ' cache-read tokens that stayed cheap; the cost is this.' },
     { label: 'Restored after offload', value: s.restored_tokens || 0, display: compact(s.restored_tokens) + ' tok',
-      color: 'var(--bad)',
+      color: 'var(--bad)', formula: 'paid for twice',
       desc: 'Content we removed and the model asked back for — a premature offload, paid for twice.' },
     { label: 'Reverted component runs', value: s.reverted_runs || 0, display: num(s.reverted_runs) + ' runs',
       desc: 'The never-worse guard rolling a component back. Safety working, and its cost is the ' +
@@ -553,7 +650,8 @@ function renderSafety(o) {
     { label: "context-guru's own latency", value: s.cg_latency_ms_total || 0, display: dur(s.cg_latency_ms_total),
       desc: 'Total wall time context-guru itself added across the window.' },
     { label: "context-guru's own LLM spend", value: (s.cg_llm_cost_usd || 0) * 1000, display: usd(s.cg_llm_cost_usd),
-      desc: 'Paid out of the savings above.' },
+      formula: 'paid out of the savings above',
+      desc: "context-guru's own model calls (extract_llm, summarize), paid out of the savings above." },
   ]);
 }
 
@@ -565,8 +663,7 @@ function renderLive() {
   const active = activeFilters();
   note.hidden = !active.length;
   if (active.length) {
-    note.textContent = 'Not filtered: this feed shows every request captured, including ones ' +
-      'outside ' + describeFilters() + '. Everything else on this page is filtered.';
+    note.textContent = 'Not filtered — shows traffic outside ' + describeFilters() + ' too.';
   }
   if (!state.live.length) {
     tableMessage(body, 8, 'Waiting for traffic',
@@ -698,6 +795,95 @@ function verdict(c) {
   return ['earning its place', 'complete'];
 }
 
+/** DAY_MS is dash.DayMs: per-day bars are the shared time series at a day-wide bucket. */
+const DAY_MS = 86400000;
+
+/** Labels for the breakdown dimensions the server offers. Unknown keys fall back to the
+ *  raw name, so a dimension added server-side appears in the picker without a UI change. */
+const DIM_LABELS = {
+  model: 'model', provider: 'provider', agent: 'agent', preset: 'preset', mode: 'mode',
+  reasoning_effort: 'reasoning effort', thinking_mode: 'thinking mode',
+  stop_reason: 'stop reason', tool_choice: 'tool choice',
+  cache_miss_reason: 'cache outcome', cache_breakpoints: 'cache_control breakpoints',
+  stream: 'streaming',
+};
+
+async function loadUsage() {
+  const dayHost = $('#chart-daily');
+  const breakHost = $('#chart-breakdown');
+  const body = clear($('#breakdown-body'));
+  loadingRows(body, 8);
+  try {
+    // Per-day bars need no endpoint of their own: the series is bucketed in SQL from the
+    // raw timestamp, so a day-wide bucket is a query parameter.
+    const [{ buckets }, bd] = await Promise.all([
+      api('series', { bucket: DAY_MS }),
+      api('breakdown', { dim: state.dim }),
+    ]);
+    pairedBars(dayHost, (buckets || []).map((b) => ({
+      label: new Date(b.ts).toISOString().slice(0, 10),
+      note: num(b.requests) + ' requests · ' + compact(b.tokens_before) + ' → ' + compact(b.tokens_after) + ' tokens',
+      a: b.cost_usd + b.cg_llm_cost_usd,
+      b: b.saved_usd,
+      aDisplay: usd(b.cost_usd + b.cg_llm_cost_usd),
+      bDisplay: usd(b.saved_usd),
+      unknown: b.baseline_cost_usd === 0 && b.cost_usd === 0,
+    })), {
+      empty: 'No days in this window',
+      emptyDetail: 'Send traffic through the proxy, or widen the time range.',
+    });
+
+    syncDimPicker(bd.dimensions || []);
+    $('#breakdown-key-head').textContent = DIM_LABELS[bd.dim] || bd.dim;
+    const groups = bd.groups || [];
+    clear(body);
+    if (!groups.length) {
+      tableMessage(body, 8, 'Nothing to break down', 'No requests match the current filters.');
+      emptyState(breakHost, 'Nothing to break down', 'No requests match the current filters.');
+      return;
+    }
+    pairedBars(breakHost, groups.map((g) => ({
+      label: g.key || '(not set)',
+      note: num(g.requests) + ' requests',
+      a: g.spent_usd,
+      b: g.saved_usd,
+      aDisplay: usd(g.spent_usd),
+      bDisplay: usd(g.saved_usd),
+      // Every row unpriced means the money figures for this bar are unknown, not zero.
+      unknown: g.incomplete_rows >= g.requests,
+    })));
+    for (const g of groups) {
+      const unpriced = g.incomplete_rows >= g.requests;
+      body.appendChild(el('tr', {},
+        el('td', { text: g.key || '(not set)' }),
+        el('td', { class: 'num', text: num(g.requests) }),
+        el('td', { class: 'num', text: compact(g.tokens_before) }),
+        el('td', { class: 'num', text: compact(g.tokens_after) }),
+        el('td', { class: 'num', text: compact(g.saved_unique) }),
+        el('td', { class: 'num' + (unpriced ? ' na' : ''), text: unpriced ? 'unknown' : usd(g.spent_usd) }),
+        el('td', { class: 'num' + (unpriced ? ' na' : ''), text: unpriced ? 'unknown' : usd(g.saved_usd) }),
+        el('td', { class: 'num', text: num(g.incomplete_rows) })));
+    }
+  } catch (err) {
+    if (aborted(err)) return;
+    clear(body);
+    tableMessage(body, 8, 'Could not load the breakdown', err.message);
+    emptyState(breakHost, 'Could not load the breakdown', err.message, { error: true });
+    emptyState(dayHost, 'Could not load daily usage', err.message, { error: true });
+  }
+}
+
+/** syncDimPicker fills the dimension picker from what the SERVER says it can group by,
+ *  so the options can never name a dimension the query would reject. */
+function syncDimPicker(dims) {
+  const sel = $('#f-dim');
+  if (sel.options.length !== dims.length) {
+    clear(sel);
+    for (const d of dims) sel.appendChild(el('option', { value: d }, DIM_LABELS[d] || d));
+  }
+  sel.value = state.dim;
+}
+
 async function loadComponents() {
   const body = clear($('#components-body'));
   loadingRows(body, 13);
@@ -734,7 +920,10 @@ async function loadComponents() {
     const top = components.filter((c) => c.saved_unique > 0).slice(0, 12);
     barRows($('#chart-comp'), top.map((c) => ({
       label: c.component, value: c.saved_unique, display: compact(c.saved_unique) + ' tok',
-      desc: `${num(c.runs)} runs, acted on ${pct(c.act_rate * 100, 1)}, own latency ${dur(c.duration_ms_total)}, ` +
+      // Figures, not prose, so they go in the always-visible slot rather than behind a
+      // disclosure: eight collapsed glyphs would each hide four numbers and cost a line to
+      // do it.
+      formula: `${num(c.runs)} runs · acted ${pct(c.act_rate * 100, 1)} · own latency ${dur(c.duration_ms_total)} · ` +
             `overcount ${c.overcount_ratio ? c.overcount_ratio.toFixed(1) + '×' : 'n/a'}`,
     })), { emptyDetail: 'No component saved any content tokens in this window.' });
   } catch (err) {
@@ -1129,6 +1318,32 @@ function attributionChips(c, components) {
 
 function kv(k, v) { return el('div', {}, el('div', { class: 'k', text: k }), el('div', { class: 'v', text: v })); }
 
+/** kvNode is kv() for a value that is a NODE rather than a string (the breakpoint chips). */
+function kvNode(k, node) { return el('div', {}, el('div', { class: 'k', text: k }), el('div', { class: 'v' }, node)); }
+
+/**
+ * kvUnset prints a value the client never set as the WORD "unset", styled as absent.
+ *
+ * The distinction is the whole reason temperature and top_p are nullable columns:
+ * `temperature: 0` means "be deterministic" and a missing temperature means "you choose".
+ * An em dash was already honest, but italic "unset" cannot be misread as a dash-shaped
+ * zero — and it never renders 0 for an absent value, which is the invariant.
+ */
+function kvMaybe(k, v, fmt) {
+  if (v === null || v === undefined || v === '') {
+    return el('div', {}, el('div', { class: 'k', text: k }),
+      el('div', { class: 'v unset', text: 'unset' }));
+  }
+  return kv(k, fmt ? fmt(v) : String(v));
+}
+
+/** kvBand groups a set of pairs under a caption. */
+function kvBand(title, testid, ...pairs) {
+  return el('div', { class: 'kv-band' },
+    el('h3', { text: title }),
+    el('div', { class: 'kv', 'data-testid': testid }, ...pairs.flat().filter(Boolean)));
+}
+
 /**
  * diffBlock builds one collapsible before/after block for a rewritten message: the
  * summary line, the view-mode toolbar, the attribution chips and the diff itself.
@@ -1246,7 +1461,12 @@ async function openRequest(id, fromURL) {
       content_archived: archived, capture_blocked_by: blockedBy } = await res.json();
     clear(body);
 
-    body.appendChild(el('div', { class: 'kv', 'data-testid': 'detail-summary' },
+    // Four captioned bands rather than twenty-four pairs in one grid. Same data, same
+    // testid on the first band (the checks and the docs screenshots read it), but "what
+    // this request was" / "what it moved" / "what it cost" are three questions and the flat
+    // wall answered them in one undifferentiated scan.
+    const priced = e.token_accounting === 'complete';
+    body.appendChild(kvBand('Request', 'detail-summary',
       kv('Session', e.session_id || '—'),
       kv('When', when(e.ts)),
       kv('Model', e.model || '—'),
@@ -1255,23 +1475,65 @@ async function openRequest(id, fromURL) {
       kv('Preset', e.preset || '—'),
       kv('Mode', modeLabel(e.mode)),
       kv('Upstream status', e.status || '—'),
-      kv('Messages', num(e.messages)),
-      kv('Tokens before → after', compact(e.tokens_before) + ' → ' + compact(e.tokens_after)),
+      kv('Messages', num(e.messages))));
+
+    body.appendChild(kvBand('Tokens', 'detail-tokens',
+      kv('Before → after', compact(e.tokens_before) + ' → ' + compact(e.tokens_after)),
       kv('Saved (gross / unique)', compact(e.tokens_before - e.tokens_after) + ' / ' + compact(e.saved_unique)),
       kv('Attempted (eligible)', compact(e.attempted_tokens)),
       kv('Frozen for cache safety', compact(e.frozen_tokens)),
       kv('Fresh / read / write / out',
         [e.fresh_input, e.cache_read, e.cache_write, e.output_tokens].map(compact).join(' / ')),
-      kv('Cost (actual / baseline)', e.token_accounting === 'complete'
-        ? usd(e.cost_usd) + ' / ' + usd(e.baseline_cost_usd) : 'not priced'),
-      kv("context-guru's own LLM", e.token_accounting === 'complete' ? usd(e.cg_llm_cost_usd) : '—'),
+      kv('Token accounting', e.token_accounting)));
+
+    body.appendChild(kvBand('Cost and latency', 'detail-cost',
+      kv('Cost (actual / baseline)', priced ? usd(e.cost_usd) + ' / ' + usd(e.baseline_cost_usd) : 'not priced'),
+      kv('Our own LLM cost', priced ? usd(e.cg_llm_cost_usd) : '—'),
       kv('context-guru latency', ms(e.cg_latency_ms)),
       kv('Upstream latency', ms(e.upstream_ms)),
       kv('Restorations', num(e.expands) + ' (' + compact(e.expand_tokens) + ' tok)'),
       kv('Reverts', num(e.reverts)),
       kv('Cache attribution', e.cache_miss_reason || '—'),
-      kv('Token accounting', e.token_accounting),
       kv('Compaction outcome', e.uncompressed_reason || 'compacted')));
+
+    // The request's own metadata: what the client ASKED for. Separate from the bands above,
+    // which are what happened to it. kvMaybe() prints an absent value as "unset" and a zero
+    // as 0 — the API sends null for "not set" and 0 for "be deterministic", and collapsing
+    // the two would misreport every deterministic request.
+    body.appendChild(el('h2', { text: 'What the request asked for' }));
+    body.appendChild(el('div', { class: 'kv', 'data-testid': 'detail-meta' },
+      kvMaybe('Reasoning effort', e.reasoning_effort),
+      kv('Thinking', e.thinking_mode
+        ? e.thinking_mode + (e.thinking_budget ? ' (' + compact(e.thinking_budget) + ' token budget)' : '')
+        : 'unset'),
+      kvMaybe('Temperature', e.temperature),
+      kvMaybe('top_p', e.top_p),
+      kvMaybe('max_tokens', e.max_tokens || null, num),
+      kv('Streaming', e.stream ? 'yes' : 'no'),
+      kvMaybe('Tool choice', e.tool_choice),
+      kv('Tools declared', num(e.tools)),
+      kv('System blocks', num(e.system_blocks)),
+      kvMaybe('Stop reason', e.stop_reason)));
+
+    // Placement, not just a count: tools and system render ahead of messages, so a
+    // breakpoint's LOCATION decides how much of the prefix it protects. Four labelled slots
+    // rather than one run-on string that wrapped mid-clause and read as a sentence.
+    const bpTotal = e.cache_bp_system + e.cache_bp_tools + e.cache_bp_messages + e.cache_bp_blocks;
+    body.appendChild(el('div', { class: 'kv' },
+      // Full width: four labelled slots do not fit a 184px grid cell, and wrapped over
+      // three lines they stopped reading as four separate measurements.
+      el('div', { class: 'kv-wide' },
+        el('div', { class: 'k', text: 'cache_control breakpoints · ' + num(bpTotal) + ' of the provider’s 4' }),
+        el('div', { class: 'v' }, el('div', { class: 'bp', 'data-testid': 'detail-breakpoints' },
+          el('span', { class: e.cache_bp_system ? 'on' : '' }, 'system ', el('b', { text: num(e.cache_bp_system) })),
+          el('span', { class: e.cache_bp_tools ? 'on' : '' }, 'tools ', el('b', { text: num(e.cache_bp_tools) })),
+          el('span', { class: e.cache_bp_messages ? 'on' : '' }, 'messages ', el('b', { text: num(e.cache_bp_messages) })),
+          el('span', { class: e.cache_bp_blocks ? 'on' : '' }, 'blocks ', el('b', { text: num(e.cache_bp_blocks) }))))),
+      kv('Tenant id', e.tenant_id || '— (single-tenant)')));
+
+    // The log lines this request emitted. Text, not a link: Grafana binds loopback on the
+    // box (see renderLogsHelp).
+    if (e.session_id) body.appendChild(logQueryBlock(e.session_id, e.tenant_id));
 
     body.appendChild(el('h2', { text: 'Components, in the order they ran' }));
     if (!e.components || !e.components.length) {
@@ -1371,10 +1633,9 @@ function contentBlockedState(host, state, opts = {}) {
       box.className = 'state blocked';
       b.appendChild(el('strong', { text: 'Transcripts are not yours to read' }));
       b.appendChild(el('span', { text:
-        'Metrics for this traffic are visible; its content is not. On a hosted deployment only ' +
-        'the owning account can read its own transcripts — a manager cannot, because reading ' +
-        "someone else's source code is not an administrative need. On a single-tenant proxy, " +
-        'content is served to loopback or a configured trusted CIDR only.' }));
+        'Metrics for this traffic are visible; its content is not. On a hosted deployment the ' +
+        'owning account and the manager can read it. On a single-tenant proxy, content is ' +
+        'served to loopback or a configured trusted CIDR only.' }));
       break;
     case 'not_captured':
       // WHOSE gate is shut decides what to say. Storing a transcript needs the operator's
@@ -1914,17 +2175,18 @@ function renderTree(v, key) {
 async function loadConfig() {
   const host = clear($('#config-body'));
   loadingState(host, 3);
+  renderLogsHelp();
   try {
     // The payload is {scope, config, description} — the same envelope /api/capture uses.
     // Rendering the envelope as the tree printed "scope: server" and "description: …" as
     // if they were configuration keys, and buried the config a level down.
     const cfg = await api('config');
     clear(host);
+    // The caveat that matters stays in the layout; the server's full explanation folds.
     host.appendChild(el('p', { class: 'note', 'data-testid': 'config-scope', text:
-      'Scope: ' + (cfg.scope || 'server') + ' — this is the configuration THIS PROXY is ' +
-      'running, which is not necessarily what compacted your traffic: on a hosted ' +
-      'deployment each account may run its own pipeline (see Settings). ' +
-      (cfg.description || '') }));
+      'Scope: ' + (cfg.scope || 'server') + ' — what this PROXY runs, not necessarily what ' +
+      'compacted your traffic.' }));
+    if (cfg.description) host.appendChild(whyBlock('Why those can differ', cfg.description));
     host.appendChild(renderTree(cfg.config || cfg));
   } catch (err) {
     if (aborted(err)) return;
@@ -1947,7 +2209,14 @@ async function loadConfig() {
       kv('Queue', c.queued + ' / ' + c.queue_cap), kv('SSE clients', num(c.sse_clients)),
       kv('Database', c.db_path || '(in memory — history is lost on restart)'),
       kv('Database size', compact(c.db_bytes) + ' B')));
-    chost.appendChild(el('p', { class: 'note', text: description }));
+    // A non-zero drop count is the one thing worth saying out loud here, because it means
+    // every number on the Overview under-reports. The definitions fold.
+    if (c.dropped > 0) {
+      chost.appendChild(el('p', { class: 'note warn-text', text:
+        num(c.dropped) + ' events dropped — every figure on this dashboard under-reports by ' +
+        'that much. Raise the queue size or lower the traffic before drawing conclusions.' }));
+    }
+    if (description) chost.appendChild(whyBlock('What these counters mean', description));
   } catch (err) {
     errorState(chost, 'Could not load capture health', err);
   }
@@ -1990,7 +2259,7 @@ async function checkCapture() {
 
 // ── views + filters ────────────────────────────────────────────────────────
 const loaders = {
-  overview: loadOverview, components: loadComponents, sessions: loadSessions,
+  overview: loadOverview, usage: loadUsage, components: loadComponents, sessions: loadSessions,
   requests: loadRequests, benchmarks: loadBenchmarks, config: loadConfig,
 };
 
@@ -2015,11 +2284,15 @@ const DIMS = [
   ['component', 'component', '#f-component'],
   ['reason', 'outcome', '#f-reason'],
   ['accounting', 'accounting', '#f-accounting'],
+  ['effort', 'effort', '#f-effort'],
+  ['thinking', 'thinking', '#f-thinking'],
+  ['stop_reason', 'stop reason', '#f-stop_reason'],
   ['session', 'session', null],
   ['tenant', 'tenant', null],
 ];
 /** The facet dimensions the server can enumerate; the rest are fixed option lists. */
-const FACET_DIMS = ['model', 'provider', 'agent', 'preset', 'mode', 'component'];
+const FACET_DIMS = ['model', 'provider', 'agent', 'preset', 'mode', 'component',
+  'effort', 'thinking', 'stop_reason'];
 
 /** activeFilters lists the set filters as [key, label, value], time range included. */
 function activeFilters() {
@@ -2048,9 +2321,17 @@ function go(view, push = true) {
   state.view = view;
   for (const t of $$('.tab')) t.setAttribute('aria-selected', String(t.dataset.view === view));
   for (const s of $$('.view')) s.hidden = s.id !== 'view-' + view;
+  // A filter bar over a view with nothing to filter is thirteen controls inviting clicks
+  // that change nothing — and on Settings it sat directly above a form, so the two read as
+  // one set of inputs. These four views read no filter at all (see refresh).
+  $('.filters').hidden = UNFILTERED_VIEWS.has(view);
   syncURL(!push);
   refresh();
 }
+
+/** The views whose data is not scoped by the filter bar: account configuration, the tenant
+ *  roster, cold storage and the process-wide configuration. */
+const UNFILTERED_VIEWS = new Set(['setup', 'settings', 'tenants', 'archive', 'config']);
 
 /**
  * setFilter is the ONE way a filter changes, wherever the change comes from: a
@@ -2131,6 +2412,9 @@ function urlFor() {
   // `session` is already a filter dimension and they are not the same thing.
   if (state.drawer && state.drawer.req) p.set('req', String(state.drawer.req));
   if (state.drawer && state.drawer.diff) p.set('diff', state.drawer.diff);
+  // The manager's account editor is state too: "the account I mean" is a thing managers
+  // send each other, and Back must close the panel rather than undo a filter change.
+  if (state.drawer && state.drawer.acct) p.set('acct', state.drawer.acct);
   const q = p.toString();
   return location.pathname + '#' + state.view + (q ? '?' + q : '');
 }
@@ -2147,9 +2431,10 @@ function parseURL() {
   for (const [k] of DIMS) if (p.get(k)) filter[k] = p.get(k);
   const req = Number(p.get('req')) || 0;
   const diff = p.get('diff') || '';
+  const acct = p.get('acct') || '';
   return {
     view: view || 'overview', filter, range: Number(p.get('range')) || 0,
-    drawer: req ? { req } : diff ? { diff } : null,
+    drawer: req ? { req } : diff ? { diff } : acct ? { acct } : null,
   };
 }
 /** applyURL makes the page match the address bar. Used on load, on Back/Forward, and
@@ -2174,9 +2459,11 @@ function applyURL() {
 function syncDrawer(prev) {
   const want = state.drawer;
   if (!want) { if (!$('#drawer').hidden) dismissDrawer(); return; }
-  const same = !!prev && prev.req === want.req && prev.diff === want.diff;
+  const same = !!prev && prev.req === want.req && prev.diff === want.diff
+    && prev.acct === want.acct;
   if (same && !$('#drawer').hidden) return;
   if (want.req) openRequest(want.req, true);
+  else if (want.acct) openTenantEditor(want.acct, true);
   else openSessionDiff(want.diff, false, true);
 }
 
@@ -2192,6 +2479,7 @@ function renderChips() {
   const host = clear($('#f-active'));
   const active = activeFilters();
   host.hidden = !active.length;
+  syncMoreCount(active);
   // Clear is the convenience, never the necessity: it says how many it will remove and
   // is disabled when there is nothing to remove, rather than sitting there implying the
   // list might be filtered when it is not.
@@ -2223,6 +2511,26 @@ function renderChips() {
   }
 }
 let chipFocus = null;
+
+/** MORE_FILTERS is which dimensions live behind the "More filters" disclosure. */
+const MORE_FILTERS = new Set(['reason', 'component', 'effort', 'thinking', 'stop_reason', 'accounting']);
+
+/**
+ * syncMoreCount badges the disclosure with how many of the filters inside it are set, and
+ * opens it when one is.
+ *
+ * A collapsed control holding a value is a hidden filter, which is the exact bug the chip
+ * row exists to prevent — so the count is the second guard: the summary itself says
+ * something in there is narrowing the page, whether or not the reader looks at the chips.
+ */
+function syncMoreCount(active) {
+  const badge = $('#f-more-count');
+  if (!badge) return;
+  const n = active.filter(([k]) => MORE_FILTERS.has(k)).length;
+  badge.textContent = n ? String(n) : '';
+  badge.hidden = !n;
+  if (n) $('#f-more').open = true;
+}
 
 /**
  * renderNoMatch explains an empty list instead of just being empty, and offers the one
@@ -2388,6 +2696,7 @@ function init() {
     $(ctl).addEventListener('change', (ev) => setFilter(key, ev.currentTarget.value));
   }
   $('#f-range').addEventListener('change', (ev) => setRange(ev.currentTarget.value));
+  $('#f-dim').addEventListener('change', (ev) => { state.dim = ev.currentTarget.value; loadUsage(); });
   // Debounced, and Enter commits immediately rather than waiting out the delay. The
   // pending timer is dropped on submit so the same query is not sent twice.
   let deb;
@@ -2524,17 +2833,196 @@ function applyRegisterMode() {
   clear(box).appendChild(el('div', { class: 'state-body' },
     el('strong', { text: 'Registration is closed on this deployment' }),
     el('span', { text:
-      'Accounts are created by whoever operates this proxy — ask them for a token, then ' +
-      'sign in with it above. An account here spends the operator\'s upstream budget, ' +
-      'which is why it is not self-serve by default.' })));
+      'Accounts are created by whoever operates this proxy — ask them for one, then sign ' +
+      'in above. Self-registration is normally open; this deployment has turned it off.' })));
 
   const hint = $('#gate-register-hint');
   if (hint) {
     hint.textContent = mode === 'invite'
       ? 'Registration is invite-only: you need the code from the operator.'
-      : mode === 'open' ? 'Anyone who can reach this host may register.' : '';
+      : mode === 'open' ? 'Anyone with an allowed work email may register.' : '';
     hint.hidden = !hint.textContent;
   }
+}
+
+// ── two-phase verification ─────────────────────────────────────────────────
+//
+// Phase one (register or sign in) returns an absolute expiry; phase two posts the code.
+// The countdown ticks against THAT timestamp rather than a five-minute timer this page
+// starts, so a code that took forty seconds to arrive shows the time it really has left.
+// The server is the only thing that enforces the deadline; this is just honest about it.
+
+const verify = { email: '', expires: 0, tick: null };
+
+/** Show the code form for an email, counting down to `expires` (epoch ms). */
+function showVerify(email, expires, intro) {
+  verify.email = email;
+  verify.expires = expires || 0;
+  hideGateForms();
+  // The sign-in/register pair goes away for phase two: that choice is already made, and
+  // leaving "Register" marked selected above a code box invited clicking it and losing the
+  // code. "Start over" is the way back, and it restores them.
+  $('.gate-tabs').hidden = true;
+  $('#gate-verify').hidden = false;
+  $('#gate-verify-intro').textContent = intro;
+  $('#gate-verify-code').value = '';
+  $('#gate-verify-code').focus();
+  if (verify.tick) clearInterval(verify.tick);
+  const paint = () => {
+    // The remaining time is still (server expiry − now), never a countdown this page
+    // started: a code that took forty seconds to arrive must show the time it really has.
+    // Only the STYLING is derived from it — amber under a minute, red once gone.
+    const left = Math.max(0, Math.round((verify.expires - Date.now()) / 1000));
+    const timer = $('#gate-verify-timer');
+    if (!verify.expires) { timer.textContent = ''; timer.className = ''; return; }
+    timer.textContent = left > 0
+      ? `Expires in ${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}`
+      : 'That code has expired — start over to get a new one.';
+    timer.className = left <= 0 ? 'hint gone' : left <= 60 ? 'hint soon' : 'hint';
+    if (left <= 0 && verify.tick) { clearInterval(verify.tick); verify.tick = null; }
+  };
+  paint();
+  verify.tick = setInterval(paint, 1000);
+}
+
+/** Leave the code form, back to whichever tab is selected. */
+function cancelVerify() {
+  if (verify.tick) { clearInterval(verify.tick); verify.tick = null; }
+  verify.email = '';
+  $('#gate-verify').hidden = true;
+  $('#gate-reset').hidden = true;
+  $('#gate-reset-verify').hidden = true;
+  $('.gate-tabs').hidden = false;
+  const onRegister = $('#gate-tab-register').getAttribute('aria-selected') === 'true';
+  $('#gate-signin').hidden = onRegister;
+  $('#gate-register').hidden = !onRegister;
+  if (onRegister) applyRegisterMode();
+}
+
+// ── password reset (the gate) ──────────────────────────────────────────────
+//
+// The flow for someone who cannot sign in, which is why it is on the gate and not behind
+// it. Two steps: ask for a code, then spend it together with the new password. One step
+// would mean holding a spent code while the user thinks of a password.
+//
+// The server answers phase one identically whether or not the address has an account, so
+// this UI must promise only that a code was sent IF there was somewhere to send it. Saying
+// "check your inbox" is true either way; saying "we found your account" would not be.
+
+const reset = { email: '', expires: 0, tick: null };
+
+/** hideGateForms hides every form the gate can show. One place, because two forms visible
+ *  at once is the bug that appears when a fifth form is added to four ad-hoc toggles. */
+function hideGateForms() {
+  for (const id of ['#gate-signin', '#gate-register', '#gate-verify', '#gate-closed',
+    '#gate-reset', '#gate-reset-verify']) {
+    const n = $(id);
+    if (n) n.hidden = true;
+  }
+}
+
+/** gateNotice shows a non-error status on the gate — "your password is set, now sign in".
+ *  Separate from gateError because a success rendered in the error box reads as a failure. */
+function gateNotice(msg) {
+  const n = $('#gate-notice');
+  n.textContent = msg || '';
+  n.hidden = !msg;
+}
+
+function showResetRequest() {
+  cancelVerify();
+  cancelReset();
+  gateError('');
+  gateNotice('');
+  hideGateForms();
+  $('.gate-tabs').hidden = true;
+  $('#gate-reset').hidden = false;
+  $('#gate-reset-email').value = $('#gate-signin-email').value.trim();
+  $('#gate-reset-email').focus();
+}
+
+/** showResetVerify counts down against the server's absolute expiry, like the sign-in code
+ *  form — never a five-minute timer this page started. */
+function showResetVerify(email, expires) {
+  reset.email = email;
+  reset.expires = expires || 0;
+  hideGateForms();
+  $('.gate-tabs').hidden = true;
+  $('#gate-reset-verify').hidden = false;
+  $('#gate-reset-intro').textContent = 'If ' + email + ' has an account, a 6-digit code is '
+    + 'on its way there. Enter it with the password you want.';
+  $('#gate-reset-code').value = '';
+  $('#gate-reset-password').value = '';
+  $('#gate-reset-code').focus();
+  if (reset.tick) clearInterval(reset.tick);
+  const paint = () => {
+    const left = Math.max(0, Math.round((reset.expires - Date.now()) / 1000));
+    const timer = $('#gate-reset-timer');
+    if (!reset.expires) { timer.textContent = ''; return; }
+    timer.textContent = left > 0
+      ? 'The code expires in ' + Math.floor(left / 60) + ':' + String(left % 60).padStart(2, '0')
+      : 'That code has expired — start over to get a new one.';
+    timer.className = left <= 0 ? 'hint gone' : left <= 60 ? 'hint soon' : 'hint';
+    if (left <= 0 && reset.tick) { clearInterval(reset.tick); reset.tick = null; }
+  };
+  paint();
+  reset.tick = setInterval(paint, 1000);
+}
+
+/** cancelReset abandons a pending reset and returns the gate to the sign-in form. */
+function cancelReset(silent) {
+  if (reset.tick) { clearInterval(reset.tick); reset.tick = null; }
+  reset.email = '';
+  if (silent) return;
+  hideGateForms();
+  $('.gate-tabs').hidden = false;
+  $('#gate-signin').hidden = false;
+  $('#gate-tab-signin').setAttribute('aria-selected', 'true');
+  $('#gate-tab-register').setAttribute('aria-selected', 'false');
+}
+
+function initReset() {
+  $('#gate-forgot').addEventListener('click', showResetRequest);
+  $('#gate-reset-cancel').addEventListener('click', () => { gateError(''); cancelReset(); });
+  $('#gate-reset-verify-cancel').addEventListener('click', () => { gateError(''); showResetRequest(); });
+
+  $('#gate-reset').addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    gateError('');
+    const email = $('#gate-reset-email').value.trim();
+    try {
+      const out = await ctl('/api/password-reset', {
+        method: 'POST', body: JSON.stringify({ email }),
+      });
+      showResetVerify(out.email || email, out.code_expires_at);
+    } catch (e) { gateError(e.message); }
+  });
+
+  $('#gate-reset-verify').addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    gateError('');
+    try {
+      await ctl('/api/password-reset/verify', {
+        method: 'POST',
+        body: JSON.stringify({
+          email: reset.email,
+          code: $('#gate-reset-code').value.trim(),
+          new_password: $('#gate-reset-password').value,
+        }),
+      });
+      // The password leaves the DOM the moment it has been spent.
+      $('#gate-reset-password').value = '';
+      cancelReset();
+      // Deliberately NOT signed in: a reset proves the address, and signing in still wants
+      // the password plus a fresh emailed code. One code must not buy two factors.
+      gateNotice('Your password is set. Sign in with it — we will email a code as usual.');
+      $('#gate-signin-email').value = reset.email || $('#gate-reset-email').value.trim();
+      $('#gate-password').focus();
+    } catch (e) {
+      $('#gate-reset-password').value = '';
+      gateError(e.message);
+    }
+  });
 }
 
 function showGate(show) {
@@ -2609,21 +3097,47 @@ async function loadOptions() {
 }
 
 // ── setup ──────────────────────────────────────────────────────────────────
+// TOKEN_SLOT is what stands in for a real token in every block on this page when we do
+// not have the plaintext. A NAMED slot rather than the account's real prefix plus an
+// ellipsis: these blocks exist to be pasted, and a credential fragment in one produces a
+// line that silently cannot work.
+const TOKEN_SLOT = 'cg_live_YOUR_TOKEN_HERE';
+
+/** claudeSettings is the WHOLE env block a Claude Code user ends up with — not a diff.
+ *  A beginner cannot apply a diff, and the two keys are the entire change. */
+function claudeSettings(base, tok) {
+  return [
+    '{',
+    '  "env": {',
+    `    "ANTHROPIC_BASE_URL": "${base}/anthropic",`,
+    `    "ANTHROPIC_CUSTOM_HEADERS": "x-context-guru-token: ${tok}"`,
+    '  }',
+    '}',
+  ];
+}
+
+// AGENTS covers the agents that are NOT Claude Code — those two are still shell exports,
+// because neither reads ~/.claude/settings.json. Claude Code has the numbered walkthrough
+// above them instead.
 const AGENTS = [
-  {
-    name: 'Claude Code',
-    path: '/anthropic',
-    lines: (base, tok) => [
-      `export ANTHROPIC_BASE_URL=${base}/anthropic`,
-      `export ANTHROPIC_AUTH_TOKEN=${tok}`,
-    ],
-  },
   {
     name: 'Bob (BobShell)',
     path: '/',
+    // Bob's client builds every request header itself and offers no hook for another
+    // one, so it cannot carry the token. Instead it is recognised by the sha256 of the
+    // key it already sends — bound once on the Settings tab, never stored in plaintext.
+    //
+    // The variable name is version-dependent, and getting it wrong is silent: Bob simply
+    // talks to its default gateway and nothing appears here. bobshell 2.x reads
+    // BOB_GATEWAY_URL (checked against the 2.0.1 bundle, where CUSTOM_BASE_URL does not
+    // appear at all); the older build read CUSTOM_BASE_URL. Both are listed, because a
+    // spare export costs nothing and a missing one costs an afternoon.
     lines: (base, tok) => [
-      `export CUSTOM_BASE_URL=${base}`,
-      `export BOBSHELL_API_KEY=${tok}`,
+      `export BOB_GATEWAY_URL=${base}    # bobshell 2.x — check with: bob --version`,
+      `export CUSTOM_BASE_URL=${base}    # older builds read this one instead`,
+      '# Your Bob key stays your own (BOB_API_KEY; BOBSHELL_API_KEY still works).',
+      '# Bob can send no header of ours, so bind that key once on the Settings tab:',
+      '#   Settings → Bound agent keys → paste the key → Bind this key',
     ],
   },
   {
@@ -2631,7 +3145,8 @@ const AGENTS = [
     path: '/openai/v1',
     lines: (base, tok) => [
       `export OPENAI_BASE_URL=${base}/openai/v1`,
-      `export OPENAI_API_KEY=${tok}`,
+      '# OPENAI_API_KEY stays your own provider key; send the token as a header:',
+      `#   x-context-guru-token: ${tok}`,
     ],
   },
 ];
@@ -2654,30 +3169,134 @@ function copyButton(text) {
   }, 'copy');
 }
 
+// ── logs: Grafana over an SSH tunnel ───────────────────────────────────────
+//
+// Grafana and Loki bind LOOPBACK on the box, deliberately — the public path serves the
+// proxy and this dashboard, nothing else. So the affordance here is copyable TEXT and
+// never a hyperlink: an <a href> to 127.0.0.1:3000 is dead for every reader who has not
+// already opened a tunnel, and a dead link is worse than instructions. Nothing is
+// embedded either: an iframe would mean loosening a CSP that is worth more than the
+// convenience.
+//
+// The address is written WITHOUT a scheme, on purpose as well as for brevity: the offline
+// guarantee is enforced by a test that greps every served asset for URL schemes, and an
+// asset that must reference no external origin should not start carrying URLs at all.
+const GRAFANA_HOSTPORT = '127.0.0.1:3000';
+const GRAFANA_LOGS_PATH = '/d/context-guru-logs/context-guru-logs';
+
+/** copyBlock is a titled, copyable code block. Nothing new: it reuses the Setup tab's
+ *  copy button and its <pre class="code">. */
+function copyBlock(title, lines, testid) {
+  const text = lines.join('\n');
+  return el('div', { class: 'copyblock' },
+    el('div', { class: 'setup-head' },
+      el('h3', { text: title }),
+      copyButton(text)),
+    el('pre', { class: 'code', 'data-testid': testid }, text));
+}
+
+/** renderLogsHelp fills the Config tab's Logs panel: the tunnel, the address, and one
+ *  LogQL query to paste into it. */
+function renderLogsHelp() {
+  const host = $('#logs-help');
+  if (!host) return;
+  clear(host);
+  host.appendChild(copyBlock('1 · Open the tunnel from your machine',
+    ['ssh -L 3000:' + GRAFANA_HOSTPORT + ' ' + (location.hostname || '<the host>')], 'logs-tunnel'));
+  host.appendChild(copyBlock('2 · Open this address in a browser',
+    [GRAFANA_HOSTPORT + GRAFANA_LOGS_PATH], 'logs-address'));
+  host.appendChild(copyBlock('3 · Or query Loki directly, in Explore',
+    ['{job="context-guru"} | json | level=~"WARN|ERROR"'], 'logs-query'));
+  host.appendChild(el('p', { class: 'note', text:
+    'Grafana and Loki bind loopback on the box, so this is text rather than a link — a ' +
+    'link would be dead until the tunnel is up.' }));
+}
+
+/** logQueryBlock is the drawer's version: the LogQL that selects THIS session's lines. */
+function logQueryBlock(session, tenant) {
+  const sel = '{job="context-guru"' + (tenant ? ', tenant="' + tenant + '"' : '') + '}';
+  return el('div', {},
+    copyBlock('Logs for this session (Grafana → Explore → Loki)',
+      [sel + ' | json | session="' + session + '"'], 'logs-session-query'));
+}
+
+/** step is one numbered instruction: the number, the sentence, and whatever it needs
+ *  pasted underneath. Short on purpose — a step that needs a paragraph is two steps. */
+function step(n, title, ...body) {
+  return el('div', { class: 'setup-step', 'data-testid': 'setup-step-' + n },
+    el('div', { class: 'setup-step-n' }, String(n)),
+    el('div', { class: 'setup-step-body' }, el('h3', {}, title), ...body));
+}
+
+/** revealToken is the one-time reveal: the plaintext, big, with a copy button and a
+ *  warning that cannot be scrolled past. Rendered only when we actually hold the
+ *  plaintext, which is only ever the reply to registration or to minting. */
+function revealToken(tok) {
+  return el('div', { class: 'token-reveal', 'data-testid': 'token-reveal' },
+    el('div', { class: 'setup-head' },
+      el('h3', {}, 'Your context-guru token'),
+      copyButton(tok)),
+    el('pre', { class: 'code token-plain', 'data-testid': 'token-plain' }, tok),
+    el('p', { class: 'warn-text', 'data-testid': 'token-once' },
+      'Shown once. We store only its hash, so nobody — including us — can show it again. '
+      + 'Copy it somewhere safe now; if you lose it, mint a new one on Settings.'));
+}
+
 function loadSetup() {
   const host = clear($('#setup-blocks'));
   const base = account.baseURL || location.origin;
-  // The plaintext only exists at mint time, so a returning user gets a placeholder. It is
-  // a NAMED slot rather than their real token's prefix plus an ellipsis: that version put
-  // a credential fragment in a block whose whole purpose is being pasted and shared, and
-  // copying it produced an export line that could not work.
-  const tok = account.freshToken || 'cg_live_YOUR_TOKEN';
+  // The plaintext only exists at mint time, so a returning user gets the named slot.
+  const tok = account.freshToken || TOKEN_SLOT;
+  const settings = claudeSettings(base, tok);
+
+  if (account.freshToken) host.appendChild(revealToken(account.freshToken));
+
+  host.appendChild(el('div', { class: 'setup-steps' },
+    step(1, 'Open your Claude Code settings file',
+      el('pre', { class: 'code' }, '~/.claude/settings.json'),
+      el('p', { class: 'hint' }, 'No such file? Create it — an empty file is fine.')),
+    step(2, 'Put this in it',
+      el('div', { class: 'setup-head' }, el('span', { class: 'hint' },
+        'Your token is already filled in.'), copyButton(settings.join('\n'))),
+      el('pre', { class: 'code', 'data-testid': 'setup-claude' }, settings.join('\n')),
+      el('p', { class: 'hint' },
+        'Already have an "env" block? Add just those two lines inside it. Leave every '
+        + 'other key alone.')),
+    step(3, 'Keep your own key where it is',
+      el('p', { class: 'hint' },
+        'ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN stays yours: we forward it, so your '
+        + 'traffic is billed to you. Without it every request answers 401.')),
+    step(4, 'Restart Claude Code, then check this dashboard',
+      el('p', { class: 'hint' },
+        'Ask it anything. Requests appear on Overview within a second.'))));
+
+  host.appendChild(el('div', { class: 'banner warn', 'data-testid': 'setup-trap' },
+    el('div', {}, el('strong', {}, 'Empty dashboard after exporting the variable? '),
+      'An "env" block in ~/.claude/settings.json silently overrides an exported '
+      + 'ANTHROPIC_BASE_URL. Claude Code answers normally and nothing reaches us. '
+      + 'Put the block in that file — step 2 — rather than in your shell.')));
+
+  const others = el('details', { class: 'setup-others' },
+    el('summary', {}, 'Other agents (Bob, OpenAI-dialect tools)'));
   for (const a of AGENTS) {
     const lines = a.lines(base, tok);
-    const block = el('div', { class: 'setup-block' },
+    others.appendChild(el('div', { class: 'setup-block' },
       el('div', { class: 'setup-head' },
         el('h3', { text: a.name }),
         copyButton(lines.join('\n'))),
-      el('pre', { class: 'code' }, lines.join('\n')));
-    host.appendChild(block);
+      el('pre', { class: 'code' }, lines.join('\n'))));
   }
+  host.appendChild(others);
+
+  // The banner above the blocks stays for the returning user's benefit — it is the only
+  // thing on the page that explains why step 2 shows a placeholder instead of a token.
   const banner = $('#setup-token-banner');
-  if (account.freshToken) {
+  banner.hidden = !!account.freshToken;
+  if (!account.freshToken) {
+    banner.className = 'banner';
     banner.hidden = false;
-    banner.textContent = 'Your new token is filled in below. It is shown once and cannot ' +
-      'be recovered — copy it somewhere safe now.';
-  } else {
-    banner.hidden = true;
+    banner.textContent = 'Paste your own token over ' + TOKEN_SLOT + ' below. Tokens are '
+      + 'shown once, at creation; mint a new one on Settings if you no longer have it.';
   }
 }
 
@@ -2708,20 +3327,89 @@ function loadSettings() {
     const effective = t.effective_config_yaml || t.config_yaml || '';
     const { active, all } = componentPickers(effective, opts);
 
-    // Spend, first: it is the thing that stops traffic, so it belongs above the knobs.
-    if (t.monthly_cap_usd > 0) {
-      const frac = Math.min(1, (t.spent_usd || 0) / t.monthly_cap_usd);
-      host.appendChild(el('div', { class: 'spend' },
-        el('div', { class: 'spend-label' },
-          `Spend this month: ${usd(t.spent_usd)} of ${usd(t.monthly_cap_usd)}`),
-        el('div', { class: 'meter' },
-          el('i', { style: `width:${(frac * 100).toFixed(1)}%`, class: frac > 0.9 ? 'hot' : '' })),
-        el('p', { class: 'hint' },
-          'Requests are refused once the cap is reached. A manager can raise it.')));
+    // Spend, first: it is what a shared box gets asked about most. Reported only —
+    // your traffic runs on YOUR provider credential, so there is nothing to cap.
+    host.appendChild(el('div', { class: 'spend' },
+      el('div', { class: 'spend-label' }, `Spend this month: ${usd(t.spent_usd)}`),
+      el('p', { class: 'hint' }, 'Billed to your own provider account, not to us.')));
+
+    // Agent keys. Only relevant to agents that cannot send x-context-guru-token.
+    //
+    // The paste field exists because the alternative was a curl line carrying the
+    // cg_dash cookie, and every part of that went wrong in practice: the cookie is not
+    // displayed anywhere, so it meant a devtools detour, and the natural guess — pasting
+    // the cg_live_ token into the cookie — fails with "no context-guru token", which
+    // names a header this route does not even read. The browser already holds the
+    // cookie. So the key is pasted HERE and sent in the Authorization slot by the same
+    // fetch, which is the only step the person could not do for themselves.
+    const keyIn = el('input', {
+      type: 'password', id: 'agent-key', autocomplete: 'off', spellcheck: 'false',
+      placeholder: 'paste your Bob API key', 'data-testid': 'agent-key-input',
+    });
+    const keyMsg = el('p', { class: 'hint', role: 'status', 'data-testid': 'agent-key-status' });
+    host.appendChild(el('div', { class: 'field' },
+      el('label', { for: 'agent-key' }, 'Bound agent keys'),
+      el('div', { 'data-testid': 'agent-keys' },
+        t.agent_keys > 0
+          ? `${t.agent_keys} provider key${t.agent_keys === 1 ? '' : 's'} bound to this account.`
+          : 'None bound.'),
+      whyBlock('Why an agent needs one',
+        'For agents that cannot send a custom header (Bob/BobShell): the proxy recognises ' +
+        'them by the sha256 of the provider key they already send. Only the digest is ' +
+        'stored — never the key, and it is not sent on anywhere. Keys under 20 characters ' +
+        'are refused — the digest is the identity, so a short key would be a guessable ' +
+        'account. A key already bound to another account is refused too, never moved: ' +
+        'its owner unbinds it first.'),
+      keyIn,
+      el('div', { class: 'actions' }, el('button', {
+        class: 'primary small', 'data-testid': 'agent-key-bind',
+        onclick: async () => {
+          const key = keyIn.value.trim();
+          keyMsg.className = 'hint';
+          if (!key) { keyMsg.textContent = 'Paste the key your agent sends first.'; return; }
+          keyMsg.textContent = 'binding…';
+          try {
+            await ctl('/api/me/agent-key', {
+              method: 'POST', headers: { authorization: `Bearer ${key}` },
+            });
+            // Cleared on success, so the key does not sit in a form field afterwards.
+            keyIn.value = '';
+            keyMsg.className = 'hint ok';
+            keyMsg.textContent = 'Bound. Your agent is recognised by this key from now on.';
+            await probeAccount();
+            loadSettings();
+          } catch (e) {
+            keyMsg.className = 'hint warn-text';
+            keyMsg.textContent = e.message;
+          }
+        },
+      }, 'Bind this key')),
+      keyMsg,
+      t.agent_keys > 0
+        ? el('button', {
+          class: 'ghost small', 'data-testid': 'agent-keys-clear',
+          onclick: async () => {
+            if (!confirm('Unbind every provider key? Agents that rely on key ' +
+              'recognition stop being identified until you bind again.')) return;
+            try { await ctl('/api/me/agent-key', { method: 'DELETE' }); await probeAccount(); loadSettings(); } catch (e) { alert(e.message); }
+          },
+        }, 'Unbind all')
+        : null));
+
+    // Who may shape the compaction itself. A plain account keeps its own settings — the
+    // upstreams it sends to, its capture consent, its tokens — but the pipeline is the
+    // manager's to set, on this page and in PUT /api/me. Drawing a component grid that
+    // the server answers 403 to would be a form that lies.
+    const mgr = isManager();
+    if (!mgr) {
+      host.appendChild(el('div', { class: 'cfg-state', 'data-testid': 'cfg-state-managed' },
+        el('div', {},
+          el('strong', {}, 'Your manager sets the compaction.'),
+          ' Ask them for a change; everything else on this page is yours.')));
     }
 
     // Which configuration is in force, and how to change that.
-    host.appendChild(inherited
+    if (mgr) host.appendChild(inherited
       ? el('div', { class: 'cfg-state', 'data-testid': 'cfg-state-inherited' },
         el('div', {},
           el('strong', {}, 'Following the server default.'),
@@ -2757,11 +3445,12 @@ function loadSettings() {
       el('option', { value: 'observe' }, 'observe — measure only, requests untouched (Mode "observe")'));
     modeSel.value = /^mode:\s*observe/m.test(effective) ? 'observe' : 'sync';
     modeSel.disabled = inherited;
-    host.appendChild(el('div', { class: 'field' },
-      el('label', { for: 'set-mode' }, 'Mode'), modeSel,
-      el('p', { class: 'hint' },
-        'observe forwards every request byte-for-byte and only records what compaction ' +
-        'would have saved. The safe way to try a configuration.')));
+    if (mgr) {
+      host.appendChild(el('div', { class: 'field' },
+        el('label', { for: 'set-mode' }, 'Mode'), modeSel,
+        el('p', { class: 'hint' },
+          'observe is the safe way to try a configuration: nothing is rewritten.')));
+    }
 
     // Upstreams, one per dialect, from the operator's allow-list.
     const ups = (opts && opts.upstreams) || [];
@@ -2790,13 +3479,13 @@ function loadSettings() {
         el('span', { class: 'comp-name' }, name),
         warn ? el('span', { class: 'comp-warn' }, warn) : null));
     }
-    host.appendChild(el('div', { class: 'field' },
+    if (mgr) host.appendChild(el('div', { class: 'field' },
       el('label', {}, 'Pipeline components'), grid,
-      el('p', { class: 'hint' },
-        'These toggles decide what runs; the ORDER is the one in your configuration, ' +
-        'which this list keeps. A newly enabled component is appended at the end — move ' +
-        'it in the YAML below if it belongs earlier. Saving rebuilds your pipeline and ' +
-        'discards frozen compaction decisions, so the next turn will not be cache-warm.')));
+      el('p', { class: 'hint' }, 'What runs. Run order comes from the YAML below.'),
+      whyBlock('What saving changes',
+        'A newly enabled component is appended at the end of the pipeline — move it in the ' +
+        'YAML below if it belongs earlier. Saving rebuilds your pipeline and discards frozen ' +
+        'compaction decisions, so the next turn will not be cache-warm.')));
 
     // Content capture consent.
     const cap = el('input', {
@@ -2807,9 +3496,12 @@ function loadSettings() {
       el('label', { class: 'comp', for: 'set-capture' }, cap,
         el('span', { class: 'comp-name' }, 'Store my transcripts for the diff view')),
       el('p', { class: 'hint warn-text' },
-        'Off by default. This writes your agent output — source code, tool results — to ' +
-        'disk behind a best-effort redactor whose own review found 11 of 22 realistic ' +
-        'credential shapes passing through it. Only you can read them; a manager cannot.')));
+        'Writes your agent output to disk. The manager can read what is stored. The ' +
+        'redactor is best-effort, not a guarantee.'),
+      whyBlock('What "best-effort" means here',
+        'Source code and tool results are stored behind a redactor whose own review found ' +
+        '11 of 22 realistic credential shapes passing through it. The manager can read ' +
+        'whatever this stores. Off by default.')));
 
     // Raw YAML, for anything the toggles do not cover.
     const ta = el('textarea', {
@@ -2818,7 +3510,7 @@ function loadSettings() {
     });
     ta.value = effective;
     ta.disabled = inherited;
-    host.appendChild(el('details', { class: 'field' },
+    if (mgr) host.appendChild(el('details', { class: 'field' },
       el('summary', {}, 'Full configuration (YAML)'), ta,
       el('p', { class: 'hint' }, inherited
         ? 'The server default, read-only. Customise above to edit it as your own.'
@@ -2833,7 +3525,124 @@ function loadSettings() {
   });
 
   loadTokens();
+  loadPassword();
+  loadMachines();
   loadAudit();
+}
+
+/**
+ * The password card. Two shapes, because two different things are true:
+ *
+ *   has_password  — a change form, and the CURRENT password is required. A stolen session
+ *                   cookie must not be enough to take the account over and lock its owner
+ *                   out of a credential they still know.
+ *   no password   — an account older than passwords. There is nothing to check a new one
+ *                   against, so the honest answer is the emailed reset, not a form with an
+ *                   "old password" box it cannot fill.
+ */
+function loadPassword() {
+  const host = clear($('#password-form'));
+  const t = account.tenant;
+  if (!t) return;
+  const status = $('#password-status');
+  status.textContent = '';
+  if (!t.has_password) {
+    emptyState(host, 'No password on this account',
+      'It was created before passwords existed and signs in with a token. Use “Forgot your '
+      + 'password?” on the sign-in page to set one by email — that proves the address, '
+      + 'which is the only thing there is to prove here.');
+    return;
+  }
+  const old = el('input', {
+    type: 'password', id: 'pw-old', autocomplete: 'current-password', 'data-testid': 'pw-old',
+  });
+  const next = el('input', {
+    type: 'password', id: 'pw-new', autocomplete: 'new-password', minlength: '8',
+    'data-testid': 'pw-new',
+  });
+  const err = el('p', { class: 'hint warn-text', role: 'alert', 'data-testid': 'pw-error' });
+  host.appendChild(el('div', { class: 'field' },
+    el('label', { for: 'pw-old' }, 'Current password'), old));
+  host.appendChild(el('div', { class: 'field' },
+    el('label', { for: 'pw-new' }, 'New password'), next,
+    el('p', { class: 'hint' }, 'At least 8 characters. Your other signed-in machines are '
+      + 'signed out; this browser stays in.')));
+  host.appendChild(err);
+  host.appendChild(el('div', { class: 'actions' },
+    el('button', {
+      class: 'primary', 'data-testid': 'pw-save',
+      onclick: async () => {
+        err.textContent = '';
+        status.textContent = 'saving…';
+        try {
+          const out = await ctl('/api/me/password', {
+            method: 'POST',
+            body: JSON.stringify({ old_password: old.value, new_password: next.value }),
+          });
+          status.textContent = 'changed';
+          err.className = 'hint ok';
+          err.textContent = out.note || '';
+          loadMachines(); // the other machines are gone; the list must say so
+        } catch (e) {
+          status.textContent = '';
+          err.className = 'hint warn-text';
+          err.textContent = e.message;
+        } finally {
+          // Neither value stays in the DOM after being spent, whatever happened.
+          old.value = '';
+          next.value = '';
+        }
+      },
+    }, 'Change password')));
+}
+
+/**
+ * The machines this account is signed in on, each revocable on its own.
+ *
+ * Named loadMachines, not loadSessions: there was already a top-level loadSessions (the
+ * Sessions TAB), and two function declarations with one name means the later one wins for
+ * every caller — so `loaders.sessions` and both pager buttons were calling this, painting
+ * "Could not list your sessions" into the Settings card and leaving the Sessions table on
+ * its loading skeleton forever.
+ */
+async function loadMachines() {
+  const host = clear($('#session-list'));
+  let rows = [];
+  try {
+    rows = (await ctl('/api/me/sessions')).sessions || [];
+  } catch (e) { errorState(host, 'Could not list your sessions', e); return; }
+  if (!rows.length) { emptyState(host, 'Not signed in anywhere', 'This browser is the only session.'); return; }
+  const tbl = el('table', { class: 'grid' },
+    el('thead', {}, el('tr', {},
+      el('th', {}, 'Machine'), el('th', {}, 'Browser'), el('th', {}, 'Address'),
+      el('th', {}, 'Signed in'), el('th', {}, 'Last active'),
+      el('th', {}, el('span', { class: 'vh' }, 'Row actions')))));
+  const body = el('tbody');
+  for (const s of rows) {
+    body.appendChild(el('tr', {},
+      el('td', {}, s.label || '—', s.current ? el('span', { class: 'muted' }, ' (this browser)') : ''),
+      el('td', {}, el('span', { class: 'clip' }, s.user_agent || '—')),
+      el('td', {}, el('code', {}, s.ip || '—')),
+      el('td', {}, when(s.created_at)),
+      el('td', {}, when(s.last_seen_at)),
+      el('td', {}, el('button', {
+        class: 'ghost small', 'data-testid': 'revoke-session-' + s.id,
+        onclick: async () => {
+          // Revoking the current browser IS signing out, so say so rather than doing it
+          // silently and leaving a dashboard that 401s on its next fetch.
+          if (!confirm(s.current
+            ? 'This is the browser you are using — revoking it signs you out here.'
+            : 'Sign this machine out? It will need to sign in again.')) return;
+          try {
+            await ctl('/api/me/sessions/' + s.id, { method: 'DELETE' });
+            if (s.current) { location.reload(); return; }
+            loadMachines();
+          } catch (e) { alert(e.message); }
+        },
+      }, s.current ? 'Sign out here' : 'Revoke'))));
+  }
+  tbl.appendChild(body);
+  host.appendChild(tbl);
 }
 
 /** Store this configuration as the tenant's own, or '' to go back to following the
@@ -2860,7 +3669,7 @@ async function saveSettings() {
   // The textarea wins when the user edited it; otherwise rebuild the pipeline line from
   // the checkboxes. Two sources for one field, so the precedence has to be explicit —
   // and "what you typed beats what you clicked" is the order that never surprises.
-  let yaml = $('#set-yaml').value;
+  let yaml = isManager() ? $('#set-yaml').value : '';
   const inherited = !!account.tenant.config_inherited;
   const original = account.tenant.effective_config_yaml || '';
   if (yaml.trim() === original.trim()) {
@@ -2887,7 +3696,10 @@ async function saveSettings() {
   // Omitted while the configuration is inherited: sending it would store a copy of
   // today's default, which is exactly the freeze this page exists to undo. Customise is
   // the deliberate way to start owning one.
-  if (!inherited) body.config_yaml = yaml;
+  // Never sent by a plain account: the pipeline is the manager's field, and PUT /api/me
+  // answers 403 to anyone else — sending it would fail the whole save, upstreams and
+  // capture consent included.
+  if (!inherited && isManager()) body.config_yaml = yaml;
   try {
     const out = await ctl('/api/me', { method: 'PUT', body: JSON.stringify(body) });
     account.tenant = out.tenant;
@@ -3005,17 +3817,25 @@ async function loadTenants() {
     }
     const tbl = el('table', { class: 'grid' },
       el('thead', {}, el('tr', {},
-        el('th', {}, 'Account'), el('th', {}, 'Role'), el('th', {}, 'Spend / cap'),
+        el('th', {}, 'Account'), el('th', {}, 'Role'), el('th', {}, 'Variant'), el('th', {}, 'Spend'),
         el('th', {}, 'Last seen'), el('th', {}, 'Transcripts'), el('th', {}, 'Configuration'),
         el('th', {}, el('span', { class: 'vh' }, 'Row actions')))));
     const body = el('tbody');
     for (const t of rows) {
-      const over = t.monthly_cap_usd > 0 && t.spent_usd >= t.monthly_cap_usd;
       body.appendChild(el('tr', { class: t.disabled ? 'revoked' : '' },
-        el('td', {}, el('div', {}, t.email), el('div', { class: 'muted small' }, t.label)),
+        el('td', {}, el('div', {}, t.email),
+          el('div', { class: 'muted small' }, t.label),
+          // Why an account is off, printed where the manager will read it — the same
+          // sentence its owner is shown when their agent is refused.
+          t.disabled
+            ? el('div', { class: 'small warn-text' },
+              t.disabled_reason ? 'disabled: ' + t.disabled_reason : 'disabled (no reason recorded)')
+            : null),
         el('td', {}, t.role),
-        el('td', { class: over ? 'warn-text' : '' },
-          t.monthly_cap_usd > 0 ? `${usd(t.spent_usd)} / ${usd(t.monthly_cap_usd)}` : usd(t.spent_usd)),
+        el('td', {}, t.variant
+          ? el('span', { class: 'ab-name' }, t.variant)
+          : el('span', { class: 'muted' }, '—')),
+        el('td', {}, usd(t.spent_usd)),
         el('td', {}, t.last_seen_at ? when(t.last_seen_at) : el('span', { class: 'muted' }, 'never')),
         // The EFFECTIVE answer to "are this account's transcripts being kept", which is
         // the AND of both gates — never the account's flag on its own.
@@ -3025,41 +3845,19 @@ async function loadTenants() {
         el('td', {},
           el('code', { class: 'clip' }, (t.effective_config_yaml || '').split('\n')[0] || '—'),
           t.config_inherited ? el('div', { class: 'muted small' }, 'server default') : null),
+        // Two buttons, not five. Everything that CHANGES this account — its configuration,
+        // its variant, disable, a reissued token, a reset, purge, delete — is in the editor,
+        // where the account's own facts are on screen next to the control. A row of small
+        // ghost buttons that each act on a different account by id is how the wrong row
+        // gets clicked.
         el('td', {}, el('div', { class: 'row-actions' },
           el('button', {
             class: 'ghost small', onclick: () => showTenantMetrics(t.id),
           }, 'Metrics'),
           el('button', {
-            class: 'ghost small', 'data-testid': 'cap-' + t.id,
-            onclick: async () => {
-              const v = prompt(`Monthly cap in USD for ${t.email} (0 = uncapped):`, String(t.monthly_cap_usd));
-              if (v === null) return;
-              const n = Number(v);
-              if (!Number.isFinite(n) || n < 0) { alert('Not a valid amount.'); return; }
-              try { await ctl('/api/tenants/' + t.id, { method: 'PATCH', body: JSON.stringify({ monthly_cap_usd: n }) }); loadTenants(); } catch (e) { alert(e.message); }
-            },
-          }, 'Set cap'),
-          el('button', {
-            class: 'ghost small', 'data-testid': 'toggle-' + t.id,
-            onclick: async () => {
-              const msg = t.disabled
-                ? `Re-enable ${t.email}?`
-                : `Disable ${t.email}? Their agents stop working immediately and they are signed out.`;
-              if (!confirm(msg)) return;
-              try { await ctl('/api/tenants/' + t.id, { method: 'PATCH', body: JSON.stringify({ disabled: !t.disabled }) }); loadTenants(); } catch (e) { alert(e.message); }
-            },
-          }, t.disabled ? 'Enable' : 'Disable'),
-          el('button', {
-            class: 'ghost small',
-            onclick: async () => {
-              if (!confirm(`Mint a replacement token for ${t.email}? Hand it over on a channel you trust.`)) return;
-              try {
-                const out = await ctl('/api/tenants/' + t.id + '/tokens', { method: 'POST', body: JSON.stringify({ label: 'reissued' }) });
-                // Shown once, so it goes in a place the manager must acknowledge.
-                prompt('Copy this token now — it cannot be recovered:', out.token);
-              } catch (e) { alert(e.message); }
-            },
-          }, 'Reissue token')))));
+            class: 'ghost small', 'data-testid': 'manage-' + t.id,
+            onclick: () => openTenantEditor(t.id),
+          }, 'Manage')))));
     }
     tbl.appendChild(body);
     host.appendChild(tbl);
@@ -3067,6 +3865,9 @@ async function loadTenants() {
     clear(host);
     errorState(host, 'Could not list tenants', e);
   }
+  // The A/B card lives in this view, above the roster: a variant is assigned here, so the
+  // comparison belongs next to the assignment rather than behind another tab.
+  loadVariants();
 }
 
 /** Jump to this tenant's traffic. Managers get ?tenant= on every read route, so the
@@ -3076,6 +3877,419 @@ function showTenantMetrics(id) {
   // fetch the current view with the new scope and then immediately fetch Overview.
   setFilter('tenant', id, { quiet: true });
   go('overview');
+}
+
+// ── the account editor (manager) ───────────────────────────────────────────
+//
+// One panel per account, opened from the roster and linkable (#tenants?acct=<id>), because
+// "the account I mean" is a thing managers send each other. It reuses the request drawer:
+// same focus trap, same Escape, same Back-closes-it behaviour — a second panel would need
+// all of that again and would get some of it wrong.
+//
+// Everything that mutates an account is in here rather than in its row, so the facts and
+// the controls are on screen together. The alternative — a row of small buttons that each
+// act on a different account by id — is how the wrong row gets clicked.
+
+/** openTenantEditor shows one account. fromURL suppresses the history push. */
+async function openTenantEditor(id, fromURL) {
+  if (!fromURL) { state.drawer = { acct: id }; syncURL(false); }
+  const body = openDrawer('Account', null);
+  loadingState(body, 4);
+  let rows = [];
+  try {
+    rows = (await ctl('/api/tenants')).tenants || [];
+  } catch (e) { errorState(body, 'Could not read the roster', e); return; }
+  const t = rows.find((x) => x.id === id);
+  if (!t) {
+    emptyState(clear(body), 'No such account', 'It may have just been deleted.');
+    return;
+  }
+  await loadOptions(); // the upstream allow-list, so the selects offer only what is accepted
+  renderTenantEditor(clear(body), t);
+}
+
+/** reloadTenantEditor repaints the panel and the roster behind it after a change, so the
+ *  two can never disagree about what was just saved. */
+function reloadTenantEditor(id) {
+  loadTenants();
+  openTenantEditor(id, true);
+}
+
+function renderTenantEditor(host, t) {
+  $('#drawer-title').textContent = t.email;
+  const status = el('span', { class: 'muted small', 'data-testid': 'acct-status' });
+  const say = (msg, bad) => {
+    status.textContent = msg || '';
+    status.className = 'small ' + (bad ? 'warn-text' : 'muted');
+  };
+
+  // What this account IS, before anything about changing it — the same fact band the
+  // request drawer uses.
+  host.appendChild(el('div', { class: 'kv-band' },
+    el('div', { class: 'kv' },
+      kv('Role', t.role),
+      kv('Variant', t.variant || 'none'),
+      kv('Month to date', usd(t.spent_usd)),
+      kv('Last seen', t.last_seen_at ? when(t.last_seen_at) : 'never'),
+      kv('Registered', when(t.created_at)),
+      kv('Provider keys bound', num(t.agent_keys)),
+      kv('Row quota', t.max_rows ? num(t.max_rows) : 'server default'),
+      kv('Password', t.has_password ? 'set' : 'never set'),
+      kv('Status', t.disabled ? 'disabled' : 'active'))));
+
+  // Says where the transcripts are rather than leaving a manager to hunt: the drawer and
+  // diff viewer are the tenant's own, reached by pointing the account selector here.
+  host.appendChild(el('div', { class: 'state blocked' },
+    el('div', { class: 'state-body' },
+      el('strong', { text: 'You can read this account’s transcripts' }),
+      el('span', {
+        text: 'Pick this account in the selector, then open any request or session diff. '
+          + 'Only what they consented to capture exists to read.',
+      }))));
+
+  const fields = el('div');
+  host.appendChild(fields);
+
+  const label = textField(fields, 'acct-label', 'Machine label', t.label);
+  const variant = textField(fields, 'acct-variant', 'A/B variant', t.variant,
+    'A label only — it changes nothing about their pipeline. Letters, digits, dot, dash '
+    + 'or underscore. Empty means not in a test.');
+  const role = el('select', { id: 'acct-role', 'data-testid': 'acct-role' },
+    el('option', { value: 'user' }, 'user'),
+    el('option', { value: 'manager' }, 'manager — can administer every account'));
+  role.value = t.role;
+  fields.appendChild(el('div', { class: 'field' },
+    el('label', { for: 'acct-role' }, 'Role'), role));
+
+  const rowsCap = el('input', {
+    type: 'number', min: '0', step: '1000', id: 'acct-rows', 'data-testid': 'acct-rows',
+  });
+  rowsCap.value = String(t.max_rows || 0);
+  fields.appendChild(el('div', { class: 'field' },
+    el('label', { for: 'acct-rows' }, 'Retained request rows'), rowsCap,
+    el('p', { class: 'hint' }, '0 follows the server default. Over the cap their oldest '
+      + 'sessions are archived or dropped — theirs, not everyone’s.')));
+
+  const ups = (account.options && account.options.upstreams) || [];
+  const upSel = {};
+  for (const [key, text] of [['up_anthropic', 'Anthropic-dialect upstream'],
+    ['up_openai', 'OpenAI-dialect upstream'], ['up_bob', 'Bob upstream']]) {
+    const sel = el('select', { id: 'acct-' + key, 'data-testid': 'acct-' + key },
+      el('option', { value: '' }, '— none —'),
+      ...ups.map((u) => el('option', { value: u.name }, u.name + ' (' + u.dialect + ')')));
+    sel.value = t[key] || '';
+    upSel[key] = sel;
+    fields.appendChild(el('div', { class: 'field' }, el('label', { for: 'acct-' + key }, text), sel));
+  }
+
+  const cap = el('input', { type: 'checkbox', id: 'acct-capture', 'data-testid': 'acct-capture' });
+  cap.checked = !!t.capture_content;
+  fields.appendChild(el('div', { class: 'field' },
+    el('label', { class: 'comp', for: 'acct-capture' }, cap,
+      el('span', { class: 'comp-name' }, 'Store their transcripts')),
+    el('p', { class: 'hint' }, 'Their consent, which you can withdraw but never read '
+      + 'through. Turning it off stops new capture; it deletes nothing.')));
+
+  // Whether the configuration is theirs or the server default is the first thing to say,
+  // because saving a tracking account's form must not silently freeze a copy of today's
+  // default onto it — the same trap the user's own settings page avoids.
+  const effective = t.effective_config_yaml || '';
+  const inherited = !!t.config_inherited;
+  fields.appendChild(el('div', { class: 'cfg-state' },
+    el('div', {}, inherited
+      ? el('span', {}, el('strong', {}, 'Following the server default.'),
+        ' Saving this form leaves that alone unless you edit the YAML below.')
+      : el('span', {}, el('strong', {}, 'Has its own configuration.'),
+        ' Changes to the server default do not reach them.'))));
+  const yaml = el('textarea', {
+    id: 'acct-yaml', rows: 12, spellcheck: 'false', 'data-testid': 'acct-yaml',
+    'aria-label': 'Their full configuration, YAML',
+  });
+  yaml.value = effective;
+  fields.appendChild(el('details', { class: 'field' },
+    el('summary', {}, 'Full configuration (YAML)'), yaml,
+    el('p', { class: 'hint' }, 'Pipeline, per-component settings and mode. Validated on '
+      + 'save by the same loader the proxy builds with, so a typo is a refusal naming the '
+      + 'key rather than a surprise at request time. Saving rebuilds their pipeline, which '
+      + 'discards their frozen compaction decisions — their next turn will not be cache-warm.')));
+
+  fields.appendChild(el('div', { class: 'actions' },
+    el('button', {
+      class: 'primary', 'data-testid': 'acct-save',
+      onclick: async () => {
+        say('saving…');
+        const patch = {
+          label: label.value.trim(),
+          variant: variant.value.trim(),
+          role: role.value,
+          max_rows: Number(rowsCap.value) || 0,
+          capture_content: cap.checked,
+          up_anthropic: upSel.up_anthropic.value,
+          up_openai: upSel.up_openai.value,
+          up_bob: upSel.up_bob.value,
+        };
+        // Omitted while it is inherited AND untouched: sending it would store a copy of
+        // today's default and quietly end their tracking of it.
+        if (!inherited || yaml.value.trim() !== effective.trim()) patch.config_yaml = yaml.value;
+        try {
+          await ctl('/api/tenants/' + t.id, { method: 'PATCH', body: JSON.stringify(patch) });
+          reloadTenantEditor(t.id);
+        } catch (e) { say('not saved: ' + e.message, true); }
+      },
+    }, 'Save'),
+    status));
+
+  // Availability and recovery. Disabling asks for a reason because the reason is what the
+  // account's owner is shown when their agent is refused — without it, "disabled" is
+  // indistinguishable from the proxy being broken.
+  host.appendChild(el('h2', {}, 'Availability'));
+  const reason = el('input', {
+    type: 'text', id: 'acct-reason', maxlength: '200', 'data-testid': 'acct-reason',
+    placeholder: 'e.g. paused pending the finance review',
+  });
+  reason.value = t.disabled_reason || '';
+  if (!t.disabled) {
+    host.appendChild(el('div', { class: 'field' },
+      el('label', { for: 'acct-reason' }, 'Reason (shown to them)'), reason,
+      el('p', { class: 'hint' }, 'Returned in the 403 their agent receives and in the '
+        + 'refusal at sign-in. They are who reads this; write it for them.')));
+  }
+  host.appendChild(el('div', { class: 'actions' },
+    el('button', {
+      class: 'ghost', 'data-testid': 'acct-toggle',
+      onclick: async () => {
+        const patch = t.disabled
+          ? { disabled: false }
+          : { disabled: true, disabled_reason: reason.value.trim() };
+        if (!t.disabled && !confirm('Disable ' + t.email + '? Their agents stop immediately '
+          + 'and they are signed out of the dashboard.')) return;
+        try {
+          await ctl('/api/tenants/' + t.id, { method: 'PATCH', body: JSON.stringify(patch) });
+          reloadTenantEditor(t.id);
+        } catch (e) { say(e.message, true); }
+      },
+    }, t.disabled ? 'Enable' : 'Disable'),
+    el('button', {
+      class: 'ghost', 'data-testid': 'acct-reset',
+      onclick: async () => {
+        if (!confirm('Email ' + t.email + ' a password reset code?\n\nYou will not see the '
+          + 'code and cannot set their password. Their current password keeps working '
+          + 'until they finish.')) return;
+        try {
+          const out = await ctl('/api/tenants/' + t.id + '/password-reset', { method: 'POST' });
+          say(out.note || 'reset code mailed');
+        } catch (e) { say(e.message, true); }
+      },
+    }, 'Email a password reset'),
+    el('button', {
+      class: 'ghost',
+      onclick: async () => {
+        if (!confirm('Mint a replacement token for ' + t.email + '? Hand it over on a '
+          + 'channel you trust; it is shown once.')) return;
+        try {
+          const out = await ctl('/api/tenants/' + t.id + '/tokens',
+            { method: 'POST', body: JSON.stringify({ label: 'reissued' }) });
+          prompt('Copy this token now — it cannot be recovered:', out.token);
+        } catch (e) { say(e.message, true); }
+      },
+    }, 'Reissue token')));
+
+  host.appendChild(dangerZone(t, say));
+}
+
+/** kv renders one label/value pair of the drawer's fact band. */
+function kv(k, v) {
+  return el('div', {}, el('div', { class: 'k' }, k), el('div', { class: 'v' }, String(v)));
+}
+
+/** textField appends a labelled text input and returns it. */
+function textField(host, id, labelText, value, hint) {
+  const input = el('input', { type: 'text', id, 'data-testid': id });
+  input.value = value || '';
+  host.appendChild(el('div', { class: 'field' },
+    el('label', { for: id }, labelText), input,
+    hint ? el('p', { class: 'hint' }, hint) : null));
+  return input;
+}
+
+/**
+ * dangerZone builds the purge and delete controls.
+ *
+ * Both are irreversible and both act on somebody else's data BY ID, so the mistake worth
+ * engineering against is acting on the wrong account. The buttons are therefore inert until
+ * that account's own address has been typed into the box beside them — the server demands
+ * the same string, so this is the visible half of a check that is enforced anyway.
+ *
+ * Folded away behind a summary, and never a bare one-click button.
+ */
+function dangerZone(t, say) {
+  const confirmBox = el('input', {
+    type: 'text', id: 'acct-confirm', 'data-testid': 'acct-confirm',
+    autocomplete: 'off', spellcheck: 'false', placeholder: t.email,
+  });
+  const purge = el('button', { class: 'ghost small', disabled: true, 'data-testid': 'acct-purge' },
+    'Purge their stored data');
+  const del = el('button', { class: 'destructive small', disabled: true, 'data-testid': 'acct-delete' },
+    'Delete this account and its data');
+  const matches = () => confirmBox.value.trim().toLowerCase() === t.email.toLowerCase();
+  const sync = () => { purge.disabled = !matches(); del.disabled = !matches(); };
+  confirmBox.addEventListener('input', sync);
+
+  // What it removed, reported afterwards: a destructive action that answers "ok" tells the
+  // person who pressed it nothing about whether it did anything.
+  const report = el('p', { class: 'hint', 'data-testid': 'acct-purge-report' });
+  const run = async (path, method, verb) => {
+    if (!matches()) return;
+    if (!confirm(verb + '.\n\nThis cannot be undone. Continue?')) return;
+    say('working…');
+    try {
+      const out = await ctl(path, {
+        method, body: JSON.stringify({ confirm: confirmBox.value.trim() }),
+      });
+      const p = out.purged || {};
+      say('');
+      report.className = 'hint ok';
+      report.textContent = out.status + ': ' + num(p.requests) + ' requests, '
+        + num(p.components) + ' component rows, ' + num(p.content) + ' stored transcripts, '
+        + num(p.archives) + ' archived sessions (' + num(p.objects)
+        + ' objects deleted from cold storage).';
+      loadTenants();
+      if (method === 'DELETE') {
+        // The account is gone, so the panel describing it must not stay open showing a form
+        // whose every button would now 404.
+        setTimeout(() => { dismissDrawer(); state.drawer = null; syncURL(true); }, 1500);
+      } else {
+        confirmBox.value = '';
+        sync();
+      }
+    } catch (e) {
+      say('');
+      report.className = 'hint warn-text';
+      report.textContent = e.message;
+    }
+  };
+  purge.addEventListener('click', () => run('/api/tenants/' + t.id + '/purge', 'POST',
+    'Purge every stored request, component row and transcript for ' + t.email
+    + ', including its archives in cold storage. The account itself keeps working'));
+  del.addEventListener('click', () => run('/api/tenants/' + t.id, 'DELETE',
+    'Delete ' + t.email + ': the account, its tokens, its sessions and all of its stored '
+    + 'data in both databases and in cold storage'));
+
+  return el('details', { class: 'danger', 'data-testid': 'acct-danger' },
+    el('summary', {}, 'Danger zone'),
+    el('p', { class: 'hint' },
+      'Purge clears their history and leaves the account working. Delete removes the '
+      + 'account too. Both reach the metrics database and cold storage, and neither can be '
+      + 'undone — the audit record of having done it is all that is kept.'),
+    el('div', { class: 'field' },
+      el('label', { for: 'acct-confirm' }, 'Type ' + t.email + ' to enable these'),
+      confirmBox),
+    el('div', { class: 'danger-act' }, purge, del),
+    report);
+}
+
+// ── A/B variants (manager) ─────────────────────────────────────────────────
+//
+// A variant is a name a manager put on a set of accounts; this panel groups the metrics
+// that already exist by it. There is deliberately no significance test and no winner
+// highlighting: assignment is not random and the workloads are not comparable, so a test
+// statistic here would look like evidence without being any.
+//
+// A TABLE rather than a chart, on purpose. This is a handful of groups across eight
+// measures whose DENOMINATORS have to sit beside the figures — a table's job. A bar chart
+// of "spend per variant" would be precisely the misleading artefact the note above it warns
+// about: two bars, no sample size, no confounds.
+
+async function loadVariants() {
+  const host = clear($('#ab-list'));
+  const caveatHost = clear($('#ab-caveats'));
+  loadingState(host, 2);
+  const range = Number($('#ab-range').value) || 0;
+  const q = range > 0 ? '?since=' + (Date.now() - range) : '';
+  let out;
+  try {
+    out = await ctl('/api/variants' + q);
+  } catch (e) { clear(host); errorState(host, 'Could not compare variants', e); return; }
+  const rows = out.variants || [];
+  clear(host);
+  if (!rows.some((v) => v.variant)) {
+    emptyState(host, 'No variants assigned yet',
+      'Open an account from the roster below and give it a variant name. Two names over two '
+      + 'groups is an A/B test; accounts with no name are grouped as unassigned.');
+    return;
+  }
+  const tbl = el('table', { class: 'grid' },
+    el('thead', {}, el('tr', {},
+      el('th', {}, 'Variant'), el('th', {}, 'Accounts'), el('th', {}, 'Requests'),
+      el('th', {}, 'Tokens in → out'), el('th', {}, 'Saved'), el('th', {}, 'Spent'),
+      el('th', {}, 'Spent / request'), el('th', {}, 'Saved (est.)'),
+      el('th', {}, 'Unpriced'))));
+  const body = el('tbody');
+  for (const v of rows) {
+    const perReq = v.requests > 0 ? v.spent_usd / v.requests : null;
+    const savedPct = v.tokens_before > 0 ? (100 * v.saved) / v.tokens_before : null;
+    body.appendChild(el('tr', {},
+      el('td', {},
+        v.variant ? el('span', { class: 'ab-name' }, v.variant)
+          : el('span', { class: 'muted' }, 'unassigned'),
+        // Several configurations inside one variant means it is not one treatment. Said on
+        // the row, because it invalidates that row's comparison specifically.
+        (v.configs || []).length > 1
+          ? el('span', { class: 'denom warn-text' }, (v.configs || []).length + ' different configs')
+          : null),
+      el('td', {}, num(v.tenants),
+        el('span', { class: 'denom' }, num(v.reporting) + ' with traffic')),
+      el('td', {}, num(v.requests),
+        el('span', { class: 'denom' }, num(v.sessions) + (v.sessions === 1 ? ' session' : ' sessions'))),
+      el('td', {}, compact(v.tokens_before) + ' → ' + compact(v.tokens_after)),
+      el('td', {}, compact(v.saved),
+        el('span', { class: 'denom' }, savedPct === null ? 'no traffic' : pct(savedPct) + ' of input')),
+      el('td', {}, usd(v.spent_usd)),
+      // The only normalisation offered, and the one this project has already been misled
+      // by: it says nothing about cost per TASK, because a variant that needs more turns
+      // can be cheaper per request and dearer per job.
+      el('td', {}, perReq === null ? '—' : usd(perReq),
+        el('span', { class: 'denom' }, 'not per task')),
+      el('td', {}, usd(v.saved_usd),
+        el('span', { class: 'denom' }, 'counterfactual')),
+      // Rows the provider priced for nobody. Where this approaches the request count, the
+      // money columns on this row are unknown rather than small.
+      el('td', {}, num(v.incomplete_rows),
+        v.requests > 0 && v.incomplete_rows >= v.requests
+          ? el('span', { class: 'denom warn-text' }, 'money unknown')
+          : null)));
+    // Which component did the work, folded across the variant's accounts — the row that
+    // turns "arm B is cheaper" into something anyone can act on.
+    const comps = v.components || [];
+    if (comps.length) {
+      const inner = el('table', { class: 'grid' },
+        el('thead', {}, el('tr', {}, el('th', {}, 'Component'), el('th', {}, 'Ran'),
+          el('th', {}, 'Acted'), el('th', {}, 'Reverted'), el('th', {}, 'Saved'))));
+      const ibody = el('tbody');
+      for (const c of comps.slice(0, 20)) {
+        ibody.appendChild(el('tr', {},
+          el('td', {}, el('code', {}, c.component)),
+          el('td', {}, num(c.runs)),
+          el('td', {}, num(c.acted) + ' (' + pct(100 * (c.act_rate || 0)) + ')'),
+          el('td', {}, c.reverted ? el('span', { class: 'warn-text' }, num(c.reverted)) : '0'),
+          el('td', {}, compact(c.saved_unique))));
+      }
+      inner.appendChild(ibody);
+      body.appendChild(el('tr', {}, el('td', { colspan: '9' },
+        el('details', {}, el('summary', { class: 'hint' },
+          'Components in ' + (v.variant || 'unassigned')), inner))));
+    }
+  }
+  tbl.appendChild(body);
+  host.appendChild(tbl);
+
+  // The full caveat list comes from the server rather than being written twice: the API
+  // decides what this comparison cannot show, and a second copy in the page would drift.
+  const list = el('ul');
+  for (const c of out.caveats || []) list.appendChild(el('li', {}, c));
+  caveatHost.appendChild(el('details', { class: 'why' },
+    el('summary', {}, 'What this comparison cannot tell you'),
+    el('p', { class: 'hint' }, out.description || ''), list));
 }
 
 // ── archive ────────────────────────────────────────────────────────────────
@@ -3143,14 +4357,20 @@ Object.assign(loaders, {
 
 function initAccounts() {
   $('#gate-tab-signin').addEventListener('click', () => {
-    $('#gate-signin').hidden = false; $('#gate-register').hidden = true;
-    $('#gate-closed').hidden = true;
+    cancelVerify(); // switching tabs abandons a pending code rather than hiding it
+    cancelReset(true);
+    hideGateForms();
+    $('#gate-signin').hidden = false;
     $('#gate-tab-signin').setAttribute('aria-selected', 'true');
     $('#gate-tab-register').setAttribute('aria-selected', 'false');
     gateError('');
+    gateNotice('');
   });
   $('#gate-tab-register').addEventListener('click', () => {
-    $('#gate-signin').hidden = true;
+    cancelVerify();
+    cancelReset(true);
+    hideGateForms();
+    gateNotice('');
     $('#gate-tab-signin').setAttribute('aria-selected', 'false');
     $('#gate-tab-register').setAttribute('aria-selected', 'true');
     // The form appears only if this deployment would accept it; applyRegisterMode puts
@@ -3163,40 +4383,78 @@ function initAccounts() {
   $('#gate-signin').addEventListener('submit', async (ev) => {
     ev.preventDefault();
     gateError('');
+    const token = $('#gate-token').value.trim();
     try {
-      await ctl('/api/login', { method: 'POST', body: JSON.stringify({ token: $('#gate-token').value.trim() }) });
-      // Do not keep the token in the DOM one moment longer than needed.
-      $('#gate-token').value = '';
-      await probeAccount();
-      go('overview'); // refresh() inside go() loads the facets for the new principal
-      connectLive();
-    } catch (e) { gateError(e.message); }
+      if (token) {
+        // The legacy path: a token, no second factor, for an account with no password.
+        await ctl('/api/login', { method: 'POST', body: JSON.stringify({ token }) });
+        $('#gate-token').value = ''; // not in the DOM one moment longer than needed
+        await probeAccount();
+        go('overview'); // refresh() inside go() loads the facets for the new principal
+        connectLive();
+        return;
+      }
+      const email = $('#gate-signin-email').value.trim();
+      const out = await ctl('/api/login', {
+        method: 'POST',
+        body: JSON.stringify({ email, password: $('#gate-password').value }),
+      });
+      // The password leaves the DOM the moment it has been spent, whatever happens next.
+      $('#gate-password').value = '';
+      showVerify(out.email || email, out.code_expires_at,
+        `We emailed a 6-digit code to ${out.email || email}.`);
+    } catch (e) { $('#gate-password').value = ''; gateError(e.message); }
   });
 
   $('#gate-register').addEventListener('submit', async (ev) => {
     ev.preventDefault();
     gateError('');
+    const email = $('#gate-email').value.trim();
     try {
       const out = await ctl('/api/register', {
         method: 'POST',
         body: JSON.stringify({
-          email: $('#gate-email').value.trim(),
+          email,
+          password: $('#gate-new-password').value,
           label: $('#gate-label').value.trim(),
           // Sent only in invite mode, where the server compares it in constant time.
           // Always present as a key so the server sees "" rather than a missing field.
           code: account.register === 'invite' ? $('#gate-code').value : '',
         }),
       });
-      // Do not leave the invite code sitting in the DOM after it has been spent.
+      // Neither the password nor the invite code stays in the DOM after being spent.
+      $('#gate-new-password').value = '';
       $('#gate-code').value = '';
-      // Registration signs the user in and hands back the ONLY copy of the token, so go
-      // straight to Setup with it substituted into the snippets.
-      account.freshToken = out.token;
+      // No token and no session yet: the account is inert until the mailed code comes
+      // back. That is the whole point of phase two, so the UI must not pretend otherwise.
+      showVerify(out.email || email, out.code_expires_at,
+        `We emailed a 6-digit code to ${out.email || email} to confirm the address.`);
+    } catch (e) { $('#gate-new-password').value = ''; gateError(e.message); }
+  });
+
+  $('#gate-verify').addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    gateError('');
+    try {
+      const out = await ctl('/api/verify', {
+        method: 'POST',
+        body: JSON.stringify({ email: verify.email, code: $('#gate-verify-code').value.trim() }),
+      });
+      cancelVerify();
       await probeAccount();
-      go('setup');
+      if (out.token) {
+        // Registration's reply carries the ONLY copy of the first token, so go straight
+        // to Setup with it substituted into the snippets.
+        account.freshToken = out.token;
+        go('setup');
+      } else {
+        go('overview');
+      }
       connectLive();
     } catch (e) { gateError(e.message); }
   });
+
+  $('#gate-verify-cancel').addEventListener('click', () => { gateError(''); cancelVerify(); });
 
   $('#signout').addEventListener('click', async () => {
     try { await ctl('/api/logout', { method: 'POST' }); } catch { /* clearing locally regardless */ }
@@ -3205,6 +4463,11 @@ function initAccounts() {
     showGate(true);
     applyAccount();
   });
+
+  initReset();
+  // The A/B window is local to that card: the Tenants view hides the global filter bar
+  // (it is not a traffic view), so the comparison carries its own range.
+  $('#ab-range').addEventListener('change', loadVariants);
 
   $('#mint-token').addEventListener('click', async () => {
     const label = prompt('Name this token (e.g. laptop, ci):', 'new-token');
@@ -3217,3 +4480,459 @@ function initAccounts() {
     } catch (e) { alert(e.message); }
   });
 }
+
+// ── feedback ───────────────────────────────────────────────────────────────
+//
+// One view, two audiences. Everybody gets the form; the manager additionally gets the
+// aggregate and every answer, which are the three [data-manager] cards in index.html —
+// so the entitlement is declared in the markup and applied by applyAccount(), exactly
+// like the Tenants tab, rather than by a second check here that could disagree with it.
+//
+// The server is the authority on all of it: it re-checks the 50-character rule, it
+// refuses a rating it did not ask for, and it answers 403 to a plain account that asks
+// to read. What this file does is make the rules visible before the round trip.
+
+/** STAR_WORDS name each step, so a rating is never just a count of shapes. */
+const STAR_WORDS = ['bad', 'poor', 'okay', 'good', 'excellent'];
+
+/**
+ * The questions and the agent selector come from the SERVER, keys AND wording:
+ * tenant.FeedbackQuestions and tenant.FeedbackAgents. A key invented here would be
+ * refused with a 422, and wording invented here would label a row with a different
+ * question from the one the manager's email reports — so neither is written down twice.
+ *
+ * Filled from /api/me for the form, and from /api/feedback for the manager's view, which
+ * is also what lets that view label a key it is only reading.
+ */
+const feedbackForm = { questions: [], agents: [] };
+
+const labelOf = (list, key) => (list.find((x) => x.key === key) || {}).label || key;
+/** dimLabel prints a question key the way the form asked it. */
+const dimLabel = (key) => labelOf(feedbackForm.questions, key);
+const agentLabel = (key) => (key ? labelOf(feedbackForm.agents, key) : 'not stated');
+
+/**
+ * meaningfulLen counts the characters a reader would see, collapsing every run of
+ * whitespace to one — the same rule tenant.meaningfulLen applies server-side.
+ *
+ * Both halves count it the same way on purpose: a counter that says 62 next to a server
+ * that says "not 50 yet" is a form the user cannot satisfy, and 50 spaces must not be a
+ * way past a mandatory field.
+ */
+function meaningfulLen(s) { return (s || '').trim().split(/\s+/).filter(Boolean).join(' ').length; }
+
+/** starSVG draws one star. currentColor, so CSS decides filled or empty. */
+function starSVG() {
+  const svg = svgEl('svg', { viewBox: '0 0 20 20', 'aria-hidden': 'true', class: 'star-icon' });
+  svg.appendChild(svgEl('path', {
+    d: 'M10 1.6l2.6 5.3 5.8.8-4.2 4.1 1 5.8-5.2-2.8-5.2 2.8 1-5.8L1.6 7.7l5.8-.8z',
+    fill: 'currentColor',
+  }));
+  return svg;
+}
+
+/**
+ * starField builds one question: a fieldset, five radios, five star labels.
+ *
+ * Native radios, deliberately. They come with keyboard support (arrows move within the
+ * group, Tab leaves it), a name/value pair the browser submits, screen-reader semantics
+ * and a focus ring — all of which a div-with-click-handlers has to reimplement and
+ * usually gets wrong. The stars are the LABELS; the .on class is paint over the radio's
+ * state, never the state itself.
+ */
+function starField(key, question, help) {
+  const name = 'fb-' + key;
+  const read = el('span', { class: 'stars-read', 'aria-live': 'polite' });
+  const row = el('div', { class: 'stars', role: 'radiogroup', 'aria-label': question });
+  const paint = () => {
+    const chosen = row.querySelector('input:checked');
+    const v = chosen ? Number(chosen.value) : 0;
+    $$('.star', row).forEach((s, i) => s.classList.toggle('on', i < v));
+    read.textContent = v ? `${v} of 5 — ${STAR_WORDS[v - 1]}` : '';
+  };
+  for (let v = 1; v <= 5; v++) {
+    const id = name + '-' + v;
+    row.appendChild(el('input', {
+      type: 'radio', name, id, value: String(v), class: 'star-input',
+      'data-testid': 'star-' + key + '-' + v, onchange: paint,
+    }));
+    // The label's accessible name is the WORD, not the position: "4 — good" is a rating,
+    // "star 4" is a coordinate.
+    row.appendChild(el('label', { for: id, class: 'star', title: `${v} — ${STAR_WORDS[v - 1]}` },
+      el('span', { class: 'vh', text: `${v} of 5 — ${STAR_WORDS[v - 1]}` }), starSVG()));
+  }
+  return el('fieldset', { class: 'stars-field', 'data-dim': key },
+    el('legend', {}, question),
+    help ? el('p', { class: 'hint', text: help }) : null,
+    el('div', { class: 'stars-line' }, row, read),
+    el('p', { class: 'field-error', role: 'alert', hidden: true, 'data-testid': 'err-' + key }));
+}
+
+/** Show or clear the error under one field. role=alert, so it is announced. */
+function fieldError(node, msg) {
+  const p = node.querySelector('.field-error');
+  if (!p) return;
+  p.textContent = msg || '';
+  p.hidden = !msg;
+}
+
+/**
+ * loadFeedback draws the form, and — for a manager — the aggregate below it.
+ *
+ * The questions and the two agents come from /api/me, so this file never guesses at a key
+ * the server validates or at wording the server's email prints.
+ */
+async function loadFeedback() {
+  const form = $('#feedback-form');
+  if (!form.dataset.built) {
+    try {
+      const me = await ctl('/api/me');
+      feedbackForm.questions = me.feedback_questions || [];
+      feedbackForm.agents = me.feedback_agents || [];
+    } catch (e) {
+      // No questions means no form: drawing an empty one would collect nothing the server
+      // would accept. The loader must not reject, so this is reported in place.
+      errorState(clear(form), 'Could not load the feedback form', e);
+      return;
+    }
+    buildFeedbackForm(form);
+    form.dataset.built = '1';
+  }
+  if (isManager()) loadFeedbackAdmin();
+}
+
+function buildFeedbackForm(form) {
+  clear(form);
+
+  // Which agent first: the same seven questions follow either way, and the answer is
+  // stored so the manager can read Claude Code and Bob apart. A native select, so the
+  // keyboard, the screen reader and the mobile picker all come for free.
+  const agent = el('select', { id: 'fb-agent', 'data-testid': 'fb-agent' },
+    el('option', { value: '' }, 'Choose one…'),
+    ...feedbackForm.agents.map((a) => el('option', { value: a.key }, a.label)));
+  const agentField = el('div', { class: 'field' },
+    el('label', { for: 'fb-agent' }, 'Which agent is this about? (required)'),
+    agent,
+    el('p', { class: 'field-error', role: 'alert', hidden: true, 'data-testid': 'err-agent' }));
+  form.appendChild(agentField);
+
+  for (const q of feedbackForm.questions) form.appendChild(starField(q.key, q.label));
+
+  const comment = el('textarea', {
+    id: 'fb-comment', rows: '6', maxlength: '4000', required: 'required',
+    'aria-describedby': 'fb-comment-count', 'data-testid': 'fb-comment',
+    placeholder: 'How it feels, what to add or improve, any bugs.',
+  });
+  // ONE element carries both the live count and the validation message for this field.
+  //
+  // It is deliberately not a separate error paragraph that appears, and this is a bug
+  // fixed rather than a preference: an element that materialises on blur moves the submit
+  // button DOWN between mousedown and mouseup, so the browser sees no click on it and the
+  // first press of "Send feedback" does nothing at all. Found in the browser, not in a
+  // test — the count line is always present, so nothing below it can move.
+  //
+  // aria-live so the count and the message are both announced as they change, and
+  // aria-describedby on the textarea so a screen reader reads the requirement on focus.
+  const count = el('p', {
+    class: 'hint', id: 'fb-comment-count', 'data-testid': 'fb-count', 'aria-live': 'polite',
+  });
+  const commentField = el('div', { class: 'field' },
+    el('label', { for: 'fb-comment' }, 'General feeling, things to add or improve, bugs (required)'),
+    el('p', { class: 'hint' }, 'At least 50 characters of real text; whitespace does not count.'),
+    comment, count);
+  form.appendChild(commentField);
+
+  // tally is the field's whole validation surface: it runs on every keystroke, so the
+  // requirement is never a surprise at submit time. `demand` is the submit-time voice.
+  const tally = (demand) => {
+    const n = meaningfulLen(comment.value);
+    count.textContent = n >= 50 ? `${n} characters — long enough.`
+      : demand ? `Please write at least 50 characters of real text; this is ${n}.`
+        : `${n} of 50 characters.`;
+    count.classList.toggle('short', n < 50);
+    return n;
+  };
+  comment.addEventListener('input', () => tally(false));
+  tally(false);
+
+  const status = el('p', { class: 'field-error', role: 'alert', hidden: true, 'data-testid': 'fb-error' });
+  const submit = el('button', { type: 'submit', class: 'primary', 'data-testid': 'fb-submit' },
+    'Send feedback');
+  form.appendChild(el('div', { class: 'actions' }, submit, status));
+
+  // Assigned rather than added: "Send more feedback" rebuilds this form on the same
+  // element, and a second addEventListener there would post the next submission twice.
+  form.onsubmit = async (ev) => {
+    ev.preventDefault();
+    status.hidden = true;
+    const scores = {};
+    let firstBad = null;
+    if (!agent.value) {
+      fieldError(agentField, 'Please say which agent this is about.');
+      firstBad = agentField;
+    } else {
+      fieldError(agentField, '');
+    }
+    for (const fs of $$('.stars-field', form)) {
+      const chosen = fs.querySelector('input:checked');
+      if (!chosen) {
+        fieldError(fs, 'Please give this a rating.');
+        if (!firstBad) firstBad = fs;
+        continue;
+      }
+      fieldError(fs, '');
+      scores[fs.dataset.dim] = Number(chosen.value);
+    }
+    if (tally(true) < 50 && !firstBad) firstBad = commentField;
+    if (firstBad) {
+      // Move to the first problem rather than reporting all of them at the bottom.
+      const focusable = firstBad.querySelector('input,textarea,select');
+      if (focusable) focusable.focus();
+      firstBad.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      return;
+    }
+
+    submit.disabled = true;
+    submit.textContent = 'Sending…';
+    try {
+      await ctl('/api/feedback', {
+        method: 'POST',
+        body: JSON.stringify({ agent: agent.value, scores, comment: comment.value }),
+      });
+      feedbackThanks(form);
+      if (isManager()) loadFeedbackAdmin();
+    } catch (e) {
+      // The server's message names the rule it enforced; passing it through beats a
+      // generic "something went wrong" that says less than the thing it replaced.
+      status.textContent = e.message;
+      status.hidden = false;
+      submit.disabled = false;
+      submit.textContent = 'Send feedback';
+    }
+  };
+}
+
+/** After a successful submit the form is replaced by what happened, and one way back. */
+function feedbackThanks(form) {
+  clear(form);
+  form.dataset.built = '';
+  form.appendChild(el('div', { class: 'banner ok', 'data-testid': 'fb-thanks', role: 'status' },
+    'Thank you — that is stored here and on its way to the manager by email.'));
+  form.appendChild(el('div', { class: 'actions' },
+    el('button', {
+      type: 'button', class: 'ghost', 'data-testid': 'fb-again',
+      onclick: () => loadFeedback(),
+    }, 'Send more feedback')));
+}
+
+// ── the manager's aggregate ────────────────────────────────────────────────
+
+/**
+ * distBars is a five-bucket histogram of one question's answers, one hue.
+ *
+ * One measure (how many people) across five ordered buckets is ONE colour: five colours
+ * would imply five different things are being plotted. aria-hidden because the same
+ * numbers are in the five columns beside it — the picture is for scanning, the columns
+ * are the accessible reading.
+ */
+function distBars(dist) {
+  const max = Math.max(...dist, 1);
+  return el('div', { class: 'dist', 'aria-hidden': 'true' },
+    ...dist.map((n, i) => el('span', {
+      class: 'dist-col', title: `${i + 1}★: ${n}`,
+    }, el('i', { style: 'height:' + Math.max(2, Math.round((n / max) * 100)) + '%' }))));
+}
+
+/** meanBar is a 0–5 track with the value beside it, so the number is never colour-only. */
+function meanBar(mean) {
+  return el('div', { class: 'mean-cell' },
+    el('div', { class: 'bar-track' },
+      el('div', { class: 'bar-fill', style: 'width:' + (mean / 5) * 100 + '%' })),
+    el('span', { class: 'mean-val', text: mean.toFixed(2) }));
+}
+
+/**
+ * npsBar renders the recommend question as its three states.
+ *
+ * Status colours, not series colours: promoter / passive / detractor is a judgement
+ * about a state, which is exactly what --good / --warn / --bad are reserved for. Each
+ * segment is also labelled in words below, because a status must never be colour alone.
+ */
+function npsBar(host, nps) {
+  clear(host);
+  // nps.n, not nps.N: the wire is JSON, and Go's tag lowercases it. This read the
+  // uppercase field at first, so the panel said "nobody has answered" beside a table
+  // reporting eight answers.
+  if (!nps || !nps.n) {
+    emptyState(host, 'Nobody has answered the recommend question yet', '');
+    return;
+  }
+  const parts = [
+    ['promoters', 'Promoters (5★)', nps.promoters, 'good'],
+    ['passives', 'Passives (4★)', nps.passives, 'warn'],
+    ['detractors', 'Detractors (1–3★)', nps.detractors, 'bad'],
+  ];
+  host.appendChild(el('div', { class: 'nps-head' },
+    el('span', { class: 'nps-score', text: (nps.score > 0 ? '+' : '') + nps.score.toFixed(0) }),
+    el('span', { class: 'muted small', text: `NPS from ${nps.n} answer${nps.n === 1 ? '' : 's'}` })));
+  host.appendChild(el('div', { class: 'nps-bar' }, ...parts
+    .filter(([, , n]) => n > 0)
+    .map(([key, , n, cls]) => el('div', {
+      class: 'nps-seg ' + cls, style: 'flex:' + n, 'data-testid': 'nps-' + key,
+    }))));
+  host.appendChild(el('div', { class: 'nps-legend' }, ...parts.map(([, label, n, cls]) =>
+    el('span', {}, el('i', { class: 'sw ' + cls }), `${label}: ${n}`))));
+}
+
+/** starText renders a stored rating as filled and empty stars plus its number. */
+function starText(v) {
+  return el('span', { class: 'star-read', title: `${v} of 5` },
+    el('span', { class: 'on', text: '★'.repeat(v) }),
+    el('span', { class: 'off', text: '★'.repeat(5 - v) }),
+    el('span', { class: 'vh', text: ` ${v} of 5` }));
+}
+
+/**
+ * loadFeedbackAdmin fills the manager's three areas.
+ *
+ * Carries the tenant filter when one is set, so drilling in from the Tenants roster
+ * narrows this view too. The server answers 403 to anyone who is not a manager whatever
+ * this sends, so the parameter is a filter and never a permission.
+ */
+async function loadFeedbackAdmin() {
+  const body = $('#feedback-dims-body');
+  const answers = $('#feedback-answers');
+  loadingRows(body, 9);
+  loadingState(answers);
+  try {
+    const q = state.filter.tenant ? '?tenant=' + encodeURIComponent(state.filter.tenant) : '';
+    const out = await ctl('/api/feedback' + q);
+    // The wording for a stored key comes with the data, so this view labels a question the
+    // way it was asked even before anybody has opened the form.
+    feedbackForm.questions = out.questions || feedbackForm.questions;
+    feedbackForm.agents = out.agents || feedbackForm.agents;
+    const sum = out.summary || {};
+    renderFeedbackTiles(sum);
+    renderFeedbackAgents(sum);
+    $('#feedback-count').textContent = `${sum.n || 0} submission${sum.n === 1 ? '' : 's'}` +
+      (state.filter.tenant ? ' from the selected account' : '');
+
+    clear(body);
+    const dims = sum.dimensions || [];
+    if (!dims.length) {
+      tableMessage(body, 9, 'No feedback yet',
+        'The form above is what fills this in. Nothing is seeded.');
+    }
+    for (const d of dims) {
+      body.appendChild(el('tr', { 'data-testid': 'dim-' + d.dimension },
+        el('td', {}, dimLabel(d.dimension)),
+        el('td', {}, meanBar(d.mean)),
+        el('td', {}, distBars(d.dist)),
+        ...d.dist.map((n) => el('td', { class: 'num', text: String(n) })),
+        el('td', { class: 'num', text: String(d.n) })));
+    }
+
+    npsBar($('#feedback-nps'), sum.nps);
+    lineChart($('#chart-feedback'), [{
+      name: 'Mean overall', color: SERIES[0], area: true,
+      points: (sum.trend || []).map((p) => [p.day, p.mean]),
+    }], { yFmt: (v) => v.toFixed(1), yMax: 5, label: 'mean overall stars per day' });
+
+    renderFeedbackAnswers(answers, out.submissions || []);
+  } catch (e) {
+    clear(body);
+    tableMessage(body, 9, 'Could not read the feedback', String(e.message || e), { error: true });
+    errorState(answers, 'Could not read the feedback', e);
+  }
+}
+
+function renderFeedbackTiles(sum) {
+  const host = clear($('#feedback-tiles'));
+  const overall = (sum.dimensions || []).find((d) => d.dimension === 'overall');
+  const nps = sum.nps || {};
+  host.appendChild(tileGroup(null, null, [
+    tile('fb-count', 'Submissions', num(sum.n || 0), 'stars plus written answers'),
+    tile('fb-overall', 'Mean overall', overall ? overall.mean.toFixed(2) + ' / 5' : '—',
+      overall ? `${overall.n} answered` : 'nobody has answered yet',
+      overall ? (overall.mean >= 4 ? 'good' : overall.mean < 3 ? 'bad' : '') : ''),
+    tile('fb-nps', 'NPS', nps.n ? (nps.score > 0 ? '+' : '') + nps.score.toFixed(0) : '—',
+      nps.n ? `${nps.promoters} promoters, ${nps.detractors} detractors` : 'no answers yet',
+      nps.n ? (nps.score > 0 ? 'good' : nps.score < 0 ? 'bad' : '') : ''),
+    // A relay that stopped working is otherwise only visible in the server log.
+    tile('fb-unmailed', 'Not emailed', num(sum.unmailed || 0),
+      sum.unmailed ? 'stored here, never left the relay' : 'every copy was delivered',
+      sum.unmailed ? 'bad' : ''),
+  ], 'headline'));
+}
+
+/**
+ * renderFeedbackAgents is the reason the form asks which agent it is about: the same
+ * headline numbers, read per agent, so "compaction is fine" and "compaction is not fine"
+ * do not average each other away.
+ *
+ * The declared agents first, then anything else stored (rows from before the selector
+ * existed carry no agent at all), so the order does not move as the numbers do.
+ */
+function renderFeedbackAgents(sum) {
+  const body = clear($('#feedback-agents-body'));
+  const by = sum.by_agent || {};
+  const keys = feedbackForm.agents.map((a) => a.key).filter((k) => by[k])
+    .concat(Object.keys(by).filter((k) => !feedbackForm.agents.some((a) => a.key === k)).sort());
+  if (!keys.length) {
+    tableMessage(body, 4, 'No feedback yet', 'The form above is what fills this in.');
+    return;
+  }
+  for (const k of keys) {
+    const s = by[k];
+    const overall = (s.dimensions || []).find((d) => d.dimension === 'overall');
+    const nps = s.nps || {};
+    body.appendChild(el('tr', { 'data-testid': 'agent-' + (k || 'none') },
+      el('td', {}, agentLabel(k)),
+      el('td', { class: 'num', text: String(s.n || 0) }),
+      el('td', {}, overall ? meanBar(overall.mean) : el('span', { class: 'muted', text: '—' })),
+      el('td', {
+        class: 'num',
+        text: nps.n ? (nps.score > 0 ? '+' : '') + nps.score.toFixed(0) : '—',
+      })));
+  }
+}
+
+/**
+ * renderFeedbackAnswers lists every submission verbatim.
+ *
+ * Every string here was typed by a user, so every one of them lands through el() and
+ * textContent. Nothing on this page concatenates markup — el() throws on raw html, which
+ * is what makes that a property of the page rather than a habit.
+ */
+function renderFeedbackAnswers(host, rows) {
+  clear(host);
+  if (!rows.length) {
+    emptyState(host, 'No written feedback yet',
+      'The form above is the only thing that writes here.');
+    return;
+  }
+  for (const fb of rows) {
+    const scores = fb.scores || {};
+    // Asked-order, not alphabetical: the chips read like the form somebody filled in.
+    const chips = feedbackForm.questions.filter((q) => scores[q.key])
+      .map((q) => el('span', { class: 'score-chip' },
+        el('span', { class: 'score-dim', text: q.label }), starText(scores[q.key])));
+    host.appendChild(el('article', { class: 'answer', 'data-testid': 'answer-' + fb.id },
+      el('header', { class: 'answer-head' },
+        el('strong', { text: fb.email || 'unknown account' }),
+        fb.label ? el('span', { class: 'muted small', text: fb.label }) : null,
+        el('span', { class: 'pill', 'data-testid': 'answer-agent-' + fb.id },
+          agentLabel(fb.agent)),
+        el('span', { class: 'muted small', text: when(fb.created_at) }),
+        fb.mailed_at
+          ? el('span', { class: 'pill complete' }, 'emailed')
+          : el('span', { class: 'pill missing' }, 'not emailed')),
+      el('div', { class: 'score-chips' }, ...chips),
+      el('div', { class: 'answer-block' },
+        el('h4', {}, 'Comment'), el('p', { text: fb.comment }))));
+  }
+}
+
+// Registered here rather than in the shared Object.assign above, so this whole feature
+// is one appended block and the view table above stays untouched.
+Object.assign(loaders, { feedback: loadFeedback });

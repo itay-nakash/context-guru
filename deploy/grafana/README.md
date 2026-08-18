@@ -1,16 +1,44 @@
 # Grafana for context-guru
 
-Two provisioned dashboards over the proxy's own `/metrics`, plus the Prometheus job that
-feeds them. Everything here is **file-provisioned**: nothing is clicked into Grafana, so a
-redeploy cannot lose it and a review can read it.
+Three provisioned dashboards — two over the proxy's own `/metrics`, one over its logs —
+plus the Prometheus job and the Loki/promtail pair that feed them. Everything here is
+**file-provisioned**: nothing is clicked into Grafana, so a redeploy cannot lose it and a
+review can read it.
 
 ```
 prometheus-scrape.yml                     the scrape job (merge into your prometheus.yml)
+loki.yml                                  the log store: single binary, filesystem, 30d
+promtail.yml                              tails the JSON log sink into Loki
+context-guru.logrotate                    rotation for that sink (copytruncate; see the file)
 provisioning/datasources/prometheus.yml   the datasource, uid pinned to cg-prom
+provisioning/datasources/loki.yml         the datasource, uid pinned to cg-loki
 provisioning/dashboards/context-guru.yml  where Grafana looks for the JSON
 dashboards/context-guru.json              the service dashboard, 6 rows
 dashboards/context-guru-slo.json          the SLO dashboard, 4 rows
+dashboards/context-guru-logs.json         the log dashboard, filterable by tenant/session/level/component
 ```
+
+## Why Loki
+
+Grafana stores no logs of its own, so something had to. Loki wins on one property that
+matters more than any feature comparison: **it is read through the Grafana that is already
+running here**, so an operator who sees a latency spike on the service dashboard clicks
+across to the log lines for the same tenant and the same minute without changing tool,
+credential or mental model — and there is exactly one thing to secure, back up and explain.
+It is also the only candidate whose storage model matches what we actually have: a
+single-binary process indexing nothing but a handful of labels and keeping compressed
+chunks on the local filesystem, which is the same shape as the Prometheus beside it and
+costs one more container. The alternatives lose on that same axis, not on capability.
+Elasticsearch (or OpenSearch) is the strongest search engine of the three and would
+full-text index every line — it also wants a JVM, several gigabytes of resident memory and
+an index lifecycle policy, on a box whose job is serving agent traffic, and it puts the
+logs behind a second UI. ClickHouse is a better analytical store than Loki will ever be,
+but reading logs is not an analytics workload and it would still need a Grafana datasource
+plus a schema we maintain. Plain files with `journalctl` and `grep` — the genuinely lazy
+option, and the one we keep as the fallback — cannot answer "every line for this tenant's
+session across the last three days" without an ssh session and a human, which is precisely
+the question this exists for. Loki is chosen for being the smallest thing that answers it,
+and the ranking would flip the day we needed real full-text search over log bodies.
 
 ## The fast path on the box that runs the proxy
 
@@ -18,46 +46,132 @@ dashboards/context-guru-slo.json          the SLO dashboard, 4 rows
 sudo deploy/service/install.sh grafana
 ```
 
-That is the whole install: it needs `docker` (or `podman`), pulls Prometheus and Grafana,
-writes the config under `/etc/context-guru/observability`, and starts both bound to
-**loopback only**. It is idempotent — re-run it after editing a dashboard JSON and it
-re-copies the files and recreates both containers, which is how the edit takes effect. The
-TSDB and Grafana's database live outside the containers, so nothing is lost. Then:
+That is the whole install: it needs `docker` (or `podman`), pulls Prometheus, Grafana, Loki
+and promtail, writes the config under `/etc/context-guru/observability`, installs the
+logrotate snippet, and starts all four bound to **loopback only**. It is idempotent —
+re-run it after editing a dashboard JSON and it re-copies the files and recreates the
+containers, which is how the edit takes effect. The TSDB, the log store and Grafana's
+database live outside the containers, so nothing is lost. Then:
 
 ```
-http://127.0.0.1:3000/d/context-guru/context-guru       # ssh -L 3000:127.0.0.1:3000 to reach it
+https://<host>/grafana/d/context-guru/context-guru            # through the front end, manager only
+https://<host>/grafana/d/context-guru-logs/context-guru-logs  # the logs
+http://127.0.0.1:3000/grafana/d/context-guru/context-guru     # or ssh -L 3000:127.0.0.1:3000
 ```
+
+### Reaching it: the manager gate
+
+Grafana binds loopback and nginx is the only thing that talks to it. The front end
+publishes it at **`/grafana/`**, behind two doors:
+
+1. **Ours.** nginx `auth_request` asks the proxy's `GET /api/authz/grafana` first, which
+   answers 204 only for a `cg_dash` browser session belonging to a **manager** — the same
+   `webPrincipal` + `IsManager()` the control plane uses, so there is no second notion of
+   who an administrator is. Anyone else gets nginx's own 401/403 and Grafana never sees the
+   request. Not even its login page is reachable, which is the point: that form would
+   otherwise be a password-guessing target in front of every tenant's spend. A proxy token
+   does not work here — cookie only, like every other control-plane route.
+2. **Grafana's** — and the gate walks through it for you. The 204 carries the manager's
+   address in `X-Cg-Grafana-User`; Grafana's auth-proxy trusts that header, creates the
+   account on first visit and signs them in as **Admin**. Anonymous access stays off, and
+   Grafana's own login form stays enabled as break-glass on the loopback port.
+
+So a manager signed in at `/dashboard/` reaches `/grafana/` and is already an Admin.
+**There is no second password to hold.** Sub-path support (`GF_SERVER_ROOT_URL`,
+`GF_SERVER_SERVE_FROM_SUB_PATH=true`) is set by the installer; without both, every asset
+Grafana generates 404s.
+
+#### Why the trusted header, and not a second account each
+
+A provisioned Grafana account per manager is the conventional answer, and it was the
+alternative here. It loses on the thing that actually goes wrong: it is a *second* password,
+in a *second* account store, ageing independently of the context-guru account beside it — so
+disabling a manager in context-guru leaves their Grafana admin login working, and the
+password ends up wherever the operator remembers passwords. The gate authenticated this
+person, with the role we care about, one request earlier. Asking again is theatre with a
+maintenance bill.
+
+#### Proving the header cannot be forged
+
+`X-Cg-Grafana-User` **is** an authentication: whoever can put it on a request that reaches
+Grafana is an admin. Three controls, all required, none sufficient alone:
+
+| Control | Where | What it stops |
+|---|---|---|
+| `auth_request_set` + an unconditional `proxy_set_header` | `deploy/service/nginx.conf`, `location /grafana/` | A client's own header. nginx *defines* the header from the subrequest's answer, which replaces whatever arrived — with the empty string when the gate named nobody, which Grafana reads as "not signed in". |
+| The gate names only the session's owner | `proxy/control.go`, `ctlAuthzGrafana` | A forged header influencing the *answer*. Covered by `TestGrafanaAuthzNamesTheSessionOwnerNotTheRequestsHeader`. |
+| `auth_proxy_whitelist = 127.0.0.1,::1` | Grafana's env, set by `install.sh` | Anything but this nginx presenting the header at all. |
+
+`deploy/service/tls-smoke.sh` runs the outside half of this on every invocation — it is four
+of its checks, so a regression in that location block fails the smoke test rather than
+waiting for someone to notice. By hand, against the live front end:
+
+```console
+$ curl -sk -H 'X-Cg-Grafana-User: attacker@ibm.com' \
+    -o /tmp/forged.body -w '%{http_code}\n' https://<host>/grafana/api/user
+401
+$ grep -ci 'grafana\|<script\|isGrafanaAdmin' /tmp/forged.body
+0
+```
+
+Both lines matter. A 401 whose body was Grafana's own error page would mean the request
+reached Grafana; the `0` is the proof it did not.
+
+From the authorized side, signed in as a manager, `/grafana/api/user` returns **that
+manager's** email with `orgRole: Admin` — and returns it *even when the request carries*
+`X-Cg-Grafana-User: someone.else@ibm.com`, because nginx overwrote it.
+
+Known ceiling: `auto_sign_up` means anything that can already reach `127.0.0.1:3000` can
+mint a Grafana Admin by naming an address. That is a local root or local user, who can
+equally read `grafana.db` or reset the admin password — the whitelist bounds the header to
+the box, not to nginx alone, and tightening it further would need a shared secret between
+nginx and Grafana that neither has today.
+
+`/api/authz/grafana` ships with the nginx config but only takes effect when the proxy
+restarts, and the gate fails **closed** until it does: a manager sees 401 too. Check with
+`grep -c api/authz/grafana /usr/local/bin/context-guru-proxy`.
 
 ### The admin password
 
-Nothing here has a default password and `admin/admin` is never set.
+**A manager needs none.** The gate signs them in as Admin (see "Reaching it" above), so the
+built-in `admin` account has no job in the normal path. It exists as break-glass for the day
+the proxy is down and you are on the loopback port through `ssh -L`.
 
-- **First install:** the installer generates a password and **prints it once**, as
-  `admin / <value>`. It is not written to any file — copy it out of that output. Or set
-  `GRAFANA_ADMIN_PASSWORD` in the environment of the `install.sh grafana` call and it uses
-  yours instead.
+- **First install:** nothing is printed and nothing is saved. `admin` is seeded with a
+  random value that not even the installer keeps, because Grafana's *unset* default is
+  `admin/admin` and that is the one outcome that must not happen. Set
+  `GRAFANA_ADMIN_PASSWORD` in the environment of the `install.sh grafana` call if you want
+  to choose it now, or set one later with the one-liner below.
+- **How it is passed, and why not `-e`:** through `docker run --env-file`, a 0600
+  root-owned file on the `/run` tmpfs that is deleted the moment the container exists.
+  `-e GF_SECURITY_ADMIN_PASSWORD=…` would put the password in the installer's own argv,
+  and `/proc/<pid>/cmdline` is world-readable — any local user running `ps auxww` during
+  the install would read it, and Grafana's admin sees every tenant's month-to-date cost.
+  If an install predating this ever ran on your box, or a password ever reached a command
+  line, treat it as **disclosed** and reset it below.
 - **Every later run:** no password is set or needed. It already lives in Grafana's own
   database under `/var/lib/context-guru/observability/grafana`, so re-running the installer
   never demands a secret and never resets one.
 
-#### Rotating the admin password
+#### Setting or rotating it: the one command
 
-There is no recovery, only a reset. Grafana stores a hash, so a lost password means
-choosing a new one:
+There is no recovery, only a reset — Grafana stores a hash. This is the whole procedure, and
+the value stays out of both your shell history and the host process list:
 
 ```bash
-# Typed at a prompt and piped in on stdin: the value never reaches a command line, so it
-# lands in neither your shell history nor the host process list.
+# Type the new password at the prompt (it does not echo), then this pipes it in on stdin.
 read -rs NEWPW
 printf '%s' "$NEWPW" | sudo docker exec -i cg-grafana \
-  sh -c 'read -r pw; grafana cli admin reset-admin-password "$pw"'
+  grafana cli admin reset-admin-password --password-from-stdin
 unset NEWPW
 # -> Admin password changed successfully ✔
 ```
 
-Rotate the same way on a schedule. `GRAFANA_ADMIN_PASSWORD` is only consulted when
-Grafana's database does not yet exist, so re-running the installer is *not* a rotation
-path.
+`--password-from-stdin` rather than the positional argument: the argument form puts the value
+in the container process's argv, which `ps auxww` on the host shows.
+
+`GRAFANA_ADMIN_PASSWORD` is only consulted when Grafana's database does not yet exist, so
+re-running the installer is *not* a rotation path.
 
 `sudo deploy/service/install.sh grafana-status` prints container state, scrape health and
 the provisioned dashboard uids. `grafana-remove` deletes the containers (the TSDB under
@@ -83,10 +197,14 @@ sudo install -d -m0755 "$ETC" "$ETC/grafana/dashboards" \
 sudo install -d -m0755 "$ST"
 sudo install -d -m0755 -o 65534 -g 65534 "$ST/prometheus"   # prometheus runs as nobody
 sudo install -d -m0755 -o 472   -g 0     "$ST/grafana"      # grafana runs as uid 472
+sudo install -d -m0755 -o 10001 -g 10001 "$ST/loki" "$ST/promtail"  # both run as 10001
+sudo install -d -m0750 -o cg    -g cg    /var/log/context-guru      # the JSON log sink
 
 # 3. our files. install -m0644 rather than cp: root's umask leaves cp output 0640, and a
 #    container user that cannot read its own config crash-loops with "permission denied".
 sudo install -m0644 deploy/grafana/prometheus-scrape.yml "$ETC/prometheus.yml"
+sudo install -m0644 deploy/grafana/loki.yml "$ETC/loki.yml"
+sudo install -m0644 deploy/grafana/promtail.yml "$ETC/promtail.yml"
 sudo install -m0644 deploy/grafana/provisioning/datasources/*.yml "$ETC/grafana/provisioning/datasources/"
 sudo install -m0644 deploy/grafana/provisioning/dashboards/*.yml  "$ETC/grafana/provisioning/dashboards/"
 sudo install -m0644 deploy/grafana/dashboards/*.json              "$ETC/grafana/dashboards/"
@@ -103,19 +221,61 @@ sudo docker run -d --name cg-prometheus --network=host --restart=unless-stopped 
   --storage.tsdb.retention.time=90d \
   --web.listen-address=127.0.0.1:9090
 
-# 5. Grafana. GF_SERVER_HTTP_ADDR keeps it on loopback; reach it over an ssh tunnel.
-#    Choose the admin password first and pass it from the environment — never write it into
-#    a file here. Only the FIRST run needs it; drop the -e line on later runs, because after
-#    this the password lives in Grafana's database under $ST/grafana.
-read -rs GRAFANA_ADMIN_PASSWORD && export GRAFANA_ADMIN_PASSWORD
-sudo -E docker run -d --name cg-grafana --network=host --restart=unless-stopped \
-  -e GF_SERVER_HTTP_ADDR=127.0.0.1 -e GF_SERVER_HTTP_PORT=3000 \
-  -e GF_AUTH_ANONYMOUS_ENABLED=false -e GF_ANALYTICS_REPORTING_ENABLED=false \
-  -e GF_SECURITY_ADMIN_PASSWORD="$GRAFANA_ADMIN_PASSWORD" \
+# 5. Loki, the log store. loki.yml pins its listen address to loopback, which host
+#    networking would otherwise leave on every interface.
+sudo docker run -d --name cg-loki --network=host --restart=unless-stopped \
+  -v "$ETC/loki.yml:/etc/loki/local-config.yaml:ro,Z" \
+  -v "$ST/loki:/loki:Z" \
+  docker.io/grafana/loki:3.4.2 -config.file=/etc/loki/local-config.yaml
+
+# 6. promtail, which tails the proxy's JSON sink into Loki. The log directory read-only;
+#    its own state directory writable, for the positions file that stops a restarted
+#    promtail re-shipping the whole log.
+sudo docker run -d --name cg-promtail --network=host --restart=unless-stopped \
+  -v "$ETC/promtail.yml:/etc/promtail/config.yml:ro,Z" \
+  -v "$ST/promtail:/var/lib/promtail:Z" \
+  -v /var/log/context-guru:/var/log/context-guru:ro,Z \
+  docker.io/grafana/promtail:3.4.2 -config.file=/etc/promtail/config.yml
+
+# 7. Grafana. GF_SERVER_HTTP_ADDR keeps it on loopback — nginx publishes it at /grafana/,
+#    and ROOT_URL + SERVE_FROM_SUB_PATH are what make its redirects and asset URLs agree
+#    with that path. The AUTH_PROXY block is the sign-in: nginx's manager gate names the
+#    manager in X-Cg-Grafana-User and Grafana trusts it, from the loopback peer ONLY —
+#    that whitelist is half of what keeps the header from being forged (nginx.conf has the
+#    other half). Admin, because everyone who gets through the gate is a manager.
+#
+#    The admin password is break-glass only and is seeded random-and-unsaved, because
+#    Grafana's default when it is unset is admin/admin. Drop that line on later runs; after
+#    the first it lives in Grafana's database under $ST/grafana. Every variable goes through
+#    an env-FILE for its sake: `-e GF_SECURITY_ADMIN_PASSWORD=…` puts the value in this
+#    shell's argv, and /proc/<pid>/cmdline is world-readable. 0600 on the /run tmpfs
+#    instead, deleted as soon as the container exists — the runtime has copied the values
+#    into it by then.
+EF=$(sudo mktemp /run/cg-grafana-env.XXXXXX) && sudo chmod 0600 "$EF"
+sudo tee "$EF" >/dev/null <<EOF
+GF_SERVER_HTTP_ADDR=127.0.0.1
+GF_SERVER_HTTP_PORT=3000
+GF_SERVER_ROOT_URL=https://$(hostname -f)/grafana/
+GF_SERVER_SERVE_FROM_SUB_PATH=true
+GF_AUTH_ANONYMOUS_ENABLED=false
+GF_ANALYTICS_REPORTING_ENABLED=false
+GF_AUTH_PROXY_ENABLED=true
+GF_AUTH_PROXY_HEADER_NAME=X-Cg-Grafana-User
+GF_AUTH_PROXY_HEADER_PROPERTY=email
+GF_AUTH_PROXY_AUTO_SIGN_UP=true
+GF_AUTH_PROXY_WHITELIST=127.0.0.1,::1
+GF_AUTH_PROXY_ENABLE_LOGIN_TOKEN=false
+GF_USERS_AUTO_ASSIGN_ORG_ROLE=Admin
+GF_USERS_ALLOW_SIGN_UP=false
+GF_SECURITY_ADMIN_PASSWORD=$(head -c 32 /dev/urandom | base64 | tr -d '/+=')
+EOF
+sudo docker run -d --name cg-grafana --network=host --restart=unless-stopped \
+  --env-file "$EF" \
   -v "$ETC/grafana/provisioning:/etc/grafana/provisioning:ro,Z" \
   -v "$ETC/grafana/dashboards:/var/lib/grafana/dashboards/context-guru:ro,Z" \
   -v "$ST/grafana:/var/lib/grafana:Z" \
   docker.io/grafana/grafana:11.6.0
+sudo rm -f "$EF"; unset EF
 ```
 
 The dashboards mount **inside** the Grafana data volume on purpose: the provider yml points
@@ -129,7 +289,8 @@ directory.
 packaged Grafana with a tarball Prometheus, and then the paths differ from everything
 above. If you go that way the only changes are: provisioning lives at
 `/etc/grafana/provisioning`, dashboards at `/var/lib/grafana/dashboards/context-guru`, and
-you set `http_addr = 127.0.0.1` in `/etc/grafana/grafana.ini` instead of the env var.
+you set `http_addr = 127.0.0.1`, `root_url` and `serve_from_sub_path = true` in
+`/etc/grafana/grafana.ini` instead of the env vars.
 
 ## Verify it
 
@@ -152,8 +313,8 @@ reads as healthy:
 $ curl -s http://127.0.0.1:4000/metrics | grep '^cg_refused_requests_total'
 cg_refused_requests_total{reason="rate_limit"} 3
 cg_refused_requests_total{reason="concurrency"} 0
-cg_refused_requests_total{reason="spend_cap"} 1
 cg_refused_requests_total{reason="auth"} 2
+cg_refused_requests_total{reason="no_provider_key"} 0
 cg_refused_requests_total{reason="forbidden"} 0
 cg_refused_requests_total{reason="no_upstream"} 0
 cg_refused_requests_total{reason="upstream_error"} 0
@@ -173,15 +334,22 @@ $ curl -sG http://127.0.0.1:9090/api/v1/query --data-urlencode 'query=cg_request
 An empty `result` array means the target is up but the exposition changed — check the
 series names against `proxy/promexport.go`.
 
-**3. Grafana provisioned both dashboards.** Must list exactly these two uids:
+**3. Grafana provisioned every dashboard.** Note the `/grafana` prefix on its API too —
+`SERVE_FROM_SUB_PATH` moves the whole application, not just the UI, and the bare paths
+answer 301. The credential is the auth-proxy header, which the loopback peer is trusted to
+present — use an address that is **already** a manager, since `auto_sign_up` would otherwise
+create a Grafana account for your typo:
 
 ```console
-$ curl -s -u admin:"$GRAFANA_ADMIN_PASSWORD" 'http://127.0.0.1:3000/api/search?type=dash-db' \
+$ MANAGER_EMAIL=$(systemctl show -p Environment context-guru \
+    | tr ' ' '\n' | sed -n 's/^MANAGER_EMAIL=//p' | tail -1)
+$ curl -s -H "X-Cg-Grafana-User: $MANAGER_EMAIL" 'http://127.0.0.1:3000/grafana/api/search?type=dash-db' \
     | python3 -c 'import json,sys;[print(d["uid"],"|",d["title"]) for d in json.load(sys.stdin)]'
 context-guru | context-guru
+context-guru-logs | context-guru logs
 context-guru-slo | context-guru service SLO
 
-$ curl -s -u admin:"$GRAFANA_ADMIN_PASSWORD" http://127.0.0.1:3000/api/dashboards/uid/context-guru \
+$ curl -s -H "X-Cg-Grafana-User: $MANAGER_EMAIL" http://127.0.0.1:3000/grafana/api/dashboards/uid/context-guru \
     | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["dashboard"]["uid"],len(d["dashboard"]["panels"]),"panels; provisioned:",d["meta"]["provisioned"])'
 context-guru 40 panels; provisioned: True
 ```
@@ -265,6 +433,141 @@ The dashboards need no change for a remote proxy: they query the datasource, and
 datasource is whatever Prometheus you provisioned. If you scrape several proxies into one
 Prometheus, add `instance` to the panels you want split — every series already carries it.
 
+## The logs
+
+### Turning DEBUG on for this deployment
+
+The whole point of DEBUG here is the per-component decision line: which gate declined a
+component, on what numbers, for which tenant and session. It is about 8x the line count of
+INFO — measured, not guessed: the same agent traffic produced 337 lines at DEBUG and 40 at
+INFO through an 8-component pipeline. So it is the level to run while investigating, not
+the level to leave on.
+
+**The exact command.** Use the drop-in, not the shipped unit — the installer replaces the
+unit on every run and would silently undo an edit there:
+
+```bash
+sudoedit /etc/systemd/system/context-guru.service.d/20-local.conf
+#   add:  Environment=CG_LOG_LEVEL=debug
+sudo systemctl daemon-reload && sudo systemctl restart context-guru
+```
+
+Confirm it took, without guessing:
+
+```console
+$ systemctl show -p Environment context-guru | tr ' ' '\n' | grep CG_LOG
+CG_LOG_FILE=/var/log/context-guru/proxy.jsonl
+CG_LOG_LEVEL=debug
+
+$ journalctl -u context-guru -n1 -o cat | python3 -c 'import json,sys; print(json.load(sys.stdin)["logs"])'
+stderr + /var/log/context-guru/proxy.jsonl, level DEBUG, format json
+```
+
+Back to normal: delete the line, `daemon-reload`, `restart`. There is no live level
+switch — a restart costs every active tenant one cold cache prefix, which is a real cost
+but a smaller one than a runtime endpoint that can turn on 8x logging without an audit
+trail.
+
+Running the proxy by hand needs no unit at all:
+
+```bash
+CG_LOG_LEVEL=debug context-guru-proxy --preset codesmart      # text on stderr, nothing shipped
+```
+
+### The four questions, as LogQL
+
+Paste these into Explore, or use the provisioned dashboard's Tenant / Level / Session /
+Component fields, which build them for you.
+
+```logql
+# 1. Everything one user's agent did, newest first.
+{job="context-guru", tenant="eab4d2de01e89d63"}
+
+# 2. One conversation, end to end. In hosted mode the resolved session id is
+#    tenant-scoped (`<tenant>:<agent session>`), so match on a substring.
+{job="context-guru"} | json | session=~".*sess-alpha.*"
+
+# 3. Why did this component do nothing? The gate names and counts are the same
+#    Report.Gates map /stats sums into components.<name>.gates.
+{job="context-guru", level="DEBUG"} | json | msg="cg.component", component="extract_llm"
+  | line_format "{{.session}} {{.verdict}} saved={{.saved}} gates={{.gates}}"
+
+# 4. What are we refusing, and to whom?
+sum by (reason) (count_over_time({job="context-guru"} | json | msg="cg.refused" [5m]))
+```
+
+`tenant` and `level` are Loki **labels**; `session` and `component` deliberately are not.
+Every distinct label-value combination is a stream, so a session label would mint one
+stream per agent conversation and eventually take the index down. They are read out of the
+JSON at query time instead — which is what the two textbox fields on the dashboard do.
+
+Single-tenant proxies log `tenant="local"`: there is no tenant id, and an empty label is
+dropped by promtail, which would leave the selector empty for exactly the people running
+this on a laptop.
+
+### Nothing leaves the box unless you ask
+
+The proxy never talks to Loki. It writes lines to the journal always, and to
+`CG_LOG_FILE` as JSON when that is set; promtail is what ships. So a local proxy with no
+containers is fully logged and ships nothing, and `CG_LOG_PLAIN=1` opts out of all of it —
+plain `log/slog` text on stderr, no file, and (say it plainly) **no credential
+scrubbing**, because that is what "use the standard logger instead" means.
+
+### Verify the log path
+
+Three checks, in the order that isolates a failure.
+
+**1. The proxy is writing JSON.** Must print a line, and `level` must be `DEBUG` if you
+turned it on:
+
+```console
+$ sudo tail -1 /var/log/context-guru/proxy.jsonl | python3 -m json.tool | head -6
+{
+    "time": "2026-08-16T19:13:18.581054577Z",
+    "level": "INFO",
+    "msg": "cg.request",
+    "tenant": "1b3aa926c98b6b85",
+```
+
+**2. Loki has the lines, and knows the tenants.** A count of 0 with traffic flowing means
+promtail is not shipping — `docker logs cg-promtail`:
+
+```console
+$ curl -sG http://127.0.0.1:3100/loki/api/v1/query \
+    --data-urlencode 'query=sum(count_over_time({job="context-guru"}[10m]))' \
+    | python3 -c 'import json,sys; r=json.load(sys.stdin)["data"]["result"]; print(r[0]["value"][1] if r else "EMPTY")'
+333
+
+$ curl -s 'http://127.0.0.1:3100/loki/api/v1/label/tenant/values'
+{"status":"success","data":["1b3aa926c98b6b85","eab4d2de01e89d63"]}
+```
+
+`sudo deploy/service/install.sh grafana-status` runs both of these plus the container
+states.
+
+**3. The log dashboard's panels return data**, without opening a browser. Same shape as
+the Prometheus check below, against Loki:
+
+```bash
+python3 - <<'EOF'
+import json, time, urllib.parse, urllib.request
+end = int(time.time()); start = end - 3600
+for p in json.load(open('deploy/grafana/dashboards/context-guru-logs.json'))['panels']:
+    for t in p.get('targets', []):
+        q = (t['expr'].replace('$tenant', '.*').replace('$level', '.*')
+             .replace('$session', '').replace('$component', '.*')
+             .replace('$search', '').replace('$__range', '1h'))
+        u = 'http://127.0.0.1:3100/loki/api/v1/query_range?' + urllib.parse.urlencode(
+            {'query': q, 'start': f'{start}000000000', 'end': f'{end}000000000',
+             'limit': 10, 'step': '60'})
+        r = json.load(urllib.request.urlopen(u, timeout=30))['data']['result']
+        print(('ok   ' if r else 'EMPTY'), p['title'], '| series', len(r))
+EOF
+```
+
+`Errors` reading EMPTY is the one expected empty: it counts ERROR lines, and a healthy
+proxy has none.
+
 ## Reading the dashboards
 
 **`context-guru`** — six rows, in the order you would actually ask the questions:
@@ -274,9 +577,16 @@ Prometheus, add `instance` to the panels you want split — every series already
 | Is it up and healthy? | scrape reachability, running build, request rate, compaction rate, added latency |
 | Am I saving tokens and money? | actual against baseline spend, token counts before/after, billed tiers, what compaction itself cost |
 | Which components earn their place? | tokens removed, hit rate and time spent, per component — a component at 0% hit rate is dead weight |
-| Who is using it? | spend against cap, request rate and a per-tenant table |
+| Who is using it? | month-to-date spend, request rate and a per-tenant table |
 | Is storage healthy? | local database against cold storage, filesystem headroom, archive reachability, dropped captures |
-| Is anything failing? | refusals by reason and by tenant, compaction-model failures, cache-write churn, wasted tokens, expand bounces, buffered streams, disabled tenants, tenants near their cap |
+| Is anything failing? | refusals by reason and by tenant, compaction-model failures, cache-write churn, wasted tokens, expand bounces, buffered streams, disabled tenants |
+
+**`context-guru-logs`** — the lines themselves, and the one thing the metric dashboards
+cannot show: WHY. Four numbers across the top (lines, requests, warnings, errors), the log
+rate by level, refusals by reason, component verdicts, a table of **which gate declined
+candidates per component**, and the log panel underneath. Tenant and Level are Loki labels;
+Session and Component are free-text over the JSON. Most of it needs `CG_LOG_LEVEL=debug` —
+see "The logs" above.
 
 **`context-guru-slo`** — availability, the latency the service is actually responsible for,
 whether the observability path itself is lossy, and the **HTTP error-rate SLI**: refused
@@ -303,7 +613,7 @@ actual" gets lied to after a filter.
 **Stat and gauge panels follow one rule, and a new panel must pick a side.** The traffic
 light (`#199e70` / `#c98500` / `#e66767`) means **act on this**: the panel carries a
 threshold an operator should respond to — availability, added latency, filesystem in use,
-buffered streams, capture loss, tenants at their cap, up/down. Our own **magnitudes carry no
+buffered streams, capture loss, up/down. Our own **magnitudes carry no
 verdict** and are pinned `#3987e5` blue: build, request rate, tokens removed, sessions
 archived, a positive saving, tokens removed per component. So green here always means "a
 threshold was met that someone might otherwise have had to act on", never merely "this
@@ -346,7 +656,7 @@ light to mean "act on this" — which on those panels is what a non-zero bar mea
 
 - **Refusals are counted, but not every 4xx is a refusal.** `cg_refused_requests_total`
   covers the ways the proxy deliberately turns a request away — 429 rate limit, 429
-  concurrency, 402 spend cap, 401/403 auth, 502 (no upstream configured, or the upstream
+  concurrency, 401/403 auth, 502 (no upstream configured, or the upstream
   call failed). It does NOT count a malformed body (400) or an oversized one (413), and it
   does not cover the control-plane endpoints under `/api/`, which write their status
   directly rather than through `failAuth`. So the error-rate SLI is a *proxy-path* error
@@ -366,6 +676,23 @@ light to mean "act on this" — which on those panels is what a non-zero bar mea
 - **Per-tenant series are month-to-date rollups** declared as counters. They reset at the
   first of the month; `rate()` handles the reset, but a `increase()` over a window spanning
   the boundary undercounts.
+- **The log dashboard is nearly empty at INFO, and that is not a fault.** Component
+  verdicts and the gate table come from DEBUG lines. At INFO you get the one line per
+  request, refusals, and whatever degraded — which is the right default, because DEBUG is
+  about 8x the volume. The panel descriptions say which need it.
+
+- **Loki's retention is enforced by its compactor, and it deletes by stream age.** A
+  30-day `retention_period` means a chunk is dropped once it is 30 days old, not that the
+  last 30 days are guaranteed present: the filesystem filling up is still the filesystem
+  filling up. `du -sh /var/lib/context-guru/observability/loki` is the number to watch, and
+  the logrotate snippet bounds the source file rather than the store.
+
+- **A rotated log file loses a few lines from Loki, never from the journal.** The rotation
+  uses `copytruncate` because the proxy holds the file open for its lifetime and has no
+  reopen path; lines written between the copy and the truncate are lost from the file. See
+  deploy/grafana/context-guru.logrotate for why that trade beats the alternative, which is
+  a log that silently stops growing.
+
 - **No alert rules are provisioned.** The thresholds live in the panels, which is where an
   operator reads them, not where a pager reads them. The panels most worth alerting on are
   cache hit ratio, dropped capture events and filesystem in use.

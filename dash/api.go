@@ -199,6 +199,7 @@ func (a *API) routes() []route {
 		{"GET /api/sessions", scopeTenant, a.sessions},
 		{"GET /api/sessions/{session}/transcript", scopeTenant, a.sessionTranscript},
 		{"GET /api/components", scopeTenant, a.components},
+		{"GET /api/breakdown", scopeTenant, a.breakdown},
 		{"GET /api/facets", scopeTenant, a.facets},
 		{"GET /api/config", scopeManager, a.config},
 		{"GET /api/benchmarks", scopeManager, a.benchmarks},
@@ -282,11 +283,13 @@ func (a *API) sessionTranscript(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Content visibility, same rule as the single-request view: single-tenant keeps the
-	// CIDR gate; hosted, only the owning tenant reads its own transcripts. A manager
-	// reading another tenant with ?tenant= gets the metrics and none of the text.
+	// CIDR gate; hosted, the owning tenant reads its own transcripts and a manager reads
+	// any account's — an explicit owner decision that widens who can read captured
+	// content. Nobody else: a non-manager's f.Tenant is their own principal, whatever
+	// ?tenant= said.
 	visible := a.trusted(r)
 	if a.auth != nil {
-		visible = !f.TenantAll && f.Tenant == p.TenantID
+		visible = p.Manager || (!f.TenantAll && f.Tenant == p.TenantID)
 	}
 
 	evs, err := a.rec.DB().SessionEvents(f, session, visible)
@@ -456,14 +459,9 @@ func (a *API) archivedSession(w http.ResponseWriter, r *http.Request) {
 			"cold storage is unreachable right now: "+err.Error())
 		return
 	}
-	// A manager may read another tenant's metrics but not their transcripts — the
-	// same rule as the live path, applied to the archive so the archive is not a way
-	// around it.
-	if a.auth != nil && meta.TenantID != p.TenantID {
-		for _, e := range evs {
-			e.Content = nil
-		}
-	}
+	// Content needs no second gate here: the ownership check above already admits only
+	// the session's own tenant and the manager, which is the same rule the live path
+	// applies — so a session cannot become unreadable to a manager by going cold.
 	writeJSON(w, map[string]any{"session": meta, "requests": evs})
 }
 
@@ -555,6 +553,9 @@ func filterFrom(r *http.Request) Filter {
 		Component:  q.Get("component"),
 		Reason:     q.Get("reason"),
 		Accounting: q.Get("accounting"),
+		Effort:     q.Get("effort"),
+		Thinking:   q.Get("thinking"),
+		StopReason: q.Get("stop_reason"),
 		Q:          q.Get("q"),
 	}
 	f.Since = atoi64(q.Get("since"))
@@ -634,12 +635,13 @@ func (a *API) request(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Content visibility: single-tenant keeps the CIDR gate (loopback or a trusted
-	// range). Hosted, the row's own tenant is the only party who may read its
-	// transcript — not the operator, not a manager. Seeing another user's source code
-	// is not an administrative need, and the consent they gave was for their own view.
+	// range). Hosted, the row's own tenant may read its transcript — and so may a
+	// manager, an explicit owner decision that widens who can read captured request
+	// content: whoever runs the service already holds purge, delete and configuration
+	// over the same rows. Nobody else, whatever they put in ?tenant=.
 	trusted := a.trusted(r)
 	if a.auth != nil {
-		trusted = true // narrowed below once the row's owner is known
+		trusted = true // hosted: the ownership 404 below is the gate, not the address
 	}
 	e, err := a.rec.DB().Request(id, trusted)
 	if err != nil {
@@ -648,14 +650,12 @@ func (a *API) request(w http.ResponseWriter, r *http.Request) {
 	}
 	if a.auth != nil {
 		// A request id is a small sequential integer, so an ownership check is the
-		// only thing standing between a curious user and the whole table.
+		// only thing standing between a curious user and the whole table. It is also
+		// the whole content gate: past it the caller is the row's owner or the manager,
+		// and both may read the text.
 		if e.TenantID != p.TenantID && !p.Manager {
 			httpErr(w, http.StatusNotFound, "no such request")
 			return
-		}
-		if e.TenantID != p.TenantID {
-			e.Content = nil // manager: metrics for everyone, transcripts for no one
-			trusted = false
 		}
 	}
 	// If this session's transcripts moved to cold storage, fetch them for this one
@@ -722,6 +722,43 @@ func (a *API) components(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]any{"components": rows})
+}
+
+// breakdown serves spent-vs-saved and usage aggregated by ONE dimension — per model, per
+// reasoning effort, per cache_control breakpoint count, per stop reason. One endpoint
+// rather than one per dimension: the caller names the dimension and gets the same row
+// shape back, so a new chart is a new query string rather than a new route.
+//
+// Scoped exactly like every other data route: the tenant on the filter is OVERWRITTEN
+// from the authenticated principal inside a.scope, so `?tenant=` cannot widen it and no
+// principal means no rows.
+func (a *API) breakdown(w http.ResponseWriter, r *http.Request) {
+	f, _, ok := a.scope(r)
+	if !ok {
+		unauthorized(w)
+		return
+	}
+	dim := r.URL.Query().Get("dim")
+	if dim == "" {
+		dim = "model"
+	}
+	rows, err := a.rec.DB().Breakdown(f, dim)
+	if err != nil {
+		// A bad dimension is the CALLER's error, not a server fault, and the answer names
+		// the dimensions that do exist rather than making the UI guess.
+		httpErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{
+		"dim":        dim,
+		"dimensions": BreakdownDims(),
+		"groups":     rows,
+		"description": "Requests, tokens and spent-vs-saved for each value of one dimension. " +
+			"spent_usd is what was billed plus context-guru's own model spend; saved_usd is the " +
+			"baseline counterfactual minus that. incomplete_rows counts rows the provider gave " +
+			"us no usage for — where it equals requests, the money figures for that bar are " +
+			"unknown rather than zero.",
+	})
 }
 
 func (a *API) facets(w http.ResponseWriter, r *http.Request) {

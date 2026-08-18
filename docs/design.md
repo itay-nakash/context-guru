@@ -166,7 +166,9 @@ cap — an already-over-cap request is forwarded untouched and is not ours to re
 If a component changes the message *count* (none of the v1 set does), the slot map no longer
 aligns, so `apply` forwards the original untouched.
 
-Diagnostics: `CONTEXT_GURU_DEBUG=1` logs each tool output's token count + first line;
+Diagnostics: `CG_LOG_LEVEL=debug` (or the legacy `CONTEXT_GURU_DEBUG=1`) logs every
+component's decision — verdict, token delta, and the gate that declined it — plus each tool
+output's token count and first line;
 `CONTEXT_GURU_DUMP=<file>` appends a before→after JSON record per rewritten message.
 
 ## Reversibility: marker + expand loop
@@ -420,20 +422,32 @@ carries the resolved session, the `RunReport`, the cache-awareness facts
 same material `CONTEXT_GURU_DUMP` writes to a file. *Refuses:* a parallel accounting path
 that could disagree with the pipeline's own.
 
-**Redaction before the database, never on read.** Headers are blanket-redacted by key
-against a short allowlist (a denylist fails the moment a gateway invents a new auth
-header); config keys are allowlisted, with credential-named keys always withheld, and an
-allowlisted key's *value* is still checked for an embedded `user:password@` credential.
+**Redaction before the database, never on read.** Request **headers are never captured at
+all** — no capture path records one, so there is no header redaction step to describe. (An
+allowlist for it existed with no production caller; it was deleted rather than wired up,
+because dead security code claims a protection that is not there. If headers are ever
+recorded, the allowlist comes back with them: a denylist fails the moment a gateway invents
+a new auth header.) Config keys are allowlisted, with credential-named keys always
+withheld, and an allowlisted key's *value* is still checked for an embedded
+`user:password@` credential.
 
 Captured message **content** is the one surface that cannot be allowlisted — it is
 arbitrary agent output — so it gets pattern scrubbing, and a pattern denylist is
 structurally always behind reality: a review of 22 realistic credential shapes found 11
 passing through, including `Authorization: Bearer <token>`, where the pattern matched the
 scheme and left the token. The patterns are fixed and the shapes are now a table-driven
-test, but the honest conclusion is that this mechanism cannot be *proved* complete, so
-content capture is **opt-in** (`--dashboard-content`, default off) rather than opt-out.
+test, but the honest conclusion is that this mechanism cannot be *proved* complete, so the
+capture is gated — by two switches that default differently, and both belong in the same
+sentence. The **operator** gate `--dashboard-content` is process-wide and defaults off.
+The **per-tenant** switch behind it defaults on: a hosted account is registered with
+`capture_content: true`, so once an operator opens theirs, a new tenant's transcripts are
+written from that tenant's first request. Either switch alone stops the writes: the tenant
+clears their consent on Settings, the operator sets `DASHBOARD_CONTENT=false` for everyone.
+Which of the two a deployment leaves open is a property of that deployment, which is why the
+effective decision is reported per request (`content_captured`, `capture_blocked_by`) instead
+of inferred from a default.
 *Refuses:* a secret on disk, a redact-on-read filter one forgotten code path from leaking
-it, and a default that writes arbitrary transcripts to disk behind a denylist.
+it, and a claim of "off by default" that names only one of the two switches.
 
 **Percentages at read time, cost at write time.** Ratios are derived per query, so a
 filter change needs no rebuild. Costs are computed when the row is written, so history does
@@ -485,8 +499,8 @@ flowchart LR
   res -->|incoming| inc["Incoming: request's own<br/>model + upstream + key<br/>(built in proxy.chat)"]
   res -->|config| stat["Static: cheap model<br/>(CHEAP_MODEL* env)"]
   res -->|nil| deg["degrade: extract_llm→no-op,<br/>summarize→no-op"]
-  inc --> call["Model.Complete(ctx, prompt)"]
-  stat --> call
+  inc --> complete["Model.Complete(ctx, prompt)"]
+  stat --> complete
 ```
 
 - **`incoming`** (default) reuses the proxied request's model + the gateway's key — zero extra config,

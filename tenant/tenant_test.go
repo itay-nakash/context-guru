@@ -2,7 +2,9 @@ package tenant
 
 import (
 	"bytes"
+	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -256,11 +258,10 @@ func TestUpdatePrivilegeBoundaries(t *testing.T) {
 	if err := r.Update(a, b.ID, Patch{ConfigYAML: &cfg}); !errors.Is(err, ErrForbidden) {
 		t.Errorf("cross-tenant edit: got %v, want ErrForbidden", err)
 	}
-	// Nor their own role, cap, quota, or disabled flag.
-	mgrRole, cap2, rows, off := RoleManager, 1e9, int64(1<<40), false
+	// Nor their own role, quota, or disabled flag.
+	mgrRole, rows, off := RoleManager, int64(1<<40), false
 	for name, p := range map[string]Patch{
 		"role":     {Role: &mgrRole},
-		"cap":      {MonthlyCapUSD: &cap2},
 		"max_rows": {MaxRows: &rows},
 		"disabled": {Disabled: &off},
 	} {
@@ -269,11 +270,11 @@ func TestUpdatePrivilegeBoundaries(t *testing.T) {
 		}
 	}
 	// A manager may do all of it.
-	if err := r.Update(mgr, a.ID, Patch{Role: &mgrRole, MonthlyCapUSD: &cap2}); err != nil {
+	if err := r.Update(mgr, a.ID, Patch{Role: &mgrRole, MaxRows: &rows}); err != nil {
 		t.Fatalf("manager update: %v", err)
 	}
 	got, _ := r.Get(a.ID)
-	if !got.IsManager() || got.MonthlyCapUSD != cap2 {
+	if !got.IsManager() || got.MaxRows != rows {
 		t.Errorf("manager update did not apply: %+v", got)
 	}
 	if err := r.Update(nil, a.ID, Patch{ConfigYAML: &cfg}); !errors.Is(err, ErrForbidden) {
@@ -508,6 +509,147 @@ func TestMigrateRefusesNewerDatabase(t *testing.T) {
 	}
 }
 
+// wantSchema is every table and column the migrations are supposed to produce,
+// across all of them. Two features landed a migration each calling itself "v2"; this
+// is the test that would have caught one of them silently replacing the other.
+var wantSchema = map[string][]string{
+	"tenants": {"id", "label", "email", "role", "config_yaml", "up_anthropic",
+		"up_openai", "up_bob", "capture_content", "max_rows", "disabled", "created_at",
+		"last_seen_at", "password_hash", "email_verified_at"},
+	"tenant_tokens":       {"token_hash", "prefix", "tenant_id", "label", "created_at", "last_used_at", "revoked_at"},
+	"dash_sessions":       {"id", "tenant_id", "created_at", "expires_at", "label", "user_agent", "ip", "last_seen_at"},
+	"tenant_config_audit": {"ts", "actor_tenant", "target_tenant", "field", "before", "after"},
+	"tenant_agent_keys":   {"key_hash", "tenant_id", "created_at", "last_used_at"},
+	"email_codes":         {"tenant_id", "purpose", "code_hash", "attempts", "created_at", "expires_at"},
+}
+
+func assertSchema(t *testing.T, r *Registry) {
+	t.Helper()
+	var got int
+	if err := r.db.QueryRow(`PRAGMA user_version`).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != len(migrations) {
+		t.Errorf("user_version = %d, want %d (one per migration)", got, len(migrations))
+	}
+	for table, cols := range wantSchema {
+		rows, err := r.db.Query(`SELECT name FROM pragma_table_info(?)`, table)
+		if err != nil {
+			t.Fatal(err)
+		}
+		have := map[string]bool{}
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				t.Fatal(err)
+			}
+			have[name] = true
+		}
+		rows.Close()
+		if len(have) == 0 {
+			t.Errorf("table %s does not exist", table)
+			continue
+		}
+		for _, c := range cols {
+			if !have[c] {
+				t.Errorf("%s.%s missing", table, c)
+			}
+		}
+	}
+	// tenantCols has to line up with what scanTenant reads, and a mismatch there
+	// compiles fine and returns the wrong field. One real read proves the alignment.
+	if _, _, err := r.Register("laptop", "schema@ibm.com"); err != nil {
+		t.Fatalf("Register on a freshly migrated database: %v", err)
+	}
+	tn, err := r.ByEmail("schema@ibm.com")
+	if err != nil || tn.Label != "laptop" || tn.Role != RoleUser || !tn.CaptureContent {
+		t.Fatalf("scanTenant read %+v, %v — tenantCols and scanTenant disagree", tn, err)
+	}
+}
+
+func TestFreshDatabaseHasEveryTableAndColumn(t *testing.T) {
+	r := open(t, Options{})
+	assertSchema(t, r)
+}
+
+// Every migration must also apply IN SEQUENCE to a database that stopped at an
+// earlier version, not just to an empty one.
+func TestMigrationsApplyInSequenceToAnOlderDatabase(t *testing.T) {
+	for stop := 1; stop < len(migrations); stop++ {
+		t.Run(fmt.Sprintf("from_v%d", stop), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "control.db")
+			db, err := sql.Open("sqlite", "file:"+path+"?_pragma=foreign_keys(1)")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i := 0; i < stop; i++ {
+				if _, err := db.Exec(migrations[i]); err != nil {
+					t.Fatalf("migration %d: %v", i+1, err)
+				}
+			}
+			if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, stop)); err != nil {
+				t.Fatal(err)
+			}
+			db.Close()
+
+			r, err := Open(path, Options{})
+			if err != nil {
+				t.Fatalf("upgrading a v%d database: %v", stop, err)
+			}
+			defer r.Close()
+			assertSchema(t, r)
+		})
+	}
+}
+
+// The v3 column email_verified_at defaults to 0, so every account that predates it
+// migrates to "unverified" — including the ones in daily use. The upgrade that
+// introduces the column must therefore also stamp the accounts already holding a live
+// token, or a working account sits in the claimable state until someone re-verifies it.
+func TestUpgradeStampsAccountsHoldingALiveToken(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "control.db")
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(migrations[0]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`PRAGMA user_version = 1`); err != nil {
+		t.Fatal(err)
+	}
+	// Two v1 accounts: one with a live token, one whose only token is revoked. Token
+	// hashes are arbitrary bytes here — the plaintext is irrelevant to a backfill.
+	for i, row := range []struct {
+		id, email string
+		revoked   int64
+	}{{"aaa", "live@ibm.com", 0}, {"bbb", "dormant@ibm.com", 1}} {
+		if _, err := db.Exec(`INSERT INTO tenants (id,label,email,created_at) VALUES (?,?,?,?)`,
+			row.id, "laptop", row.email, 1000); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`INSERT INTO tenant_tokens
+		  (token_hash,prefix,tenant_id,created_at,revoked_at) VALUES (?,?,?,?,?)`,
+			[]byte{byte(i)}, "pfx", row.id, 1000, row.revoked); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db.Close()
+
+	r, err := Open(path, Options{})
+	if err != nil {
+		t.Fatalf("upgrading a v1 database: %v", err)
+	}
+	defer r.Close()
+	if tn := mustTenant(t, r, "live@ibm.com"); !tn.Verified() {
+		t.Error("an account holding a live token migrated to unverified — it is claimable by /api/register")
+	}
+	if tn := mustTenant(t, r, "dormant@ibm.com"); tn.Verified() {
+		t.Error("an account whose only token is revoked was stamped verified")
+	}
+	assertSchema(t, r)
+}
+
 func TestInMemoryRegistriesAreIsolated(t *testing.T) {
 	a := open(t, Options{})
 	b := open(t, Options{})
@@ -561,4 +703,161 @@ func mustTenant(t *testing.T, r *Registry, email string) *Tenant {
 		t.Fatalf("ByEmail(%q): %v", email, err)
 	}
 	return tn
+}
+
+// Agent keys: bound by digest, resolvable, never stored in plaintext. This is the path
+// for an agent that can set no header of our choosing (Bob).
+func TestAgentKeyBindResolveUnbind(t *testing.T) {
+	r := open(t, Options{ManagerEmail: "boss@ibm.com"})
+	tn, _, err := r.Register("laptop", "a@ibm.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const key = "caller-provider-key-value"
+	if _, err := r.ResolveAgentKey(key); !errors.Is(err, ErrNoAgentKey) {
+		t.Fatalf("unbound key resolved: %v", err)
+	}
+	if err := r.BindAgentKey(tn.ID, key); err != nil {
+		t.Fatal(err)
+	}
+	got, err := r.ResolveAgentKey(key)
+	if err != nil || got.ID != tn.ID {
+		t.Fatalf("ResolveAgentKey = %v, %v", got, err)
+	}
+	if n, err := r.AgentKeyCount(tn.ID); err != nil || n != 1 {
+		t.Fatalf("AgentKeyCount = %d, %v", n, err)
+	}
+	// Binding twice is idempotent, not a second row.
+	if err := r.BindAgentKey(tn.ID, key); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := r.AgentKeyCount(tn.ID); n != 1 {
+		t.Errorf("re-binding created %d rows", n)
+	}
+	// The plaintext must not be in the database anywhere.
+	var hits int
+	if err := r.db.QueryRow(
+		`SELECT COUNT(*) FROM tenant_agent_keys WHERE CAST(key_hash AS TEXT) LIKE ?`,
+		"%"+key+"%").Scan(&hits); err != nil {
+		t.Fatal(err)
+	}
+	if hits != 0 {
+		t.Error("the provider key was stored in plaintext")
+	}
+	if err := r.UnbindAgentKeys(tn.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.ResolveAgentKey(key); !errors.Is(err, ErrNoAgentKey) {
+		t.Fatalf("key still resolved after unbinding: %v", err)
+	}
+}
+
+// A bound digest belongs to the tenant that bound it. Binding a digest someone else
+// holds must be refused, not silently transferred: with capture_content on, a stolen
+// binding renders the victim's transcripts on the thief's dashboard.
+func TestAgentKeyCannotBeTakenFromAnotherTenant(t *testing.T) {
+	r := open(t, Options{})
+	victim, _, err := r.Register("laptop", "victim@ibm.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	thief, _, err := r.Register("laptop", "thief@ibm.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const key = "fake-provider-key-for-tests"
+	if err := r.BindAgentKey(victim.ID, key); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.BindAgentKey(thief.ID, key); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("binding another tenant's key = %v, want ErrForbidden", err)
+	}
+	if n, _ := r.AgentKeyCount(victim.ID); n != 1 {
+		t.Errorf("victim's binding count = %d, want 1", n)
+	}
+	if n, _ := r.AgentKeyCount(thief.ID); n != 0 {
+		t.Errorf("thief's binding count = %d, want 0", n)
+	}
+	if got, err := r.ResolveAgentKey(key); err != nil || got.ID != victim.ID {
+		t.Fatalf("ResolveAgentKey = %v, %v, want the victim", got, err)
+	}
+	// The owner can still hand it over explicitly: unbind, then rebind.
+	if err := r.UnbindAgentKeys(victim.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.BindAgentKey(thief.ID, key); err != nil {
+		t.Fatalf("rebinding a released key: %v", err)
+	}
+}
+
+// A digest is only evidence of holding a key if the key could not simply be guessed.
+func TestAgentKeyRefusesLowEntropyKeys(t *testing.T) {
+	r := open(t, Options{})
+	tn, _, err := r.Register("laptop", "a@ibm.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"", "   ", "x", "bogus", "test", "changeme", "sk-",
+		strings.Repeat("z", MinAgentKeyLen-1)} {
+		if err := r.BindAgentKey(tn.ID, key); !errors.Is(err, ErrBadAgentKey) {
+			t.Errorf("BindAgentKey(%d chars) = %v, want ErrBadAgentKey", len(key), err)
+		}
+	}
+	if n, _ := r.AgentKeyCount(tn.ID); n != 0 {
+		t.Errorf("%d guessable keys were bound", n)
+	}
+}
+
+// Binding and unbinding are credential changes, so they leave a trail like every other
+// one. Without it, a stolen or replaced binding is invisible after the fact.
+func TestAgentKeyBindAndUnbindAreAudited(t *testing.T) {
+	r := open(t, Options{})
+	tn, _, err := r.Register("laptop", "a@ibm.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.BindAgentKey(tn.ID, "fake-provider-key-for-tests"); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := r.Audit(tn.ID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Field != "agent_key" || entries[0].After != "bound" {
+		t.Fatalf("audit after binding = %+v, want one agent_key/bound row", entries)
+	}
+	if err := r.UnbindAgentKeys(tn.ID); err != nil {
+		t.Fatal(err)
+	}
+	entries, err = r.Audit(tn.ID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 || entries[0].Field != "agent_key" || entries[0].After != "unbound" {
+		t.Fatalf("audit after unbinding = %+v, want an agent_key/unbound row", entries)
+	}
+}
+
+// A disabled account's bound key must stop working, exactly as its token does.
+func TestAgentKeyRespectsDisabled(t *testing.T) {
+	r := open(t, Options{ManagerEmail: "boss@ibm.com"})
+	mgr, _, err := r.Register("m", "boss@ibm.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tn, _, err := r.Register("laptop", "a@ibm.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const key = "fake-provider-key-for-tests"
+	if err := r.BindAgentKey(tn.ID, key); err != nil {
+		t.Fatal(err)
+	}
+	off := true
+	if err := r.Update(mgr, tn.ID, Patch{Disabled: &off}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.ResolveAgentKey(key); !errors.Is(err, ErrDisabled) {
+		t.Fatalf("disabled account's agent key = %v, want ErrDisabled", err)
+	}
 }

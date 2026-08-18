@@ -33,15 +33,15 @@ func TestMetadataOnlyWritesRejectsNonMetadataChanges(t *testing.T) {
 // applyMetaWrites must refuse when the raw body's block layout disagrees with what
 // the writes assume, so a key can never land on the wrong block.
 func TestApplyMetaWritesRefusesOnShapeMismatch(t *testing.T) {
-	body := []byte(`{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"t"}]}]}`)
+	msg := []byte(`{"role":"assistant","content":[{"type":"tool_use","id":"t"}]}`)
 	w := []metaWrite{{path: "content.1.cache_control", raw: `{"type":"ephemeral"}`}}
-	if _, ok := applyMetaWrites(body, "messages.0", 2, w); ok {
+	if _, ok := applyMetaWrites(msg, 2, w); ok {
 		t.Fatal("expected a refusal: the raw message has 1 block, the writes assume 2")
 	}
 	// Never overwrite a breakpoint the caller already set.
-	set := []byte(`{"messages":[{"role":"assistant","content":[{"type":"tool_use","cache_control":{"type":"ephemeral","ttl":"1h"}}]}]}`)
+	set := []byte(`{"role":"assistant","content":[{"type":"tool_use","cache_control":{"type":"ephemeral","ttl":"1h"}}]}`)
 	w = []metaWrite{{path: "content.0.cache_control", raw: `{"type":"ephemeral"}`}}
-	if _, ok := applyMetaWrites(set, "messages.0", 1, w); ok {
+	if _, ok := applyMetaWrites(set, 1, w); ok {
 		t.Fatal("expected a refusal: the caller's own cache_control must not be overwritten")
 	}
 }
@@ -99,5 +99,33 @@ func TestBreachIsOursOnly(t *testing.T) {
 	}
 	if out := wireBreakpoints(worse); !(out > maxWireBreakpoints && out > inbound) {
 		t.Fatalf("we added a breakpoint over the cap (%d -> %d); that must be reported", inbound, out)
+	}
+}
+
+// The dashboard records breakpoints BY LOCATION, not just the total, because `tools` and
+// `system` render ahead of `messages` in the provider's cache hash — so where a breakpoint
+// sits decides how much of the prefix it protects. A single total cannot tell a
+// well-placed request from a badly-placed one with the same count.
+func TestCountBreakpointsSplitsByLocation(t *testing.T) {
+	body := []byte(`{
+		"system":[{"type":"text","text":"a","cache_control":{"type":"ephemeral"}},{"type":"text","text":"b"}],
+		"tools":[{"name":"x","cache_control":{"type":"ephemeral"}}],
+		"messages":[
+			{"role":"user","cache_control":{"type":"ephemeral"},"content":[{"type":"text","text":"hi"}]},
+			{"role":"user","content":[{"type":"text","text":"yo","cache_control":{"type":"ephemeral"}}]}]}`)
+	got := CountBreakpoints(body)
+	want := Breakpoints{System: 1, Tools: 1, Messages: 1, Blocks: 1}
+	if got != want {
+		t.Fatalf("CountBreakpoints = %+v, want %+v", got, want)
+	}
+	// The total is what the provider's cap of four applies to, so it must not drift from
+	// the split the dashboard shows beside it.
+	if got.Total() != 4 || wireBreakpoints(body) != got.Total() {
+		t.Fatalf("total = %d / wireBreakpoints = %d, want both 4", got.Total(), wireBreakpoints(body))
+	}
+	// A tool output that merely mentions the field is not a breakpoint.
+	textual := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"set cache_control on it"}]}]}`)
+	if b := CountBreakpoints(textual); b.Total() != 0 {
+		t.Errorf("prose mentioning cache_control counted as %+v, want zero", b)
 	}
 }

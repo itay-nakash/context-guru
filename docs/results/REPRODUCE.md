@@ -21,7 +21,19 @@ cache-aware token/cost metrics.
 - **Model gateway creds** in `~/.claude/settings.json` under `env`
   (`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`) — the IBM LiteLLM gateway exposing
   `aws/claude-sonnet-5` (agent) and `aws/claude-haiku-4-5` (context-guru's cheap
-  compaction model).
+  compaction model). `CG_GATEWAY_BASE` / `CG_GATEWAY_KEY` override both, and are how to
+  run without that file.
+
+    The harnesses **refuse to start** if either value names a context-guru route or a
+    `cg_live_` token: a benchmark proxy pointed at another context-guru would report
+    savings measured over traffic that was already compacted once. If you have routed
+    your own Claude Code through the service, set `CG_GATEWAY_*` to the real gateway.
+
+- **Only for the hosted (multi-tenant) proxy**: `CG_TOKEN` with your tenant token and
+  `CG_PROXY_URL` naming the already-running proxy. There the pipeline comes from your
+  tenant's own configuration rather than from `--configs`, which then only labels the
+  run. With `CG_TOKEN` unset the harness starts its own single-tenant proxy and behaves
+  exactly as it always did.
 
 ### Docker Hub authentication (required — avoids the 429 pull-quota wall)
 
@@ -77,42 +89,19 @@ Notes / gotchas learned the hard way:
 - `codesmart` uses `CACHE_MODE=auto` (cache-aware on a prompt-caching agent) and
   `CHEAP_MODEL=aws/claude-haiku-4-5` for its own compaction calls.
 
-!!! warning "The published arm is an ANCESTOR of today's `codesmart` — a re-run will differ"
-    The harness embeds its own `codesmart` document rather than resolving the preset from
-    `config/config.go`. That document has since been brought back into step with the shipped
-    preset, so running the command above today reproduces the *current* `codesmart`
-    (`[format, toon, dedup, failed_run, cmdfilter, extract_llm, extract, cachesplit]`) — not
-    the configuration behind the recorded figures. Three differences, all confirmed in code:
+**A re-run today will not reproduce the published figures exactly.** The harness embeds its
+own `codesmart` and `codesafe` documents, and both have since been brought back into step
+with the shipped presets, so the command above now runs the *current* pipelines: `codesmart`
+gained `toon`, both swapped `cacheinject` for `cachesplit`, and a gating bug that kept
+`failed_run` inert on this workload is fixed. Read any difference as a change in the
+treatment, not as run-to-run noise, and re-measure before a cost claim leans on the current
+pipeline. No published number has been adjusted.
 
-    1. **No `toon`.** It was added to `codesmart` after the run.
-    2. **`cacheinject`, not `cachesplit`.** Breakpoint placement was removed from every
-       preset in [#36](https://github.com/rossoctl/context-guru/pull/36).
-    3. **`failed_run` was a permanent no-op on this workload.** It gated per *request* on
-       cache-awareness — true by default for Anthropic/Bedrock/Vertex — where its sibling
-       `mask` gates per message, and its escape hatch was unreachable because the only
-       `freeze()` call sat downstream of the gate. So it declined every collapse at every
-       depth, which is why it removed zero tokens on
-       [the arm page](context-guru.md). Fixed since, so it will now act on
-       SWE-bench-shaped (pytest-heavy) traffic for the first time.
-
-    Read a difference in a re-run as a change in the treatment, not as run-to-run noise, and
-    re-measure before any cost claim leans on the current pipeline. **No published number has
-    been adjusted** — these notes annotate what configuration produced them. Scope: (3) is
-    SWE-bench-specific; on Terminal-Bench `failed_run` gates out with `fewer_than_two_runs`
-    on 100% of requests, so it could not have contributed there either way.
-
-    **The `codesafe` arm has the same gap, and it has now been closed the same way.** That arm
-    ended in `cacheinject` where the shipped `codesafe` preset ends in `cachesplit`, so a
-    re-run today reproduces the *current* preset
-    (`[format, dedup, failed_run, cmdfilter, extract, collapse, cachesplit]`) and not the
-    configuration behind any recorded `codesafe` figure. Read that difference as a change in
-    the treatment, exactly as above; **no published number has been adjusted.**
-
-    The drift guard in `deploy/harbor/pipeline_drift_test.go` now checks **every preset a
-    harness names an arm after**, not just `codesmart` — which is how this one was found, one
-    arm down in the same file. Arms that deliberately run a non-preset pipeline — `cacheonly`,
-    which runs `[cacheinject]` alone to isolate the cache lever — are exempt by construction:
-    they are not preset names, so nothing resolves them.
+A drift guard (`deploy/harbor/pipeline_drift_test.go`) checks every preset a harness names an
+arm after, so a harness document that falls behind the shipped preset fails the test rather
+than quietly producing an unlabelled treatment. Arms that deliberately run a non-preset
+pipeline — `cacheonly`, which runs `[cacheinject]` alone to isolate the cache lever — are
+exempt, since there is no preset to compare them against.
 
 ## 4. Run headroom
 

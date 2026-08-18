@@ -11,11 +11,16 @@
 // the dashboard file, and the retention janitor never touches them.
 //
 // Second, we hold no user's provider credential. A user authenticates with a token
-// WE mint; the upstream key belongs to the server and is read from the environment
-// at request time. So the only secret in this database is the sha256 of a token,
-// and the only thing ever displayed is its 8-character prefix. There is no code
-// path that can print a token, because after Register/MintToken return, the process
-// no longer has one.
+// WE mint and forwards their OWN provider key to the upstream; that key belongs to
+// the caller, is read from the request, and is never stored. So the secrets in this
+// database are only ever DERIVED: the sha256 of a token, the sha256 of a session
+// cookie, the sha256 of an agent's provider key (for agents that cannot set a custom
+// header), an argon2id hash of a dashboard password (see password.go), and the sha256
+// of a 5-minute email code. None of the five can be replayed as the thing it was
+// derived from, and the only value ever displayed is a token's 8-character prefix.
+// There is no code path that can print a token, a provider key, or a password:
+// after Register/MintToken/RegisterAccount return the process no longer holds one,
+// and BindAgentKey hashes its argument before anything else.
 package tenant
 
 import (
@@ -47,7 +52,40 @@ var (
 	ErrBadEmail     = errors.New("tenant: malformed email")
 	ErrBadLabel     = errors.New("tenant: label must be 1-64 printable characters")
 	ErrForbidden    = errors.New("tenant: not permitted")
+	ErrBadVariant   = errors.New(
+		"tenant: variant must be 1-32 characters of letters, digits, '.', '_' or '-'")
+	ErrBadReason = errors.New("tenant: reason must be at most 200 printable characters")
+	// ErrLastManager guards the only route back into administration. Demoting or disabling
+	// the last manager locks every account out of the manager pages, and the manager pages
+	// are the only way to make another manager — so the database would be the only way back.
+	ErrLastManager = errors.New("tenant: this is the last manager; promote another one first")
 )
+
+// DisabledError is ErrDisabled carrying the manager's REASON, so the refusal an agent
+// receives can say why. It unwraps to ErrDisabled, so every existing
+// errors.Is(err, ErrDisabled) branch keeps working unchanged — the reason is additive.
+//
+// The reason is written by a manager and read by the account's owner. It is bounded and
+// printable on write (validReason) precisely because it ends up in an HTTP body.
+type DisabledError struct{ Reason string }
+
+func (e *DisabledError) Error() string {
+	if e.Reason == "" {
+		return ErrDisabled.Error()
+	}
+	return ErrDisabled.Error() + ": " + e.Reason
+}
+
+func (e *DisabledError) Unwrap() error { return ErrDisabled }
+
+// disabledErr is the refusal for a disabled account: the bare sentinel when no reason was
+// recorded, so nothing changes for the accounts that have none.
+func disabledErr(t *Tenant) error {
+	if t == nil || t.DisabledReason == "" {
+		return ErrDisabled
+	}
+	return &DisabledError{Reason: t.DisabledReason}
+}
 
 // Role decides what a token may see beyond its own rows. Exactly two, because a
 // permission matrix nobody asked for is the classic thing to regret.
@@ -93,19 +131,39 @@ type Tenant struct {
 	// Off by default and per-tenant by design: the redactor is a best-effort
 	// denylist, so this is consent, not a switch.
 	CaptureContent bool
-	// MonthlyCapUSD bounds spend against the shared server upstream key. Required,
-	// not optional: with one org credential behind the proxy, an unbounded tenant
-	// spends everybody's budget.
-	MonthlyCapUSD float64
 	// MaxRows caps this tenant's retained request rows so one heavy user cannot
 	// evict everyone else's history. 0 = the server default
 	// (--dashboard-max-rows-per-tenant). Enforced by the dashboard janitor, which reads
 	// it through dash.Recorder.SetTenantQuota — wired in cmd/context-guru-proxy.
-	MaxRows    int64
-	Disabled   bool
-	CreatedAt  time.Time
-	LastSeenAt time.Time
+	MaxRows int64
+	// Variant is the A/B group a manager put this account in, or "" for none. It is a
+	// LABEL and nothing else: it selects no configuration and changes no behaviour, so
+	// assigning it can never break someone's agent. What it buys is the ability to group
+	// the metrics that already exist by the group a manager assigned — see the /api/variants
+	// rollup, which is honest about the fact that a manager's assignment is not a
+	// randomised trial.
+	Variant string
+	// DisabledReason is the manager's note on why this account is off, shown to its
+	// owner in the 403 their agent receives and in the refusal at sign-in. Without it
+	// "disabled" is undiagnosable from the outside: the person whose agent stopped has
+	// no way to learn whether it was deliberate.
+	DisabledReason string
+	Disabled       bool
+	CreatedAt      time.Time
+	LastSeenAt     time.Time
+	// VerifiedAt is when this account proved it owns its email address, by entering
+	// a code we mailed there. Zero means unverified: the account exists but holds no
+	// token and cannot sign in.
+	VerifiedAt time.Time
+	// HasPassword reports whether a dashboard password is set. The HASH itself is
+	// deliberately NOT a field on this struct — it is loaded only inside
+	// VerifyLogin, so there is no path by which a caller that renders a Tenant can
+	// render a password hash.
+	HasPassword bool
 }
+
+// Verified reports whether this account's email address has been confirmed.
+func (t *Tenant) Verified() bool { return t != nil && !t.VerifiedAt.IsZero() }
 
 // IsManager reports whether this tenant may read and write other tenants.
 func (t *Tenant) IsManager() bool { return t != nil && t.Role == RoleManager }
@@ -148,8 +206,6 @@ type Options struct {
 	DefaultUpAnthropic string
 	DefaultUpOpenAI    string
 	DefaultUpBob       string
-	// DefaultMonthlyCapUSD is the starting spend cap. 0 = DefaultCapUSD.
-	DefaultMonthlyCapUSD float64
 	// CacheTTL bounds how long a resolved token is trusted from memory. Mutations
 	// through this registry clear the cache immediately, so the TTL only bounds
 	// staleness from an EXTERNAL edit of the database. 0 = DefaultCacheTTL.
@@ -159,12 +215,9 @@ type Options struct {
 	Validate func([]byte) error
 }
 
-// Defaults. The cache TTL is deliberately short: it exists to keep a token lookup
+// DefaultCacheTTL is deliberately short: it exists to keep a token lookup
 // off the writer's path under agent-rate traffic, not to be a session store.
-const (
-	DefaultCacheTTL = 30 * time.Second
-	DefaultCapUSD   = 50.0
-)
+const DefaultCacheTTL = 30 * time.Second
 
 // Registry is the control-plane store. Safe for concurrent use.
 type Registry struct {
@@ -189,9 +242,6 @@ func Open(path string, o Options) (*Registry, error) {
 	}
 	if o.CacheTTL == 0 {
 		o.CacheTTL = DefaultCacheTTL
-	}
-	if o.DefaultMonthlyCapUSD == 0 {
-		o.DefaultMonthlyCapUSD = DefaultCapUSD
 	}
 	dsn := memDSN()
 	if path != "" {
@@ -229,13 +279,45 @@ func (r *Registry) Close() error { return r.db.Close() }
 // time the plaintext token exists outside the caller's machine: it is not stored,
 // logged, or recoverable. Show it once.
 func (r *Registry) Register(label, email string) (*Tenant, string, error) {
+	t, err := r.newTenant(label, email)
+	if err != nil {
+		return nil, "", err
+	}
+	plain, hash, prefix, err := mintToken()
+	if err != nil {
+		return nil, "", err
+	}
+	tx, err := r.db.Begin()
+	if err != nil {
+		return nil, "", err
+	}
+	defer tx.Rollback()
+	if err := insertTenant(tx, t, ""); err != nil {
+		return nil, "", err
+	}
+	if _, err := tx.Exec(`INSERT INTO tenant_tokens
+	  (token_hash,prefix,tenant_id,label,created_at,last_used_at,revoked_at)
+	  VALUES (?,?,?,?,?,0,0)`, hash, prefix, t.ID, t.Label, t.CreatedAt.UnixMilli()); err != nil {
+		return nil, "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, "", err
+	}
+	return t, plain, nil
+}
+
+// newTenant validates the inputs and builds the row a new account starts from. It
+// touches no database, so both Register (token-first, the original single-step flow)
+// and RegisterAccount (email-verified, no token until the code is entered) get
+// byte-identical defaults instead of two lists that drift.
+func (r *Registry) newTenant(label, email string) (*Tenant, error) {
 	label = strings.TrimSpace(label)
 	if !validLabel(label) {
-		return nil, "", ErrBadLabel
+		return nil, ErrBadLabel
 	}
 	email, err := r.checkEmail(email)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	role := RoleUser
 	if r.opts.ManagerEmail != "" && strings.EqualFold(email, strings.TrimSpace(r.opts.ManagerEmail)) {
@@ -262,43 +344,36 @@ func (r *Registry) Register(label, email string) (*Tenant, string, error) {
 		// of known credential shapes and size-capped first, but that scrubbing is a
 		// pattern denylist, and a review of 22 realistic credential shapes found 11 got
 		// through. The operator gate (--dashboard-content) still has to be on as well, and
-		// a tenant can turn this off on their settings page at any time. What makes it
-		// acceptable here: content is visible ONLY to the tenant that produced it — a
-		// manager sees everyone's metrics and nobody's transcripts.
+		// a tenant can turn this off on their settings page at any time. Who can read it:
+		// the tenant that produced it and the service manager — the consent screen says so
+		// at the point of consent, because a default-on switch has to name its audience.
 		CaptureContent: true,
-		MonthlyCapUSD:  r.opts.DefaultMonthlyCapUSD,
 		CreatedAt:      now,
 	}
-	plain, hash, prefix, err := mintToken()
-	if err != nil {
-		return nil, "", err
-	}
-	tx, err := r.db.Begin()
-	if err != nil {
-		return nil, "", err
-	}
-	defer tx.Rollback()
-	if _, err := tx.Exec(`INSERT INTO tenants
+	return t, nil
+}
+
+// execer is what *sql.DB and *sql.Tx have in common, so insertTenant works inside a
+// transaction (Register, which also writes a token) and outside one (RegisterAccount).
+type execer interface {
+	Exec(string, ...any) (sql.Result, error)
+}
+
+// insertTenant writes a new account row. passwordHash may be "" for the token-only
+// flow; it is a PHC-encoded argon2id string, never a password.
+func insertTenant(q execer, t *Tenant, passwordHash string) error {
+	_, err := q.Exec(`INSERT INTO tenants
 	  (id,label,email,role,config_yaml,up_anthropic,up_openai,up_bob,
-	   capture_content,monthly_cap_usd,max_rows,disabled,created_at,last_seen_at)
-	  VALUES (?,?,?,?,?,?,?,?,?,?,0,0,?,0)`,
+	   capture_content,max_rows,disabled,created_at,last_seen_at,
+	   password_hash,email_verified_at)
+	  VALUES (?,?,?,?,?,?,?,?,?,0,0,?,0,?,0)`,
 		t.ID, t.Label, t.Email, string(t.Role), t.ConfigYAML,
 		t.UpAnthropic, t.UpOpenAI, t.UpBob, boolInt(t.CaptureContent),
-		t.MonthlyCapUSD, now.UnixMilli()); err != nil {
-		if isUniqueViolation(err) {
-			return nil, "", ErrEmailTaken
-		}
-		return nil, "", err
+		t.CreatedAt.UnixMilli(), passwordHash)
+	if isUniqueViolation(err) {
+		return ErrEmailTaken
 	}
-	if _, err := tx.Exec(`INSERT INTO tenant_tokens
-	  (token_hash,prefix,tenant_id,label,created_at,last_used_at,revoked_at)
-	  VALUES (?,?,?,?,?,0,0)`, hash, prefix, t.ID, label, now.UnixMilli()); err != nil {
-		return nil, "", err
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, "", err
-	}
-	return t, plain, nil
+	return err
 }
 
 // MintToken issues an additional token for a tenant, so a machine can be added or
@@ -384,7 +459,7 @@ func (r *Registry) Resolve(token string) (*Tenant, error) {
 	r.mu.RUnlock()
 	if ok && time.Now().Before(e.exp) {
 		if e.t.Disabled {
-			return nil, ErrDisabled
+			return nil, disabledErr(e.t)
 		}
 		return e.t, nil
 	}
@@ -404,7 +479,7 @@ func (r *Registry) Resolve(token string) (*Tenant, error) {
 	r.mu.Unlock()
 
 	if t.Disabled {
-		return nil, ErrDisabled
+		return nil, disabledErr(t)
 	}
 	return t, nil
 }
@@ -457,6 +532,16 @@ func (r *Registry) List() ([]*Tenant, error) {
 	return out, rows.Err()
 }
 
+// otherActiveManagers counts the managers who could still administer the deployment if
+// this one stopped being one. Disabled accounts do not count: they cannot sign in, so
+// they are no way back.
+func (r *Registry) otherActiveManagers(exceptID string) (int, error) {
+	var n int
+	err := r.db.QueryRow(`SELECT COUNT(*) FROM tenants
+	  WHERE role = ? AND disabled = 0 AND id != ?`, string(RoleManager), exceptID).Scan(&n)
+	return n, err
+}
+
 // Patch is a sparse update: a nil field is left alone. One method with pointers
 // beats eight single-field setters, and it lets the audit trail record exactly the
 // fields that changed.
@@ -468,15 +553,19 @@ type Patch struct {
 	UpOpenAI       *string
 	UpBob          *string
 	CaptureContent *bool
-	MonthlyCapUSD  *float64
 	MaxRows        *int64
 	Disabled       *bool
+	// Variant and DisabledReason are manager-only, like Role/MaxRows/Disabled: one is
+	// how an A/B group is assigned and the other is a note the account's owner reads,
+	// and neither is a thing a user should be able to write about themselves.
+	Variant        *string
+	DisabledReason *string
 }
 
 // Update applies a patch to a tenant, recording each changed field in the audit
 // log. actor must be the target tenant or a manager; only a manager may change
-// role, spend cap, row quota, or disabled state — the fields a user would
-// otherwise raise on themselves.
+// role, row quota, or disabled state — the fields a user would otherwise raise on
+// themselves.
 func (r *Registry) Update(actor *Tenant, targetID string, p Patch) error {
 	if actor == nil {
 		return ErrForbidden
@@ -484,7 +573,8 @@ func (r *Registry) Update(actor *Tenant, targetID string, p Patch) error {
 	if actor.ID != targetID && !actor.IsManager() {
 		return ErrForbidden
 	}
-	privileged := p.Role != nil || p.MonthlyCapUSD != nil || p.MaxRows != nil || p.Disabled != nil
+	privileged := p.Role != nil || p.MaxRows != nil || p.Disabled != nil ||
+		p.Variant != nil || p.DisabledReason != nil
 	if privileged && !actor.IsManager() {
 		return ErrForbidden
 	}
@@ -497,6 +587,25 @@ func (r *Registry) Update(actor *Tenant, targetID string, p Patch) error {
 	}
 	if p.Role != nil && *p.Role != RoleUser && *p.Role != RoleManager {
 		return fmt.Errorf("tenant: unknown role %q", *p.Role)
+	}
+	// Demoting or disabling the last manager is a one-way door: only a manager can hand
+	// out the manager role, so the deployment would have nobody left who can. Refused for
+	// both, because a disabled manager cannot sign in to re-enable themselves either.
+	demoting := p.Role != nil && *p.Role == RoleUser && cur.Role == RoleManager
+	if (demoting || (p.Disabled != nil && *p.Disabled)) && cur.Role == RoleManager && !cur.Disabled {
+		others, err := r.otherActiveManagers(targetID)
+		if err != nil {
+			return err
+		}
+		if others == 0 {
+			return ErrLastManager
+		}
+	}
+	if p.Variant != nil && !validVariant(strings.TrimSpace(*p.Variant)) {
+		return ErrBadVariant
+	}
+	if p.DisabledReason != nil && !validReason(*p.DisabledReason) {
+		return ErrBadReason
 	}
 	if p.ConfigYAML != nil && r.opts.Validate != nil && strings.TrimSpace(*p.ConfigYAML) != "" {
 		if err := r.opts.Validate([]byte(*p.ConfigYAML)); err != nil {
@@ -541,14 +650,6 @@ func (r *Registry) Update(actor *Tenant, targetID string, p Patch) error {
 		set("capture_content", boolStr(cur.CaptureContent), boolStr(next.CaptureContent),
 			next.CaptureContent != cur.CaptureContent)
 	}
-	if v := p.MonthlyCapUSD; v != nil {
-		if *v < 0 {
-			return fmt.Errorf("tenant: monthly cap must not be negative")
-		}
-		next.MonthlyCapUSD = *v
-		set("monthly_cap_usd", fmt.Sprint(cur.MonthlyCapUSD), fmt.Sprint(next.MonthlyCapUSD),
-			next.MonthlyCapUSD != cur.MonthlyCapUSD)
-	}
 	if v := p.MaxRows; v != nil {
 		if *v < 0 {
 			return fmt.Errorf("tenant: max rows must not be negative")
@@ -556,9 +657,25 @@ func (r *Registry) Update(actor *Tenant, targetID string, p Patch) error {
 		next.MaxRows = *v
 		set("max_rows", fmt.Sprint(cur.MaxRows), fmt.Sprint(next.MaxRows), next.MaxRows != cur.MaxRows)
 	}
+	if v := p.Variant; v != nil {
+		next.Variant = strings.TrimSpace(*v)
+		set("variant", cur.Variant, next.Variant, next.Variant != cur.Variant)
+	}
+	if v := p.DisabledReason; v != nil {
+		next.DisabledReason = strings.TrimSpace(*v)
+		set("disabled_reason", cur.DisabledReason, next.DisabledReason,
+			next.DisabledReason != cur.DisabledReason)
+	}
 	if v := p.Disabled; v != nil {
 		next.Disabled = *v
 		set("disabled", boolStr(cur.Disabled), boolStr(next.Disabled), next.Disabled != cur.Disabled)
+		// Re-enabling clears the reason, unless this same patch supplied one. A stale
+		// "suspected credential leak" on a live account is worse than no note at all: the
+		// next manager to read the roster acts on it.
+		if !*v && p.DisabledReason == nil && next.DisabledReason != "" {
+			next.DisabledReason = ""
+			set("disabled_reason", cur.DisabledReason, "", true)
+		}
 	}
 	if len(changes) == 0 {
 		return nil
@@ -570,10 +687,11 @@ func (r *Registry) Update(actor *Tenant, targetID string, p Patch) error {
 	}
 	defer tx.Rollback()
 	if _, err := tx.Exec(`UPDATE tenants SET label=?,role=?,config_yaml=?,up_anthropic=?,
-	  up_openai=?,up_bob=?,capture_content=?,monthly_cap_usd=?,max_rows=?,disabled=? WHERE id=?`,
+	  up_openai=?,up_bob=?,capture_content=?,max_rows=?,disabled=?,
+	  variant=?,disabled_reason=? WHERE id=?`,
 		next.Label, string(next.Role), next.ConfigYAML, next.UpAnthropic, next.UpOpenAI,
-		next.UpBob, boolInt(next.CaptureContent), next.MonthlyCapUSD, next.MaxRows,
-		boolInt(next.Disabled), targetID); err != nil {
+		next.UpBob, boolInt(next.CaptureContent), next.MaxRows,
+		boolInt(next.Disabled), next.Variant, next.DisabledReason, targetID); err != nil {
 		return err
 	}
 	now := time.Now().UnixMilli()
@@ -603,12 +721,87 @@ func (r *Registry) Update(actor *Tenant, targetID string, p Patch) error {
 	return nil
 }
 
+// Delete removes an account and every control-plane row that hangs off it: its tokens,
+// its browser sessions, its bound agent keys and any pending email code, all by
+// ON DELETE CASCADE.
+//
+// It does NOT touch the metrics database. That is a SEPARATE file (dash's request store),
+// so no foreign key reaches it and deleting this row would otherwise leave a tenant's
+// requests, component rows, captured transcripts and archived objects behind, owned by an
+// id no account answers to. The caller purges those first — see proxy's ctlDeleteTenant,
+// which runs dash.Recorder.PurgeTenant before this and once more after it.
+//
+// Manager only, and never the actor's own account. Self-deletion is refused because the
+// manager routes are the only way to make another manager: a deployment whose last
+// manager deleted themselves has no way back except editing the database by hand.
+//
+// The audit row is written in the SAME transaction, before the delete. tenant_config_audit
+// deliberately has no foreign key on target_tenant, so the trail outlives the account it
+// describes — which is the whole point of auditing a deletion.
+func (r *Registry) Delete(actor *Tenant, targetID string) error {
+	if actor == nil || !actor.IsManager() {
+		return ErrForbidden
+	}
+	if actor.ID == targetID {
+		return ErrForbidden
+	}
+	t, err := r.Get(targetID)
+	if err != nil {
+		return err
+	}
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`INSERT INTO tenant_config_audit
+	  (ts,actor_tenant,target_tenant,field,before,after) VALUES (?,?,?,?,?,?)`,
+		time.Now().UnixMilli(), actor.ID, targetID, "account", t.Email, "deleted"); err != nil {
+		return err
+	}
+	res, err := tx.Exec(`DELETE FROM tenants WHERE id = ?`, targetID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	// Now, not in 30 seconds: a deleted account's cached token must stop resolving.
+	r.clearCache()
+	return nil
+}
+
 // AuditEntry is one recorded configuration change.
 type AuditEntry struct {
 	At            time.Time
 	Actor, Target string
 	Field         string
 	Before, After string
+}
+
+// AuditWrite records an action that is not a field diff — a manager-initiated password
+// reset, a storage purge, a password change — so the trail answers "who did this to my
+// account" for those too, and not only for configuration edits.
+//
+// Exported because the actions are performed at the HTTP layer over several packages'
+// worth of state (the metrics database, the mailer), so there is no single registry method
+// they could be recorded inside. It writes to the same table Update does, which is what
+// makes /api/me/audit one list rather than three.
+func (r *Registry) AuditWrite(actorID, targetID, field, before, after string) error {
+	_, err := r.db.Exec(`INSERT INTO tenant_config_audit
+	  (ts,actor_tenant,target_tenant,field,before,after) VALUES (?,?,?,?,?,?)`,
+		time.Now().UnixMilli(), actorID, targetID, field, before, after)
+	return err
+}
+
+// auditSelf records a change a tenant made to its own account, for the cases outside
+// Update's field-by-field diff (agent-key bindings). Actor and target are the same
+// tenant: these endpoints are self-service only.
+func (r *Registry) auditSelf(tenantID, field, before, after string) error {
+	return r.AuditWrite(tenantID, tenantID, field, before, after)
 }
 
 // Audit returns the most recent changes to a tenant, newest first. A shared
@@ -624,7 +817,9 @@ func (r *Registry) Audit(targetID string, limit int) ([]AuditEntry, error) {
 		q += ` WHERE target_tenant = ?`
 		args = append(args, targetID)
 	}
-	q += ` ORDER BY ts DESC LIMIT ?`
+	// rowid breaks the tie: a single Update writes every changed field with one
+	// timestamp, so ts alone leaves the order within a change arbitrary.
+	q += ` ORDER BY ts DESC, rowid DESC LIMIT ?`
 	args = append(args, limit)
 	rows, err := r.db.Query(q, args...)
 	if err != nil {
@@ -680,10 +875,141 @@ func (r *Registry) checkEmail(email string) (string, error) {
 	return "", ErrEmailDomain
 }
 
+// --- agent keys -------------------------------------------------------------
+
+// ErrNoAgentKey is returned when a provider key's digest is bound to no tenant.
+var ErrNoAgentKey = errors.New("tenant: provider key is not bound to any account")
+
+// ErrBadAgentKey rejects a key too short to be one. A digest is only evidence of
+// holding a key if the key could not have been guessed.
+var ErrBadAgentKey = errors.New("tenant: provider key is too short to bind")
+
+// MinAgentKeyLen is the shortest string accepted as a provider key. Every real one is
+// far longer (sk-..., 40+ chars); this only rules out claiming "test" or "changeme",
+// which are digests anyone can compute and whose real owner would then be unable to
+// bind their own key.
+const MinAgentKeyLen = 20
+
+// agentKeyHash is the ONLY thing this package ever does with a provider key:
+// digest it and drop it. Nothing below this line holds the plaintext.
+func agentKeyHash(key string) []byte {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(key)))
+	return sum[:]
+}
+
+// BindAgentKey records that a provider key belongs to a tenant, by digest, so an agent
+// that can only send that key is still identified. Idempotent for the tenant that
+// already holds the binding.
+//
+// What this actually establishes is only that the caller can type the string, NOT that
+// they hold a key of their own — the digest is computed here, from whatever arrived, and
+// nothing about it is verified against a provider. So a digest another tenant has bound
+// is refused (ErrForbidden), never moved: a transfer has to be an unbind by the real
+// owner followed by a fresh bind. Silently reassigning it would route the victim's
+// traffic — and, with capture_content on, their transcripts — to whoever guessed it.
+func (r *Registry) BindAgentKey(tenantID, key string) error {
+	if len(strings.TrimSpace(key)) < MinAgentKeyLen {
+		return ErrBadAgentKey
+	}
+	if _, err := r.Get(tenantID); err != nil {
+		return err
+	}
+	// The WHERE on the upsert is what refuses the steal: a conflicting row owned by
+	// someone else matches nothing, so zero rows change.
+	res, err := r.db.Exec(`INSERT INTO tenant_agent_keys (key_hash,tenant_id,created_at)
+	  VALUES (?,?,?) ON CONFLICT(key_hash) DO UPDATE SET tenant_id = excluded.tenant_id
+	  WHERE tenant_id = excluded.tenant_id`,
+		agentKeyHash(key), tenantID, time.Now().UnixMilli())
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrForbidden
+	}
+	r.clearCache()
+	// A credential change with no trail is one nobody can investigate afterwards. The
+	// digest is deliberately not recorded: the audit answers "when did this account's
+	// key binding change", which needs no material from the key itself.
+	return r.auditSelf(tenantID, "agent_key", "", "bound")
+}
+
+// UnbindAgentKeys drops every agent key bound to a tenant. There is no per-key
+// variant: the digests are not displayable, so "which one" is not a question the
+// user can answer.
+func (r *Registry) UnbindAgentKeys(tenantID string) error {
+	res, err := r.db.Exec(`DELETE FROM tenant_agent_keys WHERE tenant_id = ?`, tenantID)
+	if err != nil {
+		return err
+	}
+	r.clearCache()
+	if n, _ := res.RowsAffected(); n == 0 {
+		return nil // nothing was bound; nothing to record
+	}
+	return r.auditSelf(tenantID, "agent_key", "bound", "unbound")
+}
+
+// AgentKeyCount reports how many keys a tenant has bound, for the settings page.
+func (r *Registry) AgentKeyCount(tenantID string) (int, error) {
+	var n int
+	err := r.db.QueryRow(`SELECT COUNT(*) FROM tenant_agent_keys WHERE tenant_id = ?`,
+		tenantID).Scan(&n)
+	return n, err
+}
+
+// ResolveAgentKey maps a caller's own provider key to the tenant that bound it. Same
+// caching and last-used bookkeeping as Resolve, and the same closed failure: an
+// unbound key is not a new tenant.
+func (r *Registry) ResolveAgentKey(key string) (*Tenant, error) {
+	if strings.TrimSpace(key) == "" {
+		return nil, ErrNoAgentKey
+	}
+	hash := agentKeyHash(key)
+	// Namespaced so a digest can never be confused with a token digest, even though
+	// the two are computed over different inputs.
+	ck := "ak:" + hex.EncodeToString(hash)
+
+	r.mu.RLock()
+	e, ok := r.cache[ck]
+	r.mu.RUnlock()
+	if ok && time.Now().Before(e.exp) {
+		if e.t.Disabled {
+			return nil, disabledErr(e.t)
+		}
+		return e.t, nil
+	}
+
+	t, err := scanTenant(r.db.QueryRow(`SELECT `+tenantCols+` FROM tenants t
+	  JOIN tenant_agent_keys k ON k.tenant_id = t.id WHERE k.key_hash = ?`, hash))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNoAgentKey
+	}
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	_, _ = r.db.Exec(`UPDATE tenant_agent_keys SET last_used_at = ? WHERE key_hash = ?`,
+		now.UnixMilli(), hash)
+	_, _ = r.db.Exec(`UPDATE tenants SET last_seen_at = ? WHERE id = ?`, now.UnixMilli(), t.ID)
+
+	r.mu.Lock()
+	r.cache[ck] = cacheEntry{t: t, exp: now.Add(r.opts.CacheTTL)}
+	r.mu.Unlock()
+
+	if t.Disabled {
+		return nil, disabledErr(t)
+	}
+	return t, nil
+}
+
 // --- tokens -----------------------------------------------------------------
 
+// TokenPrefix is how a context-guru token is recognised on sight. Exported because
+// the proxy now accepts the caller's OWN provider key in the Authorization slot, so
+// it has to be able to tell our token apart from a credential it must forward.
+const TokenPrefix = "cg_live_"
+
 const (
-	tokenPrefix = "cg_live_"
+	tokenPrefix = TokenPrefix
 	// 16 random bytes as unpadded base32 = 26 characters, 128 bits of entropy.
 	tokenBody = 26
 	tokenLen  = len(tokenPrefix) + tokenBody
@@ -692,6 +1018,14 @@ const (
 )
 
 var tokenEnc = base32.StdEncoding.WithPadding(base32.NoPadding)
+
+// LooksLikeToken reports whether s is shaped like one of our tokens. It says nothing
+// about whether the token exists — only that it is ours rather than a provider
+// credential, which is the distinction the proxy needs before deciding what to
+// forward.
+func LooksLikeToken(s string) bool {
+	return strings.HasPrefix(s, TokenPrefix) && len(s) == tokenLen
+}
 
 // mintToken returns the plaintext token, its sha256, and its public prefix.
 func mintToken() (plain string, hash []byte, prefix string, err error) {
@@ -706,6 +1040,22 @@ func mintToken() (plain string, hash []byte, prefix string, err error) {
 }
 
 // --- schema -----------------------------------------------------------------
+
+// stampInUseAccounts is the data half of the v3 upgrade, kept in a constant because it
+// is applied twice: once inside v3 for a database that has not reached it yet, and once
+// as v4 for a database that reached v3 before this statement existed.
+//
+// email_verified_at DEFAULT 0 means every account created before email auth migrates to
+// "unverified" while being in daily use, and RegisterAccount treats an unverified
+// address as claimable. An account holding a live token has demonstrably been usable, so
+// it is stamped rather than left in that state. created_at, not now(): the account has
+// been trusted since it was created, and a fixed value keeps the migration
+// deterministic. Idempotent — only rows still at 0 are touched.
+const stampInUseAccounts = `
+	 UPDATE tenants SET email_verified_at = MAX(created_at, 1)
+	   WHERE email_verified_at = 0
+	     AND EXISTS (SELECT 1 FROM tenant_tokens k
+	                 WHERE k.tenant_id = tenants.id AND k.revoked_at = 0);`
 
 // migrations is append-only: index+1 is the schema version it produces. Unlike
 // dash's disposable view, this database is migrated forward forever — never
@@ -734,7 +1084,6 @@ var migrations = []string{
 	   up_openai       TEXT    NOT NULL DEFAULT '',
 	   up_bob          TEXT    NOT NULL DEFAULT '',
 	   capture_content INTEGER NOT NULL DEFAULT 0,
-	   monthly_cap_usd REAL    NOT NULL DEFAULT 0,
 	   max_rows        INTEGER NOT NULL DEFAULT 0,
 	   disabled        INTEGER NOT NULL DEFAULT 0,
 	   created_at      INTEGER NOT NULL,
@@ -770,6 +1119,123 @@ var migrations = []string{
 	   after         TEXT    NOT NULL DEFAULT ''
 	 );
 	 CREATE INDEX idx_audit_target ON tenant_config_audit(target_tenant, ts DESC);`,
+	// v2: agent keys. Some agents (Bob/BobShell) can set no request header we do not
+	// already occupy: their client builds Authorization, User-Agent, x-instance-id and
+	// x-team-id itself and offers no hook for another one. Such an agent can still be
+	// identified by the credential it DOES send — its own provider key — so a tenant
+	// binds the sha256 of that key once and their traffic resolves by it thereafter.
+	//
+	// key_hash only. The key itself is never inserted, selected, or logged, so this
+	// table is exactly as replayable as tenant_tokens: not at all.
+	`CREATE TABLE tenant_agent_keys (
+	   key_hash     BLOB    PRIMARY KEY,
+	   tenant_id    TEXT    NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+	   created_at   INTEGER NOT NULL,
+	   last_used_at INTEGER NOT NULL DEFAULT 0
+	 );
+	 CREATE INDEX idx_agent_keys_tenant ON tenant_agent_keys(tenant_id);`,
+
+	// v3: real accounts. Email + password for the DASHBOARD, with an emailed
+	// one-time code as a second factor, and one row per signed-in machine.
+	//
+	// Additive only — every column has a DEFAULT, so an existing tenant migrates to
+	// "no password yet, email not verified" and keeps signing in with a proxy token
+	// until they set one. Nothing is dropped or rewritten.
+	`ALTER TABLE tenants ADD COLUMN password_hash     TEXT    NOT NULL DEFAULT '';
+	 ALTER TABLE tenants ADD COLUMN email_verified_at INTEGER NOT NULL DEFAULT 0;
+
+	 -- One signed-in machine per row. A user is expected to have several at once
+	 -- (laptop, desktop, phone), so these columns exist to make the list
+	 -- RECOGNISABLE: you cannot decide which session to revoke from a hash.
+	 ALTER TABLE dash_sessions ADD COLUMN label        TEXT    NOT NULL DEFAULT '';
+	 ALTER TABLE dash_sessions ADD COLUMN user_agent   TEXT    NOT NULL DEFAULT '';
+	 ALTER TABLE dash_sessions ADD COLUMN ip           TEXT    NOT NULL DEFAULT '';
+	 ALTER TABLE dash_sessions ADD COLUMN last_seen_at INTEGER NOT NULL DEFAULT 0;
+
+	 -- Pending email codes. The PRIMARY KEY is (tenant_id,purpose), which makes "one
+	 -- live code per flow" a schema property rather than a convention: INSERT OR
+	 -- REPLACE cannot leave two valid codes behind.
+	 --
+	 -- code_hash is sha256(purpose:code) — deliberately NOT a memory-hard hash, unlike
+	 -- a password. A 6-digit code has 10^6 preimages, so no KDF makes a leaked row
+	 -- safe; what makes this acceptable is that the row lives 5 minutes, is destroyed
+	 -- on use or on the 5th wrong guess, and for a login is worthless without the
+	 -- password. It is hashed rather than stored plain so a backup of this file is not
+	 -- a live second factor.
+	 CREATE TABLE email_codes (
+	   tenant_id  TEXT    NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+	   purpose    TEXT    NOT NULL,
+	   code_hash  BLOB    NOT NULL,
+	   attempts   INTEGER NOT NULL DEFAULT 0,
+	   created_at INTEGER NOT NULL,
+	   expires_at INTEGER NOT NULL,
+	   PRIMARY KEY (tenant_id, purpose)
+	 );` + stampInUseAccounts,
+
+	// v4: the backfill on its own, for a database that already reached v3 (dev and
+	// staging installs of the email-auth build) and so will never re-run it above.
+	stampInUseAccounts,
+	// v5: user feedback. Stars plus mandatory prose, in the CONTROL database rather
+	// than the dashboard's, because dash renames its file aside and rebuilds on a
+	// schemaVersion bump and somebody's written answer is not derivable from anything.
+	//
+	// Purely additive: two new tables, nothing altered, so an existing deployment
+	// migrates by gaining an empty feedback list. (It is v5 rather than v4 because the
+	// account backfill above took v4 on merge — the version IS the slice index, and
+	// nothing here depends on the number.)
+	//
+	// tenant_id is deliberately NOT a foreign key with ON DELETE CASCADE, unlike every
+	// other table here. Feedback is a historical record of what somebody said, not part
+	// of an account's live state: it must outlive the account, so email and label are
+	// copied in at write time and the id is kept only as a join hint.
+	`CREATE TABLE feedback (
+	   id         INTEGER PRIMARY KEY AUTOINCREMENT,
+	   tenant_id  TEXT    NOT NULL,
+	   email      TEXT    NOT NULL DEFAULT '',
+	   label      TEXT    NOT NULL DEFAULT '',
+	   created_at INTEGER NOT NULL,
+	   wanted     TEXT    NOT NULL DEFAULT '',
+	   comment    TEXT    NOT NULL,
+	   -- 0 = the manager's copy never reached a relay. Storing comes first and mailing
+	   -- second, so this column is how a dead relay is visible rather than silent.
+	   mailed_at  INTEGER NOT NULL DEFAULT 0
+	 );
+	 CREATE INDEX idx_feedback_created ON feedback(created_at DESC);
+	 CREATE INDEX idx_feedback_tenant ON feedback(tenant_id);
+	 -- One row per star rating. A table rather than a column per question: the
+	 -- per-agent questions depend on which agents an account actually uses, so the set
+	 -- is not fixed at schema time and a new question must not need an ALTER.
+	 CREATE TABLE feedback_scores (
+	   feedback_id INTEGER NOT NULL REFERENCES feedback(id) ON DELETE CASCADE,
+	   dimension   TEXT    NOT NULL,
+	   score       INTEGER NOT NULL,
+	   PRIMARY KEY (feedback_id, dimension)
+	 );`,
+
+	// v6: manager control. Two columns, both additive with defaults, so an existing
+	// account migrates to "no variant, no reason" and nothing changes for it.
+	//
+	// variant is an A/B GROUP LABEL. Deliberately not a foreign key into a variants
+	// table: a variant has no properties of its own — the configuration lives on the
+	// tenant row, where it already did — so a second table would hold nothing but a
+	// name, and a name is what this column is.
+	`ALTER TABLE tenants ADD COLUMN variant         TEXT NOT NULL DEFAULT '';
+	 ALTER TABLE tenants ADD COLUMN disabled_reason TEXT NOT NULL DEFAULT '';`,
+
+	// v7: the feedback form's new shape. One agent per submission, chosen from a
+	// selector, and the optional "what would you like added" folded into the single
+	// mandatory comment.
+	//
+	// A real forward migration, in place: this database is never renamed aside, so a
+	// retired column is DROP COLUMN and not a rebuild. wanted carries no index and no
+	// constraint, which is what makes that legal here.
+	//
+	// Existing rows keep their comment and gain agent = '' — an answer written before
+	// anybody was asked which agent it was about, which is exactly what it is. Their old
+	// dimension keys are left alone: Summarize reports the questions it knows, so a
+	// retired key is absent from the aggregate rather than misfiled into it.
+	`ALTER TABLE feedback DROP COLUMN wanted;
+	 ALTER TABLE feedback ADD COLUMN agent TEXT NOT NULL DEFAULT '';`,
 }
 
 func migrate(db *sql.DB) error {
@@ -804,8 +1270,12 @@ func migrate(db *sql.DB) error {
 
 // --- small helpers ----------------------------------------------------------
 
+// tenantCols is appended to, never reordered: scanTenant reads it positionally, and
+// the v3 account columns are LAST so a change to the older list stays a one-line diff.
+// password_hash is deliberately absent — see Tenant.HasPassword.
 const tenantCols = `t.id,t.label,t.email,t.role,t.config_yaml,t.up_anthropic,t.up_openai,
-	t.up_bob,t.capture_content,t.monthly_cap_usd,t.max_rows,t.disabled,t.created_at,t.last_seen_at`
+	t.up_bob,t.capture_content,t.max_rows,t.disabled,t.created_at,t.last_seen_at,
+	t.email_verified_at,t.password_hash <> '',t.variant,t.disabled_reason`
 
 // scanner is what *sql.Row and *sql.Rows have in common.
 type scanner interface{ Scan(...any) error }
@@ -813,11 +1283,11 @@ type scanner interface{ Scan(...any) error }
 func scanTenant(s scanner) (*Tenant, error) {
 	var t Tenant
 	var role string
-	var capture, disabled int
-	var created, seen int64
+	var capture, disabled, haspw int
+	var created, seen, verified int64
 	if err := s.Scan(&t.ID, &t.Label, &t.Email, &role, &t.ConfigYAML, &t.UpAnthropic,
-		&t.UpOpenAI, &t.UpBob, &capture, &t.MonthlyCapUSD, &t.MaxRows, &disabled,
-		&created, &seen); err != nil {
+		&t.UpOpenAI, &t.UpBob, &capture, &t.MaxRows, &disabled,
+		&created, &seen, &verified, &haspw, &t.Variant, &t.DisabledReason); err != nil {
 		return nil, err
 	}
 	t.Role = Role(role)
@@ -825,6 +1295,8 @@ func scanTenant(s scanner) (*Tenant, error) {
 	t.Disabled = disabled != 0
 	t.CreatedAt = msTime(created)
 	t.LastSeenAt = msTime(seen)
+	t.VerifiedAt = msTime(verified)
+	t.HasPassword = haspw != 0
 	return &t, nil
 }
 
@@ -841,6 +1313,40 @@ func newID() string {
 // lines, and in the audit trail.
 func validLabel(s string) bool {
 	if s == "" || len(s) > 64 {
+		return false
+	}
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// validVariant reports whether s may name an A/B group. Stricter than validLabel
+// because a variant name is a GROUPING KEY as well as display text — it ends up as a
+// chart legend, a query parameter and an audit value — and an allow-list is the way to
+// keep all three uses safe at once. Empty is valid: it means "no variant".
+func validVariant(s string) bool {
+	if len(s) > 32 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '.' || c == '_' || c == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// validReason bounds a manager's note. It is shown to the account's owner, so it is
+// bounded and printable rather than free-form: this string travels into a 403 body.
+func validReason(s string) bool {
+	if len(s) > 200 {
 		return false
 	}
 	for _, r := range s {

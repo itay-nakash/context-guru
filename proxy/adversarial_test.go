@@ -1,12 +1,14 @@
 package proxy
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The registration mode is switched on in TWO places — the control plane enforces it
@@ -14,13 +16,17 @@ import (
 // Before this, the banner read CG_REGISTER raw: "Open" enforced as OPEN while the log
 // said self-registration was off.
 //
-// The same table pins fail-closed for everything that is not exactly open/invite.
-func TestRegisterModeNormalisesAndFailsClosed(t *testing.T) {
+// The same table pins the DEFAULT: anything that is not recognisably invite or closed
+// resolves to open. `closed` and `invite` are the deliberate departures from the
+// default, so a typo in one of those must not silently disable accounts — and a typo
+// cannot silently ENABLE them either, because open is what an unset variable means.
+func TestRegisterModeNormalisesAndDefaultsToOpen(t *testing.T) {
 	for raw, want := range map[string]string{
 		"open": "open", "Open": "open", "OPEN": "open", " open ": "open",
 		"invite": "invite", "Invite": "invite",
-		"closed": "closed", "": "closed", "1": "closed", "true": "closed",
-		"opne": "closed", "open-ish": "closed", "yes": "closed",
+		"closed": "closed", "Closed": "closed", " closed ": "closed",
+		"": "open", "1": "open", "true": "open",
+		"opne": "open", "open-ish": "open", "yes": "open",
 	} {
 		t.Setenv(envRegisterMode, raw)
 		if got := RegisterMode(); got != want {
@@ -32,7 +38,7 @@ func TestRegisterModeNormalisesAndFailsClosed(t *testing.T) {
 // And the enforcement agrees with that resolution: a mode the banner reports as open
 // must actually register, and one it reports as closed must actually refuse.
 func TestRegistrationEnforcementMatchesReportedMode(t *testing.T) {
-	for i, raw := range []string{"OPEN", " open", "Open", "1", "true", "opne", ""} {
+	for i, raw := range []string{"OPEN", " open", "Open", "1", "true", "opne", "", "closed", "CLOSED"} {
 		t.Setenv(envRegisterMode, raw)
 		f := newHostedFixture(t, "up", "openai")
 		mode := RegisterMode()
@@ -120,17 +126,42 @@ func TestRegistrationBucketIsPerIPv6Prefix(t *testing.T) {
 	}
 
 	// End to end: rotating the host part of one /64 does not buy fresh budget.
+	//
+	// Retried on a minute rollover for the reason spendSignInBudget spells out: the
+	// limiter's window is a fixed calendar minute, so a probe straddling a boundary spends
+	// its attempts out of two budgets and neither half reaches the bound. From in here that
+	// is indistinguishable from the bypass this test exists to catch, so the crossing is
+	// detected rather than tolerated.
 	t.Setenv(envRegisterMode, "open")
-	f := newHostedFixture(t, "up", "openai")
-	limited := false
-	for i := 0; i < registrationsPerMinute+3; i++ {
-		addr := "[2001:db8::" + strconv.Itoa(i+1) + "]:5555"
-		if registerVia(t, f, "u"+strconv.Itoa(i)+"@ibm.com", "", addr) == http.StatusTooManyRequests {
-			limited = true
-			break
+	const attempts = registrationsPerMinute + 3
+	for try := 0; ; try++ {
+		f := newHostedFixture(t, "up", "openai")
+		limited := false
+		minute, start := time.Now().Truncate(time.Minute), time.Now()
+		for i := 0; i < attempts; i++ {
+			// A fresh email per try too, so a retry is not refused as a duplicate.
+			addr := "[2001:db8::" + strconv.Itoa(i+1) + "]:5555"
+			email := fmt.Sprintf("u%d-%d@ibm.com", try, i)
+			if registerVia(t, f, email, "", addr) == http.StatusTooManyRequests {
+				limited = true
+				break
+			}
 		}
-	}
-	if !limited {
-		t.Error("rotating addresses inside one IPv6 /64 bypassed the registration limit")
+		if limited {
+			return
+		}
+		elapsed := time.Since(start)
+		// Each allowed registration hashes a password with argon2 at 64 MiB; a machine that
+		// spends a whole window on these is reporting itself, not the code.
+		if elapsed >= time.Minute {
+			t.Skipf("inconclusive: %d registrations took %v, longer than the window itself. "+
+				"Re-run on a less loaded machine.", attempts, elapsed)
+		}
+		if !time.Now().Truncate(time.Minute).Equal(minute) && try < 2 {
+			t.Logf("the minute rolled over mid-probe (%v); retrying on a fresh limiter", elapsed)
+			continue
+		}
+		t.Fatalf("rotating addresses inside one IPv6 /64 bypassed the registration limit "+
+			"(%d attempts in %v, inside one window)", attempts, elapsed)
 	}
 }
