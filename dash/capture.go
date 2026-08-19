@@ -177,7 +177,8 @@ type Recorder struct {
 	// Cache-attribution state: the last time we saw each session and whether we
 	// have seen each model, so a cold start is never reported as a bust.
 	mu        sync.Mutex
-	lastSeen  map[string]int64 // session -> epoch ms of previous request
+	lastSeen  map[string]int64  // session -> epoch ms of previous request
+	lastTail  map[string]uint64 // session -> previous request's volatile-tail hash
 	seenModel map[string]bool
 	// perComp accumulates unique-savings dedup keys so a per-request unique figure
 	// exists at capture time. Bounded; see markUnique.
@@ -214,6 +215,7 @@ func NewRecorder(opts Options) (*Recorder, error) {
 		ch:        make(chan *Event, opts.QueueSize),
 		done:      make(chan struct{}),
 		lastSeen:  map[string]int64{},
+		lastTail:  map[string]uint64{},
 		seenModel: map[string]bool{},
 		seenKeys:  map[string]struct{}{},
 		remote:    opts.Remote,
@@ -439,8 +441,19 @@ func (r *Recorder) run() {
 // warm cache because a DIFFERENT tenant had used it. That is both wrong and a small
 // disclosure — it tells you which models other people are running.
 func (r *Recorder) Observe(tenant, session, model string, now int64) (seenSession, seenModel bool, sinceLastMs int64) {
+	seenSession, seenModel, sinceLastMs, _ = r.ObserveSplit(tenant, session, model, now, 0)
+	return seenSession, seenModel, sinceLastMs
+}
+
+// ObserveSplit is Observe plus the volatile-tail comparison: tailChanged reports whether this
+// request's tail differs from the previous request's in the same session, which is the turn on
+// which the split is worth money (see dash.Event.cachesplitSavedUSD). A session's FIRST request
+// counts as changed — there was nothing there to match.
+//
+// tailHash 0 means nothing split, and then tailChanged is false: there is no split to credit.
+func (r *Recorder) ObserveSplit(tenant, session, model string, now int64, tailHash uint64) (seenSession, seenModel bool, sinceLastMs int64, tailChanged bool) {
 	if r == nil {
-		return true, true, 0
+		return true, true, 0, false
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -451,19 +464,112 @@ func (r *Recorder) Observe(tenant, session, model string, now int64) (seenSessio
 	}
 	seenModel = r.seenModel[mk]
 	// Bound both maps: a proxy runs for weeks and every distinct session id would
-	// otherwise be retained forever. Sessions are keyed by content hash or client
-	// id, so the working set is small; a reset just re-reports a cold start, which
-	// is honest (we genuinely no longer know).
-	// ponytail: crude clear-on-overflow; swap for an LRU if session churn ever matters.
+	// otherwise be retained forever. Sessions are keyed by content hash or client id, so
+	// the working set is small.
+	//
+	// By AGE, not by clearing the map. The old code emptied lastSeen entirely at 20,000
+	// entries, which made every live session's next turn report a cold start at once —
+	// and `seenSession` is no longer only a label: it decides whether a cache hit is
+	// credited as ours (see Event.cachesplitSavedUSD), so a wholesale reset was a
+	// wholesale over-claim. Dropping entries by age cannot do that: a session with no
+	// request for staleSession really has lost its provider cache, so treating its next
+	// turn as a cold start is not a guess, it is correct.
 	if len(r.lastSeen) > 20000 {
-		r.lastSeen = map[string]int64{}
+		r.pruneSessionsLocked(now)
 	}
 	if len(r.seenModel) > 1000 {
 		r.seenModel = map[string]bool{}
 	}
+	if tailHash != 0 {
+		prevTail, had := r.lastTail[session]
+		tailChanged = !had || prevTail != tailHash
+		r.lastTail[session] = tailHash
+	}
 	r.lastSeen[session] = now
 	r.seenModel[mk] = true
-	return seenSession, seenModel, sinceLastMs
+	return seenSession, seenModel, sinceLastMs, tailChanged
+}
+
+// staleSession is how long a session must be silent before its state is forgettable. Well
+// past every provider cache TTL this code knows about (Anthropic 5m, or 1h with the extended
+// beta), so a pruned session's next request genuinely is a cold start.
+const staleSession = 2 * 60 * 60 * 1000
+
+// pruneSessionsLocked drops sessions idle longer than staleSession. Caller holds r.mu.
+//
+// If that frees nothing — 20,000 sessions all active inside two hours, which would be a
+// different kind of day — it falls back to emptying the map, because an unbounded map on a
+// long-running proxy is the worse failure.
+func (r *Recorder) pruneSessionsLocked(now int64) {
+	for k, ts := range r.lastSeen {
+		if now-ts > staleSession {
+			delete(r.lastSeen, k)
+			delete(r.lastTail, k)
+		}
+	}
+	if len(r.lastSeen) > 20000 {
+		r.lastSeen, r.lastTail = map[string]int64{}, map[string]uint64{}
+	}
+}
+
+// SeedSessions primes the session-recency map from the database, so a RESTART does not make
+// every live conversation's next turn look like the start of a new one.
+//
+// It matters because seenSession is not just a label any more: it is one of the three
+// conditions that decide whether a cache read is credited as our saving, so a proxy restart
+// used to hand out one bonus credit per live session — small, but exactly the kind of quiet
+// over-claim the prefix-cache figure exists to avoid. It also fixes cache_miss_reason, which
+// reported a cold start for every session in flight across a restart.
+//
+// One indexed group-by at startup, bounded to sessions young enough to still matter.
+func (r *Recorder) SeedSessions(now int64) (int, error) {
+	if r == nil || r.db == nil {
+		return 0, nil
+	}
+	// The tail hash of each session's LATEST request, alongside its recency: without it the
+	// first turn after a restart reads as a tail change and earns a credit it did not.
+	rows, err := r.db.sql.Query(`SELECT r.session_id, r.ts, r.split_tail_hash FROM requests r
+		WHERE r.ts >= ? AND r.id = (SELECT r2.id FROM requests r2
+			WHERE r2.session_id = r.session_id ORDER BY r2.ts DESC, r2.id DESC LIMIT 1)`,
+		now-staleSession)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	seeded := map[string]int64{}
+	tails := map[string]uint64{}
+	for rows.Next() {
+		var id string
+		var ts, tail int64
+		// int64, not uint64: SQLite's INTEGER is signed, so a hash whose top bit is set
+		// comes back negative and scanning it straight into a uint64 fails the whole
+		// query — which it did on every start, silently costing the seeding this function
+		// exists for ("could not recover session recency" in the log). The bits are the
+		// same; only the Go type of the container differs.
+		if err := rows.Scan(&id, &ts, &tail); err != nil {
+			return 0, err
+		}
+		seeded[id] = ts
+		if tail != 0 {
+			tails[id] = uint64(tail)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for id, ts := range seeded {
+		// Never overwrite something this process has already observed: that is newer by
+		// construction, and its sinceLastMs is the one the request path measured.
+		if _, ok := r.lastSeen[id]; !ok {
+			r.lastSeen[id] = ts
+			if t, ok := tails[id]; ok {
+				r.lastTail[id] = t
+			}
+		}
+	}
+	return len(seeded), nil
 }
 
 // MarkUnique attributes a component's savings to NEW content only, deduping by

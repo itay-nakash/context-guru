@@ -10,6 +10,7 @@ import (
 	"github.com/rossoctl/context-guru/components"
 	_ "github.com/rossoctl/context-guru/components/all"
 	"github.com/rossoctl/context-guru/config"
+	"github.com/rossoctl/context-guru/internal/tokens"
 	"github.com/rossoctl/context-guru/store"
 	"github.com/tidwall/gjson"
 )
@@ -17,7 +18,7 @@ import (
 // splitTail drops the byte-shift bookkeeping splitVolatileTail reports for the
 // writeback's benefit; these tests are about the split itself.
 func splitTail(body []byte, p bschemas.ModelProvider) ([]byte, bool) {
-	out, split, _, _ := splitVolatileTail(body, p)
+	out, split, _, _, _, _ := splitVolatileTail(body, p)
 	return out, split
 }
 
@@ -366,5 +367,131 @@ func TestSplitDoesNotDuplicateBedrockCachePoint(t *testing.T) {
 			(b.Get("cachePoint").Exists() || b.Get("cache_control").Exists()) {
 			t.Fatal("the volatile half kept a breakpoint — the churn is back inside a hashed prefix")
 		}
+	}
+}
+
+// The split is reported against the `cachesplit` component when it fires.
+//
+// It never was: the split edits the top-level `system` array, which components cannot see,
+// so Cachesplit.Reformat unconditionally sets Skipped and every report read "declined" — on
+// the requests where the measured −34.1%-cost mechanism had just run. The dashboard derives
+// `mutated` from `skipped`, so the share of prompt-cache savings attributable to our own
+// prefix placement was structurally $0.00 on every deployment that uses the default presets.
+func TestSplitIsReportedAgainstCachesplit(t *testing.T) {
+	full, _, _ := blockWithGitTail(6000)
+	pipe := pipeWith(t, "pipeline: [cachesplit]\n")
+
+	find := func(tr Trace) (components.Report, bool) {
+		if tr.Run == nil {
+			return components.Report{}, false
+		}
+		for _, r := range tr.Run.Components {
+			if r.Component == "cachesplit" {
+				return r, true
+			}
+		}
+		return components.Report{}, false
+	}
+
+	res := BodyOpts(context.Background(), pipe, store.NewMemory(store.Options{}), Opts{
+		Provider: bschemas.Anthropic, Body: sysBody(textBlock(full, true)), Session: "s-split",
+	})
+	rep, ok := find(res.Trace)
+	if !ok {
+		t.Fatal("no cachesplit report at all")
+	}
+	if rep.Skipped {
+		t.Error("the split fired and cachesplit still reported skipped: the dashboard reads " +
+			"mutated from that, so the component looks inert and nothing can be attributed to it")
+	}
+	if rep.Saved() != 0 {
+		t.Errorf("the split saves no CONTENT tokens; reported %d", rep.Saved())
+	}
+
+	// And when it does not fire, the report must still say skipped — a component credited for
+	// work it did not do is the same defect in the other direction.
+	res = BodyOpts(context.Background(), pipe, store.NewMemory(store.Options{}), Opts{
+		Provider: bschemas.Anthropic, Session: "s-nosplit",
+		Body: []byte(`{"model":"claude-sonnet-5","system":[{"type":"text","text":"short"}],` +
+			`"messages":[{"role":"user","content":"hi"}]}`),
+	})
+	if rep, ok := find(res.Trace); ok && !rep.Skipped {
+		t.Error("cachesplit reported work on a request with nothing to split")
+	}
+}
+
+// The split must be reported to EVERY consumer of a component report, not only to the
+// dashboard.
+//
+// The first version of this fix amended the report after `pipe.Run` returned — which was too
+// late: the pipeline emits each report to the metrics aggregator as it goes, so /stats and the
+// Prometheus component counters kept saying `cachesplit` skipped while the dashboard said it
+// mutated. Two surfaces disagreeing about the same fact is the bug this project has a
+// dedicated test for elsewhere; here the flag is set on the Ctx BEFORE the run instead, so the
+// report is right at its source and there is only one version of the truth.
+func TestSplitIsReportedToTheMetricsEmitterToo(t *testing.T) {
+	full, _, _ := blockWithGitTail(6000)
+	emitted := map[string]components.Report{}
+	pipe := pipeWithEmitter(t, "pipeline: [cachesplit]\n", emitterFunc(func(rep components.Report) {
+		emitted[rep.Component] = rep
+	}))
+
+	BodyOpts(context.Background(), pipe, store.NewMemory(store.Options{}), Opts{
+		Provider: bschemas.Anthropic, Body: sysBody(textBlock(full, true)), Session: "s-emit",
+	})
+	rep, ok := emitted["cachesplit"]
+	if !ok {
+		t.Fatal("no cachesplit report reached the emitter")
+	}
+	if rep.Skipped {
+		t.Error("the emitter — and so /stats and cg_component_runs_total — was told the split " +
+			"did not run, on a request where it did")
+	}
+}
+
+// emitterFunc adapts a function to components.Emitter; only Component is of interest here.
+type emitterFunc func(components.Report)
+
+func (f emitterFunc) Component(rep components.Report) { f(rep) }
+func (emitterFunc) Run(components.RunReport)          {}
+
+func pipeWithEmitter(t *testing.T, yaml string, e components.Emitter) *components.Pipeline {
+	t.Helper()
+	cfg, err := config.LoadBytes([]byte(yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := cfg.Build(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// The split has to report the SIZE of the half it moved the breakpoint onto, because that
+// is what the dashboard prices — and it is the number that stopped the prefix-cache saving
+// from being 7.5x too large. Crediting the request's whole cache_read counted the agent's
+// own breakpoints as ours: with cachesplit off, a real session's first request still read
+// 45,805 tokens from cache and only 8,499 more moved when it was on.
+func TestSplitReportsTheSizeOfTheStableHalf(t *testing.T) {
+	full, _, _ := blockWithGitTail(6000)
+	body := sysBody(textBlock(full, true))
+	_, split, _, _, stable, _ := splitVolatileTail(body, bschemas.Anthropic)
+	if !split {
+		t.Fatal("did not split")
+	}
+	if stable < minSplitTokens {
+		t.Fatalf("stable half reported as %d tokens, below the minimum that permits a split", stable)
+	}
+	// It is the STABLE half, not the whole block: the volatile tail is excluded by
+	// construction, so the count must be strictly smaller than the block it came from.
+	whole := tokens.Count(full)
+	if stable >= whole {
+		t.Errorf("stable half %d is not smaller than the whole block %d", stable, whole)
+	}
+	// And nothing is reported when nothing splits, so a dollar figure can key off it.
+	plain := []byte(`{"system":[{"type":"text","text":"short"}]}`)
+	if _, sp, _, _, n, _ := splitVolatileTail(plain, bschemas.Anthropic); sp || n != 0 {
+		t.Errorf("no split, but reported %d stable tokens", n)
 	}
 }

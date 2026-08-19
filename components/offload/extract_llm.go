@@ -224,7 +224,7 @@ func (e *ExtractLLM) inputLimit(c *components.Ctx) int {
 	if e.modelMaxInput > 0 {
 		return e.modelMaxInput
 	}
-	if e.modelName != "" { // a config-pinned client: we know exactly which model it is
+	if e.modelName != "" { // the model is named in config, so we know exactly which it is
 		if w, ok := staticWindows.Window(c.Ctx, e.modelName); ok {
 			return w
 		}
@@ -387,9 +387,9 @@ func newExtractLLM(raw []byte) (components.Component, error) {
 				(probe.Trigger != nil &&
 					(probe.Trigger.MinRequestTokens != nil || probe.Trigger.MinOutputTokens != nil))
 		}
-		if err := yaml.Unmarshal(raw, &cfg); err != nil {
-			return nil, err
-		}
+	}
+	if err := components.Decode(raw, &cfg); err != nil {
+		return nil, err
 	}
 	rewrite := true
 	if cfg.Rewrite != nil {
@@ -573,6 +573,31 @@ func looksLikeFileRead(content string) bool {
 	return checked >= 8 && numbered*100/checked >= 60
 }
 
+// pricingFor is the extraction model's REAL rates where the host could resolve them.
+//
+// The built-in default is haiku-class, while the shipped model.source is `incoming` — the
+// agent's own model — so on a sonnet-class agent the default understates every call by about
+// 3x, and the gate spends against that number. MEASURED: a call recorded at $0.0276 had cost
+// about $0.083. Hence the agent's own rates when the agent is what compacts.
+//
+// But ONLY then. `model.model` re-points an incoming-source client at a cheap model on the
+// same endpoint, and applying the agent's rates to those calls is the same error in the other
+// direction: on the deployment where this was found opus is 4.75x haiku, the per-call figure
+// on the Components tab disagreed with the request row by exactly that factor, and a
+// configuration that pays read as one that loses money. When a model is named, its rates
+// govern.
+func (e *ExtractLLM) pricingFor(c components.Ctx) cheapmodel.Pricing {
+	if e.modelSource == "config" || e.modelName != "" || c.SelfRates.Zero() {
+		return e.pricing
+	}
+	return cheapmodel.Pricing{
+		InputPerMTok:      c.SelfRates.Input * 1_000_000,
+		OutputPerMTok:     c.SelfRates.Output * 1_000_000,
+		CacheReadPerMTok:  c.SelfRates.CacheRead * 1_000_000,
+		CacheWritePerMTok: c.SelfRates.CacheWrite * 1_000_000,
+	}
+}
+
 func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.Report, c *components.Ctx) ([]string, error) {
 	// Resolved once: the candidate loop below tests it per tool output, and it is a
 	// handler call rather than a field read.
@@ -594,7 +619,21 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 	}
 	model := e.modelClient
 	if model == nil {
-		model = c.Model.For(e.modelSource)
+		// ForModel, not For: `model.model` names the model to COMPACT with even when the
+		// source is the incoming request. Without that, compaction on a coding agent runs on
+		// the agent's frontier model, and the arithmetic never closes — a real cold-cache
+		// sweep measured here cut the provider bill by $0.63 and spent $1.25 of opus doing
+		// it. Same endpoint, same credential, cheap model.
+		var usedSource string
+		model, usedSource = c.Model.ForModelSource(e.modelSource, e.modelName)
+		// The fallback from `incoming` to the static model is a DIFFERENT credential on a
+		// DIFFERENT endpoint, so it cannot be silent: an operator whose config says
+		// `source: incoming` would otherwise have no way to learn that none of their calls
+		// went there. This gate is what makes an authentication failure attributable to the
+		// credential that was actually presented.
+		if model != nil && usedSource != "" && e.modelSource != "config" && usedSource == "config" {
+			rep.Gate("model_source_fell_back_to_config")
+		}
 	}
 	// Per-session cadence: on throttled steps drop the model (skip this request). The sweep
 	// is exempt — it happens at most once per idle gap, which is its own throttle, and
@@ -646,15 +685,7 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 	// agent's own model — so on a sonnet-class agent the fallback understates every call by
 	// about 3x, and the gate spends on that number. MEASURED on a real session: a call
 	// recorded at $0.0276 had cost about $0.083.
-	pricing := e.pricing
-	if e.modelSource != "config" && !c.SelfRates.Zero() {
-		pricing = cheapmodel.Pricing{
-			InputPerMTok:      c.SelfRates.Input * 1_000_000,
-			OutputPerMTok:     c.SelfRates.Output * 1_000_000,
-			CacheReadPerMTok:  c.SelfRates.CacheRead * 1_000_000,
-			CacheWritePerMTok: c.SelfRates.CacheWrite * 1_000_000,
-		}
-	}
+	pricing := e.pricingFor(*c)
 	// The model id actually used, for the record. `source: incoming` pins no name, so without
 	// this every recorded call said model="".
 	callModel := e.modelName
@@ -932,7 +963,12 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 			// clock as well as money, and an agent on a task deadline feels the former more.
 			explore := !tooSlowToExplore(metrics.ExtractionAvgLatencyMs()) &&
 				e.ratios.exploring(c.Session)
-			d := evaluateGate(sz, ratio, val, callCost(pricing, sz), seenBefore, turnsSoFar,
+			// promptOverhead, not the 200-token constant: it already counts the rendered
+			// conversation context, which under `context: full` (every cold sweep) IS the
+			// prompt. Measured on production: five haiku calls on ONE request each sent
+			// ~138,000 prompt tokens while the gate priced them at <=6,663 — 21x to 31x low,
+			// which is what let the sweep spend $0.71 to remove 63 tokens worth $0.0003.
+			d := evaluateGate(sz, ratio, val, callCost(pricing, sz, promptOverhead), seenBefore, turnsSoFar,
 				explore, e.allowCached)
 			if !d.allow && e.fireOnSize {
 				// ADVISORY: `fire_on: size` is the operator taking the spending decision
@@ -1012,6 +1048,12 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 	// so parallel beats a single-call batch on tokens AND latency. Each output fails open
 	// independently (a miss leaves that one verbatim).
 	if len(cands) > 0 {
+		// The conversation context is identical for every candidate in this request, so with
+		// two or more calls it is worth writing into the provider's cache once and reading it
+		// back on the rest. With ONE call there is nothing to read it back, and a cache write
+		// costs 1.25x fresh — so paying for it would be a 25% loss. Decided here because this
+		// is the only place the final candidate count is known (the caps above trim it).
+		extCfg.CacheContext = len(cands) > 1
 		type outT struct{ projected, summary string }
 		out := make([]outT, len(cands))
 		// One record per call, written to its own slot so the goroutines need no lock (a
@@ -1154,4 +1196,51 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 		rep.Skipped = true
 	}
 	return keys, nil
+}
+
+func init() {
+	f := []components.Field{
+		{Key: "per_output", Type: components.FieldBool, Default: true,
+			Hint: "The HOT-PATH pass: reduce individual tool outputs as they arrive. With this off and cold_cache.enabled off the component has nothing to do and refuses to build — take it out of the pipeline instead."},
+		{Key: "fire_on", Type: components.FieldEnum, Default: "pressure", Options: []string{"pressure", "size"},
+			Hint: "What decides a request is worth a model call. pressure = the derived context-pressure trigger. size = fire whenever any candidate clears min_tokens, which ALSO demotes the economic gate and the caching-backend guard to advisory — a deliberate licence to spend, so set the caps first."},
+		{Key: "min_tokens", Type: components.FieldInt, Default: 300, Min: 1,
+			Hint: "Per-output floor. Setting it pins the trigger to your number instead of the derived pressure curve. Under fire_on: size an unset floor is raised to 2000, because 300 is a threshold nearly every output clears."},
+		{Key: "strategy", Type: components.FieldEnum, Default: "code", Options: extract.Modes,
+			Hint: "How the extraction is produced. code = model-written Starlark filter over the body; single = one JSON-returning call; rlm = chunked, for very large bodies; deterministic = NO model call at all; auto picks by size."},
+		{Key: "aggressiveness", Type: components.FieldEnum, Default: "medium",
+			Options: []string{string(extract.AggroLow), string(extract.AggroMedium), string(extract.AggroHigh)},
+			Hint:    "The compaction target taught to the model. It changes what is ASKED for, never what is ACCEPTED — the verbatim-preservation and strictly-smaller checks are identical at every level."},
+		{Key: "context", Type: components.FieldEnum, Default: "recent", Options: []string{"goal", "recent", "full"},
+			Hint: "How much conversation the extraction prompt carries: just the goal, the recent N messages, or the whole transcript."},
+		{Key: "context_messages", Type: components.FieldInt, Default: defaultContextMessages,
+			Hint: "The N for context: recent (0 = 7)."},
+		{Key: "llm_every_n_requests", Type: components.FieldInt, Default: 1,
+			Hint: "Throttle: fire at most once per N requests in a session (0 or 1 = every request)."},
+		{Key: "llm_max_per_request", Type: components.FieldInt,
+			Hint: "Cap model calls for one request. 0 = UNLIMITED, which is a real choice and not an unset value."},
+		{Key: "llm_max_per_session", Type: components.FieldInt,
+			Hint: "Cap model calls for the whole session. 0 = UNLIMITED. The per-request cap alone cannot bound a long session (2 calls x 300 turns is 600 calls), so with fire_on: size this is the outer bound on spend."},
+		{Key: "allow_on_caching_backend", Type: components.FieldBool,
+			Hint: "Re-enable extraction on prompt-caching backends. Unset = FALSE, and the economic gate then hard-declines every candidate whose tokens are prompt-cached — on Claude Code against Anthropic that is the whole workload, which is how a fully configured component ran 251 times and acted 0 times."},
+		{Key: "economic_gate", Type: components.FieldBool, Default: true,
+			Hint: "Only call the model when the expected saving exceeds the expected call cost, priced from real rates. Turning it off restores spend-on-size, needed only to reproduce old benchmark numbers."},
+		{Key: "rewrite", Type: components.FieldBool, Default: true,
+			Hint: "Let the program reword and summarize rather than only delete. Off forces verified deletion-only (the containment proof); ids, paths and errors are required verbatim either way."},
+		{Key: "skip_file_reads", Type: components.FieldBool,
+			Hint: "Leave line-numbered source dumps verbatim. Unset = AUTO: skip them when the request is prompt-cached (where reducing them measured +30% billed cost), reduce them otherwise."},
+		{Key: "model_max_input_tokens", Type: components.FieldInt,
+			Hint: "Pin the EXTRACTION model's input budget, for a model id the static table cannot name (a self-hosted id, or a gateway alias). Unset = resolved per model."},
+		markerModeField(),
+		{Key: "cold_cache.enabled", Type: components.FieldBool,
+			Hint: "The whole-transcript sweep on a turn whose prompt cache has EXPIRED. Measured here: those turns were 4% of requests and 31% of spend, and removing a token on one is worth 12.5x what it is worth on a warm turn."},
+		{Key: "cold_cache.min_tokens", Type: components.FieldInt, Default: defaultColdFloor, Min: 1,
+			Hint: "Per-output floor for the sweep. Lower than the hot path's, because on that turn every candidate is being re-billed at the write rate anyway."},
+		{Key: "cold_cache.min_idle_seconds", Type: components.FieldInt,
+			Hint: "Demand MORE idle time than the provider TTL implies (0 = just the TTL). Raises the bar, never lowers it."},
+		{Key: "cold_cache.max_calls", Type: components.FieldInt,
+			Hint: "Cap model calls for one sweep. 0 = unlimited, which is the default because the sweep runs once per idle gap on a turn that is already expensive."},
+	}
+	f = append(f, modelFields("model")...)
+	components.RegisterFields("extract_llm", extractLLMConfig{}, append(f, components.TriggerFields("trigger")...))
 }

@@ -45,6 +45,13 @@ func main() {
 		preset    = flag.String("preset", envOr("PRESET", "codesmart"), "preset to use when --config is absent (codesmart = the SWE-bench-winning cache-aware config; codesafe = deterministic-only)")
 		openai    = flag.String("openai-upstream", envOr("OPENAI_UPSTREAM", "https://api.openai.com"), "OpenAI upstream base URL")
 		anthropic = flag.String("anthropic-upstream", envOr("ANTHROPIC_UPSTREAM", "https://api.anthropic.com"), "Anthropic upstream base URL")
+		// Not a whole-request timeout on purpose: a streaming turn that is still producing
+		// tokens must never be cut off for taking a while. See proxy.upstreamTransport.
+		upstreamHeaderTimeout = flag.Duration("upstream-header-timeout",
+			envDuration("UPSTREAM_HEADER_TIMEOUT", 10*time.Minute),
+			"how long an upstream may take to send its FIRST byte before we treat it as gone. "+
+				"Not a cap on a streaming response's duration; it is the whole budget for a "+
+				"non-streaming one, whose headers arrive only once it is generated")
 		bob       = flag.String("bob-upstream", envOr("BOB_UPSTREAM", ""), "Bob (BobShell) backend base URL; enables the Bob gateway routes when set (e.g. https://api.us-east.bob.ibm.com)")
 		storeFlag = flag.String("store", envOr("STORE", ""), "override state store: true|false (default: config store.enabled, else on)")
 		modeFlag  = flag.String("mode", envOr("MODE", ""), "operating mode: sync (default) | observe (overrides the config's mode:)")
@@ -271,6 +278,16 @@ func main() {
 		}
 		rec = r
 		defer rec.Close()
+		// Recover which sessions were live before this restart. Without it every conversation
+		// in flight reports a cold start on its next turn — and that flag also decides whether
+		// a cache hit counts as our saving, so a restart handed out one bonus credit per live
+		// session (see dash.Event.cachesplitSavedUSD).
+		if n, err := rec.SeedSessions(time.Now().UnixMilli()); err != nil {
+			slog.Warn("dashboard: could not recover session recency; the first turn of each live "+
+				"session will be reported as a cold start", "err", err)
+		} else {
+			slog.Info("dashboard: recovered session recency across the restart", "sessions", n)
+		}
 		if runs, tasks := rec.DB().IngestBenchRoots(opts.BenchDirs); runs > 0 {
 			slog.Info("dashboard: ingested benchmark runs", "runs", runs, "tasks", tasks)
 		} else if len(opts.BenchDirs) > 0 {
@@ -445,7 +462,7 @@ func main() {
 		// off — with no request rows there is nothing to price a cap against and nothing
 		// to roll up per tenant.
 		Spend:          spendChecker(rec),
-		TenantMetrics:  tenantMetrics(rec),
+		TenantMetrics:  tenantMetrics(rec, priceResolver(windows)),
 		Version:        buildinfo.Version,
 		PresetNames:    config.PresetNames(),
 		ComponentNames: components.Names(),
@@ -454,9 +471,10 @@ func main() {
 			Concurrent:           *tenantConcurrent,
 			CheapModelConcurrent: *cheapConcurrent,
 		},
-		OpenAIUpstream:    *openai,
-		AnthropicUpstream: *anthropic,
-		BobUpstream:       *bob, // enables the Bob gateway routes when set (BOB_UPSTREAM)
+		OpenAIUpstream:        *openai,
+		AnthropicUpstream:     *anthropic,
+		UpstreamHeaderTimeout: *upstreamHeaderTimeout,
+		BobUpstream:           *bob, // enables the Bob gateway routes when set (BOB_UPSTREAM)
 		// Gateway mode: real provider keys live here (eval-containers passes them
 		// via env); the agent holds only a placeholder. Empty => pass client auth.
 		OpenAIKey:    os.Getenv("OPENAI_API_KEY"),
@@ -492,6 +510,14 @@ func main() {
 			return oc.Build(emitter)
 		},
 	})
+
+	// Rates for the one figure that has to be priced on READ: what the volatile-tail split
+	// earned on requests written before there was any per-request split size to price. Set
+	// whether or not this is a hosted deployment — a single-tenant dashboard has the same
+	// history and the same question about it.
+	if rec != nil {
+		h.API().SetPricer(priceResolver(windows))
+	}
 
 	// One identity resolver for both halves of the dashboard: the read routes (dash)
 	// and the write routes (control plane) must never disagree about who the caller is.
@@ -603,19 +629,39 @@ func spendChecker(rec *dash.Recorder) proxy.SpendChecker {
 // tenantMetrics adapts the recorder's per-tenant rollup for the Prometheus exporter.
 // The two row types are structurally identical but declared in different packages
 // (dash must not import proxy), so this converts.
-func tenantMetrics(rec *dash.Recorder) proxy.TenantMetricsSource {
+func tenantMetrics(rec *dash.Recorder, prices modelinfo.Pricer) proxy.TenantMetricsSource {
 	if rec == nil {
 		return nil
 	}
-	return tenantMetricsAdapter{rec}
+	return tenantMetricsAdapter{rec: rec, prices: prices}
 }
 
-type tenantMetricsAdapter struct{ rec *dash.Recorder }
+type tenantMetricsAdapter struct {
+	rec *dash.Recorder
+	// prices values the pre-instrumentation split figure, which is the one number here that
+	// has to be priced on read. nil = that metric reports 0.
+	prices modelinfo.Pricer
+}
 
 func (a tenantMetricsAdapter) TenantMetrics(since int64) ([]proxy.TenantMetricRow, error) {
 	rows, err := a.rec.DB().TenantMetrics(since)
 	if err != nil {
 		return nil, err
+	}
+	// The pre-instrumentation split figure, per tenant, priced here because this is the layer
+	// that holds the rates. One query per tenant rather than one for all of them: the figure is
+	// scoped by tenant everywhere else it appears, and a shared query would have to be
+	// re-grouped anyway. Best-effort — a tenant it cannot value reports 0 for that metric only.
+	hist := map[string]float64{}
+	if a.prices != nil {
+		for _, r := range rows {
+			h, err := a.rec.DB().CachesplitHistoricalUSD(
+				dash.Filter{Since: since, Tenant: r.TenantID}, a.prices)
+			if err != nil {
+				continue // per tenant, as the comment above promises: break zeroed every tenant after this one
+			}
+			hist[r.TenantID] = h.USD
+		}
 	}
 	out := make([]proxy.TenantMetricRow, 0, len(rows))
 	for _, r := range rows {
@@ -625,7 +671,9 @@ func (a tenantMetricsAdapter) TenantMetrics(since int64) ([]proxy.TenantMetricRo
 			SavedUnique: r.SavedUnique, CacheRead: r.CacheRead, CacheWrite: r.CacheWrite,
 			FreshInput: r.FreshInput, OutputTokens: r.OutputTokens,
 			CostUSD: r.CostUSD, BaselineUSD: r.BaselineUSD, CGLLMCostUSD: r.CGLLMCostUSD,
-			CGLatencyMs: r.CGLatencyMs, UpstreamMs: r.UpstreamMs, Sessions: r.Sessions,
+			CacheSavedUSD: r.CacheSavedUSD, CachesplitSavedUSD: r.CachesplitSavedUSD,
+			CachesplitHistoricalUSD: hist[r.TenantID],
+			CGLatencyMs:             r.CGLatencyMs, UpstreamMs: r.UpstreamMs, Sessions: r.Sessions,
 			ArchivedCount: r.ArchivedCount, ArchivedBytes: r.ArchivedBytes,
 		})
 	}
@@ -826,13 +874,36 @@ func dashMode(m components.Mode) string {
 // fallback. MODEL_INFO_URL overrides the map source; MODEL_INFO=off disables it
 // (windows unknown => fraction triggers ignored, absolutes apply).
 func modelWindows() modelinfo.Resolver {
-	if strings.EqualFold(os.Getenv("MODEL_INFO"), "off") {
-		return nil
+	chain := modelinfo.Chain{}
+	// MODEL_PRICES first: an operator's own price list beats the public map, which prices the
+	// public API and not this gateway. A file that fails to load is FATAL rather than skipped
+	// — a silently-absent price list is indistinguishable from "these models are free", and
+	// every cost on the dashboard would be wrong by whatever margin the gateway's rates
+	// differ by. See deploy/service/prices.example.yaml.
+	//
+	// Loaded ABOVE the MODEL_INFO=off check, and outside it. `off` turns off the fetched
+	// public map — a network dependency, which is what an operator disables — and it must not
+	// also discard a local file they explicitly configured. With the check first, MODEL_PRICES
+	// was never even opened, so the fatal-on-malformed promise did not hold either and every
+	// row priced as `partial`: exactly the silent failure the promise exists to prevent.
+	if path := os.Getenv("MODEL_PRICES"); strings.TrimSpace(path) != "" {
+		t, err := modelinfo.LoadTable(path)
+		if err != nil {
+			log.Fatalf("MODEL_PRICES: %v", err)
+		}
+		slog.Info("model price list loaded", "path", path, "entries", t.Len())
+		chain = append(chain, t)
 	}
-	return modelinfo.Chain{
+	if strings.EqualFold(os.Getenv("MODEL_INFO"), "off") {
+		if len(chain) == 0 {
+			return nil // no local list either: windows and prices are both unknown, as asked
+		}
+		return chain
+	}
+	return append(chain,
 		modelinfo.NewLiteLLM(os.Getenv("MODEL_INFO_URL"), nil, 0),
 		modelinfo.DefaultStatic(),
-	}
+	)
 }
 
 // cheapModelFromEnv builds the static "config"-source LLM client for NeedsModel

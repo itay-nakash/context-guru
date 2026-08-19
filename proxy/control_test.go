@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -575,5 +576,128 @@ func TestFirstTokenIsRevealedOnceAndNowhereElse(t *testing.T) {
 	lg.Info("cg.auth token="+tok, "presented", tok)
 	if strings.Contains(buf.String(), tok) {
 		t.Errorf("the log scrubber let the token through: %s", buf.String())
+	}
+}
+
+// The settings page posts FIELDS, and the round trip has to survive the document shape that
+// broke it before: a pipeline written as a YAML block sequence. The browser rewrote that line
+// in place and orphaned the items under it, so every save answered
+// "config: yaml: line 3: did not find expected key" and the stored document stayed broken for
+// the next attempt. Two accounts were stuck there.
+func TestSettingsFieldsSaveOverABlockSequencePipeline(t *testing.T) {
+	f := ctlFixture(t)
+	w, _ := f.signUp(t, "boss@ibm.com", "l")
+	jar := w.Result().Cookies()
+
+	// Store the shape the old writer could not edit.
+	w, out := f.do(t, "PUT", "/api/me",
+		`{"config_yaml":"mode: sync\npipeline:\n  - format\n  - extract\n"}`, jar)
+	if w.Code != http.StatusOK {
+		t.Fatalf("storing a block-sequence pipeline = %d %s", w.Code, w.Body)
+	}
+	tn, _ := out["tenant"].(map[string]any)
+	eff, _ := tn["effective_config"].(map[string]any)
+	if eff == nil {
+		t.Fatal("no effective_config for the settings page to render")
+	}
+	if got := eff["pipeline"]; fmt.Sprint(got) != "[format extract]" {
+		t.Fatalf("the block sequence did not reach the form as fields: %v", got)
+	}
+
+	// Now save through the fields, turning the compaction model on.
+	// The wire shape is components{name{dotted key: value}} — the same keys the YAML
+	// document uses, so the page cannot post a field name the server does not read.
+	body := `{"config":{"pipeline":["format","extract"],"mode":"sync","components":{"extract_llm":` +
+		`{"per_output":true,"fire_on":"pressure","min_tokens":2000,` +
+		`"llm_max_per_request":2,"llm_max_per_session":20,"aggressiveness":"medium","context":"recent",` +
+		`"context_messages":7,"cold_cache.enabled":true,"cold_cache.min_tokens":1000}}}}`
+	w, out = f.do(t, "PUT", "/api/me", body, jar)
+	if w.Code != http.StatusOK {
+		t.Fatalf("field save = %d %s", w.Code, w.Body)
+	}
+	tn, _ = out["tenant"].(map[string]any)
+	eff, _ = tn["effective_config"].(map[string]any)
+	comps, _ := eff["components"].(map[string]any)
+	x, _ := comps["extract_llm"].(map[string]any)
+	if x == nil || x["per_output"] != true || x["cold_cache.enabled"] != true {
+		t.Errorf("the switches did not stick: %v", eff)
+	}
+	if !strings.Contains(fmt.Sprint(eff["pipeline"]), "extract_llm") {
+		t.Errorf("the component is configured but not in the pipeline: %v", eff["pipeline"])
+	}
+
+	// A bad value is a 400 naming the field, not a key the component silently ignores.
+	w, out = f.do(t, "PUT", "/api/me",
+		`{"config":{"mode":"sync","components":{"extract_llm":{"per_output":true,"aggressiveness":"very","context":"recent"}}}}`, jar)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("a bad aggressiveness = %d, want 400", w.Code)
+	}
+	if msg, _ := out["error"].(string); !strings.Contains(msg, "aggressiveness") {
+		t.Errorf("the error does not name the field: %q", msg)
+	}
+}
+
+// A plain account cannot set the compaction configuration through the fields either — a
+// second route to a manager's field would be the same hole with a different name.
+func TestSettingsFieldsAreAManagersField(t *testing.T) {
+	f := ctlFixture(t)
+	_, _ = f.register(t, "boss@ibm.com") // the manager exists but is not who we are
+	w, _ := f.signUp(t, "user@ibm.com", "l")
+	jar := w.Result().Cookies()
+	w, _ = f.do(t, "PUT", "/api/me", `{"config":{"mode":"observe"}}`, jar)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("a plain account set the configuration through fields: %d %s", w.Code, w.Body)
+	}
+}
+
+// The two fields that decide whether extract_llm can act at all have to make the round trip
+// like any other. They were in stored documents and NOT on the page, which is how an account
+// whose extract_llm was fully configured watched it run 251 times and act zero times: its
+// traffic is prompt-cached (so the economic gate hard-declines by default) and its
+// model.source was `config`, which on this service resolves to no model whatsoever.
+func TestTheFieldsThatDecideWhetherExtractLLMRunsAtAllRoundTrip(t *testing.T) {
+	f := ctlFixture(t)
+	w, _ := f.signUp(t, "boss@ibm.com", "l")
+	jar := w.Result().Cookies()
+
+	body := `{"config":{"pipeline":["format"],"mode":"sync","components":{"extract_llm":{"per_output":true,` +
+		`"cold_cache.enabled":true,"min_tokens":2000,"llm_max_per_request":2,"llm_max_per_session":20,` +
+		`"aggressiveness":"medium","context":"recent","context_messages":7,"cold_cache.min_tokens":1000,` +
+		`"allow_on_caching_backend":true,"model.source":"incoming","strategy":"code",` +
+		`"llm_every_n_requests":1,"trigger.min_request_tokens":3000}}}}`
+	w, out := f.do(t, "PUT", "/api/me", body, jar)
+	if w.Code != http.StatusOK {
+		t.Fatalf("field save = %d %s", w.Code, w.Body)
+	}
+	tn, _ := out["tenant"].(map[string]any)
+	eff, _ := tn["effective_config"].(map[string]any)
+	comps, _ := eff["components"].(map[string]any)
+	x, _ := comps["extract_llm"].(map[string]any)
+	if x == nil {
+		t.Fatalf("no extract_llm on the form: %v", eff)
+	}
+	if x["allow_on_caching_backend"] != true {
+		t.Error("allow_on_caching_backend did not survive the round trip")
+	}
+	if x["model.source"] != "incoming" {
+		t.Errorf("model.source = %v, want incoming", x["model.source"])
+	}
+	// And it is really in the document, where the component reads it.
+	doc, _ := tn["config_yaml"].(string)
+	for _, want := range []string{"allow_on_caching_backend: true", "source: incoming"} {
+		if !strings.Contains(doc, want) {
+			t.Errorf("the document does not carry %q:\n%s", want, doc)
+		}
+	}
+
+	// The settings page needs to know whether `source: config` can resolve to anything here,
+	// because on this service it cannot and the choice would otherwise read as available.
+	w, out = f.do(t, "GET", "/api/options", "", jar)
+	if w.Code != http.StatusOK {
+		t.Fatalf("options = %d", w.Code)
+	}
+	if out["compaction_model"] != false {
+		t.Errorf("compaction_model = %v; a multi-tenant deployment withholds the operator's "+
+			"compaction model, so the page must be told", out["compaction_model"])
 	}
 }

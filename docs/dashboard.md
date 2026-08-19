@@ -31,7 +31,7 @@ Every headline number, with the honesty machinery visible rather than hidden:
 |---|---|
 | Volume | requests · sessions · tokens before/after |
 | Savings | gross · unique · net-of-restores · overcount ratio |
-| Money | baseline cost · actual cost · context-guru's own LLM spend · net dollars saved |
+| Money | baseline cost · actual cost · context-guru's own LLM spend · net dollars saved · **prefix-cache savings** · **total avoided** |
 | Tokens billed | fresh input · cache reads · cache writes · output |
 | Latency | context-guru added (mean + **p95**) · upstream (mean + p95) |
 | Quality | restorations + rate · reverts · not-compacted count |
@@ -102,8 +102,168 @@ net savings by ~9× on the same data, which is why the dashboard puts `overcount
 right beside the dollar figure.
 
 Beneath it, the **honest savings waterfall**: baseline → compaction savings →
-context-guru's own LLM cost → net cost → net savings. If context-guru cost more than it
-saved, the waterfall says so.
+context-guru's own LLM cost → net cost → net savings → prefix-cache savings → total
+avoided. If context-guru cost more than it saved, the waterfall says so.
+
+#### Two savings, added and not nested — and one number that is not a saving
+
+There are two different counterfactuals on this page and conflating them is the easiest way
+to overstate a dashboard.
+
+**Compaction savings** (`net_saved_usd`) is baseline − actual − our own spend: what content
+that never reached the provider would have cost. Its baseline prices the unique removal at
+the cache-write rate and the re-sent remainder at the rate *this request actually paid* — the
+cache-read rate when its cache hit, and the cache-**write** rate when it missed, because a
+request whose cache had expired re-billed the whole prompt and would have re-billed the
+removed part with it. On production traffic those expired turns were 4% of requests and 31%
+of spend, so valuing their removals as cache reads understated them by ~12×.
+
+**Prefix-cache savings** (`cachesplit_saved_usd`) is the one cache figure this project
+claims. The mechanism is specific: Claude Code appends a live environment snapshot (branch,
+git status, recent commits) to the **end** of its big system block, and that block is one
+cacheable unit whose breakpoint sits *after* the churn — so the provider's hash covers the
+snapshot, the prefix never matches across sessions, and every new session re-pays for ~7k
+tokens of identical instructions. `cachesplit` splits the block in two and moves the
+breakpoint onto the stable half: byte-identical prompt to the model, hash boundary that
+excludes the churn.
+
+A request contributes only when **all** of these hold:
+
+1. the split **actually ran** on it (`split_stable_tokens > 0`), which happens when
+   `cachesplit` — or `cacheinject`, which enables the same rewrite — is in the pipeline and
+   the request's system prompt really carried a volatile tail;
+2. the **snapshot moved** since this session's previous request (`split_tail_hash` differs; a
+   session's first request counts as moved, there was nothing to match). This is the condition
+   that makes the hit *ours*: with the block unsplit a moved snapshot re-creates the whole
+   thing, while a tail that did not move would have been served from cache either way;
+3. the provider **read at least the stable half** from cache **while writing less than it** —
+   on the first request after the stable half itself changed, an earlier agent breakpoint still
+   hits while our half is billed as creation.
+
+Condition 2 replaced "it was the session's first request", which sounded conservative and was
+simply wrong about how this traffic behaves — see the measurement below.
+
+**The amount is the stable half**, not the request's whole `cache_read`. From the control arm:
+
+| first request of a new session | `cache_read` | `cache_write` |
+|---|---|---|
+| cachesplit **on** | 54,304 | ~1,050 |
+| cachesplit **off** | 45,805 | ~9,560 |
+
+The control still **hit** — Claude Code sets several breakpoints and the ones before this block
+match whatever we do — so crediting the whole read would have booked the agent's own cache
+placement as ours, **7.5× in dollars**. The counterfactual is a cache *miss*, not fresh input,
+because those tokens carry `cache_control`: hence
+`split_stable_tokens × (max(cache_write_rate, input_rate) − cache_read_rate)`, an 11.5×-fresh
+spread rather than 9×.
+
+#### What it is actually worth here, and why that is small
+
+Measured on this deployment: **$0.0298 across 1,127 sessions / 11,361 requests.** That is a real
+number, not a placeholder, and three independent measurements explain it:
+
+* **The snapshot is captured once per session.** A nine-turn session in which the agent created
+  and committed four files produced **one distinct `split_tail_hash`** — Claude Code does not
+  refresh the environment block mid-session, even after commits. So within a session there is
+  nothing for the split to protect, and every turn after the first hits regardless.
+* **Session starts are almost always cold.** 1,105 of 1,127 first requests read **zero** tokens
+  from cache: the previous session's prefix had expired under the provider's 5-minute TTL before
+  the next session began. Only **9** session starts had a warm prefix to hit at all.
+* **On those 9 it works exactly as designed** — 3 qualified and each earned ~$0.010, matching
+  the controlled measurement above to the cent.
+
+So the component is not broken and the figure is not a bug: the mechanism needs a *second
+session inside five minutes*, and humans do not work that way. The SWE-bench A/B that measured
+**−34.1% cost, 0% → 96.7% hit** ran tasks back-to-back inside the TTL, which is precisely the
+regime where this pays — and is why the benchmark result and the production result differ by
+three orders of magnitude without either being wrong.
+
+The three counts behind the dollar figure are on the page for exactly this reason (**Prefix
+split**: requests it ran on · snapshot had moved · served from cache). A small saving with no
+counts beside it is indistinguishable from a broken component; that is not hypothetical, it is
+what happened while the figure was gated on the session's first request and read ~$0.
+
+**The pre-instrumentation window is valued on read, never stored.** The two facts the live
+figure needs — the size of the half the split moved and the identity of the tail it moved off —
+are recorded per request only since the instrumentation shipped, so every earlier row prices at
+$0.00, which on the page is indistinguishable from "the component did nothing". So the API
+computes a second figure, `cachesplit_historical`, over exactly those rows, and the tile
+**Before we recorded it** shows it. Nothing in history is rewritten: it is recomputed from the
+stored rows on every query.
+
+What makes that legitimate rather than a guess is that the stable half is a property of the
+*agent's system prompt*, not of the request, and it is measurably constant — per model on this
+deployment the recorded minimum and maximum are the same number. `DB.CachesplitSizeSpread`
+reports both so that gets checked rather than assumed. Three limits, all under-crediting: only
+the session's **first** request (a mid-session credit needs the tail hash those rows lack), only
+models whose stable half was actually measured (no median stands in for a model nobody has run),
+and the same read/write test as the live path. It is therefore a floor on a floor. In Grafana it
+is `cg_tenant_cachesplit_historical_usd`, and the *Prefix-cache saved this month* stat adds it to
+the measured one.
+
+**For some accounts it does nothing at all**, and the counts say so. Three of this deployment's
+larger accounts have `cachesplit` running on 125, 1,035 and 1,972 requests and **acting on none
+of them** — their system prompt carries no volatile tail for it to split, either because the big
+block is under the 1,024-token floor or because it does not contain one of the snapshot markers
+(`Recent commits:`, `Current branch: `, `gitStatus:`, `Here is a snapshot of the current
+directory`). Agents run outside a git repository are the common case. "Requests it acted on: 0"
+beside a nonzero run count on the Components tab is that situation: a fact about the prompt, not
+a fault.
+
+This is version-dependent. If a future Claude Code refreshes its environment block mid-session,
+condition 2 starts matching many more turns and the figure rises on its own — which is the point
+of measuring the tail rather than assuming it.
+
+It is a **floor**. A stable prefix serves a whole session while this counts one request of
+it, and a session resumed from disk after the TTL expires starts another first-request hit
+this cannot see. Under-crediting is the only direction a savings figure is allowed to be
+wrong in. The independent evidence that the mechanism works is the A/B: **−34.1% cost, 0% →
+96.7% cache hit** with the split on, on the same traffic.
+
+They are **added**, never nested: `total_saved_usd = net_saved_usd + cachesplit_saved_usd`.
+Both are ours and the token sets are disjoint.
+
+Every figure above is a *difference against a baseline*. The number on the invoice is separate
+and now has its own Grafana stat, **Total cost of all requests**
+(`cg_tenant_total_cost_usd` = `cg_tenant_cost_usd` + `cg_tenant_cg_llm_cost_usd`): the provider's
+billed cost for the traffic plus context-guru's own compaction-model spend, with no
+counterfactual in it. A deployment where the second term is a large fraction of the first is
+paying too much to compact, and the Components tab says which component.
+
+`cg_llm_cost_usd` is priced at the **compaction model's** own rate. It used to be priced at the
+agent's rate, on the theory that a cheap model was "close enough" and that over-reporting our
+own cost was the safe direction. It is not safe in either direction: on this deployment's rate
+card opus is 4.75x haiku, so a sweep that really spent $0.21 of haiku reported $1.02, which was
+enough to make a configuration that pays read as one that loses money — and this is the number
+someone uses to decide whether to run the component at all. The model is taken from the calls
+themselves; a request whose compaction mixed several models falls back to the agent's rate,
+because no single rate is honest for it.
+
+**`cache_saved_usd` is not a saving of ours and is not on the page.** It is what the
+*provider's* prompt cache saved over paying the fresh rate for the same tokens — typically
+one to two orders of magnitude larger than the figure above, because the agent places most
+breakpoints itself. The API and `cg_tenant_cache_saved_usd` still report it, as a
+**diagnostic**: it is the number that collapses when a compaction pipeline rewrites deep
+history, so watching it fall is how you catch a pipeline going too deep. It was briefly a
+headline tile, alongside a "of which our components acted" subset. Both were removed: the
+first measured somebody else's mechanism, and the second measured co-occurrence and read as
+cause.
+
+**`prefix_change_cost_usd` is a second diagnostic, and it is bigger than every saving here.**
+It sums the cost of requests whose cache missed with reason `prefix_change` *and* whose previous
+turn in the same session had a component that mutated the transcript — the population where "we
+rewrote history and the next turn re-billed the whole prompt" is a live hypothesis. On the
+current corpus that is roughly **$24**, and **+$39** on transcripts past 60k tokens. It is
+reported because a number that large may not be invisible, and it is **not subtracted from
+net**, because mutation is not randomly assigned: components act where there is something to
+act on, which are also the long, churny turns most likely to break a prefix on their own, and
+`prefix_change` already loses ties to `ttl_expiry`. Settling it needs the A/B, not a bigger
+query.
+
+Both real savings are only as good as the per-model rates behind them. On a gateway that does
+not charge the public API's prices — IBM's `ete-litellm` bills half of anthropic.com for
+`claude-sonnet-5` — set [`MODEL_PRICES`](reference/config.md#per-model-prices-and-why-the-public-map-is-not-enough),
+or every figure in this section is wrong by whatever margin your contract differs by.
 
 ### Components — which ones earn their place
 
@@ -119,16 +279,49 @@ to content-token counts), and a component that burned wall time for nothing read
 `overcount_ratio` is the number that keeps the rest honest: a ratio of 7× means the
 gross figure counted the same compaction seven times as the agent re-sent its transcript.
 
+**Why declined** is the column to read when `act rate` is 0%. It is the component's own gate
+counts — `no_filter_match`, `no_obvious_noise`, `below_output_floor` — commonest first, with
+the full list on hover, and the same column appears per component in the request drawer.
+Without it a table of zeros is unfalsifiable: it looks the same whether the pipeline is
+broken, the traffic is uncompactable, or the heuristics were written for a different agent's
+tool-output shapes. On a Bob session it is usually the last of those, and it says so.
+
+**Saved · LLM cost · net** is the per-component verdict, in dollars, and no bare cost is
+rendered without it. `saved_usd` is that component's share of the request-level
+counterfactual, priced **at write time from the request's own model** and at the tier the
+request itself paid:
+
+```
+saved_usd(c,r) = u·W + (g − u)·tier(r)
+```
+
+where `g` is what the component removed on that turn, `u = min(unique, g)` is the
+part that had never been sent before, `W` is the cache-creation rate, and `tier(r)` is the
+cache-read rate on a turn that hit, the creation rate on a turn whose cache had expired and
+whose whole prompt was re-billed, and the fresh rate on a backend with no cache. It is the same
+rule and the same rates as the request-level baseline, so the per-component figures **sum** to
+it — a unit fixture reconciles exactly, and production data to 0.9%. `net_usd` is
+`saved_usd − llm_cost_usd`, and it is **negative when the component is underwater**, which is
+a real outcome the page shows rather than hides.
+
+Summing over a component's turns *is* the amortization: value realized turn by turn as a frozen
+reduction replays, not a projection from one turn. That matters because most of an extractor's
+realized value comes from replay with no call at all (~93% on measured traffic) — so a single
+warm turn with one call sits near break-even by construction, and a verdict read off one turn
+is not a verdict. Sessions still inside a provider cache TTL carry `in_flight` for exactly this
+reason (see [Sessions](#sessions)).
+
+Replay is priced at the cached rate on a warm turn deliberately: it is content removed on an
+*earlier* turn that now sits deep inside the cached prefix, where the read rate is correct.
+Re-pricing it fresh — which the cache-aware argument tempts you into, since compaction only
+touches the *uncached tail* — confuses it with the unique term, which is already priced as a
+write, and inflates warm-turn savings roughly 6× with nothing behind it.
+
 **LLM calls · LLM cost** are blank for every deterministic component and filled for the ones
-that call a model themselves. Where they are filled, the verdict is stated in **dollars**
-rather than inferred from tokens and latency: what that component's calls removed, valued at
-the rate those tokens would actually have been billed at, minus what the calls cost. Cold-sweep
-calls are valued at the cache-write rate and warm ones at the cache-read rate — a ~12.5×
-spread, so a component whose calls are mostly cold is judged on the right basis. The value
-deliberately counts only what the CALLS removed, not the component's total savings: most of an
-extractor's realized value comes from frozen results replayed with no call at all (~93% on
-measured traffic), and crediting that replay to the calls would make any amount of spending
-look profitable.
+that call a model themselves. `llm_saved_tokens` counts only what the CALLS removed, which is
+why it is not the same as the component's `saved_usd`: cold-sweep calls are valued at the
+cache-write rate and warm ones at the cache-read rate — a ~12.5× spread, so a component whose
+calls are mostly cold is judged on the right basis.
 
 ### Compaction model calls
 
@@ -156,6 +349,12 @@ the cost of a call would leave an account unable to answer the question the reco
 Searchable, filterable, paginated. Per session: model · agent · preset · turns · tokens
 before/saved · dollars saved · cache reads/writes · restorations · context-guru latency ·
 start time. Clicking a session filters the request list to it.
+
+`in_flight` marks a session whose last request is still inside one provider cache TTL. Its
+dollar figures are an **incomplete amortization, not a verdict**: the next turn may replay the
+same reduction and add to its value, so a young session with one extraction call reads
+underwater and stops reading underwater as the turns come in. It is derived from the session's
+`MAX(ts)`, not stored — nothing about it is a fact about a request.
 
 ### Requests, and the diff
 
@@ -454,10 +653,21 @@ Two access rules differ from the local case, and both are enforced server-side:
   The honest reason it matters is the one above: the redactor is a best-effort denylist, and a
   review of 22 realistic credential shapes found **11 passing through it**. 22-of-22 now
   passing does not prove completeness.
-- **A manager sees everyone's metrics and everyone's transcripts.** An explicit owner
-  decision: the account selector points the ordinary request drawer and diff view at any
-  account. The archive route applies the same rule, so hot and cold cannot disagree.
-  Everyone else still reads only their own, whatever they put in `?tenant=`.
+- **A manager sees everyone's metrics and everyone's transcripts, by default.** An
+  explicit owner decision: a manager runs the service, so with no `?tenant=` at all every
+  read route — including the live SSE feed — is service-wide, and the account selector
+  points the ordinary request drawer and diff view at any account. `?tenant=<id>` picks one
+  account, `?tenant=*` is the explicit form of the default, and **`?tenant=me`** is the way
+  back to the manager's own traffic. The archive route applies the same rule, so hot and
+  cold cannot disagree. Everyone else still reads only their own, whatever they put in
+  `?tenant=` — the scope is resolved once, from the cookie-derived principal, and the
+  narrowing assignment is an overwrite of the parsed filter rather than a merge into it.
+  There is no client-supplied widening: no `?all=`, no header, nothing the browser echoes
+  back. Because the scope is service-wide by default, the session list carries
+  `tenant_id` (a comma-joined value if two accounts happen to share a session id), and a
+  **single-session** view pins itself to the account whose first turn it is — a session id
+  is unique per account, not per service, so an unpinned wide diff would interleave two
+  people's code under one id.
 - **Three surfaces become manager-only**, because they are not anybody's tenant data:
   the server's effective configuration (`/api/config`, which
   [says so in its own payload](reference/routes.md#the-config-route-serves-the-servers-configuration-not-yours)
@@ -513,3 +723,108 @@ The UI itself is regression-tested two ways: a Go test asserts every stat tile's
 `data-testid` exists (and that `app.js` parses — a dropped paren renders a blank page
 that no Go test would otherwise catch), and a browser check drives the rendered app
 end to end. See [Measure savings](how-to/measure-savings.md) for the workflow.
+
+## The time range
+
+The range control is a popover, not a dropdown, and it follows Grafana's model: the window
+is a **pair** — `from` and `to` — and each side is *either* a relative token (`now-6h`,
+`now`) or an absolute epoch-ms instant. Ten quick relative windows (5m to 30d, plus All
+time) sit above two `datetime-local` inputs and an Apply button, and the summary always
+reads the window currently in force.
+
+Why a pair rather than one duration:
+
+- **A relative window has to stay relative.** The old control stored a duration and
+  resolved `Date.now() − duration` at fetch time. One `refresh()` fires the tiles, the
+  series and the breakdown, so it called `Date.now()` three times and produced three
+  slightly different windows for one screen of numbers. `refresh()` now stamps
+  `state.nowMs` **once** and every token in that repaint resolves against that stamp.
+- **`until` is omitted while `to` is `now`.** A shared link to a live window stays live for
+  whoever opens it, instead of being pinned to the instant its author copied it.
+- **An absolute window is frozen, so it is not repolled.** The 10-second overview poll is
+  skipped whenever `to` is absolute: a past window cannot gain rows, and on a manager's
+  service-wide scope that poll is a full-corpus aggregate every ten seconds for no new data.
+
+On the wire this is `?since=`/`?until=` — `requests.ts` is epoch milliseconds UTC, `since`
+inclusive, `until` exclusive, both covered by `idx_requests_ts`. In the URL it is
+`#requests?from=now-24h&to=now`. Old `range=<ms>` bookmarks are still parsed and mapped to
+the nearest relative token, so a link pasted into an issue last month does not silently
+widen to all time.
+
+The range params are written inside `qs()` rather than passed through its `extra` argument,
+because `extra` drops any value that is `''`, `0` or `undefined` — so `until: 0` could never
+have meant "unbounded" through it.
+
+## Sortable columns — and the two tables that are not
+
+Only the **Components** table sorts. `/api/components` has no `LIMIT`: every component that
+ran in the window is in the response, so ordering it in the browser *is* a global ordering.
+The default is untouched (`saved_unique DESC`, the order the bar chart beside it shares), and
+the chosen column lands in the URL as `?sort=&dir=` so a link reproduces what its author was
+looking at. A sort gets no removable chip — it narrows nothing.
+
+**Sessions and Requests are deliberately inert.** They are `LIMIT 25` and `LIMIT 50`
+server-side. A client-side sort there would label a column "Net saved $" and show the top
+spender *of one arbitrary page*, under a header that reads as global — a feature that lies.
+Sorting them honestly needs `?sort=`/`?dir=` pushed into the SQL (`ORDER BY` off a whitelist
+of column names, keyed the way `Filter.where()` already keys its dimensions, with the
+existing `idx_requests_ts` / `idx_requests_tenant` deciding which orders are cheap). Until
+that lands, the headers carry no sort affordance at all rather than a broken one.
+
+`aria-sort` on the `<th>` is the announced state, and the arrow glyph is drawn *from that
+attribute* in CSS — so the thing a screen reader says and the thing an eye sees cannot drift
+apart, which is the usual bug when the arrow lives in its own class.
+
+## Manager scope
+
+A manager's default scope is the **whole service**: no `?tenant=` means every account. The
+filter bar's account select makes that visible and reversible — `All accounts` (the default),
+`Mine` (`?tenant=me`), or one named account. It is `data-manager` and hidden for everyone
+else; a non-manager cannot widen scope whatever they put in the query string, and the browser
+never even asks for the roster.
+
+Under wide scope the Sessions and Requests tables grow an **Account** column, because a
+session id is only unique *within* an account and a service-wide list without it is
+unattributable. The column disappears again when the scope names one account, where it would
+only repeat the filter bar.
+
+One server-side asymmetry to know about: a wide-scope single-session transcript is pinned to
+the **first turn's** tenant. A manager who wants another account's copy of a shared session
+id has to pass `?tenant=<id>` explicitly.
+
+## Never a bare cost
+
+The complaint this pass answers: users saw what `extract_llm` **cost** — a bare dollar
+figure, with no saving and no net anywhere near it — and concluded the product was
+worthless. Every place a cost appears now shows the saving and the net beside it.
+
+- **Components table**: `LLM cost`, `Saved $`, `Net $`, adjacent. Both dollar figures come
+  from the server (`ComponentRow.saved_usd` / `net_usd`), priced at write time from the
+  request's own model and the tiers it actually paid.
+- **Request drawer**: a `Net after our cost` row sits directly under `Our own LLM cost`
+  (`baseline_cost_usd − cost_usd − cg_llm_cost_usd`).
+- **Sessions table**: an `in flight` pill on any session whose last request is still inside
+  one provider cache TTL. Such a session has paid for its extraction call and not yet
+  collected the replay, so its net reads underwater and stops doing so as the turns arrive.
+  The pill says the amortization is unfinished rather than letting a half-collected figure
+  read as a verdict.
+
+The browser no longer prices anything from a rate table. It used to: `3.00`/`3.75`/`0.30` per
+MTok, hardcoded, sonnet-class — while this deployment bills opus (`4.75`/`0.38`), so every
+figure derived from them was ~27% wrong in a direction no reader could see. The
+component-level version also valued only what the *calls* removed and so discarded replay,
+which is ~93% of an extractor's realized value. `verdict()` reads `net_usd`; the per-call
+panel in the drawer derives its per-token value from the request's own
+`(baseline_cost_usd − cost_usd) ÷ tokens removed`, which is the same rule the server uses,
+and prints `—` rather than a number when the request is not fully priced.
+
+### The prefix-change diagnostic
+
+`prefix_change_cost_usd` appears as a sentence beside the cache-miss attribution it is
+computed from, and the sentence says what it is: money billed on turns whose cache missed
+with `prefix_change` directly after a turn we mutated. It is **not** a tile and it is
+subtracted from no savings figure on the page. Components act on exactly the long, churny
+turns most likely to break a prefix by themselves, so mutation is not randomly assigned and
+this is a correlation; netting it would book a correlation as a debt. It is nonetheless
+larger than every saving on some corpora, which is why hiding it would be the dishonest
+option. Settling it needs the A/B, not a bigger query.

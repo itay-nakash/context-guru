@@ -463,6 +463,13 @@ GRAFANA_ROOT_URL="${GRAFANA_ROOT_URL:-https://$(hostname -f 2>/dev/null || hostn
 # Loki holds the LOGS; Prometheus holds the numbers. Both are read through the same
 # Grafana, which is the whole reason Loki won over the alternatives — see
 # deploy/grafana/README.md, "Why Loki".
+# node_exporter is the HOST's own metrics — CPU, memory, disk, filesystem fill, network,
+# load. The proxy's /metrics answers "is context-guru working"; nothing answered "is this
+# box healthy", which is the question behind every report that starts "it felt slow".
+# Writing our own /proc reader was the alternative and it is strictly worse: this is the
+# standard exporter, the queries are the ones every runbook already uses, and it is one
+# more container beside four.
+NODE_EXPORTER_IMAGE="${NODE_EXPORTER_IMAGE:-docker.io/prom/node-exporter:v1.9.0}"
 LOKI_IMAGE="${LOKI_IMAGE:-docker.io/grafana/loki:3.4.2}"
 PROMTAIL_IMAGE="${PROMTAIL_IMAGE:-docker.io/grafana/promtail:3.4.2}"
 # Where the proxy writes its JSON log sink (CG_LOG_FILE in the unit) and promtail
@@ -507,6 +514,13 @@ cmd_grafana() {
     "$OBS_ETC/grafana/provisioning/datasources/"
   install -m0644 "$REPO_DIR"/deploy/grafana/provisioning/dashboards/*.yml \
     "$OBS_ETC/grafana/provisioning/dashboards/"
+  # Alert rules, if any are provisioned. Guarded with a glob check because the directory
+  # is deliberately created empty (Grafana logs a warning without it) and shipped empty for
+  # a long time — which is why the first rules written into the repo never reached a box.
+  if compgen -G "$REPO_DIR/deploy/grafana/provisioning/alerting/*.yml" >/dev/null; then
+    install -m0644 "$REPO_DIR"/deploy/grafana/provisioning/alerting/*.yml \
+      "$OBS_ETC/grafana/provisioning/alerting/"
+  fi
   install -m0644 "$REPO_DIR"/deploy/grafana/dashboards/*.json "$OBS_ETC/grafana/dashboards/"
   ok "$OBS_ETC ($(ls "$OBS_ETC/grafana/dashboards" | wc -l) dashboard(s))"
 
@@ -547,6 +561,32 @@ promtail will find nothing until the service starts"
     --storage.tsdb.retention.time="$PROM_RETENTION" \
     --web.listen-address=127.0.0.1:9090 >/dev/null
   ok "cg-prometheus on 127.0.0.1:9090, retention $PROM_RETENTION"
+
+  say "node_exporter"
+  $oci rm -f cg-node-exporter >/dev/null 2>&1 || true
+  # The host's /proc, /sys and / are mounted read-only and the exporter is pointed at them,
+  # which is the documented way to make a containerised node_exporter report the HOST rather
+  # than the container. --path.rootfs makes its filesystem metrics carry the host's
+  # mountpoints, so a full /var shows up as /var and not as /host/var.
+  #
+  # Loopback only, like everything else here: host metrics name every mountpoint and every
+  # process count on a box that serves several tenants.
+  #
+  # NOT --collector.systemd. It would report the context-guru unit's own state, which is the
+  # one thing here the proxy's /metrics cannot answer during a crash loop — but it needs
+  # /run/systemd/private mounted WRITABLE, and that socket is full control of systemd on this
+  # host. One panel is not worth handing that to a metrics exporter; `up{job="context-guru"}`
+  # on the SLO dashboard covers the same question from outside.
+  $oci run -d --name cg-node-exporter --network=host --restart=unless-stopped \
+    --pid=host \
+    -v /proc:/host/proc:ro,rslave \
+    -v /sys:/host/sys:ro,rslave \
+    -v /:/rootfs:ro,rslave \
+    "$NODE_EXPORTER_IMAGE" \
+    --path.procfs=/host/proc --path.sysfs=/host/sys --path.rootfs=/rootfs \
+    --web.listen-address=127.0.0.1:9100 \
+    --collector.filesystem.mount-points-exclude='^/(dev|proc|sys|var/lib/docker/.+|var/lib/containers/.+)($|/)' >/dev/null
+  ok "cg-node-exporter on 127.0.0.1:9100 (host cpu/memory/disk/network)"
 
   say "Loki"
   $oci rm -f cg-loki >/dev/null 2>&1 || true
@@ -675,7 +715,7 @@ cmd_grafana_status() {
   oci=$(oci_runtime) || { no "no container runtime"; exit 1; }
   say "Containers"
   $oci ps -a --filter name=cg-prometheus --filter name=cg-grafana \
-    --filter name=cg-loki --filter name=cg-promtail \
+    --filter name=cg-loki --filter name=cg-promtail --filter name=cg-node-exporter \
     --format '{{.Names}}  {{.Status}}' 2>&1 | sed 's/^/  /' || true
 
   say "Prometheus scrape target"
@@ -698,6 +738,47 @@ if not ts:
 r=json.load(sys.stdin)["data"]["result"]
 print("  cg_requests_total = %s" % r[0]["value"][1] if r else "  EMPTY — target up but the exposition changed")' 2>/dev/null; then
     no "query failed"
+  fi
+
+  # Every panel of the HOST dashboard, asked whether it would actually draw anything.
+  #
+  # This check exists because a panel that queries a series this kernel or this exporter does
+  # not produce renders EMPTY, which looks exactly like a healthy idle box — and PromQL that
+  # parses is no evidence at all. Two of the eighteen were caught this way on first install:
+  # load-per-core divided a labelled series by a bare aggregate (no labels, so vector matching
+  # matched nothing), and the pressure-stall panels needed /proc/pressure, which this kernel
+  # does not expose.
+  say "Host dashboard panels with no data"
+  if ! python3 - "$OBS_ETC/grafana/dashboards/context-guru-host.json" <<'PY' 2>/dev/null; then
+import json, sys, urllib.parse, urllib.request
+try:
+    d = json.load(open(sys.argv[1]))
+except OSError as e:
+    print("  cannot read the dashboard: %s" % e)
+    raise SystemExit(0)
+bad = []
+for p in d.get("panels", []):
+    for t in p.get("targets", []):
+        e = t.get("expr")
+        if not e:
+            continue
+        try:
+            u = "http://127.0.0.1:9090/api/v1/query?" + urllib.parse.urlencode({"query": e})
+            with urllib.request.urlopen(u, timeout=10) as r:
+                out = json.load(r)
+        except Exception as err:
+            bad.append((p.get("title"), "query failed: %s" % err))
+            continue
+        if out.get("status") != "success":
+            bad.append((p.get("title"), "rejected: %s" % out.get("error")))
+        elif not out["data"]["result"]:
+            bad.append((p.get("title"), "no data"))
+if not bad:
+    print("  all panels return data")
+for title, why in bad:
+    print("  EMPTY  %-42s %s" % (title, why))
+PY
+    no "could not check the host panels"
   fi
 
   say "Loki"
@@ -766,8 +847,8 @@ cmd_grafana_remove() {
   need_root
   local oci
   oci=$(oci_runtime) || { no "no container runtime"; exit 1; }
-  $oci rm -f cg-prometheus cg-grafana cg-loki cg-promtail >/dev/null 2>&1 || true
-  ok "removed cg-prometheus, cg-grafana, cg-loki and cg-promtail"
+  $oci rm -f cg-prometheus cg-grafana cg-loki cg-promtail cg-node-exporter >/dev/null 2>&1 || true
+  ok "removed cg-prometheus, cg-grafana, cg-loki, cg-promtail and cg-node-exporter"
   warn "kept $OBS_STATE — the metrics history, the log store and Grafana's database, and"
   warn "kept $LOG_DIR. Delete them by hand if you actually want the history gone."
 }

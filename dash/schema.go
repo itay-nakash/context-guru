@@ -84,6 +84,23 @@ CREATE TABLE IF NOT EXISTS requests (
   cost_usd           REAL    NOT NULL DEFAULT 0,
   baseline_cost_usd  REAL    NOT NULL DEFAULT 0, -- what the same request would have cost uncompacted
   cg_llm_cost_usd    REAL    NOT NULL DEFAULT 0, -- context-guru's OWN model spend attributable here
+  -- What the PROVIDER's prompt cache saved on this request: its cache-read tokens priced
+  -- at the fresh rate, minus what they were billed. A measurement of their mechanism, kept
+  -- because it is what collapses when a pipeline rewrites deep history. Never reported as
+  -- our saving.
+  cache_saved_usd    REAL    NOT NULL DEFAULT 0,
+  -- What OUR volatile-tail split saved: nonzero only where the split ran on the request, the
+  -- provider read at least that much from cache while writing less, and it was the session's
+  -- first request — the one that would have missed. Priced against a cache MISS (creation
+  -- rate), not fresh input. See Event.cachesplitSavedUSD.
+  cachesplit_saved_usd REAL  NOT NULL DEFAULT 0,
+  -- The size of the prefix half cachesplit moved the breakpoint onto: the numerator of the
+  -- column above, stored so a dollar figure can be checked against a token count.
+  split_stable_tokens INTEGER NOT NULL DEFAULT 0,
+  -- The volatile half's identity on this request. Compared against the same session's previous
+  -- request to decide whether the snapshot MOVED, which is the turn the split is worth
+  -- anything on. Stored so the figure survives a restart and can be recomputed from the table.
+  split_tail_hash    INTEGER NOT NULL DEFAULT 0,
   cg_latency_ms      REAL    NOT NULL DEFAULT 0,
   upstream_ms        REAL    NOT NULL DEFAULT 0,
   expands            INTEGER NOT NULL DEFAULT 0,
@@ -167,8 +184,19 @@ CREATE TABLE IF NOT EXISTS request_components (
   skipped      INTEGER NOT NULL DEFAULT 0,
   saved_gross  INTEGER NOT NULL DEFAULT 0,
   saved_unique INTEGER NOT NULL DEFAULT 0,
+  -- This component's share of the request's baseline delta, in DOLLARS, priced at write
+  -- time from the request's own model and the cache tier the request itself paid (see
+  -- Event.Price). Stored rather than derived on read because the rate has to be the one
+  -- that was in force, and because the UI was otherwise left improvising a dollar value
+  -- from hardcoded rates.
+  saved_usd    REAL    NOT NULL DEFAULT 0,
   duration_ms  REAL    NOT NULL DEFAULT 0,
-  err          TEXT    NOT NULL DEFAULT ''
+  err          TEXT    NOT NULL DEFAULT '',
+  -- Why this component turned candidates away, as {"gate_name":count} — the only answer
+  -- to "nothing happened, why?", and the answer a user of a non-Claude agent needs most.
+  -- JSON rather than a row per gate: it is read whole, never joined on, and json_each
+  -- aggregates it in SQL when the components view needs totals.
+  gates        TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_rc_request ON request_components(request_id);
 CREATE INDEX IF NOT EXISTS idx_rc_comp    ON request_components(component);
@@ -301,12 +329,37 @@ CREATE INDEX IF NOT EXISTS idx_xcalls_tenant_ts ON extraction_calls(tenant_id, t
 CREATE INDEX IF NOT EXISTS idx_xcalls_session ON extraction_calls(session_id, ts);
 `
 
+// additiveColumns are columns added to an EXISTING table without a version bump.
+//
+// The same argument as additiveDDL, one step further: `ALTER TABLE … ADD COLUMN` with a
+// NOT NULL DEFAULT is non-destructive and instant in SQLite, every read of the column on
+// an old row yields the default, and every query that does not name it is unaffected. The
+// alternative is a version bump, which renames the file aside and discards every request
+// row — on the live service, thousands of them — to gain one column.
+//
+// So the rule additiveDDL states is narrowed, not broken: a NEW column with a default may
+// go here; a column without a default, a changed type, a renamed or dropped column, or a
+// changed index still needs a bump, because those cannot be reconciled with an old file.
+// Every entry must ALSO be present in `ddl` above, or a fresh database and an upgraded one
+// end up with different shapes.
+var additiveColumns = []struct{ table, column, ddl string }{
+	{"requests", "cache_saved_usd", "REAL NOT NULL DEFAULT 0"},
+	{"requests", "cachesplit_saved_usd", "REAL NOT NULL DEFAULT 0"},
+	{"requests", "split_stable_tokens", "INTEGER NOT NULL DEFAULT 0"},
+	{"requests", "split_tail_hash", "INTEGER NOT NULL DEFAULT 0"},
+	{"request_components", "gates", "TEXT NOT NULL DEFAULT ''"},
+	{"request_components", "saved_usd", "REAL NOT NULL DEFAULT 0"},
+}
+
 // migrate creates the schema and validates its version. A version mismatch is
 // reported to the caller, which renames the old file aside and retries — see Open.
 func migrate(db *sql.DB) error {
 	// Additive tables first, and on every open: an existing database at the current version
 	// returns early below, so a new table added to `ddl` would never appear on it.
 	if _, err := db.Exec(additiveDDL); err != nil {
+		return err
+	}
+	if err := addColumns(db); err != nil {
 		return err
 	}
 	var have string
@@ -326,6 +379,40 @@ func migrate(db *sql.DB) error {
 	}
 	_, err = db.Exec(`INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)`, fmt.Sprint(schemaVersion))
 	return err
+}
+
+// addColumns applies additiveColumns idempotently. It probes pragma table_info rather
+// than swallowing the "duplicate column name" error, so a genuine failure is still an
+// error; a table that does not exist yet is skipped, because `ddl` below will create it
+// with the column already in place.
+func addColumns(db *sql.DB) error {
+	for _, c := range additiveColumns {
+		rows, err := db.Query(`SELECT 1 FROM pragma_table_info(?) WHERE name = ?`, c.table, c.column)
+		if err != nil {
+			return err
+		}
+		has := rows.Next()
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+		if has {
+			continue
+		}
+		// No such table yet (fresh database): nothing to alter.
+		var n int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, c.table).Scan(&n); err != nil {
+			return err
+		}
+		if n == 0 {
+			continue
+		}
+		if _, err := db.Exec(`ALTER TABLE ` + c.table + ` ADD COLUMN ` + c.column + ` ` + c.ddl); err != nil {
+			return fmt.Errorf("dash: add %s.%s: %w", c.table, c.column, err)
+		}
+	}
+	return nil
 }
 
 // versionMismatch signals that the file on disk was written by another schema.

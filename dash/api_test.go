@@ -7,10 +7,18 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"slices"
+
+	"github.com/rossoctl/context-guru/components"
+	// The registry is populated by each component's init(), so the descriptors this test
+	// walks only exist if every component is linked in.
+	_ "github.com/rossoctl/context-guru/components/all"
 )
 
 // newTestAPI wires a recorder + API with a few requests already persisted.
@@ -305,7 +313,10 @@ func TestUIHasTestIDsForEveryStatTile(t *testing.T) {
 	for _, key := range []string{
 		"requests", "tokens-before", "tokens-after", "saved-gross", "saved-unique",
 		"saved-adjusted", "overcount", "cost-baseline", "cost-actual", "cost-cg",
-		"saved-usd", "cache-read", "cache-write", "fresh-input", "output",
+		"saved-usd", "total-saved-usd", "cachesplit-saved",
+		"split-requests", "split-tail-moved", "split-credited", "split-hit-rate",
+		"split-historical",
+		"cache-read", "cache-write", "fresh-input", "output",
 		"cg-latency", "upstream-latency", "expands", "reverts", "passthroughs",
 	} {
 		if !strings.Contains(source, "tile('"+key+"'") {
@@ -338,6 +349,13 @@ func TestUIHasTestIDsForEveryStatTile(t *testing.T) {
 		// The gate's three registration modes: the closed explanation that replaces the
 		// form, and the invite-code field that only appears when a code is checked.
 		"gate-closed", "gate-code", "gate-register", "gate-signin",
+		// The Grafana-style time range: the popover itself, its absolute pair and Apply.
+		// (the per-range buttons get their testid from QUICK_RANGES at runtime, so they are
+		// asserted in TestUINeverShowsABareCost against the table instead of by literal)
+		"filter-from", "filter-to", "filter-range-apply",
+		// The manager's scope control, and the two things the money pass added to the page:
+		// the not-netted prefix-change diagnostic and the unfinished-amortization pill.
+		"filter-tenant", "prefix-change-cost", "in-flight",
 	} {
 		if !strings.Contains(source, `"`+id+`"`) && !strings.Contains(source, "'"+id+"'") {
 			t.Errorf("data-testid %q is not produced by the UI; a check or screenshot depends on it", id)
@@ -674,4 +692,409 @@ func unbalancedAt(s string) (int, bool) {
 		return openLine[len(stack)], false
 	}
 	return 0, true
+}
+
+// The dashboard must not reference a savings field the API stopped emitting, and must not
+// re-grow the two it deliberately dropped.
+//
+// `cache_saved_usd` was a headline tile reading "Prompt-cache savings", and
+// `cache_saved_protected_usd` a second one reading "of which where we split the prefix".
+// Neither was a saving of ours: the first is the provider's whole prompt cache, which the
+// agent's own breakpoints earn, and the second was co-occurrence dressed as cause. They were
+// replaced by `cachesplit_saved_usd`, which is measured, and the provider figure stays in the
+// API as a diagnostic only. A revert that puts either back on the page fails here.
+func TestUIClaimsOnlyTheCacheSavingWeMeasure(t *testing.T) {
+	js, err := uiFS.ReadFile("ui/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(js)
+	if !strings.Contains(src, "o.cachesplit_saved_usd") {
+		t.Error("the overview does not render cachesplit_saved_usd, the one cache saving we claim")
+	}
+	if strings.Contains(src, "cache_saved_protected_usd") {
+		t.Error("cache_saved_protected_usd is back on the page; it measured co-occurrence, not cause")
+	}
+	// The provider figure may appear ONCE in the per-request drawer and ONCE in the A/B
+	// comparison (where it is the control variable, not the credit) — never in a tile.
+	for _, forbidden := range []string{
+		"tile('cache-saved'", "'Prompt-cache savings'", "o.cache_saved_usd",
+	} {
+		if strings.Contains(src, forbidden) {
+			t.Errorf("the provider's cache saving is presented as ours again: %q", forbidden)
+		}
+	}
+}
+
+// TestSettingsFormSpeaksTheSameFieldNamesAsTheServer is the UI half of the descriptor
+// contract, and it is deliberately INVERTED from the test it replaces.
+//
+// The old one asserted that app.js MENTIONED every field name the server expected, because
+// the page hand-wrote one control per knob and the failure mode was omission: it reached 18
+// keys of 97 and one component of fourteen, and the two fields that decided whether
+// extract_llm could act at all (allow_on_caching_backend, model.source) were simply absent.
+//
+// A page that renders from components.Field cannot omit a field — the loop does not have an
+// opinion — so mentioning a name is no longer evidence of anything. What can still go wrong
+// is the opposite: somebody hand-writes a control again, and their copy of a default, an
+// enum list or a threshold drifts from the declaration. That already happened once, and it
+// was not cosmetic: the browser offered four strategies where the engine parses five, so a
+// stored `strategy: deterministic` was not recognised and got rewritten to `code`, silently
+// turning an LLM-free configuration into one that makes model calls.
+//
+// So this test walks every declared field and asserts the page does NOT name it, plus the
+// typed structure a name-only grep could not check: one branch per declared type, the enum
+// options taken from the descriptor, secrets write-only, and Min carried through as the
+// number input's floor. The per-field RENDERING is checked by driving the real page under
+// jsdom; what a Go test can pin is that nothing here is hand-copied.
+func TestSettingsFormSpeaksTheSameFieldNamesAsTheServer(t *testing.T) {
+	js, err := uiFS.ReadFile("ui/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(js)
+	all := components.AllFields()
+	if len(all) < 10 {
+		t.Fatalf("only %d components registered; the blank import of components/all is missing "+
+			"and this test would pass by having nothing to check", len(all))
+	}
+
+	// The page reads the descriptors, every part of them. Each of these is a fact about a
+	// field that used to be retyped in JavaScript.
+	for _, want := range []string{
+		"opts.component_fields", "renderComponentFields(",
+		"fd.key", "fd.type", "fd.default", "fd.options", "fd.min", "fd.secret", "fd.hint",
+	} {
+		if !strings.Contains(src, want) {
+			t.Errorf("the settings form does not read %s; it is not descriptor-driven", want)
+		}
+	}
+	// And the hand-kept copies are gone. XLLM_DEFAULTS duplicated the server's default table,
+	// which is the drift this refactor removes; renderXllmForm was the sixteen literal control
+	// calls, and one component of fourteen.
+	for _, gone := range []string{"XLLM_DEFAULTS", "renderXllmForm", "xllmState"} {
+		if strings.Contains(src, gone) {
+			t.Errorf("%s is back: the page is hand-listing fields again, which is a second "+
+				"source of truth for every default and enum it names", gone)
+		}
+	}
+
+	// One branch per DECLARED type, derived from the declarations rather than listed here: a
+	// component that gains the first field of some type must not fall through to a text box
+	// that posts a string where the server demands a number.
+	types := map[string]string{} // type -> an example field, for the message
+	for name, decls := range all {
+		for _, fd := range decls {
+			if _, seen := types[fd.Type]; !seen {
+				types[fd.Type] = name + "." + fd.Key
+			}
+		}
+	}
+	if len(types) < 5 {
+		t.Errorf("only %d field types in the registry (%v); this test is not covering much", len(types), types)
+	}
+	for typ, example := range types {
+		if !strings.Contains(src, "case '"+typ+"'") {
+			t.Errorf("no control for field type %q (e.g. %s): it would fall through to the "+
+				"string branch and post the wrong JSON type", typ, example)
+		}
+	}
+
+	// No field NAME is written in the page. The allowlist is short and each entry is a
+	// deliberate exception with a reason — add a control by hand and this names your key.
+	allowed := map[string]string{
+		// The one coupling the page is allowed to know: extract_llm's constructor refuses
+		// both passes off ("nothing to do"), so the form must not be able to post that.
+		"per_output":         "the extract_llm both-switches-off coupling",
+		"cold_cache.enabled": "the extract_llm both-switches-off coupling",
+		// Whether `source: config` resolves to anything on this deployment. It does not on
+		// the hosted service, and a page that offers the choice silently is how an account
+		// ran extract_llm 251 times and made zero model calls.
+		"model.source": "the no-configured-compaction-model warning",
+		// Not a component key here: the request drawer's own max_tokens fact band, which
+		// predates the form and is a different thing from collapse.max_tokens.
+		"max_tokens": "the request drawer's sampling-parameter band",
+	}
+	for name, decls := range all {
+		for _, fd := range decls {
+			if _, ok := allowed[fd.Key]; ok {
+				continue
+			}
+			for _, quoted := range []string{"'" + fd.Key + "'", `"` + fd.Key + `"`} {
+				if strings.Contains(src, quoted) {
+					t.Errorf("app.js names the field %s.%s literally (%s); controls come from "+
+						"the descriptor, and a hand-written one is a copy of a default, a min "+
+						"or an enum list that can drift from the declaration",
+						name, fd.Key, quoted)
+				}
+			}
+		}
+	}
+
+	// Enum options come from the descriptor, in its order, and the page adds exactly one
+	// option of its own: the empty "use the component's default" choice. R8 was a hand-typed
+	// list missing a value the engine accepts.
+	if !strings.Contains(src, "(fd.options || []).map(") {
+		t.Error("the enum control does not render fd.options; a retyped list is how a stored " +
+			"`strategy: deterministic` came to be rewritten to `code`")
+	}
+	for name, decls := range all {
+		for _, fd := range decls {
+			if fd.Type != components.FieldEnum {
+				continue
+			}
+			// A descriptor whose default is not one of its own options would render an
+			// unselectable "— default (x) —", i.e. a control with no way back to unset.
+			if len(fd.Options) == 0 {
+				t.Errorf("%s.%s is an enum with no options: the control would offer only the "+
+					"default choice", name, fd.Key)
+			}
+			if def, ok := fd.Default.(string); ok && def != "" && !slices.Contains(fd.Options, def) {
+				t.Errorf("%s.%s defaults to %q, which is not one of its options %v", name, fd.Key, def, fd.Options)
+			}
+		}
+	}
+
+	// Secrets are WRITE-ONLY, in both directions: never rendered from the server's payload
+	// (a credential in the DOM is a credential in every screenshot), and an empty box means
+	// "leave the stored one alone" rather than "delete it".
+	if !strings.Contains(src, "fd.secret ? 'password' : 'text'") {
+		t.Error("a secret field is not rendered as a password input")
+	}
+	if !strings.Contains(src, "fd.secret || !stated(fd.key) ? '' :") {
+		t.Error("the text control does not blank a secret before rendering: a stored " +
+			"credential would be echoed into the DOM")
+	}
+	secrets := 0
+	for name, decls := range all {
+		for _, fd := range decls {
+			if !fd.Secret {
+				continue
+			}
+			secrets++
+			if fd.Type != components.FieldString {
+				t.Errorf("%s.%s is secret but typed %q; only the string control blanks a secret",
+					name, fd.Key, fd.Type)
+			}
+		}
+	}
+	if secrets == 0 {
+		t.Error("no secret fields declared; the write-only path above is untested")
+	}
+
+	// Min is semantics, not validation trivia, and the number input has to carry the right
+	// one: 0 on a CAP means unlimited and is a legitimate choice, while 0 on a size threshold
+	// is a removed brake the server answers 400 for. Both readings must be in the page,
+	// because a control that posts a value earning an unactionable 400 is the failure.
+	if !strings.Contains(src, "min: String(min)") || !strings.Contains(src, "fd.min || 0") {
+		t.Error("the number control does not carry the declared min")
+	}
+	if !strings.Contains(src, "0 is allowed here and means unlimited") {
+		t.Error("the number control does not distinguish min 0 (a cap, where 0 is a choice)")
+	}
+	if !strings.Contains(src, "it removes the brake") {
+		t.Error("the number control does not refuse a value below a min of 1 (a threshold, " +
+			"where 0 is not a setting)")
+	}
+	caps, floors := 0, 0
+	for _, decls := range all {
+		for _, fd := range decls {
+			if fd.Type != components.FieldInt && fd.Type != components.FieldFloat {
+				continue
+			}
+			if fd.Min == 0 {
+				caps++
+			} else {
+				floors++
+			}
+		}
+	}
+	if caps == 0 || floors == 0 {
+		t.Errorf("the min 0 / min 1 distinction is not exercised by the registry "+
+			"(%d with min 0, %d with a floor)", caps, floors)
+	}
+
+	// The document itself is the server's: no YAML editor on the settings page, and no
+	// hand-rolled writer behind it.
+	for _, gone := range []string{"'#set-yaml'", "writeXllm", "readXllm", "unmanagedXllmLines"} {
+		if strings.Contains(src, gone) {
+			t.Errorf("%s is back; the browser must not build the configuration document "+
+				"(that is what produced \"did not find expected key\" on every save)", gone)
+		}
+	}
+	// And it posts fields, in the shape the server reads: components keyed by name, each a
+	// map of DOTTED keys. The old flat `extract_llm:` payload was silently ignored by
+	// ApplyForm — no data loss, but every component control on the page was inert on save,
+	// which is worse than a missing one.
+	if !strings.Contains(src, "body.config = {") || !strings.Contains(src, "components: cfgState") {
+		t.Error("saveSettings does not post the descriptor-driven shape " +
+			"({pipeline, mode, components: {name: {dotted: value}}})")
+	}
+	// With the YAML box gone, a document the server could not fully read must be VISIBLE and
+	// unsaveable. Otherwise the fields draw a guess as fact and a save writes the guess back,
+	// which is a worse version of the bug this replaced.
+	for _, want := range []string{"cfg-unreadable", "parse_error"} {
+		if !strings.Contains(src, want) {
+			t.Errorf("the settings page does not handle an unreadable stored configuration (%q)", want)
+		}
+	}
+	// The fields are a subset of what a document can say, so the document itself has to be
+	// on the page somewhere — read-only, since an editable box here is the writer that
+	// corrupted configurations.
+	if !strings.Contains(src, "full-config-yaml") {
+		t.Error("the settings page does not show the full stored configuration")
+	}
+	// The roster's configuration column must not be the document's first line: the form
+	// writes YAML through a marshaller, so that line is the word `components:` for every
+	// account that has saved once.
+	if strings.Contains(src, "effective_config_yaml || '').split('\\n')[0]") {
+		t.Error("the tenants roster is back to showing line one of the document, which now " +
+			"reads \"components:\" for every configured account")
+	}
+}
+
+// TestUINeverShowsABareCost is the UI contract for the cost-accounting pass, and it reflects
+// over the Go structs on purpose: a hand-kept list of field names is exactly how the view
+// ended up improvising dollars client-side from a hardcoded rate table. Rename a field on the
+// server and this test names it; drop it from the view and this test names it.
+//
+// The complaint it exists to prevent is specific. Users saw what extract_llm COST — a bare
+// figure, with no saving and no net anywhere near it — and concluded the product was
+// worthless. Every one of these fields is half of a pair that has to appear together.
+func TestUINeverShowsABareCost(t *testing.T) {
+	js, err := uiFS.ReadFile("ui/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html, err := uiFS.ReadFile("ui/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(js) + string(html)
+
+	// hasTag asserts the struct really carries this json tag. Checking only the JS side
+	// would pass forever after a server-side rename; checking only the Go side would pass
+	// with the field rendered nowhere.
+	hasTag := func(v any, name string) bool {
+		rt := reflect.TypeOf(v)
+		for i := 0; i < rt.NumField(); i++ {
+			if strings.Split(rt.Field(i).Tag.Get("json"), ",")[0] == name {
+				return true
+			}
+		}
+		return false
+	}
+	for _, c := range []struct {
+		v     any
+		field string
+		why   string
+	}{
+		{ComponentRow{}, "saved_usd", "the components table would show a bare LLM cost again"},
+		{ComponentRow{}, "net_usd", "verdict() would have to improvise a net client-side"},
+		{SessionRow{}, "in_flight", "a young session's incomplete amortization would read as a verdict"},
+		{SessionRow{}, "tenant_id", "a manager's service-wide list would be unattributable"},
+		{Overview{}, "prefix_change_cost_usd", "the largest figure on the corpus would be invisible"},
+	} {
+		rt := reflect.TypeOf(c.v)
+		if !hasTag(c.v, c.field) {
+			t.Errorf("%s no longer has json field %q; the dashboard reads it", rt.Name(), c.field)
+		}
+		if !strings.Contains(src, c.field) {
+			t.Errorf("the dashboard does not render %s.%s — %s", rt.Name(), c.field, c.why)
+		}
+	}
+
+	// The client-side rate table is gone and must stay gone: 3.75/0.30 per MTok is
+	// sonnet-class, this deployment bills opus (4.75/0.38), and the figures it produced were
+	// ~27% wrong with no way for a reader to tell. It also valued only what the CALLS removed
+	// and so discarded replay, which is ~93% of an extractor's realized value.
+	for _, gone := range []string{
+		"componentNetUSD", "AGENT_CACHE_WRITE_PER_MTOK", "AGENT_CACHE_READ_PER_MTOK",
+		"AGENT_FRESH_PER_MTOK", "savedTokenUSD",
+	} {
+		if strings.Contains(src, gone) {
+			t.Errorf("%s is back on the page; component dollars must come from the server, "+
+				"which prices them at the model the request actually paid", gone)
+		}
+	}
+	// verdict() must read the server's net rather than any local arithmetic.
+	if !strings.Contains(src, "c.net_usd") {
+		t.Error("verdict() does not read c.net_usd")
+	}
+	// The Saved $ / Net $ columns are static markup, so their absence is a markup fact.
+	for _, th := range []string{`<th class="num">Saved $</th>`, `<th class="num">Net $</th>`} {
+		if !strings.Contains(string(html), th) {
+			t.Errorf("the components table has no %s column header", th)
+		}
+	}
+
+	// The time range is from/to now, not one duration. A <select id="f-range"> back in the
+	// markup means the absolute window and the once-per-refresh clock stamp went with it.
+	if strings.Contains(string(html), `<select id="f-range"`) {
+		t.Error(`the time range is a <select> again; an absolute "from X to Y" window cannot ` +
+			"be expressed as one value, and a relative window resolved per-request produced " +
+			"a different window for each panel of one repaint")
+	}
+	if !strings.Contains(src, "state.nowMs = Date.now()") {
+		t.Error("refresh() does not stamp state.nowMs; relative windows would resolve " +
+			"separately in every fetch of one repaint")
+	}
+	// Legacy range= bookmarks must still land somewhere sensible.
+	// The quick ranges are a table, and their testids are derived from it, so the table is
+	// what a check can assert on.
+	for _, tok := range []string{"now-5m", "now-1h", "now-6h", "now-24h", "now-7d", "now-30d"} {
+		if !strings.Contains(src, "'"+tok+"'") {
+			t.Errorf("QUICK_RANGES no longer offers %q", tok)
+		}
+	}
+	if !strings.Contains(src, "'range-' + (tok || 'all')") {
+		t.Error("the quick-range buttons no longer carry a data-testid per range")
+	}
+	if !strings.Contains(src, "legacyFrom") {
+		t.Error("the legacy range=<ms> URL parameter is no longer honoured; existing " +
+			"bookmarks would silently widen to all time")
+	}
+
+	// Sorting: aria-sort on the <th> is the announced state, and the arrow is drawn from it.
+	if !strings.Contains(src, "aria-sort") {
+		t.Error("no column publishes aria-sort")
+	}
+	css, err := uiFS.ReadFile("ui/style.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(css), `th[aria-sort="ascending"]`) {
+		t.Error("the sort arrow is not driven by aria-sort, so the glyph and the announced " +
+			"state can drift apart")
+	}
+	// Only the unpaginated table is sorted client-side. /api/components returns every row;
+	// /api/sessions and /api/requests are LIMIT 25 / LIMIT 50, so sorting those here would
+	// order one arbitrary page under a header that reads as global.
+	if strings.Contains(src, "sortable('[data-testid=sessions-table]") ||
+		strings.Contains(src, "sortable('[data-testid=requests-table]") {
+		t.Error("a paginated table was made sortable client-side; that sorts one page and " +
+			"presents it as a global ordering. Push ?sort=/?dir= into the SQL first.")
+	}
+
+	// Manager scope: one select, and tenant is a full filter dimension with a control.
+	if !strings.Contains(src, `id="f-tenant"`) {
+		t.Error("there is no manager scope control")
+	}
+	if !strings.Contains(src, "['tenant', 'tenant', '#f-tenant']") {
+		t.Error("tenant is still a control-less filter dimension; the select cannot be synced " +
+			"from state.filter and the chip/URL layer would disagree with the bar")
+	}
+	// The control must be manager-gated by the same attribute every other manager-only
+	// element uses, and must NOT be data-local-ok: a single-tenant proxy has nothing to scope.
+	for _, line := range strings.Split(string(html), "\n") {
+		if !strings.Contains(line, `id="f-tenant"`) {
+			continue
+		}
+		if !strings.Contains(line, "data-manager") {
+			t.Errorf("the scope select is not manager-gated: %s", strings.TrimSpace(line))
+		}
+		if strings.Contains(line, "data-local-ok") {
+			t.Error("the scope select is data-local-ok; a single-tenant proxy has one account")
+		}
+	}
 }

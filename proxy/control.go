@@ -15,6 +15,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rossoctl/context-guru/components"
+	"github.com/rossoctl/context-guru/config"
 	"github.com/rossoctl/context-guru/dash"
 	"github.com/rossoctl/context-guru/tenant"
 )
@@ -364,13 +366,19 @@ type tenantView struct {
 	// ConfigInherited says which of the two it came from, so the UI can show a
 	// tracking tenant their real pipeline without claiming they chose it.
 	EffectiveConfigYAML string `json:"effective_config_yaml"`
-	ConfigInherited     bool   `json:"config_inherited"`
-	UpAnthropic         string `json:"up_anthropic"`
-	UpOpenAI            string `json:"up_openai"`
-	UpBob               string `json:"up_bob"`
-	CaptureContent      bool   `json:"capture_content"`
-	MaxRows             int64  `json:"max_rows"`
-	Disabled            bool   `json:"disabled"`
+	// EffectiveConfig is the same document as FIELDS, which is what the settings page
+	// renders and posts back. The page used to read and write the YAML text with regular
+	// expressions in the browser; that lost a block-sequence pipeline on every save (see
+	// config.Form). Parsing is the server's job because the server is where the YAML
+	// library is.
+	EffectiveConfig *config.Form `json:"effective_config,omitempty"`
+	ConfigInherited bool         `json:"config_inherited"`
+	UpAnthropic     string       `json:"up_anthropic"`
+	UpOpenAI        string       `json:"up_openai"`
+	UpBob           string       `json:"up_bob"`
+	CaptureContent  bool         `json:"capture_content"`
+	MaxRows         int64        `json:"max_rows"`
+	Disabled        bool         `json:"disabled"`
 	// DisabledReason is the manager's note, shown to the account's owner as well as to a
 	// manager — it is written to be read by the person whose agent stopped.
 	DisabledReason string `json:"disabled_reason"`
@@ -400,6 +408,11 @@ func (h *Handler) view(t *tenant.Tenant) tenantView {
 		MaxRows:        t.MaxRows, Disabled: t.Disabled,
 		DisabledReason: t.DisabledReason, Variant: t.Variant, HasPassword: t.HasPassword,
 		CreatedAt: msOrZero(t.CreatedAt), LastSeenAt: msOrZero(t.LastSeenAt),
+	}
+	// Best-effort, like the spend below: a settings page that cannot draw the fields is a
+	// problem, but it is a smaller one than a 500 on every page load.
+	if f, err := config.ParseForm(v.EffectiveConfigYAML); err == nil {
+		v.EffectiveConfig = &f
 	}
 	if n, err := h.registry().AgentKeyCount(t.ID); err == nil {
 		v.AgentKeys = n
@@ -1172,16 +1185,49 @@ func (h *Handler) ctlUpdateMe(w http.ResponseWriter, r *http.Request) {
 	// Pointers so "not sent" and "set to empty/false" are different things — a settings
 	// form that omits a field must not silently clear it.
 	var in struct {
-		Label          *string `json:"label"`
-		ConfigYAML     *string `json:"config_yaml"`
-		UpAnthropic    *string `json:"up_anthropic"`
-		UpOpenAI       *string `json:"up_openai"`
-		UpBob          *string `json:"up_bob"`
-		CaptureContent *bool   `json:"capture_content"`
+		Label      *string `json:"label"`
+		ConfigYAML *string `json:"config_yaml"`
+		// Config is the settings page's fields. It is applied to the account's effective
+		// document with a real YAML library and validated before anything is stored, which
+		// is the whole point: the browser used to build that document with regular
+		// expressions and corrupted every config whose pipeline was a block sequence.
+		Config         *config.Form `json:"config"`
+		UpAnthropic    *string      `json:"up_anthropic"`
+		UpOpenAI       *string      `json:"up_openai"`
+		UpBob          *string      `json:"up_bob"`
+		CaptureContent *bool        `json:"capture_content"`
 	}
 	if err := readJSON(w, r, &in); err != nil {
 		readErr(w, err)
 		return
+	}
+	if in.Config != nil {
+		if in.ConfigYAML != nil {
+			ctlErr(w, http.StatusBadRequest, "send config or config_yaml, not both")
+			return
+		}
+		if !t.IsManager() {
+			ctlErr(w, http.StatusForbidden, "a manager sets the compaction configuration")
+			return
+		}
+		current := h.registry().Config(t)
+		// Refuse to edit a document we could not fully read. ParseForm falls back to a
+		// best-effort decode so the page can still draw controls, but a SAVE from a misread
+		// form would post whatever the fallback happened to see — and with no YAML box on
+		// that page, over an already-broken document. The account editor still takes a
+		// document, which is where this gets fixed.
+		if cur, _ := config.ParseForm(current); cur.ParseError != "" {
+			ctlErr(w, http.StatusConflict, "your stored configuration does not load ("+cur.ParseError+
+				"), so it cannot be edited as fields; a manager must repair it on the account page")
+			return
+		}
+		doc, err := config.ApplyForm(current, *in.Config)
+		if err != nil {
+			// The message names the field or the offending key; showing it beats "invalid".
+			ctlErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		in.ConfigYAML = &doc
 	}
 	if err := h.checkUpstreams(in.UpAnthropic, in.UpOpenAI, in.UpBob); err != nil {
 		code, msg := statusOf(err)
@@ -1387,10 +1433,28 @@ func (h *Handler) ctlOptions(w http.ResponseWriter, r *http.Request) {
 		ups = append(ups, up{Name: name, Dialect: u.Dialect})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"upstreams":      ups,
-		"presets":        h.opts.PresetNames,
-		"components":     h.opts.ComponentNames,
+		"upstreams":  ups,
+		"presets":    h.opts.PresetNames,
+		"components": h.opts.ComponentNames,
+		// component_fields is every configurable key of every REGISTERED component, as
+		// declared beside the config struct that reads it (components.Field): the settings
+		// page draws its controls from this rather than from a hand-kept list in
+		// JavaScript, which is how it came to expose 18 keys of about a hundred and to
+		// offer a strategy list the engine had outgrown. Keyed by component name, in
+		// declaration order, and served next to "components" so a name in that list always
+		// has an entry here — empty for a component that takes no configuration.
+		"component_fields": components.AllFields(),
+		// recommended is the PREFILL policy — what to offer somebody switching a component
+		// on for the first time — which is not the same thing as a component's default
+		// (that is Field.default, i.e. what an absent key means). One copy, on the server.
+		"recommended":    config.RecommendedComponents(),
 		"default_config": tenant.DefaultConfigYAML,
+		// Whether `extract_llm.model.source: config` can resolve to anything here. It
+		// cannot on the hosted service — staticModel() withholds the operator's compaction
+		// model from tenant traffic on purpose — and a settings page that offers the choice
+		// without saying so is how an account ran that component 251 times, made zero model
+		// calls, and had nothing on screen to explain it.
+		"compaction_model": h.staticModel() != nil,
 	})
 }
 
@@ -2002,7 +2066,16 @@ type abVariant struct {
 	SpentUSD        float64 `json:"spent_usd"`
 	SavedUSD        float64 `json:"saved_usd"`
 	BaselineCostUSD float64 `json:"baseline_cost_usd"`
-	Incomplete      int64   `json:"incomplete_rows"`
+	// CacheSavedUSD folds the PROVIDER's prompt-cache saving into the comparison too.
+	// Without it an A/B between a shallow and a deep pipeline reads the deep one as the
+	// winner on compaction savings alone, while the cache it destroyed is where the money
+	// went. This is the one place that number belongs in a comparison rather than in a
+	// savings total: here it is the control variable, not the credit.
+	CacheSavedUSD float64 `json:"cache_saved_usd"`
+	// CachesplitSavedUSD is our own prefix-cache saving, which is what an A/B of
+	// cachesplit on-versus-off is actually measuring.
+	CachesplitSavedUSD float64 `json:"cachesplit_saved_usd"`
+	Incomplete         int64   `json:"incomplete_rows"`
 	// Components is per-component acted/reverted/saved, folded across this variant's
 	// accounts.
 	Components []abComponent `json:"components"`
@@ -2090,6 +2163,8 @@ func (h *Handler) ctlVariants(w http.ResponseWriter, r *http.Request) {
 			v.SpentUSD += g.SpentUSD
 			v.SavedUSD += g.SavedUSD
 			v.BaselineCostUSD += g.BaselineCostUSD
+			v.CacheSavedUSD += g.CacheSavedUSD
+			v.CachesplitSavedUSD += g.CachesplitSavedUSD
 			v.Incomplete += g.Incomplete
 		}
 		// Per-component rows are only available per tenant, so they are folded one account

@@ -190,6 +190,17 @@ type Trace struct {
 	// split by location. Observational, and free: the pipeline already counts them to
 	// respect the provider's cap of four.
 	Breakpoints Breakpoints
+	// SplitTailHash identifies the VOLATILE half the split moved the breakpoint off. Compared
+	// against the same session's previous request to decide whether the snapshot moved, which
+	// is the turn on which the split is worth anything: with the block unsplit, a moved
+	// snapshot re-creates the whole thing. 0 when nothing split.
+	SplitTailHash uint64
+	// SplitStableTokens is the token count of the half the volatile-tail split moved the
+	// breakpoint onto — the tokens it moved out of the cache-creation tier. 0 when nothing
+	// split. It is the honest numerator for the prefix-cache saving: the alternative,
+	// crediting the request's whole cache_read, over-credits by whatever the agent's OTHER
+	// breakpoints were already matching — 7.5x in dollars on a measured session.
+	SplitStableTokens int
 	// Run is the pipeline's aggregate report (nil when the pipeline never ran).
 	Run *components.RunReport
 	// Changes lists each rewritten message's before/after text (clipped).
@@ -339,8 +350,15 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 	// than re-parse the whole messages array to find each message again — that parse
 	// measured ~3x the cost of the whole-body copy it was meant to save.
 	shiftAt, shift := 0, 0
+	// splitStableTokens is what the split rescued from the cache-creation tier; the
+	// dashboard prices it (see dash.Event.cachesplitSavedUSD). 0 when nothing split.
+	splitStableTokens := 0
+	// splitTailHash identifies the volatile half, so a later turn can tell whether the
+	// snapshot MOVED. Only on such a turn would the unsplit block have been re-created.
+	var splitTailHash uint64
 	if !bypass && pipe != nil && (pipe.Has("cachesplit") || pipe.Has("cacheinject")) {
-		body, systemSplit, shiftAt, shift = splitVolatileTail(body, provider)
+		body, systemSplit, shiftAt, shift, splitStableTokens, splitTailHash =
+			splitVolatileTail(body, provider)
 	}
 
 	// Parsed ONCE and shared: normalize, the count-changed rebuild and the writeback
@@ -444,9 +462,15 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 		// provider's cap of four counts them all (issue #32, defect 2).
 		ExistingBreakpoints: bps.Total(),
 		Mode:                mode,
+		// Set BEFORE the run, so cachesplit's own report is right at the source and every
+		// consumer of it agrees. Amending the report afterwards fixed the dashboard and
+		// left /stats and the Prometheus component counters still saying "skipped",
+		// because the pipeline emits each report to them as it goes.
+		SystemSplit: systemSplit,
 	}
 	tr.Session, tr.CacheAware, tr.MaxCachedIdx, tr.Messages = sessionID, cacheAware, maxCachedIdx, len(norm)
 	tr.Breakpoints = bps
+	tr.SplitStableTokens, tr.SplitTailHash = splitStableTokens, splitTailHash
 	// The eligible (attempted) denominator: what age/supersession offloaders were
 	// allowed to touch. Everything before MaxCachedIdx is frozen for cache safety —
 	// the cost of that mechanism, reported next to its benefit.

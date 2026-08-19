@@ -29,7 +29,7 @@ harnesses in `deploy/harbor/` are unaffected.
 | Pipeline | `--config` / `--preset`, one for the process | the caller's own from the control database, or the [server default they track](#tenants-track-the-default-they-are-not-stamped-with-a-copy-of-it) |
 | Compaction state store | one, shared | one per tenant |
 | Upstream + credential | fixed at boot from flags/env | the tenant's chosen name from the allow-list; **the caller's own provider key forwarded** |
-| Dashboard data | everything | scoped to the caller; managers may widen |
+| Dashboard data | everything | scoped to the caller; a **manager defaults to the whole service** (`?tenant=me` for their own, `?tenant=<id>` for one account) |
 | `/stats` | open | loopback or a manager (it is a service-wide aggregate) |
 | Transcript capture | operator's flag | operator's flag **and** the tenant's consent |
 
@@ -487,6 +487,26 @@ that tenant's agent sends, so there is no shared budget to guard. Month-to-date 
 still computed and shown, per tenant, on Settings and in the manager's roster — it needs
 `MODEL_INFO` on to be non-zero, because an unpriced row costs $0.00.
 
+**Set `MODEL_PRICES` on this box.** ete-litellm bills about half of anthropic.com's published
+rates (`aws/claude-sonnet-5`: $1.52/MTok in against $3.00), and it serves ids the public price
+map has never heard of — the preview Gemini deployments, and Bob's server-resolved tier names,
+which are why a Bob session used to show tokens and latency but no cost at all. Both are fixed
+by pointing at the shipped list:
+
+```sh
+sudo install -m0644 deploy/service/prices.example.yaml /etc/context-guru/prices.yaml
+sudo systemctl edit context-guru          # or a drop-in file:
+#   [Service]
+#   Environment=MODEL_PRICES=/etc/context-guru/prices.yaml
+sudo systemctl restart context-guru
+journalctl -u context-guru -n 20 | grep "price list"   # "entries=42"
+```
+
+A malformed file refuses to start rather than falling back, because a price list that
+silently failed to load is indistinguishable from "every model is free". The file holds list
+prices and no credential. Details and the matching rules:
+[Per-model prices](reference/config.md#per-model-prices-and-why-the-public-map-is-not-enough).
+
 Two things that are *not* IBM-specific and should not be relaxed: cold storage on Box is one
 rclone remote name away from being any other remote, and `/metrics` plus Grafana binding
 loopback-only is about cross-tenant spend data, not about IBM.
@@ -592,12 +612,18 @@ Every new tenant starts on `codesmart` minus the LLM extractor (and minus `codes
 blind `collapse`):
 
 ```yaml
-pipeline: [format, toon, dedup, failed_run, cmdfilter, extract, cachesplit]
+pipeline: [format, toon, dedup, cmdfilter, extract, cachesplit]
 components:
   extract:
     min_tokens: 400
 mode: sync
 ```
+
+`failed_run` used to be in that list and is not any more. It acted **zero** times on every
+workload measured here — 251 requests on one account (843 ms spent scanning), and 28.8 s on
+the Terminal-Bench arm — so it was latency with a name. It is still a registered component
+and can be added back on the settings page by anyone whose traffic actually re-sends
+superseded failures.
 
 Fully deterministic, which is the property that matters on a shared box: no
 cheap-model calls, so it adds no upstream spend, contends for no shared LLM budget,
@@ -610,7 +636,79 @@ an account opts in. It is the only component that spends money to save money, an
 halves have opposite economics, so they are separate switches.
 
 **Settings → Compaction model calls (extract_llm)** on the account's own page (manager-only,
-because the server refuses `config_yaml` from anyone else). Each control states what it costs.
+because the server refuses a configuration from anyone else). Each control states what it costs.
+
+#### The settings page has no YAML box
+
+It had one, and it was the cause of the failure it was supposed to be the escape hatch from.
+The page built the document by rewriting the `pipeline:` line with a regular expression in the
+browser, which produced this on a config whose pipeline was written as a block sequence:
+
+```
+Not saved: tenant: config rejected: config: yaml: line 3: did not find expected key
+```
+
+The refusal left the old document stored, so the next attempt mangled the same input again —
+two accounts were stuck in that loop on every save. A `preset:` document lost its entire
+pipeline the same way, silently, because there was no flow-style line to read the existing
+names out of.
+
+So the page posts **fields** (`config` on `PUT /api/me`) and the server applies them to the
+account's document with a real YAML library, validates the result by building it, and stores
+it only then. Keys the form does not own — `model:`, `strategy`, `marker_mode`, another
+component's block — survive the round trip untouched. What is not preserved is comments and
+key order: a map has neither, and that is the trade for never emitting a broken document.
+
+Anything the fields do not cover is set by a manager through **Accounts → the account →
+Full configuration (YAML)**, which still takes a document and still validates it strictly.
+The settings page shows that whole document read-only under **Full configuration**, so
+"what am I actually running" is a fact on the page rather than an inference from the fields.
+
+#### A long streamed turn is not a timeout
+
+Symptom: a big session, `continue`, four or five minutes of apparently healthy work, then the
+agent reports an API error. It looks like compaction is hanging. It is not — on the eleven
+requests measured this way, context-guru's own time was 25-84 ms and it made zero model calls.
+
+The proxy's upstream client carried `http.Client{Timeout: 5 * time.Minute}`, and that timeout
+covers reading the response **body**. On a streaming dialect that is not a liveness check, it
+is a ceiling on how long a generation may take: a long turn with thinking enabled hit
+~297,900 ms of upstream time and came back **502**, while 160 shorter streamed turns from the
+same account through the same upstream succeeded.
+
+It is `ResponseHeaderTimeout` now — time to the FIRST byte, so a dead upstream is still
+caught and a stream that is producing tokens is never interrupted for having produced them
+for a while. `--upstream-header-timeout` / `UPSTREAM_HEADER_TIMEOUT` tunes it (default 10m).
+That default is generous because a NON-streaming request sends its headers only once it is
+generated, so for that shape it is still the whole budget.
+
+If you see this symptom, check `upstream_ms` on the request row before suspecting a
+component: ours is the `cg_latency_ms` column, and the two are not close.
+
+#### Two fields decide whether `extract_llm` can act at all
+
+Both were in stored documents and on neither the form nor the page, and the result was an
+account whose `extract_llm` was fully configured, ran on 251 requests, and made zero model
+calls with nothing on screen to explain it:
+
+- **`model.source`** — `config` selects an operator-configured compaction model, and this
+  service deliberately has none: it will not spend the operator's credential on a tenant's
+  traffic. So `config` here means *the component has no model* and silently never calls
+  anything. `incoming` uses the caller's own model and key. The settings page now says this
+  in the field's own hint, driven by `compaction_model` from `GET /api/options`.
+- **`model.model`** — the model that does the compacting, on the same endpoint and credential.
+  Leave it empty and the work runs on your agent's own frontier model, which does not pay:
+  measured here, a cold-cache sweep cut the provider bill by $0.63 and spent **$1.25 of opus**
+  doing it. `claude-haiku-4-5` is the recommended value and is what the form pre-fills.
+- **`allow_on_caching_backend`** — absent means **false**, and the economic gate then
+  hard-declines every candidate whose tokens are already prompt-cached. On Claude Code
+  against Anthropic that is the whole workload. The cold-cache sweep is not subject to it,
+  which is why the sweep is the recommended way in.
+
+Both are switches on the settings page now, alongside `strategy`,
+`llm_every_n_requests` and `trigger.min_request_tokens` — the other keys real stored
+documents already carried and the form could not show.
+
 
 **Start with the cold-cache sweep alone.** This is the half whose economics are not in doubt:
 turns that resume after the provider's cache TTL are ~4% of this deployment's requests and
@@ -622,7 +720,9 @@ nothing touches them.
 3. Save. The page warns that saving discards frozen compaction decisions, so the next turn
    is not cache-warm — expected, once.
 
-Equivalent YAML, for the Advanced box or the server default:
+Equivalent YAML, for the **server default** (`--config`) or a manager setting it on someone
+else's account through the account editor — the settings page itself has no YAML box any
+more, see below:
 
 ```yaml
 components:
@@ -693,7 +793,7 @@ because drawing the empty stored one would read as "my configuration is gone":
 
 | State | Settings shows |
 |---|---|
-| Tracking | *Following the server default.* The pipeline, mode and YAML are shown **read-only**, labelled as the operator's, with a note that they change when the operator changes the default. One button: **Customise**. |
+| Tracking | *Following the server default.* The pipeline, mode and compaction fields are shown **read-only**, labelled as the operator's, with a note that they change when the operator changes the default. One button: **Customise**. |
 | Own configuration | *Using your own configuration*, plus the warning that changes to the server default do not reach you — and, when the stored document is byte-identical to the current default, that it is identical. Controls editable. One button: **Follow the server default** (confirmed, audited). |
 
 Moving between them: **Customise** stores the current effective document as your own, so
@@ -1001,14 +1101,25 @@ dozen series we already compute.
     person reading the panel never sees. See
     [Routes](reference/routes.md#get-metrics-the-two-families-do-not-agree).
 
+!!! warning "Four `cg_tenant_*` names end in `_total` and are gauges"
+    `cg_tenant_requests_total`, `cg_tenant_tokens_total`,
+    `cg_tenant_saved_tokens_unique_total` and `cg_tenant_billed_tokens_total` are
+    month-to-date: they reset on the first and they **fall** mid-month as rows migrate to
+    cold storage. `rate()` and `increase()` both read a fall as a counter reset and
+    extrapolate a spike where the value went *down*, so those series are declared `gauge`
+    and no shipped panel wraps them — `Requests per tenant, month to date` plots the
+    cumulative value, and fleet-wide requests per minute comes off the in-process
+    `cg_requests_total`, which is a real counter.
+
 The installer brings up Prometheus and Grafana beside the proxy, provisioned, in two
 commands:
 
 ```sh
-sudo deploy/service/install.sh grafana          # both containers, config, dashboards
+sudo deploy/service/install.sh grafana          # all five containers, config, dashboards
 sudo deploy/service/install.sh grafana-status   # scrape health + provisioning errors
 # then, signed in as a MANAGER at /dashboard/:
 #   https://<the host>/grafana/d/context-guru/context-guru
+#   https://<the host>/grafana/d/context-guru-host/context-guru-host   # the box itself
 # or without the front end:
 ssh -L 3000:127.0.0.1:3000 <the host>
 # then http://127.0.0.1:3000/grafana/d/context-guru/context-guru
@@ -1085,9 +1196,31 @@ Worth knowing before you read either dashboard as a verdict:
   `avg_over_time(up[30d])` averages the samples that exist, so a Prometheus started an hour
   ago reports a flattering 100%.
 
+Two panels that *did* lie and no longer do, worth knowing because a screenshot taken
+before this may still be in circulation:
+
+- **`Total avoided this month` used to paint a negative figure green.** Its only threshold
+  step was green at `null`, so −$10.19 — compaction saving $6.96 against $17.22 of its own
+  model spend — read as a win. It now steps red below 0. An honest negative has to *look*
+  negative; that tile is the one number an operator reads to decide whether to keep the
+  thing switched on.
+- **`Hit rate by component` divided `acted` by `ran`**, which paints `cachesplit` as a dead
+  red component. It is mutated-never-acted by design (the split removes no content tokens,
+  it moves them out of the hashed prefix), so the component with the measured −34.1% cost
+  effect ranked last. The panel is now **`Activity rate by component`** over
+  `outcome="mutated"`, and "why did it decline?" has its own panel over
+  `cg_component_gate_declines_total`.
+
+**Alert rules are provisioned** — two, in
+`deploy/grafana/provisioning/alerting/context-guru.yml`: `up{job="context-guru"} == 0` for
+5 minutes, and refusals above 10% of `refused + processed` for 15 minutes (measured live at
+20.3% of requests, 92% of them `rate_limit` — invisible on every panel that plots only the
+requests that got through). They fire into whatever notification policy the instance
+already has; a contact point in version control is either a stale address or a leaked
+webhook secret.
+
 Those and the rest — what `cg_refused_requests_total` does *not* count, the per-tenant
-series cap, month-to-date counters resetting at the first of the month, and the fact that
-no alert rules are provisioned — are in
+series cap, and month-to-date series resetting at the first of the month — are in
 [`deploy/grafana/README.md`, "Known gaps"](https://github.com/rossoctl/context-guru/blob/main/deploy/grafana/README.md#known-gaps).
 
 **Access.** `/metrics` is a service-wide view that includes per-tenant cost, so in
@@ -1109,14 +1242,23 @@ and personal data does not belong in a scrape target. There is a test asserting 
    doing nothing, so the deployment looks fast because it stopped working.
 
 `cg_archive_configured` at 0 is the fourth: while it is 0, disk pressure deletes
-instead of migrating.
+instead of migrating. `cg_extract_net_value_usd` below 0 is the fifth, and the only one
+denominated in money: extraction is the one component that *spends*, so its gross token
+count can look impressive while it is underwater (measured live at −$0.7085).
+
+Two of those are wired as provisioned Grafana rules today — service down and refusal rate,
+the two failures a dashboard cannot catch because nobody is watching a screen at 03:00. The
+rest are one `data:` block each in the same file if you want them.
 
 Series colours in the dashboard are pinned rather than left to Grafana's classic
 palette, which cycles hues and repaints the survivors when a series disappears. The
 three used are validated colourblind-safe against Grafana's dark surface (worst
 all-pairs CVD ΔE 9.4, normal-vision 20.9), and the meaning is consistent across
 panels: **blue is what actually happened, orange is the comparison to read it
-against**, so the gap between them is the story. No panel uses two y-axes.
+against**, so the gap between them is the story. No panel uses two y-axes, which is also
+why `Spend: actual against baseline` no longer plots the prefix-split saving: at $0.03
+against $2,523 of spend it was four orders of magnitude down, pinned flat on the x-axis
+and readable as zero. It has its own stat tile.
 
 ## Accounts, in the browser
 
@@ -1132,7 +1274,7 @@ thing to keep in step with the server.
 |---|---|
 | Sign in / Register | Registration takes an email, a password, a token label, and an invite code if the deployment is in `invite` mode; entering the [mailed 6-digit code](#the-sign-in-flow) verifies the address, returns the token **once**, and signs you in — so registration flows straight to Setup with the token already substituted into the snippets. On a `closed` deployment the attempt is refused — see [step 4](#4-choose-how-accounts-are-created). Signing in later is password + a fresh mailed code, and an account created before passwords existed can still sign in with its token. Either way the browser only ever holds the session cookie. |
 | Setup | The three copy-paste blocks, with your own token and this deployment's real base URL (derived from the request, so it is correct behind nginx and on loopback alike). Your provider key stays where it already is; the blocks only add the base URL and the `x-context-guru-token` header — or, for Bob, the one-time key-binding curl. |
-| Settings | Upstream per dialect, content-capture consent, month-to-date spend, bound agent keys, token management, signed-in machines, and your own configuration-change history. Mode, component toggles and raw YAML are the **manager's**, per account; a plain account is told so and asks them. For a manager, they are read-only while [tracking the server default](#tenants-track-the-default-they-are-not-stamped-with-a-copy-of-it), with **Customise** to take ownership. |
+| Settings | Upstream per dialect, content-capture consent, month-to-date spend, bound agent keys, token management, signed-in machines, and your own configuration-change history. Mode, component toggles and the compaction fields are the **manager's**, per account; a plain account is told so and asks them. For a manager, they are read-only while [tracking the server default](#tenants-track-the-default-they-are-not-stamped-with-a-copy-of-it), with **Customise** to take ownership. |
 | Archive | What has moved to cold storage, from the local index. Opening one fetches it back read-only. |
 | Components | Manager only on a hosted deployment, since the pipeline it exists to tune is the manager's. Still there on a single-tenant proxy, where the operator is the only user of their own box. |
 | Tenants | Manager only: every account with its month-to-date spend, disable an account, reissue a lost token. |

@@ -112,6 +112,82 @@ Reading these:
     call. Set `allow_on_caching_backend: true` to override. Check `/stats` →
     `extract.net_value_usd` on your own workload before doing so.
 
+## Four defects fixed, August 2026
+
+A measurement pass over real production traffic and fresh Claude Code CLI sessions found four
+independent reasons this component was losing money. All four are fixed; the numbers below are
+measured, not projected. Full context in
+[Measured value, Aug 2026](../results/measured-2026-08.md).
+
+### 1. The model was writing Python, and every program was thrown away
+
+On real traffic `claude-haiku-4-5` returns a plausible filter program on essentially every
+call, and the sandbox discarded **12 of 13**. Starlark is a Python *subset*: it has no
+generator expressions, and `any(k in ln for k in ids)` — the single most natural way to write
+the filter — is a syntax error.
+
+The prompt contract now states what Starlark is not, naming the constructs models actually
+reach for: generator expressions, f-strings, `while`, `try/except`, set literals,
+`sorted(key=…)` closing over a mutable local. `codeContract` is part of `PromptVersion`, so
+results cached against the old prompt are not reused.
+
+**Measured on the same real 33,932-character file read, three runs each:** before, 0/3
+produced any output; after, 3/3, at 56%, 83% and 55% reduction.
+
+### 2. Every failure reported the same reason
+
+`RunExtractionDetail` collapsed a sandbox syntax rejection, a transport error and "the model
+never replied" into one string, `"no usable program or reply"`. Three causes with opposite
+fixes — fix the prompt, retry the call, stop calling — reported identically. That is why
+defect 1 survived: the component looked like it was being ignored when it was being answered
+and then thrown away.
+
+The reason now escapes to the call record and into the dashboard: `program rejected: <the
+sandbox error>`, `model call failed: <status>`, `OUTPUT was not a string`, `program returned
+no (OUTPUT, SUMMARY) pair`. The first thing this bought was a `status 401` in a test harness,
+visible immediately instead of after an afternoon.
+
+### 3. The economic gate under-priced its own calls by 21–31×
+
+`callCost` modelled the prompt as `preamble(1463) + min(candidate, 5000) + 200` — at most
+6,663 tokens. Under `context: full`, which every cold sweep uses, the rendered transcript
+**is** the prompt. Measured on production: five calls on one request each sent **~138,000**
+prompt tokens. For a 3,433-token candidate the gate weighed an expected saving of $0.0077
+against an estimated cost of $0.0046 and allowed the call; it cost $0.1422 and removed nothing.
+
+The true figure was already computed two lines from the gate, as `promptOverhead`, and
+discarded. The gate now receives it, and `analyticBaseline` scales with it so the
+observed-cost blend stays comparable.
+
+### 4. Our own calls were not being prompt-cached
+
+Five calls on one request with `cache_read = 0` and `cache_write = 0` on all five: the same
+~138k transcript sent fresh, five times over. The conversation context is computed **once per
+request** and is identical for every candidate in it — but it sat in the user message, which
+is not cacheable.
+
+It is now a trailing **system** block, inside the prefix `CompleteBlocks` marks — but only when
+the request will make more than one call (`Cfg.CacheContext`, set from the final candidate
+count). That condition is the design, not an optimisation: a cache write costs 1.25× fresh, so
+paying it for a single call is a 25% loss with nothing to read it back.
+
+It also lifts the prefix over the model's minimum cacheable size. The invariant preamble alone
+is ~1,463 tokens, below `claude-haiku-4-5`'s 4,096-token floor — so on haiku **nothing was
+being cached at all**, breakpoint or not.
+
+Verified against the live gateway: first call `cache_creation_input_tokens: 30007`, every
+repeat `cache_read_input_tokens: 30007` with `cache_creation: 0`. On a five-call request that
+is $0.114 → $0.038, a **67% reduction**.
+
+### The one thing not fixed here
+
+**94% of the losing spend ($16.38 of $17.48 on the affected account) was made against this
+gate's own written advisory.** `fire_on: size` demotes the economic gate to advisory and
+leaves the per-turn and per-session caps as the only brake. The gate was right and was
+overridden by configuration. The advisory is recorded per call so the counterfactual is
+visible, but no code change can rescue an operator from switching the brake off — if you set
+`fire_on: size`, read the `economic_gate_advisory` gate count and the net column.
+
 ## How it works
 
 For a large tool output, `extract_llm` asks a **cheap model** to write a short **Starlark filter**
@@ -400,11 +476,16 @@ Lossy but reversible — the original is stashed and recovered via `context_guru
 |---|---|---|
 | `allow_on_caching_backend` | `false` | **Off by default on prompt-caching backends** — measured net-negative there even with the gate working. `true` re-enables it and lets the gate decide per call. |
 | `economic_gate` | `true` | Only call the LLM when expected saving > expected cost. `false` restores the older spend-on-size behaviour (and implies `allow_on_caching_backend`). |
-| `min_tokens` | *derived* | Output floor. **Unset = derived from context pressure** (no tuning). Set explicitly to pin it (folds into `trigger.min_output_tokens`). |
-| `strategy` | `code` | `code` \| `single` \| `rlm` \| `auto` (`rlm` maps to `code`). |
-| `model.source` | `incoming` | `incoming` (proxied model+key) or `config` (cheap model via `CHEAP_MODEL*`). |
+| `min_tokens` | 300 | Output floor. The literal default is **300**; leaving it unset also means the *derived* context-pressure trigger governs when a request is worth a call, and setting it pins the floor to your number instead (it folds into `trigger.min_output_tokens`). Under `fire_on: size` an unset floor is raised to **2000**, because 300 is a threshold nearly every tool output clears — that combination is the 271-call failure mode. |
+| `strategy` | `code` | `code` \| `single` \| `rlm` \| `auto` \| `deterministic`. `deterministic` makes **no model call at all** (the projection runs locally), which is the one value the settings form used to omit — a stored `deterministic` was then not recognised and got rewritten to `code`, silently turning an LLM-free configuration into one that spends. |
+| `model.model` | *the source's own model* | The model to COMPACT with, on the source's endpoint and credential. Empty means the source's own model, which for `incoming` is the agent's frontier model — and compaction on one does not pay: a measured cold-cache sweep through the hosted service cut the provider bill by **$0.63** and spent **$1.25 of opus** doing it (net **−$0.62**). Naming a cheap model here keeps the same account and the same gateway and does the work for roughly a tenth of the call cost. On a multi-tenant deployment this is the only way to get a cheap compactor, since `source: config` has no model there. |
+| `model.source` | `incoming` | `incoming` (proxied model+key) or `config` (cheap model via `CHEAP_MODEL*`). **On a multi-tenant deployment `config` resolves to NOTHING** — `staticModel()` withholds the operator's compaction model from tenant traffic on purpose — so the component silently makes no calls however else it is configured. Measured on the hosted service: one account with `source: config`, 251 requests, zero model calls. The settings page now warns in the field itself. |
+| `model.provider` | `anthropic` | Wire dialect for a config-pinned endpoint: `anthropic` \| `openai`. |
+| `model.base_url` | *the provider's public API* | Pin a dedicated endpoint (a gateway, a self-hosted server) as a full URL. |
+| `model.api_key` | *the process env key* | **Credential** for the pinned endpoint. Empty falls back to `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` / `OPENAI_API_KEY`, and a **hosted** deployment refuses that fallback rather than bill a tenant's compaction to the operator (`offload.AllowEnvModelKey`). The settings page can set it and never displays it back. |
+| `model.auth` | `x-api-key` | Anthropic only: how the key is sent. `bearer` is what a LiteLLM/gateway front end expects. |
 | `model_max_input_tokens` | *derived* | The extraction model's input budget (see [Context guard](#context-guard)). Pin it for a model whose id nothing can resolve. |
-| `trigger` | *derived* | Explicit gate: `min_output_tokens`, `min_request_tokens`, `min_messages`. Setting any pins the trigger. |
+| `trigger` | *derived* | Explicit gate: `min_output_tokens`, `min_request_tokens`, `min_messages`, plus the window fractions `min_request_frac`, `min_output_frac`, `huge_output_frac`. Setting any of the absolute thresholds pins the trigger; a fraction only ever *raises* the absolute floor it resolves against. |
 | `llm_every_n_requests` | — | Fire the LLM path at most once per N requests per session. |
 | `llm_max_per_request` | 0 | Cap LLM calls per firing request (0 = unlimited). |
 | `rewrite` | `true` | `false` forces the verified deletion-only (subsequence) guarantee. |

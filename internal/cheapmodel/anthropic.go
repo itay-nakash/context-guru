@@ -9,8 +9,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
+
+	"github.com/rossoctl/context-guru/components"
 )
 
 // Anthropic calls a small Anthropic model with a single user prompt and returns the
@@ -28,6 +31,9 @@ type Anthropic struct {
 	// anthropic-version header is sent in both cases.
 	AuthScheme string
 }
+
+// AsModel is components.Remodeler: same endpoint, same credential, different model.
+func (a Anthropic) AsModel(id string) components.Model { a.Model = id; return a }
 
 func (a Anthropic) Complete(ctx context.Context, prompt string) (string, error) {
 	return a.CompleteSystem(ctx, "", prompt)
@@ -115,7 +121,12 @@ func (a Anthropic) CompleteBlocks(ctx context.Context, system []string, prompt s
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("cheapmodel: status %d", resp.StatusCode)
+		// The upstream's own message, clipped. A bare status is undiagnosable: a 401 can be a
+		// wrong auth scheme, an expired key, a model the key may not use, or a gateway policy,
+		// and those have nothing in common. Clipped and body-only — the response body of an
+		// auth failure does not echo the credential, but the REQUEST headers would, so this
+		// deliberately reads the body and never the request.
+		return "", fmt.Errorf("cheapmodel: status %d: %s", resp.StatusCode, clipErrBody(resp.Body))
 	}
 	var out struct {
 		Content []struct {
@@ -133,7 +144,7 @@ func (a Anthropic) CompleteBlocks(ctx context.Context, system []string, prompt s
 	}
 	// track CG component LLM cost, split by cache tier so /stats can show whether the
 	// preamble breakpoint actually caches (read>0) or is silently ignored (read==0).
-	recordUsageCache(ctx, out.Usage.InputTokens, out.Usage.OutputTokens,
+	recordUsageCache(ctx, a.Model, out.Usage.InputTokens, out.Usage.OutputTokens,
 		out.Usage.CacheCreationTok, out.Usage.CacheReadTok)
 	// Tell the prefix bookkeeping what actually happened, so the next call knows whether a
 	// breakpoint would be a read (worth it) or another write (not).
@@ -147,3 +158,16 @@ func (a Anthropic) CompleteBlocks(ctx context.Context, system []string, prompt s
 	}
 	return "", nil
 }
+
+// clipErrBody reads at most errBodyCap bytes of an error response for the message, so a
+// gateway that answers with a whole HTML page cannot flood a log line.
+func clipErrBody(r io.Reader) string {
+	b, _ := io.ReadAll(io.LimitReader(r, errBodyCap))
+	s := strings.TrimSpace(string(b))
+	if s == "" {
+		return "(empty body)"
+	}
+	return strings.Join(strings.Fields(s), " ")
+}
+
+const errBodyCap = 512

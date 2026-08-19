@@ -72,6 +72,51 @@ type Overview struct {
 	BaselineCostUSD float64 `json:"baseline_cost_usd"`
 	CGLLMCostUSD    float64 `json:"cg_llm_cost_usd"`
 	NetSavedUSD     float64 `json:"net_saved_usd"`
+	// CacheSavedUSD is what the PROVIDER's prompt cache saved over paying the fresh rate
+	// for the same tokens. Context, not credit: the agent places most of the breakpoints
+	// itself. It is here because it is the number that collapses when a pipeline rewrites
+	// deep history — a diagnostic, and the API keeps it for that. The dashboard does not
+	// show it as a saving, because it is not ours.
+	CacheSavedUSD float64 `json:"cache_saved_usd"`
+	// CachesplitSavedUSD is the cache saving that IS ours: summed over requests where the
+	// volatile-tail split ran, the snapshot had MOVED since the session's previous request,
+	// and the provider then read at least the stable half from cache while writing less than
+	// it. Priced against a cache miss. A floor. See Event.cachesplitSavedUSD.
+	CachesplitSavedUSD float64 `json:"cachesplit_saved_usd"`
+	// The three counts behind that figure, so a small number is explicable rather than
+	// mysterious. This mattered: gated on the session's first request the figure read ~$0 on
+	// real traffic, and the reason was visible only in these counts — 1,105 of 1,127 session
+	// starts had no cache to hit, because the previous session's had expired.
+	//
+	// SplitRequests is requests the split ran on; SplitTailMoved is the subset whose snapshot
+	// had moved (the turns it can earn on); SplitCredited is the subset that also read the
+	// stable half from cache instead of re-creating it (the turns it did earn on).
+	// CachesplitHistorical is what the split earned on requests that predate the
+	// instrumentation for it, valued at read time and never stored. nil when it could not be
+	// priced — absent, not zero. See DB.CachesplitHistoricalUSD.
+	CachesplitHistorical *CachesplitHistorical `json:"cachesplit_historical,omitempty"`
+
+	SplitRequests  int64 `json:"split_requests"`
+	SplitTailMoved int64 `json:"split_tail_moved"`
+	SplitCredited  int64 `json:"split_credited"`
+	// TotalSavedUSD is our two savings together: compaction's, less our own spend, plus
+	// the prefix components'. Both are ours and the token sets are disjoint.
+	TotalSavedUSD float64 `json:"total_saved_usd"`
+	// PrefixChangeCost is a DIAGNOSTIC, not a cost subtracted from net.
+	//
+	// It sums cost_usd over requests whose cache missed with reason prefix_change AND whose
+	// PREVIOUS request in the same session had a component that mutated the transcript. That
+	// is the population where "we rewrote history and the next turn re-billed the whole
+	// prompt" is a live hypothesis, and it has to be visible: size-stratified it comes to
+	// roughly $24 on the current corpus, and +$39 over transcripts past 60k tokens — larger
+	// than every saving on this dashboard.
+	//
+	// It stays observational because mutation is NOT randomly assigned. Components act where
+	// there is something to act on, which are also the long, churny turns most likely to break
+	// a prefix for reasons of their own; and prefix_change already loses ties to ttl_expiry, so
+	// this bucket is not even a clean partition of causes. Subtracting it from net would book a
+	// correlation as a debt. Settling it needs the A/B, not a bigger query.
+	PrefixChangeCost float64 `json:"prefix_change_cost_usd"`
 
 	CGLatencyMsAvg float64 `json:"cg_latency_ms_avg"`
 	UpstreamMsAvg  float64 `json:"upstream_ms_avg"`
@@ -132,6 +177,34 @@ func (d *DB) Overview(f Filter) (*Overview, error) {
 		COALESCE(SUM(r.fresh_input),0), COALESCE(SUM(r.cache_read),0), COALESCE(SUM(r.cache_write),0),
 		COALESCE(SUM(r.output_tokens),0),
 		COALESCE(SUM(r.cost_usd),0), COALESCE(SUM(r.baseline_cost_usd),0), COALESCE(SUM(r.cg_llm_cost_usd),0),
+		COALESCE(SUM(r.cache_saved_usd),0),
+		-- Our own cache saving. A plain SUM of a per-request column, because all three
+		-- conditions that qualify a request were settled at write time where the model's
+		-- rates and the session's history were both in hand (Event.cachesplitSavedUSD).
+		-- The predecessor did the component test here as a correlated EXISTS over
+		-- request_components, which was both slower and wrong: it credited every cache read
+		-- in a session, including the later turns that would have hit anyway.
+		COALESCE(SUM(r.cachesplit_saved_usd),0),
+		-- The counts behind that dollar figure. tail_moved is derived rather than stored: a
+		-- request's tail moved if the previous request in the same session carried a different
+		-- one. Recomputable from the table on purpose, so the money can be audited without
+		-- trusting the write path.
+		COALESCE(SUM(CASE WHEN r.split_stable_tokens > 0 THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN r.split_stable_tokens > 0 AND r.split_tail_hash <> COALESCE((
+			SELECT p.split_tail_hash FROM requests p
+			WHERE p.session_id = r.session_id AND (p.ts < r.ts OR (p.ts = r.ts AND p.id < r.id))
+			ORDER BY p.ts DESC, p.id DESC LIMIT 1), 0) THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN r.cachesplit_saved_usd > 0 THEN 1 ELSE 0 END),0),
+		-- The prefix-change diagnostic (Overview.PrefixChangeCost): what the turns cost where
+		-- the cache missed on a changed prefix AND the session's previous turn had mutated
+		-- something. Derived, never stored, and never netted off — see the field's comment for
+		-- why a correlation this confounded may not be turned into a debt.
+		COALESCE(SUM(CASE WHEN r.cache_miss_reason = 'prefix_change' AND EXISTS (
+			SELECT 1 FROM request_components c WHERE c.mutated = 1 AND c.request_id = (
+				SELECT p.id FROM requests p
+				WHERE p.session_id = r.session_id AND (p.ts < r.ts OR (p.ts = r.ts AND p.id < r.id))
+				ORDER BY p.ts DESC, p.id DESC LIMIT 1)
+		) THEN r.cost_usd ELSE 0 END),0),
 		AVG(r.cg_latency_ms), AVG(r.upstream_ms),
 		COALESCE(SUM(r.expands),0), COALESCE(SUM(r.expand_tokens),0), COALESCE(SUM(r.reverts),0),
 		COALESCE(SUM(CASE WHEN r.uncompressed_reason <> '' THEN 1 ELSE 0 END),0),
@@ -139,8 +212,9 @@ func (d *DB) Overview(f Filter) (*Overview, error) {
 		FROM requests r WHERE `+cond, args...).Scan(
 		&o.Requests, &o.Sessions, &o.TokensBefore, &o.TokensAfter, &o.SavedUnique,
 		&o.AttemptedTokens, &o.FrozenTokens, &o.FreshInput, &o.CacheRead, &o.CacheWrite,
-		&o.OutputTokens, &o.CostUSD, &o.BaselineCostUSD, &o.CGLLMCostUSD,
-		&cgAvg, &upAvg, &o.Expands, &o.ExpandTokens, &o.Reverts, &o.Passthroughs,
+		&o.OutputTokens, &o.CostUSD, &o.BaselineCostUSD, &o.CGLLMCostUSD, &o.CacheSavedUSD,
+		&o.CachesplitSavedUSD, &o.SplitRequests, &o.SplitTailMoved, &o.SplitCredited,
+		&o.PrefixChangeCost, &cgAvg, &upAvg, &o.Expands, &o.ExpandTokens, &o.Reverts, &o.Passthroughs,
 		&o.SafetyCost.CGLatencyMsTotal)
 	if err != nil {
 		return nil, err
@@ -155,6 +229,7 @@ func (d *DB) Overview(f Filter) (*Overview, error) {
 		o.ExpandRate = float64(o.Expands) / float64(o.Requests)
 	}
 	o.NetSavedUSD = o.BaselineCostUSD - o.CostUSD - o.CGLLMCostUSD
+	o.TotalSavedUSD = o.NetSavedUSD + o.CachesplitSavedUSD
 
 	for name, col := range map[string]string{
 		"accounting": "token_accounting", "cache_miss": "cache_miss_reason", "uncompressed": "uncompressed_reason",
@@ -233,8 +308,9 @@ func (o *Overview) denominators() []Denominator {
 	return ds
 }
 
-// waterfall builds the honest cost walk: baseline, each reduction, each penalty
-// we owe back, and the net. Signed deltas, so the UI just accumulates.
+// waterfall builds the honest cost walk: baseline, each reduction, each penalty we owe back,
+// and the net. Signed deltas — negative is money not spent — and each bar is drawn against
+// the largest absolute delta rather than accumulated, so a step may be read on its own.
 func (o *Overview) waterfall() []WaterfallStep {
 	compactionSaving := o.BaselineCostUSD - o.CostUSD
 	// Split the compaction saving into the part attributable to LLM-based
@@ -243,14 +319,17 @@ func (o *Overview) waterfall() []WaterfallStep {
 		{Key: "baseline", Label: "Baseline cost (no context-guru)", DeltaUSD: o.BaselineCostUSD, Total: true,
 			Description: "What this window's requests would have cost with nothing removed: the " +
 				"billed cost, plus the UNIQUE removed tokens priced at the cache-WRITE rate they " +
-				"would have entered as, plus the re-sent remainder priced at the cache-READ rate " +
-				"the provider would have served it from."},
+				"would have entered as, plus the re-sent remainder priced at the rate each request " +
+				"ACTUALLY paid — the cache-read rate where its cache hit, the cache-creation rate " +
+				"where it had expired and the whole prompt was re-billed."},
 		{Key: "compaction", Label: "Compaction savings", DeltaUSD: -compactionSaving,
 			Description: "Cost avoided because content never reached the provider. Only the UNIQUE " +
-				"saving earns the cache-write rate (~11.5x a read on a prompt-caching backend); the " +
-				"re-sent remainder earns the read rate, because that is all it would ever have been " +
-				"billed at. Pricing gross savings as writes is how a dashboard overstates itself by " +
-				"its own overcount_ratio."},
+				"saving earns the cache-write rate (12.5x a read on a prompt-caching backend); the " +
+				"re-sent remainder earns whatever the request itself was billed at, which is the " +
+				"read rate on a warm turn and the creation rate on a turn whose cache had expired. " +
+				"Pricing gross savings as writes is how a dashboard overstates itself by its own " +
+				"overcount_ratio; pricing an expired turn's removals as reads was how this one " +
+				"understated the turns that matter most."},
 		{Key: "cg_llm", Label: "context-guru's own LLM cost", DeltaUSD: o.CGLLMCostUSD,
 			Description: "What context-guru's own model calls (extract_llm, summarize) cost. Paid " +
 				"out of the savings above; a component whose spend exceeds its saving is " +
@@ -260,6 +339,23 @@ func (o *Overview) waterfall() []WaterfallStep {
 		{Key: "net_saved", Label: "Net savings", DeltaUSD: o.NetSavedUSD, Total: true,
 			Description: "Baseline minus net. Negative means context-guru cost more than it saved " +
 				"in this window, which is a real outcome the dashboard will not hide."},
+		{Key: "cachesplit_saved", Label: "Prefix-cache savings", DeltaUSD: -o.CachesplitSavedUSD,
+			Description: "A SECOND saving, outside the walk above, and the only cache figure we " +
+				"claim. Claude Code ends its big system block with a live environment snapshot, so " +
+				"the block's own breakpoint hashes the churn and the prefix never matches across " +
+				"sessions; cachesplit moves the breakpoint onto the stable half. Counted only where " +
+				"the component rewrote the prefix, the provider then read it from cache, AND it was " +
+				"the session's first request — the one that would otherwise have missed. Later turns " +
+				"hit whether or not we ever split, so they are not ours. Priced against a cache " +
+				"MISS, which is what the counterfactual actually is: those tokens carry " +
+				"cache_control, so a miss bills them as creation at 1.25x fresh, not at 1x. A " +
+				"floor — a stable prefix serves a whole session and this counts one request of it."},
+		{Key: "total_saved", Label: "Total cost avoided", DeltaUSD: o.TotalSavedUSD, Total: true,
+			Description: "Net compaction savings plus prefix-cache savings. Two disjoint token " +
+				"sets, both ours, so nothing is counted twice. It is not the cost of a fully " +
+				"uncached world: the provider's own cache saved far more than this on the same " +
+				"traffic (cache_saved_usd, reported by the API as a diagnostic), and none of that " +
+				"is credited here."},
 	}
 	return steps
 }

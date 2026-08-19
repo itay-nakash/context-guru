@@ -76,6 +76,15 @@ type Cfg struct {
 	// may reword/summarize/rewrite freely. Lossy + unverified — the caller must accept
 	// that (e.g. a non-full marker_mode). Default false keeps the verified guarantee.
 	Rewrite bool
+	// CacheContext moves the conversation context into a trailing CACHEABLE system block
+	// instead of the user message. Worth it only when the request will make MORE THAN ONE
+	// call: the context is identical across a request's candidates, so calls 2..N read it
+	// instead of re-sending it — but a cache WRITE costs 1.25x fresh, so paying it for a
+	// single call is a 25% loss. The caller decides; default false keeps the old placement.
+	//
+	// Measured on production: five haiku calls on ONE request each sent ~138,000 prompt
+	// tokens with cache_read=0 and cache_write=0, the same transcript five times over.
+	CacheContext bool
 	// Aggressiveness selects the compaction target taught in the second system block
 	// (low | medium | high; empty = medium). It changes what the model is ASKED for, never
 	// what is ACCEPTED — the verbatim-preservation, strictly-smaller and (in deletion-only
@@ -432,6 +441,17 @@ func intersectAllowed(order, allowed []string) []string {
 	return out
 }
 
+// Modes are the values Cfg.Mode accepts, in the order a settings form should offer them.
+// The empty string means "auto".
+//
+// It is a declared list because the settings form used to carry its own copy, which had
+// drifted: "deterministic" was missing, so a stored `strategy: deterministic` was not
+// recognised, fell back to "code", and the next save WROTE `strategy: code` over it —
+// silently turning an LLM-free configuration into one that makes model calls. Anything
+// offering these values reads them from here; TestModesAreTheModesRawStrategyOrderHonors
+// pins the list against the switch below.
+var Modes = []string{"auto", "code", "single", "rlm", "deterministic"}
+
 func strategyOrder(tokenEst int, cfg Cfg) []string {
 	return intersectAllowed(rawStrategyOrder(tokenEst, cfg), cfg.AllowedStrategies)
 }
@@ -504,10 +524,10 @@ func RunExtractionDetail(ctx context.Context, body, goal string, keepIDs []strin
 	base := tokens.Count(body)
 	var reasons []string
 	for _, name := range strategyOrder(tokenEst, cfg) {
-		var cand, sum string
+		var cand, sum, why string
 		switch name {
 		case "code":
-			cand, sum = runStarlark(ctx, body, goal, keepIDs, model, cfg.Rewrite, cfg.Aggressiveness)
+			cand, sum, why = runStarlark(ctx, body, goal, keepIDs, model, cfg.Rewrite, cfg.CacheContext, cfg.Aggressiveness)
 		case "single":
 			cand = runSingle(ctx, body, goal, keepIDs, model)
 		case "rlm":
@@ -517,9 +537,14 @@ func RunExtractionDetail(ctx context.Context, body, goal string, keepIDs []strin
 		}
 		switch {
 		case cand == "":
-			// No usable candidate: no reply, a transport error, or a program the sandbox
-			// refused to run (bad syntax, a step/time/memory limit, a non-string OUTPUT).
-			reasons = append(reasons, name+": no usable program or reply")
+			// No usable candidate. `why` says WHICH of the several very different causes it
+			// was — no reply, a transport error, or a program the sandbox refused (bad
+			// syntax, a step/time/memory limit, a non-string OUTPUT). They have opposite
+			// fixes, and reporting them alike hid a 92% syntax-rejection rate for months.
+			if why == "" {
+				why = "no usable program or reply"
+			}
+			reasons = append(reasons, name+": "+why)
 			continue
 		case tokens.Count(cand) >= base:
 			reasons = append(reasons, name+": result not smaller")

@@ -279,9 +279,32 @@ func (c *capture) finish(usage Usage, usageOK bool, captureContent bool, content
 	// tenant's month-to-date figure and cg_tenant_cg_llm_cost_usd. It also let a tenant
 	// infer other tenants' compaction activity from its own rows.
 	//
-	// Priced with the same model rates; a cheap model configured to a different id is
-	// close enough here that over-reporting our own cost is the safe direction.
+	// Priced at the COMPACTION model's rate when the sink knows which model made the calls,
+	// falling back to the agent's rate when it does not.
+	//
+	// It used to always use the agent's rate, on the theory that a cheap model was "close
+	// enough" and that over-reporting our own cost was the safe direction. It is not safe in
+	// either direction: haiku tokens billed at opus rates is roughly 15x, enough to make a
+	// configuration that pays read as one that loses money on the dashboard, which is a
+	// decision people make with this number.
 	_, cgIn, cgOut := c.llm.Totals()
+	// Our compaction calls are prompt-cached too — a cold sweep sends the whole transcript,
+	// so the cache-write tier is the LARGEST part of what it costs. This used to pass 0 for
+	// both tiers, which under-counted our own spend by roughly 4x on a sweep and disagreed
+	// with the per-call figure on the Components tab. A cost that is wrong in the flattering
+	// direction is worse than one that is wrong the other way: it argues for spending.
+	cgCacheWrite, cgCacheRead := c.llm.CacheTotals()
+	cgModel := c.llm.Model()
+
+	// Cache attribution, with a cold start treated as the non-failure it is. BEFORE
+	// pricing, because whether this is the session's first request is an input to a dollar
+	// figure and not only to a label — see Event.cachesplitSavedUSD.
+	seenSession, seenModel, sinceMs, tailChanged := c.rec.ObserveSplit(
+		e.TenantID, e.SessionID, e.Model, e.TS, e.SplitTailHash)
+	// Anthropic's prompt cache has a 5-minute TTL; a gap wider than that explains a
+	// miss without blaming a prefix change (TTL wins ties).
+	e.AttributeCache(seenSession, seenModel, sinceMs, 5*60*1000, e.CacheWrite > 0)
+	e.SessionFirst, e.TailChanged = !seenSession, tailChanged
 
 	var price modelinfo.Price
 	priced := false
@@ -289,15 +312,17 @@ func (c *capture) finish(usage Usage, usageOK bool, captureContent bool, content
 		price, priced = c.pricer.Price(context.Background(), c.model)
 	}
 	e.Price(price, usageOK && priced)
-	if priced && (cgIn > 0 || cgOut > 0) {
-		e.CGLLMCostUSD = price.Cost(cgIn, 0, 0, cgOut)
+	if cgIn > 0 || cgOut > 0 || cgCacheWrite > 0 || cgCacheRead > 0 {
+		cgPrice, cgPriced := price, priced
+		if c.pricer != nil && cgModel != "" && cgModel != c.model {
+			if p2, ok := c.pricer.Price(context.Background(), cgModel); ok {
+				cgPrice, cgPriced = p2, true
+			}
+		}
+		if cgPriced {
+			e.CGLLMCostUSD = cgPrice.Cost(cgIn, cgCacheRead, cgCacheWrite, cgOut)
+		}
 	}
-
-	// Cache attribution, with a cold start treated as the non-failure it is.
-	seenSession, seenModel, sinceMs := c.rec.Observe(e.TenantID, e.SessionID, e.Model, e.TS)
-	// Anthropic's prompt cache has a 5-minute TTL; a gap wider than that explains a
-	// miss without blaming a prefix change (TTL wins ties).
-	e.AttributeCache(seenSession, seenModel, sinceMs, 5*60*1000, e.CacheWrite > 0)
 
 	if !captureContent {
 		e.Content = nil

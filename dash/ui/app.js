@@ -63,23 +63,31 @@ function compact(v) {
   if (a >= 1e3) return (v / 1e3).toFixed(a >= 1e4 ? 0 : 1) + 'k';
   return nf.format(Math.round(v));
 }
-// netUSD is what one recorded compaction call was worth: the value of the tokens it removed
-// minus what the call cost. The per-token value depends on how the request was billed — a
-// token removed on a cold-cache turn is worth the cache-WRITE rate (1.25x fresh), one removed
-// from a warm cached prefix only the cache-READ rate (0.1x fresh), a ~12.5x spread. Using one
-// rate for both would either flatter warm calls or slander cold ones.
-const AGENT_FRESH_PER_MTOK = 3.0;
-const AGENT_CACHE_READ_PER_MTOK = 0.3;
-const AGENT_CACHE_WRITE_PER_MTOK = 3.75;
-
-function savedTokenUSD(x, cacheAware) {
-  if (x.cold) return AGENT_CACHE_WRITE_PER_MTOK / 1e6;
-  if (cacheAware) return AGENT_CACHE_READ_PER_MTOK / 1e6;
-  return AGENT_FRESH_PER_MTOK / 1e6;
+/**
+ * savedPerTok is what ONE token removed from this request was worth, read off the
+ * request's own billed figures: (baseline − actual) ÷ tokens removed.
+ *
+ * There used to be a rate table here — 3.00/3.75/0.30 per MTok, hardcoded — and it was
+ * sonnet-class while this deployment bills opus, so every net figure derived from it was
+ * ~27% wrong, in a direction nobody could see. The request already carries the answer,
+ * priced server-side at write time from its OWN model and the tiers it actually paid, which
+ * is the same rule dash's baselineDeltaUSD and CompRow.SavedUSD use. So the browser asks
+ * the row instead of guessing.
+ *
+ * null, not 0, when the request is not fully priced: an unknown must not render as "worth
+ * nothing".
+ */
+function savedPerTok(e) {
+  if (e.token_accounting !== 'complete') return null;
+  const removed = (e.tokens_before || 0) - (e.tokens_after || 0);
+  if (removed <= 0) return null;
+  return ((e.baseline_cost_usd || 0) - (e.cost_usd || 0)) / removed;
 }
 
-function netUSD(x, cacheAware) {
-  return (x.saved_tokens || 0) * savedTokenUSD(x, cacheAware) - (x.cost_usd || 0);
+/** netUSD prices one recorded compaction call: what its removals were worth, less the call. */
+function netUSD(x, perTok) {
+  if (perTok === null || perTok === undefined) return null;
+  return (x.saved_tokens || 0) * perTok - (x.cost_usd || 0);
 }
 
 function usd(v) {
@@ -152,7 +160,21 @@ function modeLabel(m) {
 const state = {
   view: 'overview',
   filter: {},
-  range: 0,
+  // The time range, Grafana's model: `from` and `to` are each EITHER a relative token
+  // ('now-6h', 'now') or an absolute epoch-ms number. 0 means unbounded, which is what
+  // "All time" is. Keeping a relative window relative is the whole point — the old
+  // state.range froze the window at the moment it was resolved, and one refresh() that
+  // fires stats + series + breakdown resolved Date.now() three times and produced three
+  // slightly different windows for one screen of numbers.
+  from: 0,
+  to: 'now',
+  // nowMs is stamped ONCE per refresh() and every relative token in that repaint resolves
+  // against it. That is the fix for the three-windows bug above.
+  nowMs: 0,
+  // sort is the client-side sort of the components table: a field name and a direction, or
+  // '' for the server's own order (saved_unique DESC, which the bar chart beside it shares).
+  sort: '',
+  dir: 'desc',
   reqCursor: 0,
   reqStack: [],
   sessOffset: 0,
@@ -171,10 +193,48 @@ const state = {
   ac: null,
 };
 
+/** RANGE_UNIT_MS is the suffix table for a relative token: `now-90m`, `now-7d`. */
+const RANGE_UNIT_MS = { s: 1000, m: 60000, h: 3600000, d: 86400000, w: 604800000 };
+
+/**
+ * resolveTime turns one endpoint into epoch ms against a FIXED `now`, or 0 for unbounded.
+ * Accepts 'now', 'now-<n><unit>', a number, or a numeric string (the URL gives us strings).
+ */
+function resolveTime(v, nowMs) {
+  if (v === 'now') return nowMs;
+  if (typeof v === 'string') {
+    const m = /^now-(\d+)([smhdw])$/.exec(v);
+    if (m) return nowMs - Number(m[1]) * RANGE_UNIT_MS[m[2]];
+    const n = Number(v);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  }
+  return Number(v) > 0 ? Number(v) : 0;
+}
+/** The window as the server sees it: [since, until), either bound 0 for unbounded. */
+function rangeMs() {
+  const now = state.nowMs || Date.now();
+  return [resolveTime(state.from, now), state.to === 'now' ? 0 : resolveTime(state.to, now)];
+}
+/**
+ * writeRange stamps since/until onto a URLSearchParams. `until` is OMITTED while `to` is
+ * 'now', so a live window stays live rather than being pinned to this repaint.
+ *
+ * It lives here rather than being passed through qs()'s `extra` because that argument drops
+ * any value that is '', 0 or undefined — so `until: 0` could never mean "unbounded" through it.
+ */
+function writeRange(p) {
+  const [since, until] = rangeMs();
+  if (since > 0) p.set('since', String(since));
+  if (until > 0) p.set('until', String(until));
+  return p;
+}
+/** hasRange is whether the time filter is narrowing anything at all. */
+function hasRange() { const [a, b] = rangeMs(); return a > 0 || b > 0; }
+
 function qs(extra) {
   const p = new URLSearchParams();
   for (const [k, v] of Object.entries(state.filter)) if (v) p.set(k, v);
-  if (state.range > 0) p.set('since', String(Date.now() - state.range));
+  writeRange(p);
   for (const [k, v] of Object.entries(extra || {})) if (v !== '' && v !== 0 && v !== undefined) p.set(k, String(v));
   const s = p.toString();
   return s ? '?' + s : '';
@@ -547,6 +607,12 @@ function renderTiles(o) {
   // same ("gross" vs "unique"). Anything that only restated the label is gone — "Tokens
   // before / content tokens in" was a caption explaining a caption.
   host.appendChild(tileGroup(null, null, [
+    // Our two savings, added: compaction's and the prefix components'. Both are ours and
+    // the token sets are disjoint. The provider's own cache saving is much larger and is
+    // NOT in here — it was, under the label "compaction + provider cache", and a headline
+    // number that mostly measures somebody else's mechanism is not a headline number.
+    tile('total-saved-usd', 'Total dollars avoided', costKnown ? usd(o.total_saved_usd) : 'unknown',
+      'compaction + prefix cache', costKnown ? (o.total_saved_usd < 0 ? 'bad' : 'good') : ''),
     tile('saved-usd', 'Net dollars saved', costKnown ? usd(o.net_saved_usd) : 'unknown',
       'baseline − actual − our spend', costKnown ? (o.net_saved_usd < 0 ? 'bad' : 'good') : ''),
     tile('saved-unique', 'Tokens saved (unique)', compact(o.saved_unique),
@@ -575,6 +641,54 @@ function renderTiles(o) {
       costKnown ? 'as billed' : 'needs all four tiers'),
     tile('cost-cg', 'Our own LLM cost', costKnown ? usd(o.cg_llm_cost_usd) : 'unknown',
       'extract_llm, summarize'),
+    // The cache saving this project claims, and the only one. Three conditions per request:
+    // the volatile-tail split ran, the provider then READ that prefix from cache, and it was
+    // the session's FIRST request — the one that would have missed. And the amount is the
+    // stable half the split moved, not the whole cache_read: the cachesplit-off control arm
+    // still read 45,805 tokens, so only the 8,499-token difference was ever ours.
+    //
+    // What was here before was the provider's whole cache saving ("Prompt-cache savings")
+    // plus the subset that merely co-occurred with our components. On the traffic that
+    // measured this, 23x larger — and neither of them a thing we did.
+    // Measured + the pre-instrumentation window, added, because the question "what has this
+    // component earned" is about the whole history and the split of it into measured and
+    // valued-on-read is an implementation detail of when we started recording. The
+    // decomposition is one group down, and the historical half is absent (not zero) when it
+    // could not be priced.
+    tile('cachesplit-saved', 'Prefix-cache savings',
+      costKnown ? usd(o.cachesplit_saved_usd + histUSD(o)) : 'unknown',
+      num(o.split_credited) + ' of ' + num(o.split_tail_moved) + ' moved-snapshot turns'
+        + (histRequests(o) ? ' + ' + num(histRequests(o)) + ' earlier' : ''),
+      costKnown && (o.cachesplit_saved_usd + histUSD(o)) > 0 ? 'good' : ''),
+  ]));
+
+  // Why the figure above is the size it is. Without these three counts a small number is
+  // indistinguishable from a broken component — which is exactly what happened: gated on the
+  // session's first request it read ~$0, and the reason (1,105 of 1,127 session starts had no
+  // cache to hit) was invisible.
+  host.appendChild(tileGroup('Prefix split', 'the turns behind the saving above', [
+    // "acted on", not "ran on": the component runs on every request and does nothing on most.
+    // Three of this deployment's largest accounts have it running on 125, 1,035 and 1,972
+    // requests and acting on NONE of them — their system prompts carry no volatile tail to
+    // split. All zeros here with a nonzero run count on the Components tab is that case, and
+    // it is a fact about their prompt, not a fault.
+    tile('split-requests', 'Requests it acted on', num(o.split_requests),
+      o.split_requests === 0 ? 'no volatile tail to split' : ''),
+    tile('split-tail-moved', 'Snapshot had moved', num(o.split_tail_moved),
+      'the turns it can earn on'),
+    tile('split-credited', 'Served from cache', num(o.split_credited),
+      'the turns it did earn on'),
+    tile('split-hit-rate', 'Of moved snapshots', o.split_tail_moved > 0
+      ? pct((100 * o.split_credited) / o.split_tail_moved) : '—',
+      'kept out of the write tier'),
+    // The pre-instrumentation window, valued on read and never stored. Its own tile so the
+    // measured figure above is never confused with an estimate — and "—" when it could not be
+    // priced, because an unpriced number must not read as "saved nothing".
+    tile('split-historical', 'Before we recorded it',
+      o.cachesplit_historical ? usd(o.cachesplit_historical.usd) : '—',
+      o.cachesplit_historical
+        ? num(o.cachesplit_historical.requests) + ' session starts, valued on read'
+        : 'no rates for these models'),
   ]));
 
   host.appendChild(tileGroup('Billed tokens', 'the four tiers the provider charges on', [
@@ -674,6 +788,33 @@ function renderSafety(o) {
   ]);
 }
 
+/**
+ * renderPrefixChangeCost surfaces prefix_change_cost_usd, beside the prefix_change bucket it
+ * is computed from — and says in the sentence itself that it is a DIAGNOSTIC that is
+ * subtracted from nothing.
+ *
+ * It is not a tile and it is not summed into any saving: components act where there is
+ * something to act on, which are also the long churny turns most likely to break a prefix on
+ * their own, so mutation is not randomly assigned and this is observational. Netting it would
+ * book a correlation as a debt. It is nonetheless larger than every saving on this page on
+ * some corpora, so hiding it would be the dishonest option.
+ */
+function renderPrefixChangeCost(o) {
+  const n = $('#prefix-change-note');
+  if (!n) return;
+  const v = o.prefix_change_cost_usd;
+  n.hidden = !v;
+  if (!v) return;
+  clear(n);
+  n.appendChild(el('strong', { text: 'Diagnostic, not netted: ' + usd(v) }));
+  n.appendChild(document.createTextNode(
+    ' was billed on turns whose cache missed with prefix_change directly after a turn we '
+    + 'mutated. That is where "we rewrote history and the next turn re-billed the whole '
+    + 'prompt" is a live hypothesis — but components act on exactly the long, churny turns '
+    + 'most likely to break a prefix by themselves, so this is a correlation. It is '
+    + 'subtracted from no savings figure on this dashboard; settling it needs the A/B.'));
+}
+
 function renderLive() {
   const body = clear($('#live-body'));
   // The feed is the raw capture stream: it is not filtered, and with a filter bar right
@@ -715,6 +856,7 @@ async function loadOverview() {
       hit: 'cache hit', cold_start: 'cold start (not a failure)', ttl_expiry: 'TTL expiry',
       prefix_change: 'prefix change', unknown: 'unknown', '': 'no cache data',
     }, 'Every request carries a cache attribution once one has been captured in this window.');
+    renderPrefixChangeCost(o);
     renderDistribution('#reasons', o.uncompressed, {
       '': 'compacted', bypassed: 'bypassed by header', below_trigger: 'below every trigger',
       cache_frozen: 'frozen for cache safety', found_nothing: 'nothing to remove',
@@ -731,9 +873,11 @@ async function loadOverview() {
 }
 
 function bucketFor() {
-  if (state.range === 0) return 3600000;
-  if (state.range <= 3600000) return 60000;
-  if (state.range <= 86400000) return 300000;
+  const [since, until] = rangeMs();
+  if (since === 0) return 3600000;
+  const span = (until || state.nowMs || Date.now()) - since;
+  if (span <= 3600000) return 60000;
+  if (span <= 86400000) return 300000;
   return 3600000;
 }
 
@@ -807,7 +951,11 @@ function verdict(c) {
   // money to reason with — so it judged the one component that can lose money on tokens and
   // latency, and could describe a $3 loss as "expensive for its yield".
   if (c.llm_calls > 0) {
-    const net = componentNetUSD(c);
+    // c.net_usd is the SERVER's figure: saved_usd (summed per turn, so the amortization of
+    // a frozen reduction replaying across a session is already in it) minus llm_cost_usd.
+    // The browser used to compute this from a hardcoded rate table AND from calls-only
+    // savings, which both mispriced it and threw away ~93% of the realized value.
+    const net = c.net_usd || 0;
     if (net < -0.01) return ['underwater ' + usd(net), 'missing'];
     if (net <= 0) return ['break-even', 'partial'];
     return ['net ' + usd(net), 'complete'];
@@ -822,27 +970,6 @@ function verdict(c) {
   }
   if (c.act_rate < 0.02) return ['rarely fires', 'partial'];
   return ['earning its place', 'complete'];
-}
-
-/**
- * componentNetUSD prices a component's own LLM spend against what its calls removed.
- *
- * Deliberately uses only what the CALLS saved (llm_saved_tokens), not the component's total
- * unique savings: most of an extractor's realized value comes from frozen results being
- * replayed with no call at all — ~93% on measured traffic — and crediting that replay to the
- * calls would make any amount of spending look profitable.
- *
- * Cold-sweep calls are valued at the cache-write rate and warm ones at the cache-read rate,
- * a ~12.5x spread, so a component whose calls are mostly cold is judged on the right basis.
- */
-function componentNetUSD(c) {
-  const cold = c.llm_calls_cold || 0;
-  const warm = Math.max(0, (c.llm_calls || 0) - cold);
-  const saved = c.llm_saved_tokens || 0;
-  const total = cold + warm;
-  const perTok = total === 0 ? 0
-    : (cold * AGENT_CACHE_WRITE_PER_MTOK + warm * AGENT_CACHE_READ_PER_MTOK) / total / 1e6;
-  return saved * perTok - (c.llm_cost_usd || 0);
 }
 
 /** DAY_MS is dash.DayMs: per-day bars are the shared time series at a day-wide bucket. */
@@ -862,7 +989,7 @@ async function loadUsage() {
   const dayHost = $('#chart-daily');
   const breakHost = $('#chart-breakdown');
   const body = clear($('#breakdown-body'));
-  loadingRows(body, 8);
+  loadingRows(body, 10);
   try {
     // Per-day bars need no endpoint of their own: the series is bucketed in SQL from the
     // raw timestamp, so a day-wide bucket is a query parameter.
@@ -888,7 +1015,7 @@ async function loadUsage() {
     const groups = bd.groups || [];
     clear(body);
     if (!groups.length) {
-      tableMessage(body, 8, 'Nothing to break down', 'No requests match the current filters.');
+      tableMessage(body, 10, 'Nothing to break down', 'No requests match the current filters.');
       emptyState(breakHost, 'Nothing to break down', 'No requests match the current filters.');
       return;
     }
@@ -912,16 +1039,25 @@ async function loadUsage() {
         el('td', { class: 'num', text: compact(g.saved_unique) }),
         el('td', { class: 'num' + (unpriced ? ' na' : ''), text: unpriced ? 'unknown' : usd(g.spent_usd) }),
         el('td', { class: 'num' + (unpriced ? ' na' : ''), text: unpriced ? 'unknown' : usd(g.saved_usd) }),
+        // Ours, not the provider's: this column used to carry cache_saved_usd, which made
+        // every model look like a large cache saving we had nothing to do with.
+        el('td', { class: 'num' + (unpriced ? ' na' : ''), text: unpriced ? 'unknown' : usd(g.cachesplit_saved_usd) }),
+        el('td', { class: 'num' + (unpriced ? ' na' : ''), text: unpriced ? 'unknown' : usd(g.total_saved_usd) }),
         el('td', { class: 'num', text: num(g.incomplete_rows) })));
     }
   } catch (err) {
     if (aborted(err)) return;
     clear(body);
-    tableMessage(body, 8, 'Could not load the breakdown', err.message);
+    tableMessage(body, 10, 'Could not load the breakdown', err.message);
     emptyState(breakHost, 'Could not load the breakdown', err.message, { error: true });
     emptyState(dayHost, 'Could not load daily usage', err.message, { error: true });
   }
 }
+
+/** histUSD and histRequests read the pre-instrumentation split figure, which the API OMITS
+ *  rather than zeroes when it cannot price it — so every read of it has to tolerate absence. */
+function histUSD(o) { return (o.cachesplit_historical || {}).usd || 0; }
+function histRequests(o) { return (o.cachesplit_historical || {}).requests || 0; }
 
 /** syncDimPicker fills the dimension picker from what the SERVER says it can group by,
  *  so the options can never name a dimension the query would reject. */
@@ -934,14 +1070,49 @@ function syncDimPicker(dims) {
   sel.value = state.dim;
 }
 
+/**
+ * gateSummary renders a component's gate counts: the reasons it turned candidates away,
+ * commonest first.
+ *
+ * This is the answer to the question the components table could not answer before —
+ * "act rate 0%, why?" — and it is the difference between a Bob user concluding
+ * context-guru does nothing and reading `no_filter_match 15`, which says the heuristics
+ * were written for another agent's tool-output shapes.
+ *
+ * Three states, all different: a populated map is the reasons; an EMPTY map is "this
+ * component turned nothing away"; a MISSING map is "unknown" — on a request row that means
+ * it was written before the column existed, and on an aggregate row that no row in the
+ * window carried gate data at all.
+ */
+function gateSummary(gates) {
+  if (!gates) return el('span', { class: 'na', text: 'unknown' });
+  const all = Object.entries(gates).sort((a, b) => b[1] - a[1]);
+  if (!all.length) return el('span', { class: 'na', text: '—' });
+  const shown = all.slice(0, 2).map(([k, v]) => k + ' ' + num(v)).join(' · ');
+  const rest = all.length > 2 ? ' +' + (all.length - 2) : '';
+  return el('span', { title: all.map(([k, v]) => k + ' ' + num(v)).join('\n'), text: shown + rest });
+}
+
+/**
+ * COMPONENT_SORT is one field per column of the components table, in column order. null is
+ * a column with nothing orderable in it (the gate summary, the verdict prose).
+ */
+const COMPONENT_SORT = ['component', 'kind', 'runs', 'acted', 'act_rate', 'reverted',
+  'saved_unique', 'saved_gross', 'overcount_ratio', 'duration_ms_total', 'duration_ms_avg',
+  'llm_calls', 'llm_cost_usd', 'saved_usd', 'net_usd', 'errors', null, null];
+
 async function loadComponents() {
   const body = clear($('#components-body'));
-  loadingRows(body, 15);
+  loadingRows(body, 18);
   try {
-    const { components } = await api('components');
+    const { components: raw } = await api('components');
+    // /api/components has no LIMIT — every component that ran in the window is in this
+    // array — so sorting it here IS a global sort, not a sort of one page.
+    const components = state.sort ? sortRows(raw, state.sort, state.dir) : raw;
+    syncSortHeads('[data-testid=components-table]', COMPONENT_SORT);
     clear(body);
     if (!components.length) {
-      tableMessage(body, 15, 'No component runs captured',
+      tableMessage(body, 18, 'No component runs captured',
         'Run some traffic through the proxy with a non-empty pipeline.');
       emptyState($('#chart-comp'), 'No component data',
         'This chart fills in once a component has saved something.');
@@ -963,7 +1134,17 @@ async function loadComponents() {
         el('td', { class: 'num', text: ms(c.duration_ms_avg) }),
         el('td', { class: 'num', text: c.llm_calls ? num(c.llm_calls) : '—' }),
         el('td', { class: 'num', text: c.llm_calls ? usd(c.llm_cost_usd) : '—' }),
+        // A cost never travels alone. saved_usd is what this component's removals were
+        // worth over the window — summed per turn, so a frozen reduction replaying across a
+        // session is already amortized into it — and net_usd is the verdict. Both from the
+        // server, priced at the model this deployment actually bills.
+        el('td', { class: 'num', text: usd(c.saved_usd) }),
+        el('td', {
+          class: 'num' + (c.net_usd < 0 ? ' warn-text' : ''),
+          title: 'saved ' + usd(c.saved_usd) + ' − own LLM cost ' + usd(c.llm_cost_usd || 0),
+        }, usd(c.net_usd)),
         el('td', { class: 'num', text: num(c.errors) }),
+        el('td', {}, gateSummary(c.gates)),
         el('td', {}, el('span', { class: 'pill ' + vcls, text: vtext }))));
     }
     // One measure (unique tokens saved) across up to twelve components: a magnitude
@@ -980,27 +1161,54 @@ async function loadComponents() {
     })), { emptyDetail: 'No component saved any content tokens in this window.' });
   } catch (err) {
     if (aborted(err)) return;
-    tableMessage(body, 15, 'Could not load components', String(err.message || err), { error: true });
+    tableMessage(body, 18, 'Could not load components', String(err.message || err), { error: true });
   }
 }
 
 // ── sessions ───────────────────────────────────────────────────────────────
+/**
+ * wideScope is "this list can contain more than one account", which is a manager with no
+ * ?tenant= — the server's default. It is what decides whether the Account column is shown:
+ * a single-account list does not need a column repeating the filter bar.
+ */
+function wideScope() { return isManager() && !state.filter.tenant; }
+/** showScopeCol toggles the static Account <th> of one table. */
+function showScopeCol(tableSel, wide) {
+  for (const th of $$('thead th[data-scope-col]', $(tableSel))) th.hidden = !wide;
+  return wide;
+}
+
 async function loadSessions() {
   const body = clear($('#sessions-body'));
-  loadingRows(body, 13);
+  const wide = showScopeCol('[data-testid=sessions-table]', wideScope());
+  const cols = wide ? 14 : 13;
+  loadingRows(body, cols);
   try {
     const { sessions, total } = await api('sessions', { limit: 25, offset: state.sessOffset });
     clear(body);
     if (!sessions.length) {
-      if (activeFilters().length) renderNoMatch(body, 13, 'sessions');
+      if (activeFilters().length) renderNoMatch(body, cols, 'sessions');
       else {
-        tableMessage(body, 13, 'No sessions yet',
+        tableMessage(body, cols, 'No sessions yet',
           'A session appears as soon as its first request is captured.');
       }
     }
     for (const s of sessions) {
       body.appendChild(el('tr', { class: 'click', onclick: () => { setFilter('session', s.session_id, { quiet: true }); go('requests'); } },
-        el('td', {}, el('span', { class: 'trunc', title: s.session_id, text: s.session_id || '(none)' })),
+        el('td', {}, el('span', { class: 'trunc', title: s.session_id, text: s.session_id || '(none)' }),
+          // A young session has paid for its extraction call and not yet collected the
+          // replay, so its net reads underwater and stops doing so as the turns come in.
+          // The pill says the amortization is unfinished instead of letting a half-collected
+          // figure read as a verdict.
+          s.in_flight
+            ? el('span', {
+              class: 'pill partial', 'data-testid': 'in-flight',
+              title: 'This session\'s last request is still inside one provider cache TTL, so '
+                   + 'the next turn may replay the same reduction. Its dollar figures are an '
+                   + 'incomplete amortization, not a verdict.',
+            }, 'in flight')
+            : null),
+        wide ? el('td', {}, el('span', { class: 'trunc', title: s.tenant_id, text: s.tenant_id || '—' })) : null,
         el('td', { text: firstOf(s.models) }),
         el('td', { text: firstOf(s.agents) }),
         el('td', { text: firstOf(s.presets) }),
@@ -1036,25 +1244,28 @@ async function loadSessions() {
     $('#sess-next').disabled = state.sessOffset + 25 >= total;
   } catch (err) {
     if (aborted(err)) return;
-    tableMessage(body, 13, 'Could not load sessions', String(err.message || err), { error: true });
+    tableMessage(body, cols, 'Could not load sessions', String(err.message || err), { error: true });
   }
 }
 
 // ── requests ───────────────────────────────────────────────────────────────
 async function loadRequests() {
   const body = clear($('#requests-body'));
-  loadingRows(body, 13, 6);
+  const wide = showScopeCol('[data-testid=requests-table]', wideScope());
+  const cols = wide ? 14 : 13;
+  loadingRows(body, cols, 6);
   try {
     const page = await api('requests', { limit: 50, before: state.reqCursor });
     clear(body);
     if (!page.requests.length) {
-      renderNoMatch(body, 13, 'requests');
+      renderNoMatch(body, cols, 'requests');
     }
     for (const e of page.requests) {
       body.appendChild(el('tr', { class: 'click', 'data-testid': 'request-row', onclick: () => openRequest(e.id) },
         el('td', { text: e.id }),
         el('td', { text: when(e.ts) }),
         el('td', {}, el('span', { class: 'trunc', title: e.session_id, text: e.session_id || '—' })),
+        wide ? el('td', {}, el('span', { class: 'trunc', title: e.tenant_id, text: e.tenant_id || '—' })) : null,
         el('td', { text: e.model || '—' }),
         el('td', {}, el('span', { class: 'pill neutral', text: modeLabel(e.mode) })),
         el('td', { class: 'num', text: compact(e.tokens_before) }),
@@ -1072,7 +1283,7 @@ async function loadRequests() {
     state.nextCursor = page.next_cursor;
   } catch (err) {
     if (aborted(err)) return;
-    tableMessage(body, 13, 'Could not load requests', String(err.message || err), { error: true });
+    tableMessage(body, cols, 'Could not load requests', String(err.message || err), { error: true });
   }
 }
 
@@ -1541,6 +1752,17 @@ async function openRequest(id, fromURL) {
     body.appendChild(kvBand('Cost and latency', 'detail-cost',
       kv('Cost (actual / baseline)', priced ? usd(e.cost_usd) + ' / ' + usd(e.baseline_cost_usd) : 'not priced'),
       kv('Our own LLM cost', priced ? usd(e.cg_llm_cost_usd) : '—'),
+      // Directly beneath the cost, because the cost on its own is the figure that makes
+      // readers conclude the product is worthless: baseline − actual − our own spend is
+      // what this one turn was actually worth.
+      kv('Net after our cost',
+        priced ? usd(e.baseline_cost_usd - e.cost_usd - e.cg_llm_cost_usd) : '—'),
+      // On a turn whose cache HIT this is usually the largest money figure on the row,
+      // and it was not reported anywhere: the cache reads this request was billed for,
+      // against the fresh rate they would have cost without the cache.
+      kv('Prefix-cache saved (ours)', priced ? usd(e.cachesplit_saved_usd) : '—'),
+      kv('Prefix half we moved', e.split_stable_tokens ? compact(e.split_stable_tokens) + ' tok' : '—'),
+      kv('Provider cache saved', priced ? usd(e.cache_saved_usd) : '—'),
       kv('context-guru latency', ms(e.cg_latency_ms)),
       kv('Upstream latency', ms(e.upstream_ms)),
       kv('Restorations', num(e.expands) + ' (' + compact(e.expand_tokens) + ' tok)'),
@@ -1595,7 +1817,8 @@ async function openRequest(id, fromURL) {
         el('thead', {}, el('tr', {},
           el('th', { text: '#' }), el('th', { text: 'Component' }), el('th', { text: 'Kind' }),
           el('th', { class: 'num', text: 'Saved' }), el('th', { class: 'num', text: 'Unique' }),
-          el('th', { class: 'num', text: 'Latency' }), el('th', { text: 'Outcome' }))));
+          el('th', { class: 'num', text: 'Latency' }), el('th', { text: 'Outcome' }),
+          el('th', { text: 'Why declined' }))));
       const tb = el('tbody');
       e.components.forEach((c, i) => {
         const outcome = c.reverted ? ['reverted', 'missing'] : c.skipped ? ['skipped', 'neutral']
@@ -1608,7 +1831,8 @@ async function openRequest(id, fromURL) {
           el('td', { class: 'num', text: compact(c.saved_unique) }),
           el('td', { class: 'num', text: ms(c.duration_ms) }),
           el('td', {}, el('span', { class: 'pill ' + outcome[1], text: outcome[0] }),
-            c.err ? el('div', { class: 's', text: c.err }) : null)));
+            c.err ? el('div', { class: 's', text: c.err }) : null),
+          el('td', {}, gateSummary(c.gates))));
       });
       tbl.appendChild(tb);
       body.appendChild(el('div', { class: 'tblwrap', tabindex: '0' }, tbl));
@@ -1620,12 +1844,15 @@ async function openRequest(id, fromURL) {
     // underwater on a particular KIND of call.
     if (e.extractions && e.extractions.length) {
       body.appendChild(el('h2', { text: 'Compaction model calls' }));
-      const net = e.extractions.reduce((a, x) => a + netUSD(x, e.cache_aware), 0);
+      const perTok = savedPerTok(e);
+      const net = perTok === null ? null
+        : e.extractions.reduce((a, x) => a + netUSD(x, perTok), 0);
       const spent = e.extractions.reduce((a, x) => a + (x.cost_usd || 0), 0);
       body.appendChild(el('div', { class: 'note' },
         `${e.extractions.length} call(s), spent ${usd(spent)}, net `,
-        el('strong', { class: net < 0 ? 'warn-text' : '', text: usd(net) }),
-        net < 0 ? ' — these calls cost more than the tokens they removed were worth.' : '.'));
+        el('strong', { class: net !== null && net < 0 ? 'warn-text' : '', text: usd(net) }),
+        net === null ? ' — this request is not fully priced, so the calls cannot be valued.'
+          : net < 0 ? ' — these calls cost more than the tokens they removed were worth.' : '.'));
       const xt = el('table', { class: 'tbl compact', 'data-testid': 'detail-extractions' },
         el('thead', {}, el('tr', {},
           el('th', { text: '#' }), el('th', { text: 'Component' }), el('th', { text: 'Target' }),
@@ -1635,7 +1862,7 @@ async function openRequest(id, fromURL) {
           el('th', { text: 'Outcome' }))));
       const xb = el('tbody');
       e.extractions.forEach((x, i) => {
-        const n = netUSD(x, e.cache_aware);
+        const n = netUSD(x, perTok);
         xb.appendChild(el('tr', {},
           el('td', { text: i + 1 }),
           el('td', {}, el('code', { text: x.component }),
@@ -1646,7 +1873,7 @@ async function openRequest(id, fromURL) {
           el('td', { class: 'num', text: compact(x.saved_tokens) }),
           el('td', { class: 'num', text: compact(x.prompt_tokens) }),
           el('td', { class: 'num', text: usd(x.cost_usd) }),
-          el('td', { class: 'num ' + (n < 0 ? 'warn-text' : ''), text: usd(n) }),
+          el('td', { class: 'num ' + (n !== null && n < 0 ? 'warn-text' : ''), text: usd(n) }),
           el('td', { class: 'num', text: ms(x.latency_ms) }),
           el('td', {},
             el('span', {
@@ -2376,8 +2603,8 @@ const loaders = {
  * DIMS is every filter dimension, and it is the single list the whole filter layer
  * reads: the URL, the chips, the facet dropdowns and the "why is this empty" copy.
  *
- * The third column is the control, where one exists. `session` and `tenant` have NO
- * control — they are set by drilling in from the Sessions or Tenants table — and that
+ * The third column is the control, where one exists. `session` has NO control — it is set
+ * by drilling in from the Sessions table — and that
  * is exactly what the reported bug was: state.filter was rebuilt from the DOM on every
  * change, so a filter with no control could only be got rid of by pressing Clear, and
  * a filter with no control and no chip could not even be SEEN. Nothing here is
@@ -2397,7 +2624,7 @@ const DIMS = [
   ['thinking', 'thinking', '#f-thinking'],
   ['stop_reason', 'stop reason', '#f-stop_reason'],
   ['session', 'session', null],
-  ['tenant', 'tenant', null],
+  ['tenant', 'tenant', '#f-tenant'],
 ];
 /** The facet dimensions the server can enumerate; the rest are fixed option lists. */
 const FACET_DIMS = ['model', 'provider', 'agent', 'preset', 'mode', 'component',
@@ -2406,12 +2633,29 @@ const FACET_DIMS = ['model', 'provider', 'agent', 'preset', 'mode', 'component',
 /** activeFilters lists the set filters as [key, label, value], time range included. */
 function activeFilters() {
   const out = DIMS.filter(([k]) => state.filter[k]).map(([k, label]) => [k, label, state.filter[k]]);
-  if (state.range > 0) out.push(['range', 'range', rangeLabel()]);
+  if (hasRange()) out.push(['range', 'range', rangeLabel()]);
   return out;
 }
+/**
+ * QUICK_RANGES are the relative windows offered in the popover. The label is also the chip
+ * text and the summary text, so there is one wording per window rather than three.
+ */
+const QUICK_RANGES = [
+  ['now-5m', 'Last 5 minutes'], ['now-15m', 'Last 15 minutes'], ['now-1h', 'Last hour'],
+  ['now-6h', 'Last 6 hours'], ['now-12h', 'Last 12 hours'], ['now-24h', 'Last 24 hours'],
+  ['now-2d', 'Last 2 days'], ['now-7d', 'Last 7 days'], ['now-30d', 'Last 30 days'],
+  [0, 'All time'],
+];
 function rangeLabel() {
-  const opt = $('#f-range').selectedOptions[0];
-  return (opt ? opt.textContent : String(state.range)).toLowerCase();
+  if (state.to === 'now') {
+    const q = QUICK_RANGES.find(([tok]) => tok === state.from);
+    if (q) return q[1].toLowerCase();
+    if (!state.from) return 'all time';
+    return 'since ' + when(resolveTime(state.from, state.nowMs || Date.now()));
+  }
+  const [since, until] = rangeMs();
+  if (!since) return 'up to ' + when(until);
+  return when(since) + ' → ' + when(until);
 }
 /** describeFilters renders the active set the way a person would say it out loud. */
 function describeFilters() {
@@ -2462,22 +2706,127 @@ function setFilter(key, value, opts = {}) {
   syncURL();
   refresh();
 }
-function setRange(msWindow) {
-  state.range = Number(msWindow) || 0;
-  $('#f-range').value = String(state.range);
+/** setRange is the one way the window changes: a quick token, or an absolute pair. */
+function setRange(from, to = 'now') {
+  state.from = from || 0;
+  state.to = to || 'now';
+  syncRangeControl();
   resetPaging();
   syncURL();
   refresh();
 }
 function clearFilters() {
   state.filter = {};
-  state.range = 0;
+  state.from = 0;
+  state.to = 'now';
   for (const [k] of DIMS) syncControl(k);
-  $('#f-range').value = '0';
+  syncRangeControl();
   resetPaging();
   syncURL();
   refresh();
 }
+/**
+ * initRange builds the quick-range buttons and wires the absolute pair. Called once.
+ *
+ * The two <input type="datetime-local"> are the platform's own picker: nothing here needs a
+ * date library, and a native picker is the one a user already knows how to type into.
+ */
+function initRange() {
+  const quick = clear($('#f-range-quick'));
+  for (const [tok, label] of QUICK_RANGES) {
+    quick.appendChild(el('button', {
+      class: 'ghost small', 'data-testid': 'range-' + (tok || 'all'),
+      onclick: () => { $('#f-range').open = false; setRange(tok); },
+    }, label));
+  }
+  $('#f-range-apply').addEventListener('click', () => {
+    const from = localToMs($('#f-from').value);
+    const to = localToMs($('#f-to').value);
+    // Either bound alone is a legitimate window ("everything before Friday"), so this does
+    // not demand both. Both empty means the same as All time.
+    if (!from && !to) { setRange(0); return; }
+    $('#f-range').open = false;
+    setRange(from || 0, to || 'now');
+  });
+  syncRangeControl();
+}
+/** localToMs reads a datetime-local value (no zone, so it is the VIEWER's local time). */
+function localToMs(v) { const t = v ? Date.parse(v) : NaN; return Number.isFinite(t) ? t : 0; }
+/** msToLocal writes one back, in the form the input accepts: YYYY-MM-DDTHH:mm, local. */
+function msToLocal(ms) {
+  if (!ms) return '';
+  const d = new Date(ms - new Date(ms).getTimezoneOffset() * 60000);
+  return d.toISOString().slice(0, 16);
+}
+/** syncRangeControl makes the popover show what state.from/to actually say. */
+function syncRangeControl() {
+  const label = $('#f-range-label');
+  if (!label) return;
+  label.textContent = rangeLabel().replace(/^./, (c) => c.toUpperCase());
+  const [since, until] = rangeMs();
+  // An absolute window fills the inputs; a relative one leaves them empty rather than
+  // printing a resolved instant the window is not actually pinned to.
+  $('#f-from').value = typeof state.from === 'number' && since ? msToLocal(since) : '';
+  $('#f-to').value = state.to === 'now' ? '' : msToLocal(until);
+}
+
+// ── sortable columns ───────────────────────────────────────────────────────
+/**
+ * sortable turns a static <thead> into a sortable one. `keys` is one entry per column, in
+ * column order; a null means that column is not sortable.
+ *
+ * Only wired where the sort can be honest — see sortRows. A <button> inside the <th>, not a
+ * click handler on the <th>, because a header a mouse can activate and a keyboard cannot is
+ * not a control. aria-sort goes on the <th>, which is where a screen reader looks for it.
+ */
+function sortable(tableSel, keys) {
+  const ths = $$('thead th', $(tableSel));
+  keys.forEach((key, i) => {
+    const th = ths[i];
+    if (!th || !key) return;
+    const label = th.textContent;
+    clear(th).appendChild(el('button', {
+      class: 'sort', title: 'Sort by ' + label, onclick: () => toggleSort(key),
+    }, label));
+  });
+  syncSortHeads(tableSel, keys);
+}
+/** syncSortHeads publishes the current sort on the headers. */
+function syncSortHeads(tableSel, keys) {
+  const ths = $$('thead th', $(tableSel));
+  keys.forEach((key, i) => {
+    const th = ths[i];
+    if (!th || !key) return;
+    th.setAttribute('aria-sort', key === state.sort
+      ? (state.dir === 'asc' ? 'ascending' : 'descending') : 'none');
+  });
+}
+/** toggleSort flips direction on the current column, or takes over a new one descending. */
+function toggleSort(key) {
+  state.dir = state.sort === key && state.dir === 'desc' ? 'asc' : 'desc';
+  state.sort = key;
+  resetPaging();
+  syncURL();
+  refresh();
+}
+/**
+ * sortRows sorts a COMPLETE result set in place. Numbers compare numerically, everything
+ * else by locale — one comparator, because a column is one type in every row.
+ *
+ * "Complete" is load-bearing: /api/components returns every row, so sorting it here is the
+ * whole answer. Sessions and Requests are paginated server-side, so the same code applied
+ * there would label a column "Net saved $" and show the top spender of an arbitrary page.
+ * They are deliberately NOT wired — see docs/dashboard.md.
+ */
+function sortRows(rows, key, dir) {
+  const sign = dir === 'asc' ? 1 : -1;
+  return rows.slice().sort((a, b) => {
+    const x = a[key], y = b[key];
+    if (typeof x === 'number' || typeof y === 'number') return sign * ((x || 0) - (y || 0));
+    return sign * String(x || '').localeCompare(String(y || ''));
+  });
+}
+
 /** Push the state value into the control, adding the option if the facets dropped it. */
 function syncControl(key) {
   const dim = DIMS.find(([k]) => k === key);
@@ -2495,6 +2844,9 @@ function resetPaging() { state.reqCursor = 0; state.reqStack = []; state.sessOff
 /** refresh aborts whatever the previous filter state was still fetching, then reloads
  *  the current view, the chips and the facet lists. */
 function refresh() {
+  // ONE clock reading for the whole repaint. Every relative token resolves against it, so
+  // the tiles, the series and the breakdown describe the same window.
+  state.nowMs = Date.now();
   if (state.ac) state.ac.abort();
   state.ac = new AbortController();
   renderChips();
@@ -2514,7 +2866,13 @@ function refresh() {
 function urlFor() {
   const p = new URLSearchParams();
   for (const [k] of DIMS) if (state.filter[k]) p.set(k, state.filter[k]);
-  if (state.range > 0) p.set('range', String(state.range));
+  // from/to rather than one duration, and only when they are not the defaults. `to` is
+  // omitted while it is 'now' so a shared link to a live window stays live for its reader.
+  if (state.from) p.set('from', String(state.from));
+  if (state.to !== 'now') p.set('to', String(state.to));
+  // A sort is a VIEW of the same rows, so it belongs in the URL (a link reproduces what its
+  // author was looking at) but gets no chip: it narrows nothing.
+  if (state.sort && state.view === 'components') { p.set('sort', state.sort); p.set('dir', state.dir); }
   // The open drawer is state too, so a request and a session diff are both linkable and
   // Back dismisses the drawer rather than undoing the last filter change — which was the
   // one thing that made Back dangerous here. `diff` rather than `session` because
@@ -2541,23 +2899,45 @@ function parseURL() {
   const req = Number(p.get('req')) || 0;
   const diff = p.get('diff') || '';
   const acct = p.get('acct') || '';
+  // Legacy `range=<ms>` bookmarks: the same window, said the new way. Kept because links
+  // into this dashboard are pasted into issues and they should not quietly widen to all time.
+  const legacy = Number(p.get('range')) || 0;
+  let from = p.get('from') || (legacy ? 'now-' + legacy + 'ms' : 0);
+  if (legacy) from = legacyFrom(legacy);
   return {
-    view: view || 'overview', filter, range: Number(p.get('range')) || 0,
+    view: view || 'overview', filter,
+    from: numish(from), to: numish(p.get('to') || 'now'),
+    sort: p.get('sort') || '', dir: p.get('dir') === 'asc' ? 'asc' : 'desc',
     drawer: req ? { req } : diff ? { diff } : acct ? { acct } : null,
   };
+}
+/** numish keeps a relative token as a string and an absolute stamp as a number. */
+function numish(v) {
+  if (typeof v !== 'string' || /^now/.test(v)) return v || 0;
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+/** legacyFrom maps an old `range=<ms>` duration onto the nearest relative token. */
+function legacyFrom(ms) {
+  const unit = [['w', 604800000], ['d', 86400000], ['h', 3600000], ['m', 60000], ['s', 1000]]
+    .find(([, u]) => ms % u === 0 && ms >= u);
+  return unit ? 'now-' + ms / unit[1] + unit[0] : 'now-' + Math.round(ms / 1000) + 's';
 }
 /** applyURL makes the page match the address bar. Used on load, on Back/Forward, and
  *  when someone edits the hash by hand — one reader for all three. */
 function applyURL() {
   const want = parseURL();
   state.filter = want.filter;
-  state.range = want.range;
+  state.from = want.from;
+  state.to = want.to;
+  state.sort = want.sort;
+  state.dir = want.dir;
   // state.drawer is adopted BEFORE go(), because go() calls syncURL(replace) and would
   // otherwise rewrite the entry we just navigated to with the drawer we are leaving.
   const prev = state.drawer;
   state.drawer = want.drawer;
   for (const [k] of DIMS) syncControl(k);
-  $('#f-range').value = String(state.range);
+  syncRangeControl();
   resetPaging();
   go(want.view, false);
   syncDrawer(prev);
@@ -2680,11 +3060,10 @@ function renderNoMatch(body, cols, noun) {
 /** suggestDrop measures each filter's cost: the count with that one filter removed. */
 async function suggestDrop(active) {
   const base = { ...state.filter };
-  const baseRange = state.range;
   const counts = await Promise.all(active.map(async ([key]) => {
     const p = new URLSearchParams();
     for (const [k, v] of Object.entries(base)) if (v && k !== key) p.set(k, v);
-    if (baseRange > 0 && key !== 'range') p.set('since', String(Date.now() - baseRange));
+    if (key !== 'range') writeRange(p);
     p.set('limit', '1');
     const res = await fetch('/api/requests?' + p.toString(),
       { headers: { accept: 'application/json' }, signal: state.ac ? state.ac.signal : undefined });
@@ -2722,7 +3101,7 @@ async function loadFacets() {
   // permission boundary, not a view preference.
   const uni = new URLSearchParams();
   if (state.filter.tenant) uni.set('tenant', state.filter.tenant);
-  if (state.range > 0) uni.set('since', String(Date.now() - state.range));
+  writeRange(uni);
   try {
     const [scoped, all] = await Promise.all([
       api('facets'),
@@ -2804,7 +3183,11 @@ function init() {
     if (!ctl || ctl === '#f-q') continue;
     $(ctl).addEventListener('change', (ev) => setFilter(key, ev.currentTarget.value));
   }
-  $('#f-range').addEventListener('change', (ev) => setRange(ev.currentTarget.value));
+  initRange();
+  // Only the components table. Sessions and Requests are LIMIT 25 / LIMIT 50 server-side, so
+  // a client-side sort there would sort ONE PAGE under a header that looks global — see
+  // sortRows and docs/dashboard.md. They stay unsorted until ?sort=/?dir= reach the SQL.
+  sortable('[data-testid=components-table]', COMPONENT_SORT);
   $('#f-dim').addEventListener('change', (ev) => { state.dim = ev.currentTarget.value; loadUsage(); });
   // Debounced, and Enter commits immediately rather than waiting out the delay. The
   // pending timer is dropped on submit so the same query is not sent twice.
@@ -2868,7 +3251,11 @@ function init() {
   // the login form — and after a sign-out — so a page left sitting on the gate produced
   // a 401 every ten seconds forever.
   const gated = () => !$('#gate').hidden;
-  setInterval(() => { if (state.view === 'overview' && !gated()) loadOverview(); }, 10000);
+  // A window whose `to` is absolute cannot gain rows, so repolling it is pure waste — and
+  // on a wide manager scope it is a full-corpus aggregate every ten seconds for no new data.
+  setInterval(() => {
+    if (state.view === 'overview' && !gated() && state.to === 'now') loadOverview();
+  }, 10000);
   setInterval(() => { if (!gated()) { loadFacets(); checkCapture(); } }, 30000);
 }
 
@@ -3163,8 +3550,29 @@ function applyAccount() {
   for (const el of $$('[data-manager]')) {
     el.hidden = account.hosted ? !(t && t.role === 'manager') : !el.hasAttribute('data-local-ok');
   }
+  loadTenantOptions();
 }
 function isManager() { return !!(account.tenant && account.tenant.role === 'manager'); }
+
+/**
+ * loadTenantOptions fills the manager's scope select from the roster. Once per session: the
+ * roster changes when an account is created, which is a page the manager is already on.
+ *
+ * The first two options are in the markup because they are not accounts: '' is the server's
+ * own default (the whole service) and 'me' is the way back to own-only. A failure here leaves
+ * those two, which is a usable control, so it is not reported.
+ */
+async function loadTenantOptions() {
+  const sel = $('#f-tenant');
+  if (!sel || !isManager() || sel.dataset.filled) return;
+  sel.dataset.filled = '1';
+  try {
+    for (const t of (await ctl('/api/tenants')).tenants || []) {
+      sel.appendChild(el('option', { value: t.id }, t.label ? t.email + ' · ' + t.label : t.email));
+    }
+    syncControl('tenant');
+  } catch (_) { /* All accounts / Mine still work */ }
+}
 
 /**
  * probeAccount decides which of the three worlds this page is in: a single-tenant proxy,
@@ -3410,14 +3818,12 @@ function loadSetup() {
 }
 
 // ── settings ───────────────────────────────────────────────────────────────
-function componentPickers(cfgText, opts) {
-  // Parse the pipeline line out of the YAML rather than shipping a YAML parser: the one
-  // field the checkboxes drive is `pipeline: [a, b, c]`, and a full parser for one line
-  // would be a lot of bytes in a page that has no build step.
-  const m = /^pipeline:\s*\[(.*?)\]\s*$/m.exec(cfgText || '');
-  const active = new Set((m ? m[1] : '').split(',').map((s) => s.trim()).filter(Boolean));
-  const all = (opts && opts.components) || [];
-  return { active, all };
+function componentPickers(pipeline, opts) {
+  // The pipeline comes from the server as a resolved list of names (tenant.effective_config).
+  // It used to be scraped out of the YAML text with a regex here, which only understood the
+  // flow style and read an empty pipeline for a `preset:` account — so the grid showed
+  // nothing running on the very configurations that ran the most.
+  return { active: new Set(pipeline || []), all: (opts && opts.components) || [] };
 }
 
 function loadSettings() {
@@ -3433,8 +3839,50 @@ function loadSettings() {
     // EFFECTIVE document — what the proxy actually runs — and when it is inherited they
     // are read-only and labelled as such, because it is not this tenant's choice yet.
     const inherited = !!t.config_inherited;
+    const cfg = t.effective_config || {};
+    const { active, all } = componentPickers(cfg.pipeline, opts);
+    // The descriptors and the recommended prefill, both from /api/options. Nothing about a
+    // field — its name, type, default, enum options, min or hint — is written in this file.
+    const compFields = (opts && opts.component_fields) || {};
+    const recommended = (opts && opts.recommended) || {};
+    // Seeded with ONLY the keys the stored document states. See cfgState — an absent key is
+    // not a zero. Secrets are dropped on the way in as well as on the way out: the server
+    // does not read one back (config.readBlocks skips them), and if some future payload did,
+    // holding it here would put a credential in a form's state and post it straight back.
+    cfgState = {};
+    for (const [cname, vals] of Object.entries(cfg.components || {})) {
+      const secret = new Set((compFields[cname] || []).filter((fd) => fd.secret).map((fd) => fd.key));
+      cfgState[cname] = Object.fromEntries(Object.entries(vals).filter(([k]) => !secret.has(k)));
+    }
+    // A best-effort read of a document the server could not fully load is drawn but never
+    // editable: posting it back would write the fallback's guess over the real thing. The
+    // server refuses that too (409), which is the backstop rather than the only guard.
+    const cfgDisabled = inherited || !!cfg.parse_error;
+
+    // One <details> per component that HAS knobs, drawn from the descriptors. Redrawn in
+    // place when a component is enabled or disabled, or when the recommended values are
+    // taken — cfgState survives a redraw, which is what makes the round trip work.
+    const compHost = el('div', { 'data-testid': 'comp-fields' });
+    const enabledNow = (cname) => {
+      const cb = $('#comp-' + cname);
+      return cb ? cb.checked : active.has(cname);
+    };
+    const drawComps = () => {
+      clear(compHost);
+      for (const cname of all) {
+        const fields = compFields[cname] || [];
+        if (!fields.length) continue; // takes no configuration (cachesplit)
+        if (!cfgState[cname]) cfgState[cname] = {};
+        const off = !enabledNow(cname);
+        compHost.appendChild(renderComponentFields(cname, fields, cfgState[cname],
+          cfgDisabled || off,
+          { recommended: recommended[cname], redraw: drawComps, opts, off }));
+      }
+    };
+    // Still the document itself, for the two things that are ABOUT the document rather than
+    // about its contents: Customise stores a byte-identical copy of the default (comments and
+    // all), and "identical to the current default" is a text comparison.
     const effective = t.effective_config_yaml || t.config_yaml || '';
-    const { active, all } = componentPickers(effective, opts);
 
     // Spend, first: it is what a shared box gets asked about most. Reported only —
     // your traffic runs on YOUR provider credential, so there is nothing to cap.
@@ -3552,7 +4000,7 @@ function loadSettings() {
     const modeSel = el('select', { id: 'set-mode', 'data-testid': 'set-mode' },
       el('option', { value: 'sync' }, 'sync — compaction is applied (requests show Mode "active")'),
       el('option', { value: 'observe' }, 'observe — measure only, requests untouched (Mode "observe")'));
-    modeSel.value = /^mode:\s*observe/m.test(effective) ? 'observe' : 'sync';
+    modeSel.value = cfg.mode === 'observe' ? 'observe' : 'sync';
     modeSel.disabled = inherited;
     if (mgr) {
       host.appendChild(el('div', { class: 'field' },
@@ -3580,7 +4028,10 @@ function loadSettings() {
       const id = 'comp-' + name;
       const cb = el('input', { type: 'checkbox', id, 'data-comp': name, 'data-testid': id });
       cb.checked = active.has(name);
-      cb.disabled = inherited;
+      cb.disabled = cfgDisabled;
+      // Enablement is pipeline membership, so this checkbox is what makes a component's
+      // fields editable — and unticking it is what clears them on save.
+      cb.addEventListener('change', () => drawComps());
       const warn = name === 'extract_llm'
         ? ' — calls a compaction model on the request path (+117ms typical, up to ~945ms on file reads) and bills to the shared credential'
         : '';
@@ -3590,11 +4041,14 @@ function loadSettings() {
     }
     if (mgr) host.appendChild(el('div', { class: 'field' },
       el('label', {}, 'Pipeline components'), grid,
-      el('p', { class: 'hint' }, 'What runs. Run order comes from the YAML below.'),
+      el('p', { class: 'hint' }, 'What runs, in the order shown.'),
       whyBlock('What saving changes',
-        'A newly enabled component is appended at the end of the pipeline — move it in the ' +
-        'YAML below if it belongs earlier. Saving rebuilds your pipeline and discards frozen ' +
-        'compaction decisions, so the next turn will not be cache-warm.')));
+        'A newly enabled component is appended at the end of the pipeline. Ticking one here ' +
+        'is what makes its fields below editable, and unticking one CLEARS the keys it has ' +
+        'in your document — a block is configuration, not enablement, so leaving a block ' +
+        'behind for a component that does not run is the state nobody can read back. ' +
+        'Saving rebuilds your pipeline and discards frozen compaction decisions, so the ' +
+        'next turn will not be cache-warm.')));
 
     // Content capture consent.
     const cap = el('input', {
@@ -3612,22 +4066,67 @@ function loadSettings() {
         '11 of 22 realistic credential shapes passing through it. The manager can read ' +
         'whatever this stores. Off by default.')));
 
-    // The compaction-model form, above the raw YAML it writes into.
-    if (mgr) renderXllmForm(host, effective, inherited);
+    // A stored document the server could not fully load. The fields below are a best-effort
+    // read of it, and saving from them would post whatever that read happened to see — over
+    // an already-broken document, on a page with no YAML box. So say so, and let the server's
+    // 409 be the backstop rather than the only guard.
+    if (mgr && cfg.parse_error) {
+      host.appendChild(el('div', { class: 'state blocked', 'data-testid': 'cfg-unreadable' },
+        el('div', { class: 'state-body' },
+          el('strong', {}, 'Your stored configuration does not load.'),
+          el('span', {}, cfg.parse_error),
+          el('span', {}, 'The controls below are a guess at it and saving them is refused. '
+            + 'A manager can repair the document on this account\u2019s page under Accounts.'))));
+    }
 
-    // Raw YAML, for anything the toggles do not cover.
-    const ta = el('textarea', {
-      id: 'set-yaml', rows: 10, spellcheck: 'false', 'data-testid': 'set-yaml',
-      'aria-label': 'Full configuration, YAML',
-    });
-    ta.value = effective;
-    ta.disabled = inherited;
-    if (mgr) host.appendChild(el('details', { class: 'field' },
-      el('summary', {}, 'Full configuration (YAML)'), ta,
-      el('p', { class: 'hint' }, inherited
-        ? 'The server default, read-only. Customise above to edit it as your own.'
-        : 'Edited here, this wins over the toggles above. Rejected on save if it does not ' +
-          'build, with the offending key named.')));
+    // Every component's configuration, one <details> each, drawn from /api/options.
+    //
+    // There is no YAML editor here any more. It was not a convenience, it was the failure:
+    // the page rewrote the document with regular expressions, which corrupted any config
+    // whose pipeline was written as a block sequence and produced "did not find expected
+    // key" on every save, with no way out from the UI. Fields post fields; the server owns
+    // the document.
+    //
+    // And the fields themselves are not written here either. The hand-written version of
+    // this form covered 18 keys of 97 and one component of fourteen, and every field on it
+    // was a second copy of a fact the server already stated — including a strategy list the
+    // engine had outgrown, which silently rewrote a stored value. So the descriptors decide
+    // what is drawn, and a knob added to a component appears here with no change to this
+    // file.
+    if (mgr) {
+      host.appendChild(el('div', { class: 'field' },
+        el('label', {}, 'Component configuration'),
+        el('p', { class: 'hint' },
+          'Every key each component reads, from the server\u2019s own declarations. A field '
+          + 'left empty is UNSET: the key is removed from your document and the component\u2019s '
+          + 'default decides, which is not the same thing as writing that default down.'),
+        whyBlock('What happens when you save',
+          'These fields are applied to your configuration on the server with a YAML library '
+          + 'and the result is built once before it is stored, so a value that would not work '
+          + 'is a refusal naming the field rather than a surprise on your next turn. A key you '
+          + 'leave empty is REMOVED from the document and the component\u2019s own default '
+          + 'takes over. Saving rebuilds your pipeline and discards frozen compaction '
+          + 'decisions, so the next turn will not be cache-warm.')));
+      host.appendChild(compHost);
+      drawComps();
+    }
+
+    // The whole document, read-only. The fields above are the knobs worth turning from a
+    // page; they are not every key a configuration can hold, and an operator asking "what
+    // am I actually running" deserves the answer rather than an inference from a form. Not
+    // editable: a textarea here is the regex-rewriting save path this page was rebuilt to
+    // remove. Anything the fields do not cover is a manager edit on the account page.
+    if (effective) {
+      host.appendChild(el('details', { class: 'field', 'data-testid': 'full-config' },
+        el('summary', {}, 'Full configuration (read-only)'),
+        el('p', { class: 'hint' },
+          inherited
+            ? 'The server default, which your traffic follows because you have stored no '
+              + 'configuration of your own.'
+            : 'Your stored document, exactly as the proxy builds it. The fields above write '
+              + 'into it; every other key here was set by a manager and is left untouched.'),
+        el('pre', { class: 'code', 'data-testid': 'full-config-yaml' }, effective)));
+    }
 
     // Save covers the upstreams and the capture consent in both states; it leaves the
     // configuration alone while it is inherited (see saveSettings), so saving one of
@@ -3776,345 +4275,274 @@ async function setStoredConfig(yaml) {
 }
 
 /**
- * The compaction-model form.
+ * cfgState is what Save posts as `components`: component name → DOTTED key → value, holding
+ * ONLY the keys the stored document actually states plus the ones edited on this page.
  *
- * extract_llm has fourteen knobs and every one of them is reachable only by hand-editing
- * raw YAML, in a textarea, with no validation until save — and the component's own loader
- * unmarshals its block NON-strictly, so a misspelled key is silently ignored rather than
- * rejected. It is also the one component that spends money, so a typo there is not a typo,
- * it is a bill. Hence a form with the recommended defaults filled in.
+ * The distinction is the whole contract. An absent key means "the component's own default",
+ * which is a DIFFERENT thing from a value — so a key this object does not carry is deleted
+ * from the block on save and the component decides again. Inventing a value for a key the
+ * document never stated is how a save wrote 20 over a deliberate `llm_max_per_session: 0`.
+ * Every control below therefore renders an unstated key as EMPTY with its default as the
+ * placeholder, and only writes into this object when somebody changes it.
  *
- * The YAML textarea stays, as Advanced, and still wins when edited: it is the only way to
- * express anything this form does not cover.
+ * One entry per component with knobs, created on load and kept even when it empties: a name
+ * present in `components` is what tells the server to CLEAR that block, so dropping an
+ * emptied entry would silently ignore a field the operator just cleared.
  */
-const XLLM_DEFAULTS = {
-  per_output: false,
-  size_trigger: false,
-  cold_enabled: true,
-  min_tokens: 2000,
-  max_per_request: 2,
-  max_per_session: 20,
-  aggressiveness: 'medium',
-  context: 'recent',
-  context_messages: 7,
-  cold_min_tokens: 1000,
-};
+let cfgState = null;
 
-/** readXllm pulls the current settings out of a YAML document by regex.
+/** openComps remembers which component sections are unfolded, so redrawing one (the
+ *  recommended button) does not collapse the page under the cursor. */
+const openComps = new Set();
+
+/** fieldDefault is what an ABSENT key means: the descriptor's `default`, and when that is
+ *  omitted the type's zero — the server omits it exactly when it is the zero value. */
+function fieldDefault(fd) {
+  if (fd.default !== undefined && fd.default !== null) return fd.default;
+  switch (fd.type) {
+    case 'bool': return false;
+    case 'int': case 'float': return 0;
+    case 'strings': return [];
+    default: return '';
+  }
+}
+
+/** fieldText renders a value for a text input. */
+function fieldText(fd, v) {
+  return fd.type === 'strings' ? (Array.isArray(v) ? v.join(', ') : String(v || '')) : String(v);
+}
+
+/** XLLM_SWITCHES are the two passes extract_llm can do. Its constructor REFUSES both off
+ *  ("nothing to do"), so the form must not be able to post that combination — see
+ *  config.applyExtractLLMCoupling, which takes the component out of the pipeline instead. */
+const XLLM_SWITCHES = ['per_output', 'cold_cache.enabled'];
+
+/**
+ * renderComponentFields draws ONE component's whole configuration from the descriptors the
+ * server serves at /api/options — no field names, types, defaults, enum options or hints in
+ * this file at all.
  *
- *  Regex, not a YAML parser, for the same reason componentPickers uses one: this file ships
- *  no dependencies. It reads only the keys the form owns and it never WRITES through these
- *  patterns — writeXllm replaces the whole block — so a document shape it misreads costs a
- *  wrong default in the form, never a corrupted config. */
-function readXllm(yaml) {
-  const blk = xllmBlock(yaml);
-  const num = (k, d) => {
-    const m = new RegExp('^\\s*' + k + ':\\s*(\\d+)\\s*$', 'm').exec(blk);
-    return m ? parseInt(m[1], 10) : d;
-  };
-  const str = (k, d) => {
-    const m = new RegExp('^\\s*' + k + ':\\s*([a-z_]+)\\s*$', 'm').exec(blk);
-    return m ? m[1] : d;
-  };
-  const bool = (k, d) => {
-    const m = new RegExp('^\\s*' + k + ':\\s*(true|false)\\s*$', 'm').exec(blk);
-    return m ? m[1] === 'true' : d;
-  };
-  // The cold_cache SUB-BLOCK, read separately: `num('min_tokens')` matches the first
-  // occurrence in the whole block, which is the hot-path threshold — so the sweep's floor was
-  // displayed wrong and then overwritten with the hot-path value on save.
-  const sub = coldSubBlock(blk);
-  const subNum = (k, d) => {
-    const m = new RegExp('^\\s*' + k + ':\\s*(\\d+)\\s*$', 'm').exec(sub);
-    return m ? parseInt(m[1], 10) : d;
-  };
-  const subBool = (k, d) => {
-    const m = new RegExp('^\\s*' + k + ':\\s*(true|false)\\s*$', 'm').exec(sub);
-    return m ? m[1] === 'true' : d;
-  };
-  const cold = sub !== '';
-  return {
-    in_pipeline: pipelineList(yaml).includes('extract_llm'),
-    per_output: bool('per_output', true),
-    size_trigger: str('fire_on', 'pressure') === 'size',
-    cold_enabled: cold ? subBool('enabled', false) : false,
-    min_tokens: num('min_tokens', XLLM_DEFAULTS.min_tokens),
-    max_per_request: num('llm_max_per_request', XLLM_DEFAULTS.max_per_request),
-    max_per_session: num('llm_max_per_session', XLLM_DEFAULTS.max_per_session),
-    aggressiveness: str('aggressiveness', XLLM_DEFAULTS.aggressiveness),
-    context: str('context', XLLM_DEFAULTS.context),
-    context_messages: num('context_messages', XLLM_DEFAULTS.context_messages),
-    cold_min_tokens: subNum('min_tokens', XLLM_DEFAULTS.cold_min_tokens),
-    // Keys the form does not manage, preserved verbatim on save (see writeXllm).
-    keep_lines: unmanagedXllmLines(blk),
-  };
-}
-
-/** pipelineList returns the configured component names. */
-function pipelineList(yaml) {
-  return ((/^pipeline:\s*\[(.*?)\]\s*$/m.exec(yaml) || ['', ''])[1])
-    .split(',').map((x) => x.trim()).filter(Boolean);
-}
-
-/** xllmBlock returns the text of the components.extract_llm block, or ''. */
-function xllmBlock(yaml) {
-  const lines = yaml.split('\n');
-  const start = lines.findIndex((l) => /^\s+extract_llm:\s*$/.test(l));
-  if (start < 0) return '';
-  const indent = lines[start].match(/^\s*/)[0].length;
-  let end = start + 1;
-  while (end < lines.length) {
-    const l = lines[end];
-    if (l.trim() !== '' && l.match(/^\s*/)[0].length <= indent) break;
-    end++;
-  }
-  return lines.slice(start, end).join('\n');
-}
-
-/** coldSubBlock returns the text of the cold_cache: sub-block inside an extract_llm block. */
-function coldSubBlock(blk) {
-  const lines = blk.split('\n');
-  const start = lines.findIndex((l) => /^\s*cold_cache:\s*$/.test(l));
-  if (start < 0) return '';
-  const indent = lines[start].match(/^\s*/)[0].length;
-  let end = start + 1;
-  while (end < lines.length) {
-    const l = lines[end];
-    if (l.trim() !== '' && l.match(/^\s*/)[0].length <= indent) break;
-    end++;
-  }
-  return lines.slice(start, end).join('\n');
-}
-
-/** MANAGED_XLLM_KEYS are the keys the form owns and will rewrite. Everything else in the
- *  block is somebody's deliberate configuration and must survive a save untouched. */
-const MANAGED_XLLM_KEYS = ['per_output', 'fire_on', 'min_tokens', 'llm_max_per_request',
-  'llm_max_per_session', 'aggressiveness', 'context', 'context_messages', 'cold_cache'];
-
-/** unmanagedXllmLines returns the top-level lines of an extract_llm block whose keys the form
- *  does not manage, with their sub-blocks, so a save preserves them.
+ * That is the point. The hand-written version reached 18 keys of 97, one component of
+ * fourteen, and had already drifted: it offered four strategies where the engine parses
+ * five, so a stored `deterministic` was not recognised and got rewritten to `code`, quietly
+ * turning an LLM-free configuration into one that makes model calls. Anything hand-copied
+ * here is a second source of truth for the same fact, which is the bug.
  *
- *  Without this, any manager settings save rewrote the block from the form's fields alone and
- *  silently DELETED rewrite, marker_mode, model, economic_gate, trigger, skip_file_reads and
- *  llm_every_n_requests. Unticking an unrelated component in the grid would have reset
- *  somebody's deliberate compaction configuration. */
-function unmanagedXllmLines(blk) {
-  const lines = blk.split('\n').slice(1); // drop the "extract_llm:" header
-  const out = [];
-  let skipping = false;
-  let skipIndent = 0;
-  for (const l of lines) {
-    if (l.trim() === '') continue;
-    const indent = l.match(/^\s*/)[0].length;
-    if (skipping && indent > skipIndent) continue;
-    skipping = false;
-    const key = (/^\s*([A-Za-z_][\w]*):/.exec(l) || [])[1];
-    if (!key) { out.push(l); continue; }
-    if (MANAGED_XLLM_KEYS.includes(key)) { skipping = true; skipIndent = indent; continue; }
-    out.push(l);
-  }
-  return out;
-}
-
-/** writeXllm returns the document with components.extract_llm replaced by cfg, and the
- *  pipeline updated to match whether the component is wanted at all.
- *
- *  Whole-block replacement rather than per-key edits: a partial edit has to reason about
- *  which keys already exist and at what indentation, which is where a hand-rolled YAML
- *  writer goes wrong. The server validates the result strictly (LoadBytes + a real pipeline
- *  build) and answers 400 naming the offending key, so a document this mangles is rejected
- *  rather than stored. */
-function writeXllm(yaml, cfg) {
-  const wanted = cfg.per_output || cfg.cold_enabled;
-  let out = yaml.replace(/\s*$/, '\n');
-
-  // 1. pipeline membership.
-  const names = pipelineList(out);
-  if (wanted && !names.includes('extract_llm')) {
-    // Before the deterministic `extract` where possible: the cheap pass should see whatever
-    // the LLM pass leaves, which is the order every shipped preset uses.
-    const at = names.indexOf('extract');
-    if (at >= 0) names.splice(at, 0, 'extract_llm'); else names.push('extract_llm');
-  } else if (!wanted) {
-    const at = names.indexOf('extract_llm');
-    if (at >= 0) names.splice(at, 1);
-  }
-  const line = `pipeline: [${names.join(', ')}]`;
-  out = /^pipeline:/m.test(out) ? out.replace(/^pipeline:.*$/m, line) : line + '\n' + out;
-
-  // 2. the block itself.
-  const body = [
-    '  extract_llm:',
-    ...(cfg.keep_lines || []),
-    `    per_output: ${cfg.per_output}`,
-    // fire_on comes from an explicit choice, never from per_output being on. Deriving it
-    // meant a plain save turned the economic gate and the caching-backend guard advisory --
-    // i.e. quietly removed the spending brakes -- as a side effect of ticking a checkbox.
-    `    fire_on: ${cfg.size_trigger ? 'size' : 'pressure'}`,
-    `    min_tokens: ${cfg.min_tokens}`,
-    `    llm_max_per_request: ${cfg.max_per_request}`,
-    `    llm_max_per_session: ${cfg.max_per_session}`,
-    `    aggressiveness: ${cfg.aggressiveness}`,
-    `    context: ${cfg.context}`,
-    `    context_messages: ${cfg.context_messages}`,
-    '    cold_cache:',
-    `      enabled: ${cfg.cold_enabled}`,
-    `      min_tokens: ${cfg.cold_min_tokens}`,
-  ].join('\n');
-
-  const lines = out.split('\n');
-  const start = lines.findIndex((l) => /^\s+extract_llm:\s*$/.test(l));
-  if (start >= 0) {
-    const indent = lines[start].match(/^\s*/)[0].length;
-    let end = start + 1;
-    while (end < lines.length) {
-      const l = lines[end];
-      if (l.trim() !== '' && l.match(/^\s*/)[0].length <= indent) break;
-      end++;
-    }
-    if (!wanted) return lines.slice(0, start).concat(lines.slice(end)).join('\n');
-    return lines.slice(0, start).concat(body.split('\n'), lines.slice(end)).join('\n');
-  }
-  if (!wanted) return out;
-  const ci = lines.findIndex((l) => /^components:\s*$/.test(l));
-  if (ci >= 0) return lines.slice(0, ci + 1).concat(body.split('\n'), lines.slice(ci + 1)).join('\n');
-  return out.replace(/\s*$/, '\n') + 'components:\n' + body + '\n';
-}
-
-/** renderXllmForm draws the compaction-model controls. Manager-only, matching the server:
- *  PUT /api/me answers 403 to anyone else sending config_yaml. */
-function renderXllmForm(host, yaml, disabled) {
-  const cur = readXllm(yaml);
-  const state = {
-    per_output: cur.in_pipeline && cur.per_output,
-    size_trigger: cur.size_trigger,
-    cold_enabled: cur.in_pipeline && cur.cold_enabled,
-    keep_lines: cur.keep_lines,
-    min_tokens: cur.min_tokens,
-    max_per_request: cur.max_per_request,
-    max_per_session: cur.max_per_session,
-    aggressiveness: cur.aggressiveness,
-    context: cur.context,
-    context_messages: cur.context_messages,
-    cold_min_tokens: cur.cold_min_tokens,
+ *   name      component name, used for the ids and for the one coupling below
+ *   fields    the descriptors, in declaration order
+ *   values    this component's entry in cfgState — MUTATED in place as controls change
+ *   disabled  read-only: an inherited configuration, an unreadable one, or a component
+ *             that is not in the pipeline
+ *   ctx       { recommended, redraw, opts }
+ */
+function renderComponentFields(name, fields, values, disabled, ctx) {
+  const { recommended, redraw, opts } = ctx || {};
+  const tid = (key) => 'x-' + name + '-' + key.replace(/\./g, '-');
+  const stated = (key) => Object.prototype.hasOwnProperty.call(values, key);
+  const set = (key, v) => { values[key] = v; };
+  // Deleting, not zeroing: "unset" hands the key back to the component's default, and the
+  // server deletes exactly the declared leaf from the document.
+  const unset = (key) => { delete values[key]; };
+  // Every hint gains what an absent key does, phrased so it stays true whatever the control
+  // currently holds — a live "currently unset" note goes stale the moment somebody types.
+  const hintOf = (fd) => {
+    const def = fieldDefault(fd);
+    const shown = fd.type === 'strings' ? (def.length ? fieldText(fd, def) : 'nothing') : String(def);
+    return (fd.hint ? fd.hint + ' ' : '') + `Unset means ${shown === '' ? 'empty' : shown}.`;
   };
-  xllmState = state;
+  const field = (fd, ctl, ...extra) => el('div', { class: 'field cfg-field' },
+    el('label', { for: tid(fd.key) }, el('code', {}, fd.key)),
+    ctl, el('p', { class: 'hint' }, hintOf(fd)), ...extra);
 
-  const sw = (key, label, hint) => {
-    const cb = el('input', { type: 'checkbox', id: 'x-' + key, 'data-testid': 'x-' + key });
-    cb.checked = !!state[key];
+  // The one place a combination is refused client-side, and it is refused because the
+  // component's constructor refuses it. Rather than redraw, the sibling switch is flipped
+  // in place and the note says what happened and what to do instead.
+  const boxes = {};
+  const note = el('p', { class: 'hint warn-text', role: 'status', 'data-testid': 'cfg-note-' + name });
+  const effective = (key) => {
+    const fd = fields.find((f) => f.key === key);
+    return stated(key) ? values[key] : (fd ? fieldDefault(fd) : false);
+  };
+
+  const sw = (fd) => {
+    const cb = el('input', { type: 'checkbox', id: tid(fd.key), 'data-testid': tid(fd.key) });
+    // The default's own value while unstated: a checkbox cannot draw "absent", but leaving
+    // it alone still posts nothing, so an untouched form adds no key.
+    cb.checked = !!(stated(fd.key) ? values[fd.key] : fieldDefault(fd));
     cb.disabled = disabled;
-    cb.addEventListener('change', () => { state[key] = cb.checked; });
-    return el('div', { class: 'field' },
-      el('label', { class: 'comp', for: 'x-' + key }, cb, el('span', { class: 'comp-name' }, label)),
-      el('p', { class: 'hint' }, hint));
+    boxes[fd.key] = cb;
+    cb.addEventListener('change', () => {
+      set(fd.key, cb.checked);
+      note.textContent = '';
+      if (name !== 'extract_llm' || !XLLM_SWITCHES.includes(fd.key) || cb.checked) return;
+      if (XLLM_SWITCHES.some((k) => effective(k))) return;
+      const other = XLLM_SWITCHES.find((k) => k !== fd.key);
+      set(other, true);
+      if (boxes[other]) boxes[other].checked = true;
+      note.textContent = 'extract_llm with both passes off is a component with nothing to '
+        + 'do — its own constructor refuses that, so ' + other + ' was switched back on. To '
+        + 'stop it running at all, untick extract_llm in Pipeline components above.';
+    });
+    return el('div', { class: 'field cfg-field' },
+      el('label', { class: 'comp', for: tid(fd.key) }, cb, el('span', { class: 'comp-name' }, fd.key)),
+      el('p', { class: 'hint' }, hintOf(fd)));
   };
-  const numField = (key, label, hint) => {
-    const inp = el('input', { type: 'number', min: '0', id: 'x-' + key, 'data-testid': 'x-' + key });
-    inp.value = String(state[key]);
+
+  const numField = (fd) => {
+    // min is semantics, not decoration: 0 on a CAP means unlimited and is a legitimate
+    // choice, while 0 on a size threshold is not a setting, it is a removed brake — and the
+    // server answers 400 for it. Carrying the right min is what stops a user earning that.
+    const min = fd.min || 0;
+    const inp = el('input', {
+      type: 'number', min: String(min), step: fd.type === 'float' ? 'any' : '1',
+      id: tid(fd.key), 'data-testid': tid(fd.key), placeholder: String(fieldDefault(fd)),
+    });
+    inp.value = stated(fd.key) ? String(values[fd.key]) : '';
+    inp.disabled = disabled;
+    const err = el('p', { class: 'hint warn-text', role: 'status', 'data-testid': tid(fd.key) + '-err' });
+    const restore = () => { inp.value = stated(fd.key) ? String(values[fd.key]) : ''; };
+    inp.addEventListener('change', () => {
+      err.textContent = '';
+      const raw = inp.value.trim();
+      if (raw === '') { unset(fd.key); return; }
+      const v = fd.type === 'float' ? Number(raw) : parseInt(raw, 10);
+      if (!Number.isFinite(v)) {
+        err.textContent = 'Not a number. Left as it was; clear the box to use the default.';
+        restore();
+        return;
+      }
+      if (v < min) {
+        err.textContent = min > 0
+          ? `Must be at least ${min}: ${v} here is not a setting, it removes the brake — `
+            + 'every candidate clears a floor of 0. Left as it was.'
+          : 'Cannot be negative. 0 is allowed here and means unlimited.';
+        restore();
+        return;
+      }
+      set(fd.key, v);
+    });
+    return field(fd, inp, err);
+  };
+
+  const textField = (fd) => {
+    const inp = el('input', {
+      type: fd.secret ? 'password' : 'text', id: tid(fd.key), 'data-testid': tid(fd.key),
+      autocomplete: 'off', spellcheck: 'false',
+      placeholder: fd.secret
+        ? 'stored credential kept — type to replace it'
+        : (fd.type === 'strings' ? 'comma separated' : String(fieldDefault(fd))),
+    });
+    // A secret is WRITE-ONLY. The server never reads it back into the form, and this never
+    // puts one in the DOM: a value here would be a credential in every screenshot of this
+    // page. Empty therefore means "leave the stored credential alone" — never "clear it" —
+    // which is the same reading the server has (an absent secret is not a deletion).
+    inp.value = fd.secret || !stated(fd.key) ? '' : fieldText(fd, values[fd.key]);
     inp.disabled = disabled;
     inp.addEventListener('change', () => {
-      const v = parseInt(inp.value, 10);
-      state[key] = Number.isFinite(v) && v >= 0 ? v : XLLM_DEFAULTS[key];
-      inp.value = String(state[key]);
+      const raw = inp.value.trim();
+      if (raw === '') { unset(fd.key); return; }
+      set(fd.key, fd.type === 'strings' ? raw.split(',').map((s) => s.trim()).filter(Boolean) : raw);
     });
-    return el('div', { class: 'field' },
-      el('label', { for: 'x-' + key }, label), inp, el('p', { class: 'hint' }, hint));
+    return field(fd, inp);
   };
-  const pick = (key, label, opts, hint) => {
-    const sel = el('select', { id: 'x-' + key, 'data-testid': 'x-' + key },
-      ...opts.map(([v, t]) => el('option', { value: v }, t)));
-    sel.value = state[key];
+
+  const pick = (fd) => {
+    // The empty option is how an enum gets back to "unset". The server reads an empty enum
+    // as the component's default too, but deleting the key is the honest version of it.
+    const sel = el('select', { id: tid(fd.key), 'data-testid': tid(fd.key) },
+      el('option', { value: '' }, `— default (${fieldDefault(fd)}) —`),
+      ...(fd.options || []).map((v) => el('option', { value: v }, v)));
+    sel.value = stated(fd.key) ? String(values[fd.key]) : '';
     sel.disabled = disabled;
-    sel.addEventListener('change', () => { state[key] = sel.value; });
-    return el('div', { class: 'field' },
-      el('label', { for: 'x-' + key }, label), sel, el('p', { class: 'hint' }, hint));
+    sel.addEventListener('change', () => {
+      if (sel.value === '') unset(fd.key); else set(fd.key, sel.value);
+    });
+    // Whether `source: config` can resolve to anything on THIS deployment. It cannot on the
+    // hosted service, and a page that offers the choice silently is how an account watched
+    // this component run 251 times and make zero model calls.
+    const noStatic = fd.key === 'model.source' && opts && opts.compaction_model === false;
+    return field(fd, sel, noStatic
+      ? el('p', { class: 'hint warn-text' },
+        'THIS DEPLOYMENT HAS NO CONFIGURED COMPACTION MODEL — it deliberately does not spend '
+        + 'the operator’s credential on your traffic. So "config" here means the '
+        + 'component has no model and never makes a call, however else it is configured.')
+      : null);
   };
 
-  host.appendChild(el('details', { class: 'field', 'data-testid': 'xllm-form' },
-    el('summary', {}, 'Compaction model calls (extract_llm)'),
-    el('p', { class: 'hint warn-text' },
-      'This is the only component that spends money to save money, and it can be net '
-      + 'negative. Both switches are off by default. Every call it makes is recorded with '
-      + 'its cost and its saving — open any request to see them.'),
-    sw('cold_enabled', 'Sweep the transcript when the prompt cache has expired',
-      'Fires only on a turn that resumes after the provider\'s cache TTL, where the whole '
-      + 'transcript is re-billed at 1.25x the fresh rate anyway. Measured on this service: '
-      + 'those turns are 4% of requests and 31% of spend, and nothing touches them today. '
-      + 'This is the half whose economics are unambiguous.'),
-    sw('per_output', 'Also reduce large tool outputs as they arrive',
-      'Runs on ordinary turns. On a warm prompt cache a removed token saves only the '
-      + 'cache-read rate, so measured results here range from break-even to underwater, and '
-      + 'each call adds seconds to the turn. Turn it on deliberately, watch the net figure.'),
-    sw('size_trigger', 'Let size alone decide, and make the economic gate advisory',
-      'Off: the gate blocks a call it expects to lose money on, and on a warm prompt cache '
-      + 'that is most of them. On: the threshold and the caps below are the ONLY brakes — the '
-      + 'gate still records what it would have refused (shown on each call) but no longer '
-      + 'stops it. This is a deliberate licence to spend; set the caps first.'),
-    numField('min_tokens', 'Only consider outputs above (tokens)',
-      'The size threshold: below this an output is never a candidate. Whether size is the '
-      + 'WHOLE trigger depends on the switch above.'),
-    numField('max_per_request', 'Max calls per turn',
-      'Bounds one turn\'s added latency. Calls run concurrently, so a turn costs about one '
-      + 'call\'s wall time.'),
-    numField('max_per_session', 'Max calls per session',
-      'The outer bound on spend. The per-turn cap alone cannot bound a long session: 2 calls '
-      + 'across 300 turns is 600 calls. 0 means unlimited.'),
-    pick('aggressiveness', 'How hard to compact', [
-      ['low', 'low — remove only clear redundancy (~10-25%)'],
-      ['medium', 'medium — recommended (~25-50%)'],
-      ['high', 'high — keep what the goal needs (~50-80%)'],
-    ], 'Taught with worked examples rather than a threshold. It changes what the model is '
-      + 'asked for, never what is accepted: ids, paths, numbers and error lines stay '
-      + 'byte-identical at every level, and the original is always recoverable.'),
-    pick('context', 'Conversation the model is shown', [
-      ['goal', 'goal — the task and the latest turn (cheapest)'],
-      ['recent', 'recent — every user turn plus the last N (recommended)'],
-      ['full', 'full — the whole transcript (expensive per call)'],
-    ], 'More context means better decisions and a bigger prompt on every call. A cold-cache '
-      + 'sweep always uses the full transcript regardless of this.'),
-    numField('context_messages', 'N, for "recent"', 'Messages of recent history to include.'),
-    numField('cold_min_tokens', 'Cold sweep: only outputs above (tokens)',
-      'Lower than the everyday threshold on purpose — on that turn every candidate is being '
-      + 're-billed at the write rate whatever we do.'),
-    whyBlock('What happens when you save',
-      'Saving rebuilds your pipeline and discards frozen compaction decisions, so the next '
-      + 'turn will not be cache-warm. The document this form writes is validated on the '
-      + 'server exactly as hand-written YAML is; a rejected save names the offending key.')));
-}
+  const control = (fd) => {
+    switch (fd.type) {
+      case 'bool': return sw(fd);
+      case 'int': case 'float': return numField(fd);
+      case 'enum': return pick(fd);
+      case 'string': case 'strings': return textField(fd);
+      // A type this bundle does not know — the server is newer than the cached page. Shown
+      // with no control rather than as a text box: a string posted where the server wants a
+      // number is a 400, and inventing a control for an unknown type is guessing.
+      default: return el('div', { class: 'field cfg-field' },
+        el('label', {}, el('code', {}, fd.key)),
+        el('p', { class: 'hint warn-text' },
+          `This page does not know the field type “${fd.type}”, so it cannot draw a control `
+          + 'for it. Reload; if it persists, the server is newer than this dashboard and a '
+          + 'manager can set the key on the account page.'),
+        el('p', { class: 'hint' }, hintOf(fd)));
+    }
+  };
 
-/** xllmState holds the form's current values between render and save. One variable because
- *  the form is rendered once per Settings load and read once per save. */
-let xllmState = null;
+  // A component that reaches a model is the one that can cost more than it saves, and that
+  // is read off the descriptors (it has a model block) rather than from a list here.
+  const callsModel = fields.some((fd) => fd.key === 'model.source');
+  const setCount = fields.filter((fd) => stated(fd.key)).length;
+  const det = el('details', { class: 'field comp-fields', 'data-testid': 'cfg-' + name });
+  det.open = openComps.has(name);
+  det.addEventListener('toggle', () => {
+    if (det.open) openComps.add(name); else openComps.delete(name);
+  });
+  det.appendChild(el('summary', {},
+    el('span', { class: 'comp-name' }, name),
+    el('span', { class: 'muted' },
+      ` — ${setCount} of ${fields.length} key${fields.length === 1 ? '' : 's'} set`
+      + (disabled ? ', read-only' : ''))));
+  // Why it is locked, when the reason is this component rather than the whole page (an
+  // inherited or unreadable configuration is stated once, above, not fourteen times).
+  if (ctx && ctx.off) {
+    det.appendChild(el('p', { class: 'hint', 'data-testid': 'cfg-off-' + name },
+      'Not editable here. Tick it under Pipeline components to configure it — a component '
+      + 'that is not in the pipeline does not run, whatever its block says, and switching it '
+      + 'off clears the keys below.'));
+  }
+  if (callsModel) {
+    det.appendChild(el('p', { class: 'hint warn-text' },
+      'This component calls a model to save tokens, so it can be net negative. Every call is '
+      + 'recorded with its cost and its saving — open any request to see them.'));
+  }
+  det.appendChild(note);
+  if (recommended) {
+    det.appendChild(el('div', { class: 'actions' },
+      el('button', {
+        class: 'ghost small', 'data-testid': 'cfg-rec-' + name, disabled: disabled || null,
+        onclick: () => { Object.assign(values, recommended); if (redraw) redraw(); },
+      }, 'Use recommended values')));
+    det.appendChild(el('p', { class: 'hint' },
+      'Recommended is not the same thing as default: the defaults below are what an unset '
+      + 'key means to the component, this is what we suggest you spend, from our own '
+      + 'measurements. It fills the fields in; nothing is saved until you press Save.'));
+  }
+  for (const fd of fields) det.appendChild(control(fd));
+  return det;
+}
 
 async function saveSettings() {
   const status = $('#settings-saved');
   status.textContent = 'saving…';
-  // The textarea wins when the user edited it; otherwise rebuild the pipeline line from
-  // the checkboxes. Two sources for one field, so the precedence has to be explicit —
-  // and "what you typed beats what you clicked" is the order that never surprises.
-  let yaml = isManager() ? $('#set-yaml').value : '';
   const inherited = !!account.tenant.config_inherited;
-  const original = account.tenant.effective_config_yaml || '';
-  if (yaml.trim() === original.trim()) {
-    const picked = new Set($$('#comp-grid input[type=checkbox]')
-      .filter((c) => c.checked).map((c) => c.dataset.comp));
-    // Keep the configured run order for everything still enabled; a newly ticked
-    // component is appended, never inserted, because this grid does not know where in
-    // the pipeline it belongs.
-    const prev = (/^pipeline:\s*\[(.*?)\]\s*$/m.exec(original) || ['', ''])[1]
-      .split(',').map((x) => x.trim()).filter(Boolean);
-    const ordered = prev.filter((n) => picked.has(n))
-      .concat([...picked].filter((n) => !prev.includes(n)));
-    const mode = $('#set-mode').value;
-    yaml = yaml.replace(/^pipeline:.*$/m, `pipeline: [${ordered.join(', ')}]`);
-    if (!/^pipeline:/m.test(yaml)) yaml = `pipeline: [${ordered.join(', ')}]\n` + yaml;
-    yaml = /^mode:/m.test(yaml) ? yaml.replace(/^mode:.*$/m, `mode: ${mode}`) : yaml + `\nmode: ${mode}\n`;
-    // The form last, so it owns the extract_llm block and the component's presence in the
-    // pipeline — otherwise the checkbox grid and the form would disagree about whether the
-    // component runs, and whichever wrote last would win by accident.
-    if (xllmState) yaml = writeXllm(yaml, xllmState);
-  }
+  const prev = (account.tenant.effective_config || {}).pipeline || [];
+  const picked = new Set($$('#comp-grid input[type=checkbox]')
+    .filter((c) => c.checked).map((c) => c.dataset.comp));
+  // Keep the configured run order for everything still enabled; a newly ticked component is
+  // appended, never inserted, because this grid does not know where in the pipeline it
+  // belongs.
+  const ordered = prev.filter((n) => picked.has(n))
+    .concat([...picked].filter((n) => !prev.includes(n)));
   const body = {
     capture_content: $('#set-capture').checked,
     up_anthropic: $('#set-up_anthropic').value,
@@ -4127,7 +4555,17 @@ async function saveSettings() {
   // Never sent by a plain account: the pipeline is the manager's field, and PUT /api/me
   // answers 403 to anyone else — sending it would fail the whole save, upstreams and
   // capture consent included.
-  if (!inherited && isManager()) body.config_yaml = yaml;
+  // Never posted from a form the server told us was a guess: the fields would carry the
+  // fallback's reading of a document nobody can see. The server refuses this too (409).
+  const unreadable = !!(account.tenant.effective_config || {}).parse_error;
+  if (!inherited && isManager() && !unreadable) {
+    // components carries, per component, ONLY the dotted keys the form actually holds a
+    // value for. A key that is not here is DELETED from the block on the server and the
+    // component's own default takes over, which is the same thing an absent key means — so
+    // the page must not invent one. A component present with an empty object is how a
+    // cleared block is expressed; a component absent from it entirely is left untouched.
+    body.config = { pipeline: ordered, mode: $('#set-mode').value, components: cfgState || {} };
+  }
   try {
     const out = await ctl('/api/me', { method: 'PUT', body: JSON.stringify(body) });
     account.tenant = out.tenant;
@@ -4268,10 +4706,19 @@ async function loadTenants() {
         // The EFFECTIVE answer to "are this account's transcripts being kept", which is
         // the AND of both gates — never the account's flag on its own.
         el('td', {}, captureCell(t.capture_content, operatorGate)),
-        // The EFFECTIVE first line, plus whose it is: an account that follows the
-        // default stores nothing, and an empty cell would read as a broken account.
+        // The EFFECTIVE pipeline, plus whose it is: an account that follows the default
+        // stores nothing, and an empty cell would read as a broken account.
+        //
+        // Not the document's first line, which is what this cell used to show. Since the
+        // settings form writes the document through a YAML marshaller its keys come out
+        // alphabetically, so line one is the word `components:` for every account that has
+        // ever saved — a cell that reads as "configured with no components" on exactly the
+        // accounts that are configured. The pipeline is the fact anyone opens this column
+        // for anyway.
         el('td', {},
-          el('code', { class: 'clip' }, (t.effective_config_yaml || '').split('\n')[0] || '—'),
+          el('code', { class: 'clip' },
+            ((t.effective_config || {}).pipeline || []).join(' → ')
+            || (t.effective_config_yaml ? 'no components' : '—')),
           t.config_inherited ? el('div', { class: 'muted small' }, 'server default') : null),
         // Two buttons, not five. Everything that CHANGES this account — its configuration,
         // its variant, disable, a reissued token, a reset, purge, delete — is in the editor,
@@ -4651,6 +5098,7 @@ async function loadVariants() {
       el('th', {}, 'Variant'), el('th', {}, 'Accounts'), el('th', {}, 'Requests'),
       el('th', {}, 'Tokens in → out'), el('th', {}, 'Saved'), el('th', {}, 'Spent'),
       el('th', {}, 'Spent / request'), el('th', {}, 'Saved (est.)'),
+      el('th', {}, 'Prefix split'), el('th', {}, 'Provider cache'),
       el('th', {}, 'Unpriced'))));
   const body = el('tbody');
   for (const v of rows) {
@@ -4680,6 +5128,14 @@ async function loadVariants() {
         el('span', { class: 'denom' }, 'not per task')),
       el('td', {}, usd(v.saved_usd),
         el('span', { class: 'denom' }, 'counterfactual')),
+      // Beside it, because an arm that compacts deeper can win on the column above while
+      // losing more than that on the cache it destroyed. Both figures, because they answer
+      // different questions: ours is what the prefix split earned in this arm, the provider's
+      // is the control variable — the thing a deep pipeline silently spends.
+      el('td', {}, usd(v.cachesplit_saved_usd),
+        el('span', { class: 'denom' }, 'prefix split, ours')),
+      el('td', {}, usd(v.cache_saved_usd),
+        el('span', { class: 'denom' }, 'provider cache')),
       // Rows the provider priced for nobody. Where this approaches the request count, the
       // money columns on this row are unknown rather than small.
       el('td', {}, num(v.incomplete_rows),
