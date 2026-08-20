@@ -265,6 +265,15 @@ type Ctx struct {
 	// on the very requests where the mechanism had just run — and everything downstream
 	// derives "did it do anything" from that.
 	SystemSplit bool
+	// ToolSchema says the host already stripped JSON-Schema annotation keywords from
+	// the top-level `tools` array for this request. Only `toolschema` reads it, and
+	// only to report itself honestly — same arrangement, same reason, as SystemSplit.
+	ToolSchema bool
+	// FilteredDecls is how many tool/MCP declarations the host dropped from `tools` on
+	// this request under the account's opt-in removal list. Set for the same reason
+	// ToolSchema is: `tools` is a top-level field no component can see, so toolfilter
+	// would otherwise report itself as skipped on every request where it just acted.
+	FilteredDecls int
 }
 
 // effMode is Ctx.Mode with the zero value normalized to sync, so a Ctx built by older
@@ -297,6 +306,25 @@ func (c *Ctx) TailOnly(i int) bool {
 		return true
 	}
 	return i > c.MaxCachedIdx
+}
+
+// TailOnlyCold is TailOnly with the depth restriction lifted on a turn whose prompt cache
+// is provably gone (ColdCache), for a component that opted in.
+//
+// The opt-in is per component and off by default. When ColdCache is right there is no
+// prefix to disturb, so acting at depth is free by construction — but when it is WRONG the
+// component flips content the provider is still holding and forces a cache-write of the
+// whole suffix at 1.25x the fresh rate. A missed cold turn only forgoes a saving, so the
+// asymmetry decides the default. See docs/design.md.
+//
+// Only safe for a component whose replacement is a pure function of (content, config) —
+// the same property repairLostFreeze requires — because the decision it makes at depth is
+// frozen and replayed on every later (warm) turn.
+func (c *Ctx) TailOnlyCold(i int, optIn bool) bool {
+	if c != nil && optIn && c.ColdCache {
+		return true
+	}
+	return c.TailOnly(i)
 }
 
 // Stats returns the per-filter ledger sink, or nil in observe mode.

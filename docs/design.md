@@ -11,11 +11,11 @@ infrastructure the components sit on.
 | Package | Role |
 |---|---|
 | `components/` | `Component`/`Reformat`/`Offload` interfaces, `Report`, `Ctx`, the `Pipeline`, the registry |
-| `components/reformat/` | lossless components: `format`, `toon`, `cacheinject`, `cachesplit` |
+| `components/reformat/` | lossless components: `format`, `toon`, `searchfold`, `cacheinject`, `cachesplit` |
 | `components/offload/` | lossy-reversible components: `skeleton`, `dedup`, `collapse`, `failed_run`, `cmdfilter`, `extract`, `extract_llm`, `smartcrush`, `mask`, `summarize` |
 | `components/dsl/` | declarative text-filter engine (wrapped by `cmdfilter`) |
 | `components/all/` | blank-imports every component so `init()` registrations run |
-| `schema/` | helpers over bifrost's schema: token counting, deep-clone, `MessageText`/`SetMessageText`, `Rewritable` |
+| `schema/` | helpers over bifrost's schema: token counting, deep-clone, `MessageText`/`SetMessageText`, `Rewritable`, `ToolCalls` (pairs a tool result with the call that produced it) |
 | `apply/` | the one place the pipeline meets a raw wire body: extract `messages` → run → byte-lossless splice |
 | `expand/` | reversibility: `<<cg:HASH>>` marker, the `context_guru_expand` tool def, response parsing + continuation |
 | `store/` | `Store` interface + in-memory TTL+LRU backend (rewind + sticky ids) |
@@ -257,6 +257,122 @@ set — the payload need not survive, only the knowledge that it existed):
   disabled — a repair that can splice different bytes is not a repair worth keeping behind a flag.
   `cg:res:` also unifies what were two keys (`cg:res:` + `cg:sum1:`) into one JSON value, so the
   projection and its summary line cannot half-survive a drop.
+
+### The one turn where depth is free: `cold_cache`
+
+The tail gate protects the provider's cached prefix. On a turn whose prompt cache has **provably
+expired** there is no prefix left to protect — the whole transcript is being re-billed as cache
+creation at 1.25x the fresh rate regardless of what we do — so restricting a deterministic
+offloader to the tail buys nothing on exactly the most expensive turns there are.
+
+`mask`, `failed_run` and `collapse` therefore take a `cold_cache` option (default **off**). When
+it is set and `Ctx.ColdCache` is true, `Ctx.TailOnlyCold` lifts the depth restriction for **new**
+decisions; the decision is then frozen and replayed byte-for-byte on every later warm turn, so the
+new prefix is as cache-stable as one established in the tail. Everything else is unchanged: the
+never-worse, `skipReduce` and kept-verbatim guards still apply, and with `cold_cache` unset — or on
+a warm turn — behaviour is byte-identical to the tail gate alone (`cold_gate_test.go`).
+
+Only components whose replacement is a pure function of `(content, config)` may opt in, the same
+requirement `repairLostFreeze` has, because the bytes decided at depth on a cold turn must be
+re-derivable on every warm turn that follows. That is why the option exists on these three and
+not on `extract_llm`, which has its own sampled-output sweep instead.
+
+**Why the default is off.** The two errors are not symmetric. A missed cold turn only forgoes a
+saving; a *wrong* cold reading makes the component rewrite a prefix the provider is still holding
+and forces a cache-write of the whole suffix at 1.25x fresh — 12.5x the cache-read price it was
+paying. Detection is deliberately conservative (TTL read out of the request, one-hour outer bound
+for providers that declare none, a minute of margin, and "no previous turn on record" reads WARM),
+but two paths can still fabricate coldness, and neither is instrumented today:
+
+- a client that asks for `ttl: "1h"` on one turn and a bare `ephemeral` mark on the next — the TTL
+  is read from **this** request, so the prefix would be judged cold at six minutes while the
+  provider holds it for an hour;
+- a prefix touched under a different session id than the one the idle clock is kept under
+  (`session.Scoped` falls back to a `system + first user` hash), which leaves our `prevAt` stale
+  while the provider's entry stays warm.
+
+Both are rare on real Claude Code traffic — every one of ~5,000 captured requests carries a bare
+`ephemeral` mark — and both are the expensive direction, which is the whole reason an operator has
+to ask for this rather than inherit it.
+
+**What "cold" was actually verified to mean.** Note that the dashboard's `ttl_expiry` bucket cannot
+be used to check this: `Event.AttributeCache` only reaches it when `cache_read == 0`, so it agrees
+with the runtime predicate by construction. Checked instead against the recorded upstream usage of
+the bench cold session (`cg-research/bench`, epoch-ms `ts` per request, gap to the previous request
+of the same session): the predicate fires on **4** of the 9 requests, and **3 of those 4 recorded
+`cache_read = 0`**. The fourth (gap 437s) read exactly **54,800** tokens — Claude Code's shared
+`system` + `tools` prefix, which other traffic on the same gateway keeps warm — while the session's
+own message history was cache-*written* in full (88,154 tokens).
+
+That is the precise form of the guarantee, and it is narrower than "nothing is cached":
+
+> `ColdCache` means **this session's own message prefix** is gone. It does **not** mean
+> `cache_read == 0`, because a shared `system`/`tools` prefix can stay warm across the gap.
+
+Which is exactly enough for these three components, since they only ever rewrite `messages`. It is
+**not** enough for anything that would mutate `system` or `tools` on a cold reading — that could
+break a prefix another tenant is keeping warm — so the lift is deliberately not offered there. Four
+predicate firings in one session is a thin basis; a deployment enabling this should watch
+`cache_miss_reason` and `frozen_flips` on its own traffic first.
+
+**The predictor is trusted, and the outcome is not checked — state that, because it is the real
+ceiling here.** Every request's recorded `usage` says after the fact whether `cache_read` was 0, so a
+wrong prediction is *observable* but nothing feeds it back: the component acts on the prediction and
+never learns that the session's last cold reading was wrong. The price of one false positive is the
+whole suffix re-written at the cache-write rate against an upside priced at the cache-read rate —
+roughly **12.5:1 against**, per token, before counting the re-anchor. That is the entire reason for
+the default, and it is also why the honest upgrade path is *outcome*-driven rather than a better
+clock: record per session whether the previous cold prediction came back with `cache_read = 0`, and
+stop trusting the predictor for that session when it did not. The recorder already has the number
+(`dash/event.go`), so this is plumbing, not new measurement — but it is not built, and until it is,
+"cold" here means "the clock says so", checked against 4 real firings in one session.
+
+**It cannot widen the `MaxCachedIdx < 0` hole.** A compaction reset opens the boundary to -1 on
+turns that then cache-HIT, and there `TailOnly` already returns true for every index — the lift adds
+nothing, because `TailOnlyCold` is a pure widening that only fires when the component opted in *and*
+the cache is cold (`TestTailOnlyColdOnlyWidensWhenOptedInAndCold`). `collapse` is the only component
+whose exposure to that hole changes, and it *narrows*: it had no boundary check at all before.
+
+**Measured delta, and it is much smaller than the headroom suggests.** On the deployment's own
+dashboard DB over 2.4 days (14,407 requests, read-only snapshot), TTL-expired turns were 3.46% of
+requests but **$564.38 = 22.06% of all spend**, the pipeline realized **$0.50** on them, and
+**92.54%** of their tokens were withheld as frozen. That 92.5% is what this option unfreezes — and
+almost none of it turns out to be mass these components can compact.
+
+Replayed through `apply/sweep_capture_test.go` (`CG_SWEEP_YAML` A/B, config the only difference,
+n=3 — the arms are deterministic and repeated **byte-identically**, zero variance):
+
+| corpus | pipeline | removed, gate as-is | with `cold_cache` | delta | of transcript |
+|---|---|---|---|---|---|
+| bench `cold.jsonl` — 9 requests, **3 verified `cache_read=0` / `ttl_expiry`** | `general` shape | 96,940 | 97,558 | **+618** | +0.37% |
+| SWE-bench, 300 requests, every turn forced cold | `general` shape | 950,532 | 973,120 | **+22,588** | +1.19% |
+| one real Claude Code session, 35 requests, every turn forced cold | `general` shape | 1,004,216 | 1,119,523 | **+115,307** | +7.14% |
+| SWE-bench, 300 requests, every turn forced cold | **as deployed** (`failed_run` only) | 33,695 | 38,249 | **+4,554** | +0.24% |
+
+Priced at the deployment's own measured cold rate ($564.38 / 31.2M tokens = **$18.07/MTok**, an
+opus-class cache-write), those shares are worth **$2.09 – $40.29** of the same 2.4-day window of
+cold traffic on a `general`-shaped pipeline, and **$0 – $1.36** on the pipeline as actually deployed,
+which runs neither `mask` nor `collapse`. Against the $0.50 realized today that is a large *ratio*
+and a small *number*: the honest claim is single-digit-to-low-tens of dollars over two days, not the
+$564 the cold turns cost. The remaining 92% of a cold turn is assistant text, small tool outputs and
+content below every floor — the gate was never what stood in the way.
+
+Three caveats that belong with the numbers:
+
+- **3 genuinely cold requests is a thin evidence base.** In the bench cold arm only 3 of 9 requests
+  recorded `cache_read = 0`; Claude Code's ~54.8k-token system+tools prefix is shared and kept warm
+  by other traffic on the same gateway, so the earlier post-gap turns are not cold at all. The
+  larger corpora are *forced* cold on every turn, which is not a realistic mix — it is an upper
+  bound on steady-state behaviour, not a projection.
+- **`removed > attempted` is not a saving.** `attempted_tokens` is derived from the tail boundary,
+  so it does not widen when the gate lifts (nor did it account for `collapse` ignoring the gate
+  entirely). On a *cold* turn the excess is real removal, because there is no live cache to
+  invalidate; on a warm turn the same shape would be invalidation. Read the two apart before
+  quoting either.
+- **It overlaps `extract_llm`'s cold sweep.** Both target the same tokens on the same turns. The
+  deterministic pass runs first and costs nothing, and on the measured window the LLM cold path
+  spent $12.71 to save 3,161 tokens — 4x worse per token than its own warm path. If both are
+  enabled, the sweep should fire *less* on cold turns, not more.
 
 `/stats` reports `frozen_hits`, `frozen_misses`, `frozen_dropped`, `frozen_repaired`, and
 `frozen_flips` (= dropped − repaired; should be 0). `frozen_misses` is a *lookup* counter dominated

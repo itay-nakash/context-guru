@@ -94,6 +94,7 @@ nav:
       - Reversibility & recovery: how-to/recover-context.md
       - When your agent compacts: how-to/agent-compaction.md
       - Measuring savings: how-to/measure-savings.md
+      - Stop carrying unused tools: how-to/declaration-removal.md
   - Components:
       - Overview: components.md
       - Choose a preset: how-to/choose-a-preset.md
@@ -101,11 +102,15 @@ nav:
       - Reformat:
           - format: components/format.md
           - toon: components/toon.md
+          - textclean: components/textclean.md
           - cachesplit: components/cachesplit.md
           - cacheinject: components/cacheinject.md
+          - toolschema: components/toolschema.md
+          - toolfilter: components/toolfilter.md
       - "Offload (reversible)":
           - skeleton: components/skeleton.md
           - dedup: components/dedup.md
+          - readlifecycle: components/readlifecycle.md
           - collapse: components/collapse.md
           - failed_run: components/failed_run.md
           - cmdfilter: components/cmdfilter.md
@@ -127,6 +132,8 @@ nav:
       - Config & environment: reference/config.md
       - Settings form & field descriptors: how-to/settings-form.md
   - Dashboard: dashboard.md
+  - Tool inventory: tool-inventory.md
+  - Inventory page (UI): dashboard-inventory-page.md
   - Hosted service: hosted.md
   - Results:
       - Overview: RESULTS.md
@@ -136,6 +143,9 @@ nav:
       - Component internals & examples: results/components.md
       - Reproduce the results: results/REPRODUCE.md
       - Improvement plan: results/improvement-plan.md
+      - "Measured, Aug 2026: this branch": results/branch-2026-08-19.md
+      - "Why below_trigger is not the trigger": results/below-trigger-2026-08.md
+      - "The flattened one-message class": results/flattened-compaction-2026-08.md
       - "SWE-bench Verified: per-arm detail":
           - baseline: results/baseline.md
           - context-guru: results/context-guru.md

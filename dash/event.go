@@ -33,12 +33,36 @@ const (
 // "Why didn't you compact this?" — a first-class reason bucket, not an absence of
 // data. An empty string means we DID compact.
 const (
-	ReasonBypassed     = "bypassed"      // x-context-guru-bypass on this request
-	ReasonNoMessages   = "no_messages"   // nothing to operate on
-	ReasonBelowTrigger = "below_trigger" // every component's trigger declined
-	ReasonAllFrozen    = "cache_frozen"  // eligible tail was empty (cache safety)
-	ReasonNoSavings    = "found_nothing" // components ran, found nothing to remove
-	ReasonReverted     = "reverted"      // components acted but were all reverted
+	ReasonBypassed   = "bypassed"      // x-context-guru-bypass on this request
+	ReasonNoMessages = "no_messages"   // nothing to operate on
+	ReasonAllFrozen  = "cache_frozen"  // eligible tail was empty (cache safety)
+	ReasonNoSavings  = "found_nothing" // components ran, found nothing to remove
+	ReasonReverted   = "reverted"      // components acted but were all reverted
+	// No component mutated anything. These two replace ReasonBelowTrigger, which named a
+	// mechanism that was not the cause and cost a whole investigation to disprove:
+	// components.Trigger is not consulted in this decision at all, and of the eight
+	// components in the default preset only extract_llm ever calls Trigger.Fires. The label
+	// nonetheless read "every component's trigger declined", which was reported upward as
+	// "$744.62 of spend was gated by the trigger" and sent an agent off tuning triggers whose
+	// measured counterfactual on interactive traffic was $0.00.
+	//
+	// What actually happens, measured over the 7,660 affected requests on the production
+	// corpus: every deployed offloader and both JSON reformatters gate on `role == tool`, so a
+	// request carrying no tool output has nothing any of them can rewrite, whatever any
+	// trigger says. 4,199 of those requests (206.9M tokens, 54.3% of the gated total) carry
+	// four messages or fewer and therefore hold no tool_result block at all — the largest
+	// single group being 734 claude-cli requests averaging 120,245 tokens with ONE message and
+	// ZERO tools, which is Claude Code's own summarisation call flattening a transcript into a
+	// single user text block. The rest are long transcripts 65–89% frozen whose eligible tail
+	// holds no recognised candidate.
+	//
+	// So the reason splits in two, on a fact the row already carries:
+	ReasonNoToolOutput = "no_tool_output" // the request declared no tools: no tool_result to rewrite
+	ReasonNoCandidate  = "no_candidate"   // tools present, nothing any component recognised
+	// ReasonBelowTrigger is retained for READING rows written before the rename. Never emitted.
+	// The UI labels it with the same words as ReasonNoCandidate so one history does not read as
+	// two mechanisms.
+	ReasonBelowTrigger = "below_trigger"
 )
 
 // Operating modes, as rendered in the UI.
@@ -102,6 +126,15 @@ type Event struct {
 	// it seeds the per-session comparison across a restart, and it lets the whole figure be
 	// recomputed from the table rather than trusted.
 	SplitTailHash uint64 `json:"split_tail_hash"`
+	// FilteredDeclTokens is what the declaration filter stopped carrying on this request —
+	// the token weight of the `tools` elements it removed under the account's opt-in list.
+	//
+	// It is a TOKEN count and not a dollar figure on purpose: what those tokens would have
+	// cost depends on the tier this same row was billed at (cache_read 0.1x, cache creation
+	// 1.25x, fresh 1.0x), and those columns are right here — so the price is computed by the
+	// query that reads them together rather than frozen into a second column that could
+	// disagree with them. See DB.DeclFilterSavings.
+	FilteredDeclTokens int `json:"filtered_decl_tokens"`
 
 	CGLatencyMs float64 `json:"cg_latency_ms"`
 	UpstreamMs  float64 `json:"upstream_ms"`
@@ -248,6 +281,13 @@ func (e *Event) Redact() {
 		e.Extractions[i].Before = RedactContent(e.Extractions[i].Before, e.ContentCap)
 		e.Extractions[i].After = RedactContent(e.Extractions[i].After, e.ContentCap)
 		e.Extractions[i].Summary = RedactContent(e.Extractions[i].Summary, e.ContentCap)
+		// And the REJECTION slug, which is the one field here that is stored whether or not
+		// the account consented to content capture. It is not always a slug: the
+		// "model call failed" leg carries the upstream error verbatim (cheapmodel clips a
+		// non-2xx body into the message), so a gateway that echoes the presented credential
+		// in a 401 would put it on disk and on a dashboard row. Cap 0: this is a short
+		// diagnostic, so it is scrubbed but never truncated.
+		e.Extractions[i].Rejection = RedactContent(e.Extractions[i].Rejection, 0)
 	}
 }
 
@@ -359,6 +399,7 @@ func (e *Event) FromTrace(tr apply.Trace, uniqueSaved map[string]int) {
 	e.CacheBPMessages = tr.Breakpoints.Messages
 	e.CacheBPBlocks = tr.Breakpoints.Blocks
 	e.SplitStableTokens, e.SplitTailHash = tr.SplitStableTokens, tr.SplitTailHash
+	e.FilteredDeclTokens = tr.FilteredDeclTokens
 	if tr.Bypassed {
 		e.Mode = ModeBypass
 	} else if e.Mode == "" {
@@ -437,7 +478,13 @@ func uncompressedReason(e *Event, tr apply.Trace) string {
 		}
 	}
 	if acted == 0 {
-		return ReasonBelowTrigger
+		// A request that declared no tools cannot contain a tool_result, and every deployed
+		// component rewrites nothing else. That is a property of the request, not a decision
+		// any trigger made. Meta is filled before FromTrace runs, so Tools is in hand here.
+		if e.Tools == 0 {
+			return ReasonNoToolOutput
+		}
+		return ReasonNoCandidate
 	}
 	return ReasonNoSavings
 }

@@ -22,8 +22,10 @@ func init() { components.Register("cmdfilter", newCmdfilter) }
 
 // Cmdfilter shrinks tool-output messages with declarative DSL filters. It is an
 // Offload: it stashes the original before filtering so the expand tool can
-// recover it. Filters match on the tool output's first non-empty line (the
-// proxy-world stand-in for rtk's shell command).
+// recover it. Filters match on the tool output's first few non-empty lines AND,
+// when the transcript pairs the result with its call (schema.ToolCalls), on a
+// leading `$ <command>` line — so a filter can key on the command that produced
+// the output the way rtk's do, not only on the output's shape.
 type Cmdfilter struct {
 	reg     *dsl.Registry
 	mode    markerMode
@@ -35,6 +37,7 @@ type cmdfilterConfig struct {
 	DisableBuiltins bool     `yaml:"disable_builtins"` // skip the bundled starter filters
 	MarkerMode      string   `yaml:"marker_mode"`      // full (default) | summary | off
 	MinSize         *int     `yaml:"min_size"`         // byte floor below which filtering isn't worth a marker
+	AgentFilters    string   `yaml:"agent_filters"`    // off (default) | safe | lossy — the ledger-derived coding-agent sets
 }
 
 // defaultMinSize is the byte floor below which a filter isn't attempted at all.
@@ -72,7 +75,13 @@ func newCmdfilter(raw []byte) (components.Component, error) {
 			return nil, err
 		}
 	}
-	for _, doc := range cfg.Filters {
+	// The ledger-derived sets are OPT-IN so that codesmart/codesafe — the published
+	// SWE-bench arms — keep their measured baseline. See cmdfilter_agentcmd.go.
+	extra, err := agentFilterDocs(cfg.AgentFilters)
+	if err != nil {
+		return nil, err
+	}
+	for _, doc := range append(extra, cfg.Filters...) {
 		if err := reg.Load([]byte(doc)); err != nil {
 			return nil, err
 		}
@@ -91,6 +100,7 @@ func (f *Cmdfilter) Enabled(*components.Ctx) bool { return f.reg.Len() > 0 }
 func (f *Cmdfilter) Offload(req *schemas.BifrostChatRequest, rep *components.Report, c *components.Ctx) ([]string, error) {
 	var keys []string
 	changed := 0
+	pairs := schema.ToolCalls(req)
 	for i := range req.Input {
 		m := &req.Input[i]
 		if m.Role != schemas.ChatMessageRoleTool {
@@ -116,7 +126,11 @@ func (f *Cmdfilter) Offload(req *schemas.BifrostChatRequest, rep *components.Rep
 			continue
 		}
 		key := selectorKey(content)
-		filt := f.reg.Match(key)
+		// Additive: the shape key is unchanged, a `$ <command>` line is PREPENDED when
+		// the producing call is known. A filter that matched on shape still matches
+		// (match regexes are (?m) and scan the whole key); one anchored on `^\$ ` now
+		// matches by command as well.
+		filt := f.reg.Match(matchKey(pairs[i], key))
 		if filt == nil {
 			if fs := c.Stats(); fs != nil {
 				// The miss ledger: it turns "which filter to write next" into data
@@ -250,6 +264,26 @@ func selectorKey(content string) string {
 	return strings.Join(head, "\n")
 }
 
+// matchKey is the string a filter's match regex is tested against: the output-shape
+// selector, prefixed with `$ <command>` when the request pairs this tool result with
+// the call that produced it.
+//
+// The `$ ` sigil is what keeps command matching from colliding with shape matching —
+// a shape signature is a line of program output, which does not start with a shell
+// prompt. The ledger key stays shape-only (see the FilterMiss call site): commands
+// carry paths and arguments, so keying the bounded miss ledger on them would make
+// almost every entry unique.
+func matchKey(tc schema.ToolCall, shape string) string {
+	cmd := tc.Command()
+	if cmd == "" {
+		return shape
+	}
+	if i := strings.IndexByte(cmd, '\n'); i >= 0 {
+		cmd = cmd[:i] // a heredoc/multi-line command: its first line is the selector
+	}
+	return "$ " + cmd + "\n" + shape
+}
+
 // recoveryHint types the hint by WHAT was lost. A clean contiguous tail cut is
 // cheaply recoverable — the agent can re-read from the cut point instead of pulling
 // the whole blob back — so it says so (rtk emits a partial-recovery hint for the
@@ -277,6 +311,9 @@ func init() {
 			Hint: "Inline filter YAML documents, added to the bundled set. See the DSL reference."},
 		{Key: "disable_builtins", Type: components.FieldBool,
 			Hint: "Skip the bundled starter filters and run only the ones configured above."},
+		{Key: "agent_filters", Type: components.FieldEnum, Default: "off",
+			Options: []string{"off", "safe", "lossy"},
+			Hint:    "Load the ledger-derived coding-agent filters: off (default), safe (enumerated boilerplate only), or lossy (adds pytest-signal, a keep-only-signal reducer). Off by default so the measured presets keep their baseline."},
 		{Key: "min_size", Type: components.FieldInt, Default: defaultMinSize,
 			Hint: "Byte floor below which a filter is not attempted at all (0 = no floor). 400 is measured: it takes the whole Terminal-Bench win and is the last value at which the never-worse guard rejects nothing new."},
 		markerModeField(),

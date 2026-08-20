@@ -33,6 +33,7 @@ import (
 
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/components"
+	"github.com/rossoctl/context-guru/components/reformat"
 	"github.com/rossoctl/context-guru/internal/logging"
 	"github.com/rossoctl/context-guru/modes"
 	"github.com/rossoctl/context-guru/schema"
@@ -201,6 +202,17 @@ type Trace struct {
 	// crediting the request's whole cache_read, over-credits by whatever the agent's OTHER
 	// breakpoints were already matching — 7.5x in dollars on a measured session.
 	SplitStableTokens int
+	// FilteredDeclTokens is what the declaration filter stopped carrying on this request:
+	// the token weight of the `tools` elements it removed under the account's opt-in list.
+	// 0 when nothing was configured, nothing matched, or the prose gate refused.
+	//
+	// It is the ONLY honest numerator for this feature's saving, and it is written from the
+	// filter itself rather than derived from the inventory: the inventory records what the
+	// CLIENT declared (it reads the pristine body), so a figure computed from it would keep
+	// reporting a saving for a request the filter had declined to touch.
+	FilteredDeclTokens int
+	// FilteredDecls is how many declarations went, for the component's own report.
+	FilteredDecls int
 	// Run is the pipeline's aggregate report (nil when the pipeline never ran).
 	Run *components.RunReport
 	// Changes lists each rewritten message's before/after text (clipped).
@@ -322,12 +334,36 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 	// its own; it does not any more, because that would now render the key twice.
 	ctx = logging.With(ctx, logging.From(ctx).With("mode", string(mode)))
 	models := o.Models
+	// Tool-schema annotation strip: a top-level field the pipeline never sees (it
+	// operates on `messages`). Done FIRST, before any byte offset into the body is
+	// taken, because `tools` may be serialized either side of `messages` and a rewrite
+	// after the fact would move every offset the writeback relies on.
+	// See components/reformat/toolschema.go for the mechanism and the break-even.
+	toolSchema := false
+	if !bypass && pipe != nil && pipe.Has("toolschema") {
+		body, toolSchema = reformat.CompactToolSchemas(body)
+	}
+	// Declaration filter: drop the tool/MCP declarations this account explicitly opted to
+	// stop carrying. Here for the same two reasons as the strip above — `tools` is a
+	// top-level field the pipeline never sees, and any rewrite of it must happen before a
+	// byte offset into the body is taken — and it is the biggest measured lever in the
+	// envelope (82.7% of a session's declared tokens are never invoked). Deterministic,
+	// unconditional while configured, and never touching a name the account did not list:
+	// see toolfilter.go for the prose gate and the determinism argument.
+	filteredTokens, filteredDecls := 0, 0
+	if !bypass && pipe != nil {
+		if tf, ok := pipe.Find("toolfilter").(interface{ Removed() []string }); ok {
+			body, filteredTokens, filteredDecls = filterDeclarations(body, tf.Removed())
+		}
+	}
+
 	msgsRaw := gjson.GetBytes(body, "messages")
 	if !msgsRaw.Exists() || !msgsRaw.IsArray() {
 		// Assign rather than return a fresh Result: res already carries the trace fields
 		// set above, and a bypassed request that also lacks a messages array must still
 		// report itself as bypassed rather than as "no messages".
-		res.Body = body
+		res.Body, res.Changed = body, toolSchema || filteredDecls > 0
+		tr.FilteredDeclTokens, tr.FilteredDecls = filteredTokens, filteredDecls
 		return res
 	}
 
@@ -366,7 +402,8 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 	msgs := msgsRaw.Array()
 	norm, slots := normalize(provider, msgs)
 	if len(norm) == 0 {
-		res.Body, res.Changed = body, systemSplit // keep the split even with nothing to compact
+		res.Body, res.Changed = body, systemSplit || toolSchema || filteredDecls > 0 // keep the envelope rewrites even with nothing to compact
+		tr.FilteredDeclTokens, tr.FilteredDecls = filteredTokens, filteredDecls
 		return res
 	}
 
@@ -466,11 +503,14 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 		// consumer of it agrees. Amending the report afterwards fixed the dashboard and
 		// left /stats and the Prometheus component counters still saying "skipped",
 		// because the pipeline emits each report to them as it goes.
-		SystemSplit: systemSplit,
+		SystemSplit:   systemSplit,
+		ToolSchema:    toolSchema,
+		FilteredDecls: filteredDecls,
 	}
 	tr.Session, tr.CacheAware, tr.MaxCachedIdx, tr.Messages = sessionID, cacheAware, maxCachedIdx, len(norm)
 	tr.Breakpoints = bps
 	tr.SplitStableTokens, tr.SplitTailHash = splitStableTokens, splitTailHash
+	tr.FilteredDeclTokens, tr.FilteredDecls = filteredTokens, filteredDecls
 	// The eligible (attempted) denominator: what age/supersession offloaders were
 	// allowed to touch. Everything before MaxCachedIdx is frozen for cache safety —
 	// the cost of that mechanism, reported next to its benefit.
@@ -522,13 +562,13 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 			res.Body, res.Changed = body, true // keep the split even when the rebuild declined
 			return res
 		}
-		res.Body, res.Changed = nb, ok || systemSplit
+		res.Body, res.Changed = nb, ok || systemSplit || toolSchema || filteredDecls > 0
 		return res
 	}
 
-	// The tail split already rewrote `body`, so the result must be forwarded even
-	// if no component changes a message.
-	changed := systemSplit
+	// The envelope rewrites (tail split, tool-schema strip) already rewrote `body`, so
+	// the result must be forwarded even if no component changes a message.
+	changed := systemSplit || toolSchema || filteredDecls > 0
 	// Each changed message's new bytes, keyed by its index in the body's messages array,
 	// spliced into the body in ONE pass after the loop (spliceMessages). The loop used to
 	// sjson.SetBytes into the whole body per changed message, which copies the entire
@@ -1010,6 +1050,7 @@ func normalize(provider bschemas.ModelProvider, arr []gjson.Result) (norm []bsch
 		if err := cm.UnmarshalJSON([]byte(m.Raw)); err != nil {
 			continue // unparseable message — leave it in the body untouched
 		}
+		attachToolUse(&cm, m)
 		preMarshal, _ := json.Marshal(cm)
 		norm = append(norm, cm)
 		slots = append(slots, slot{
@@ -1020,6 +1061,54 @@ func normalize(provider bschemas.ModelProvider, arr []gjson.Result) (norm []bsch
 		})
 	}
 	return norm, slots
+}
+
+// attachToolUse lifts an Anthropic assistant turn's `tool_use` blocks into bifrost's
+// OpenAI-shaped ToolCalls, so the normalized transcript exposes WHICH tool produced
+// each tool_result in both dialects (schema.ToolCalls pairs them by id).
+//
+// It is needed because bifrost's chat schema does not model `tool_use`: unmarshalling
+// `{"type":"tool_use","id":…,"name":…,"input":{…}}` keeps the block's TYPE and drops
+// its id, name and input entirely. Every capture of real Claude Code traffic is this
+// dialect, so without the lift a command-keyed filter would only ever fire on
+// OpenAI-shaped requests.
+//
+// Purely additive to the NORMALIZED view: the raw body is untouched, and a message
+// that no component changes is still emitted from its original bytes (the writeback
+// compares the post-pipeline marshal against slot.pre, which is taken after this
+// runs). Such a message is already not round-trip-lossless — the dropped tool_use
+// fields are why — so this changes no writeback decision.
+func attachToolUse(cm *bschemas.ChatMessage, m gjson.Result) {
+	if cm.Role != bschemas.ChatMessageRoleAssistant {
+		return
+	}
+	content := m.Get("content")
+	if !content.IsArray() {
+		return
+	}
+	var calls []bschemas.ChatAssistantMessageToolCall
+	for _, blk := range content.Array() {
+		if blk.Get("type").String() != "tool_use" {
+			continue
+		}
+		id, name := blk.Get("id").String(), blk.Get("name").String()
+		fn := bschemas.ChatAssistantMessageToolCallFunction{Arguments: blk.Get("input").Raw}
+		if name != "" {
+			fn.Name = &name
+		}
+		call := bschemas.ChatAssistantMessageToolCall{Index: uint16(len(calls)), Function: fn}
+		if id != "" {
+			call.ID = &id
+		}
+		calls = append(calls, call)
+	}
+	if len(calls) == 0 {
+		return
+	}
+	if cm.ChatAssistantMessage == nil {
+		cm.ChatAssistantMessage = &bschemas.ChatAssistantMessage{}
+	}
+	cm.ChatAssistantMessage.ToolCalls = append(cm.ChatAssistantMessage.ToolCalls, calls...)
 }
 
 // toolMessage builds a synthetic OpenAI-shaped tool message from an Anthropic
