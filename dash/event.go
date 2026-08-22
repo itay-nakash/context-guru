@@ -141,6 +141,32 @@ type Event struct {
 	// it seeds the per-session comparison across a restart, and it lets the whole figure be
 	// recomputed from the table rather than trusted.
 	SplitTailHash uint64 `json:"split_tail_hash"`
+	// CacheTTL is the prompt-cache lifetime tier this request ASKED for — "ephemeral_5m",
+	// "ephemeral_1h", or "" for a body that carried no cache_control at all. The pipeline has
+	// always computed this (it is an input to cold-cache attribution) and then discarded it,
+	// so nothing downstream could say which tier a prompt used: the strings did not appear in
+	// the source at all, and a 1h prompt was priced at the 5m write rate because there was
+	// nothing to price it differently by. Where a breakpoint SITS is already recorded
+	// (CacheBP*); how long it was meant to live was the missing half.
+	CacheTTL string `json:"cache_ttl"`
+	// SSEBuffered and TTFBMs are the response-side latency the dashboard could not see.
+	//
+	// A third of streamed responses on measured traffic are BUFFERED rather than streamed
+	// through — the client sees nothing until the whole response has arrived — and those wait
+	// about 21 seconds longer for their first byte (29.0 s against 7.9 s). That is two orders
+	// of magnitude more user-visible delay than anything the pipeline itself adds, and it was
+	// visible only as a process-lifetime counter on /stats: unfilterable, unattributable to a
+	// model or an account, and gone on restart. Persisting the pair makes it a fact about a
+	// request like every other on this row.
+	//
+	// TTFBMs is 0 on a non-streamed response. On a BUFFERED one it is the total response time,
+	// not a first-byte time: proxy.go leaves the first-byte instant zero and msSince falls back
+	// to time.Now(). That is the right number for a buffered response — nothing is written to
+	// the client until the whole response has arrived, so the client's first byte and its last
+	// byte are the same moment — but it is a different measurement from the streamed figure,
+	// which is why the flag is stored beside it and the two are never averaged together.
+	SSEBuffered bool    `json:"sse_buffered"`
+	TTFBMs      float64 `json:"ttfb_ms"`
 	// FilteredDeclTokens is what the declaration filter stopped carrying on this request —
 	// the token weight of the `tools` elements it removed under the account's opt-in list.
 	//
@@ -441,6 +467,7 @@ func (e *Event) FromTrace(tr apply.Trace, uniqueSaved map[string]int) {
 	e.CacheBPMessages = tr.Breakpoints.Messages
 	e.CacheBPBlocks = tr.Breakpoints.Blocks
 	e.SplitStableTokens, e.SplitTailHash = tr.SplitStableTokens, tr.SplitTailHash
+	e.CacheTTL = tr.CacheTTL
 	e.FilteredDeclTokens = tr.FilteredDeclTokens
 	if tr.Bypassed {
 		e.Mode = ModeBypass
@@ -685,8 +712,8 @@ func (e *Event) Price(p modelinfo.Price, accountingComplete bool) {
 // 7.5x, and that 7.5x is the claim this replaced.
 //
 // The counterfactual is a cache MISS, not fresh input: those tokens carry cache_control, so
-// a miss bills them as creation at 1.25x fresh, not at 1x. Hence CacheWrite - CacheRead, an
-// 11.5x-fresh spread rather than 9x. The max(CacheWrite, Input) floor covers a provider that
+// a miss bills them as creation at 1.25x fresh, not at 1x. Hence CacheWrite - CacheRead, a
+// 1.15x-fresh spread rather than 0.9x. The max(CacheWrite, Input) floor covers a provider that
 // charges no write premium, where a miss still costs at least the fresh rate.
 //
 // It is a FLOOR: a stable prefix serves a whole session while this counts one request of it,

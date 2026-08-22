@@ -1198,8 +1198,15 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 		// prefix a ping would replay is the one the provider just hashed. Costs nothing when
 		// no tenant has opted in.
 		h.keeper.record(tn, session, lastUpStart, body, up, r, provider, up.path, status, usage, usageOK)
-		if sse && h.agg != nil {
-			h.agg.RecordSSE(msSince(reqStart, sseFirstByte), sseBuffered)
+		if sse {
+			// The same two facts to both sinks. The aggregator keeps the process-lifetime
+			// average; the dashboard row keeps the per-request pair, so "which model, which
+			// account, which hour buffers" becomes answerable instead of being one gauge
+			// that resets on restart.
+			if h.agg != nil {
+				h.agg.RecordSSE(msSince(reqStart, sseFirstByte), sseBuffered)
+			}
+			cp.observeSSE(msSince(reqStart, sseFirstByte), sseBuffered)
 		}
 		if h.agg != nil && usageOK {
 			h.agg.RecordUsage(usage.FreshInput, usage.CacheRead, usage.CacheWrite, usage.Output)

@@ -119,6 +119,154 @@ func (d *DB) TierCosts(f Filter, p modelinfo.Pricer) (*TierCosts, error) {
 	return out, nil
 }
 
+// DecomposeComponentSavedUSD splits each component's dollar value into the two halves it is
+// made of — the FIRST removal of a piece of content, and every later turn that same removal
+// was re-earned on — and prices each at the tier the requests behind it actually paid.
+//
+// WHY THIS EXISTS. This dashboard and the proxy's own /stats endpoint report opposite signs
+// for the same component. On measured traffic extract_llm reads +$1.40 saved here and
+// −$0.82 there, and until now nothing on either surface acknowledged the other existed. The
+// gap is not a disagreement about facts; it is one arithmetic step:
+//
+//   - /stats prices each piece of removed content ONCE. That answers "did this turn's call
+//     pay for itself?"
+//   - This dashboard prices it on every turn it stayed removed for, because the agent
+//     re-sends its whole transcript each turn and content we removed at turn k is still
+//     absent at turns k+1…N. That answers "has this component paid for itself across the
+//     sessions it ran in?"
+//
+// Both are defensible and they differ by the replay multiple — 51.9x for extract_llm. A
+// reader cannot check either number, or understand why a component is green here and red in
+// an operator's terminal, unless both halves are on screen. So both are.
+//
+// It needs no new column: request_components already stores saved_gross and saved_unique per
+// component per request, which is exactly the decomposition, and the tiers are on the
+// request. Everything here is valued at READ time from those, over every priced row rather
+// than only the un-backfilled ones, which is also what makes it a cross-check on the stored
+// figure — see ComponentRow.SavedUSDDecomposed.
+func (d *DB) DecomposeComponentSavedUSD(f Filter, p modelinfo.Pricer, out []*ComponentRow) error {
+	if d == nil || p == nil || len(out) == 0 {
+		return nil
+	}
+	by := make(map[string]*ComponentRow, len(out))
+	for _, c := range out {
+		by[c.Component] = c
+	}
+	// Rows scanned per component, and how many of them had unique differing from gross. This is
+	// what decides whether `unique` is a dedup measurement at all — see the flag below.
+	seen, differ := map[string]int64{}, map[string]int64{}
+	cond, args := f.where()
+	// Same clamps and the same three tier cases as EstimateComponentSavedUSD and
+	// Event.repeatRate, deliberately duplicated as constants rather than shared through a
+	// helper: if these two queries ever disagree the reconciliation below silently stops
+	// meaning anything, so they are written to be diffed by eye.
+	const gross = `max(c.saved_gross,0)`
+	const uniq = `min(max(c.saved_unique,0), max(c.saved_gross,0))`
+	// Grouped by whether the row carried a STORED saved_usd, because that is what decides
+	// whether comparing the two is a check or a tautology — see the cross-check note below.
+	rows, err := d.sql.Query(`SELECT c.component, r.model,
+		CASE WHEN r.cache_read > 0 THEN 'read'
+		     WHEN r.cache_write > 0 AND r.cache_write >= r.fresh_input THEN 'write'
+		     ELSE 'fresh' END,
+		CASE WHEN c.saved_usd <> 0 THEN 1 ELSE 0 END,
+		COALESCE(SUM(`+uniq+`),0), COALESCE(SUM(`+gross+` - `+uniq+`),0),
+		COUNT(*), SUM(CASE WHEN c.saved_gross <> c.saved_unique THEN 1 ELSE 0 END)
+		FROM request_components c JOIN requests r ON r.id = c.request_id
+		WHERE `+cond+` AND c.saved_gross > 0 AND r.token_accounting = 'complete'
+		GROUP BY 1, 2, 3, 4`, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name, model, tier string
+		var storedRow int
+		var unique, replay, nRows, nDiff int64
+		if err := rows.Scan(&name, &model, &tier, &storedRow, &unique, &replay,
+			&nRows, &nDiff); err != nil {
+			return err
+		}
+		seen[name] += nRows
+		differ[name] += nDiff
+		c, ok := by[name]
+		if !ok {
+			continue
+		}
+		price, priced := p.Price(context.Background(), model)
+		if !priced || price.Zero() {
+			continue // already counted as unpriced by the estimator; not valued at zero here
+		}
+		rate := price.Input
+		switch tier {
+		case "read":
+			rate = price.CacheRead
+		case "write":
+			rate = price.CacheWrite
+		}
+		// The first removal enters at the CACHE-WRITE rate because that is the tier content
+		// entering a prompt for the first time is billed at. The replay is priced at the tier
+		// the later turn actually paid, which on warm traffic is the cache-read rate — a tenth
+		// of the write rate. That asymmetry is why a large replay multiple still adds up to
+		// very little money, and the UI has to be able to say so.
+		first, rep := float64(unique)*price.CacheWrite, float64(replay)*rate
+		c.SavedUSDFirstRemoval += first
+		c.SavedUSDReplay += rep
+		// The subset that a stored figure exists for. Only this part of the decomposition is a
+		// genuine cross-check: for a row whose saved_usd is 0 the stored side is supplied by
+		// EstimateComponentSavedUSD, which runs the IDENTICAL formula, so agreement there is
+		// arithmetic rather than evidence.
+		if storedRow == 1 {
+			c.SavedUSDDecomposedStored += first + rep
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, c := range out {
+		c.SavedUSDDecomposed = c.SavedUSDFirstRemoval + c.SavedUSDReplay
+		c.NetUSDFirstRemoval = c.SavedUSDFirstRemoval - c.LLMCostUSD
+		if c.SavedUSDFirstRemoval > 0 {
+			c.ReplayMultiple = c.SavedUSDDecomposed / c.SavedUSDFirstRemoval
+		}
+		// Whether this component's `unique` is a DEDUP MEASUREMENT at all.
+		//
+		// Recorder.MarkUnique dedups on the content keys a component reports, and returns the
+		// full saving unchanged when there are none (dash/capture.go). A component that reports
+		// no key therefore has saved_unique identically equal to saved_gross on every turn, by
+		// construction and not by measurement. Measured on the snapshot: 0 of 3,783 reformatter
+		// rows differ, against 7,884 of 8,063 offload rows.
+		//
+		// DERIVED FROM THE ROWS, not from the component's kind. Keying it off
+		// `Kind == "reformat"` was the same answer today and the wrong answer soon: the
+		// reformatters are getting content-derived keys, and a kind-based flag could never
+		// clear — it would go on printing "NOT a deduplicated figure" over figures that had
+		// become real measurements, which is this dashboard's own worst failure mode, activated
+		// by somebody else's merge. Counting rows self-corrects: a window whose rows dedup is
+		// not flagged, a window of pre-fix rows still is, and neither depends on which
+		// components happen to set keys.
+		//
+		// The row floor is because a component with two rows that happen to agree is not
+		// evidence of anything. Below it the flag stays off: claiming a measurement is fake is
+		// the more damaging error of the two.
+		//
+		// That matters because this function prices `unique` at the CACHE-WRITE rate, 12.5x a
+		// read. For a reformatter that puts its entire saving in the expensive tier and reports
+		// a replay multiple of exactly 1.00 — which on measured traffic is 77% of the whole
+		// "credited once" figure, in the flattering direction, landing on the very verdict this
+		// decomposition exists to make conservative.
+		//
+		// It is FLAGGED and not repriced. The agent re-sends the original bytes each turn, so
+		// turns 2..N are almost certainly replays that belong at the read rate — but "almost
+		// certainly" is not a measurement either, and silently moving the money on an inference
+		// would be the same mistake in the other direction. The reformatters need a
+		// content-derived key; until they have one the honest report is "we cannot say".
+		const minRowsToJudge = 20
+		c.UniqueRows, c.UniqueDiffRows = seen[c.Component], differ[c.Component]
+		c.UniqueUnkeyed = c.UniqueRows >= minRowsToJudge && c.UniqueDiffRows == 0
+	}
+	return nil
+}
+
 // EstimateComponentSavedUSD fills SavedUSDEstimated on component rows whose stored saved_usd
 // predates the column, and recomputes NetUSDWithEstimate. Rows that already carry a stored
 // figure are untouched, so the estimate can only ever ADD to history and never restate the

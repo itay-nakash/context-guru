@@ -1,6 +1,9 @@
 package dash
 
-import "database/sql"
+import (
+	"database/sql"
+	"fmt"
+)
 
 // Denominator is one labelled savings ratio. Shipping a single "savings %" is the
 // mistake both reference implementations make in different ways: a whole-request
@@ -104,9 +107,11 @@ type Overview struct {
 	// it. Priced against a cache miss. A floor. See Event.cachesplitSavedUSD.
 	CachesplitSavedUSD float64 `json:"cachesplit_saved_usd"`
 	// The three counts behind that figure, so a small number is explicable rather than
-	// mysterious. This mattered: gated on the session's first request the figure read ~$0 on
-	// real traffic, and the reason was visible only in these counts — 1,105 of 1,127 session
-	// starts had no cache to hit, because the previous session's had expired.
+	// mysterious. This mattered: when the credit was gated on the session's FIRST REQUEST the
+	// figure read ~$0 on real traffic, and the reason was visible only in these counts —
+	// 1,105 of 1,127 session starts had no cache to hit, because the previous session's had
+	// expired. That gate is gone (it is TailChanged now, see Event.cachesplitSavedUSD); the
+	// counts stay, because the replacement gate also fires rarely and for its own reason.
 	//
 	// SplitRequests is requests the split ran on; SplitTailMoved is the subset whose snapshot
 	// had moved (the turns it can earn on); SplitCredited is the subset that also read the
@@ -189,6 +194,87 @@ type Overview struct {
 	PrefixChangeCostAll     float64 `json:"prefix_change_cost_all_usd"`
 	PrefixChangeRequestsAll int64   `json:"prefix_change_requests_all"`
 
+	// The response-side latency, which is where the user-visible time actually goes.
+	//
+	// A third of streamed responses are BUFFERED — the client sees nothing until the whole
+	// response has arrived — and those wait about 21 seconds longer for a first byte. That is
+	// two orders of magnitude more delay than the pipeline itself adds (154 ms), and it was
+	// reported nowhere on this dashboard: it existed only as a process-lifetime gauge on
+	// /stats, which cannot be filtered by model, account or hour and resets on restart.
+	//
+	// Both averages are kept, never blended. TTFB is 0 by construction on a buffered response
+	// (there is no first byte before the whole write), so one combined average would report
+	// the healthiest number for exactly the requests having the worst experience.
+	// SSERecorded and CacheTTLRecorded are the COVERAGE of the two newly captured facts: how
+	// many requests in the window actually carry them. Both columns default to zero/"" on
+	// every row written before they existed, so without these counts a five-day history reads
+	// as "0% buffered, no request uses prompt caching" — which is not a measurement, it is the
+	// absence of one, and it is the single easiest way for a new column to tell a lie.
+	SSERecorded      int64 `json:"sse_recorded"`
+	SSEStreamRows    int64 `json:"sse_stream_rows"`
+	CacheTTLRecorded int64 `json:"cache_ttl_recorded"`
+
+	// Both averages come from the SAME ttfb_ms column but they are NOT the same measurement,
+	// and that is why they are named apart rather than blended.
+	//
+	// On a streamed response ttfb_ms is a real time-to-first-byte. On a buffered one
+	// proxy.go leaves sseFirstByte zero and msSince falls back to time.Now(), so the value is
+	// the TOTAL response time — which is also, for a buffered response, the moment the client
+	// receives anything at all, because nothing is written until the whole response has
+	// arrived. So the figure is the right one to show; calling it a "time to first byte"
+	// alongside the streamed one is what would be wrong, and the UI names it as the total.
+	SSEStreamed        int64   `json:"sse_streamed"`
+	SSEBuffered        int64   `json:"sse_buffered"`
+	SSEBufferedPct     float64 `json:"sse_buffered_pct"`
+	TTFBMsAvgStreamed  float64 `json:"ttfb_ms_avg_streamed"`
+	TotalMsAvgBuffered float64 `json:"total_ms_avg_buffered"`
+	// CacheTTL buckets requests by the prompt-cache lifetime tier they ASKED for:
+	// ephemeral_5m, ephemeral_1h, or "" for a body that carried no cache_control. Newly
+	// captured — every row written before the column exists reads "", which is why the UI
+	// must distinguish "no caching asked for" from "not recorded yet" by the coverage count
+	// beside it rather than by the bucket alone.
+	CacheTTL map[string]int64 `json:"cache_ttl"`
+	// Breakpoints is the aggregate placement of prompt-cache breakpoints BY LOCATION. Where a
+	// breakpoint sits decides how much prefix it protects, so a count alone cannot answer the
+	// question: system=2/tools=0/messages=0/blocks=1 and system=0/tools=0/messages=3/blocks=0
+	// are both "three breakpoints" and are not remotely the same prompt. These four columns
+	// have existed since the placement work and were readable only one request at a time in
+	// the drawer.
+	Breakpoints BreakpointTotals `json:"breakpoints"`
+	// CompactionResets is how many turns arrived SMALLER than the previous turn of the same
+	// session — a context-window reset, or the agent compacting its own transcript.
+	//
+	// DERIVED from the requests table rather than captured, because the proxy's own counter is
+	// a process-lifetime number in the metrics aggregator and this question is per-window. It
+	// belongs on this page because it BOUNDS the amortization: replay accrues only while the
+	// removed content keeps being re-sent, and a reset is where that stops. 1,364 of them on
+	// measured traffic against a replay ceiling built by assuming none.
+	CompactionResets int64 `json:"compaction_resets"`
+	// EstimatorDivergence is the MEDIAN per-request ratio of provider-billed input to our own
+	// tokens_before, over the requests where nothing was compacted — i.e. where the two are
+	// measuring the same prompt and should agree.
+	//
+	// It is here because the divergence is the central honesty problem with every token figure
+	// on this page, and a ratio of sums hides it. Measured on 12,882 uncompacted production
+	// rows: ratio-of-sums 2.87x, but the MEDIAN per-request ratio is 3.38x (p25 2.43, p75 4.64,
+	// p90 6.80). The median is the right one to show, because the question a reader has is "how
+	// wrong is the number in front of me", not "how wrong is the corpus in aggregate".
+	//
+	// The gap is mostly SCOPE rather than tokenizer error: tokens_before is
+	// schema.MessagesTokens, which counts message TEXT only — no system prompt, no tool
+	// declarations, no JSON envelope — while the provider bills all of it. Dollars are
+	// unaffected: they come from the provider's own reported usage.
+	//
+	// EstimatorDivergenceRows is the population, so a ratio over four requests is not read as a
+	// fact about the deployment. Zero rows leaves the ratio at 0 and the UI shows nothing.
+	EstimatorDivergence     float64 `json:"estimator_divergence"`
+	EstimatorDivergenceRows int64   `json:"estimator_divergence_rows"`
+	// BilledInputTokens is fresh + cache reads + cache writes: the input the PROVIDER counted.
+	// It is here to be compared with TokensBefore, which is what our own tokenizer counted
+	// over message text only — a different unit, roughly a third the size, and the reason no
+	// token figure on this page may be read as a billed-token figure. See the tile.
+	BilledInputTokens int64 `json:"billed_input_tokens"`
+
 	CGLatencyMsAvg float64 `json:"cg_latency_ms_avg"`
 	UpstreamMsAvg  float64 `json:"upstream_ms_avg"`
 	CGLatencyMsP95 float64 `json:"cg_latency_ms_p95"`
@@ -221,6 +307,26 @@ type Overview struct {
 	// SafetyCost reports what our own safety mechanisms cost, beside what they
 	// bought. A compaction proxy that only reports tokens removed is unfalsifiable.
 	SafetyCost SafetyCost `json:"safety_cost"`
+}
+
+// BreakpointTotals is prompt-cache breakpoint placement summed by location, plus the number
+// of requests behind it. The provider caps a request at four breakpoints and its automatic
+// caching consumes one of the slots, so the interesting question is never "how many" but
+// "where" — and only these four numbers together answer it.
+type BreakpointTotals struct {
+	System   int64 `json:"system"`
+	Tools    int64 `json:"tools"`
+	Messages int64 `json:"messages"`
+	Blocks   int64 `json:"blocks"`
+	// Requests is the denominator, so a total can be read as a per-request average rather
+	// than as a raw sum whose size only reflects the window.
+	Requests int64 `json:"requests"`
+	// Modal is the single most common (system, tools, messages, blocks) placement in the
+	// window, as a display string, with ModalRequests behind it. An average placement is
+	// meaningless — 1.5 breakpoints in the system block is not a thing any request did —
+	// so the typical case is reported as the mode, not the mean.
+	Modal         string `json:"modal"`
+	ModalRequests int64  `json:"modal_requests"`
 }
 
 // SafetyCost is the price of context-guru's own protective mechanisms.
@@ -275,8 +381,9 @@ func (d *DB) Overview(f Filter) (*Overview, error) {
 	o := &Overview{
 		Since: f.Since, Until: f.Until,
 		Accounting: map[string]int64{}, CacheMiss: map[string]int64{}, Uncompressed: map[string]int64{},
+		CacheTTL: map[string]int64{},
 	}
-	var cgAvg, upAvg sql.NullFloat64
+	var cgAvg, upAvg, ttfbAvg, upBufAvg sql.NullFloat64
 	err := d.sql.QueryRow(`SELECT COUNT(*), COUNT(DISTINCT r.session_id),
 		COALESCE(SUM(r.tokens_before),0), COALESCE(SUM(r.tokens_after),0), COALESCE(SUM(r.saved_unique),0),
 		COALESCE(SUM(r.attempted_tokens),0), COALESCE(SUM(r.frozen_tokens),0),
@@ -331,6 +438,29 @@ func (d *DB) Overview(f Filter) (*Overview, error) {
 		COALESCE(SUM(r.expands),0), COALESCE(SUM(r.expand_tokens),0), COALESCE(SUM(r.reverts),0),
 		COALESCE(SUM(CASE WHEN r.uncompressed_reason <> '' THEN 1 ELSE 0 END),0),
 		COALESCE(SUM(r.cg_latency_ms),0),
+		-- Streaming split. A "streamed" row is one with a measured first byte; a buffered row
+		-- has the flag and no TTFB, by construction (proxy.go). Counting them separately is
+		-- what stops the buffered third from disappearing into a healthy-looking average.
+		COALESCE(SUM(CASE WHEN r.sse_buffered = 0 AND r.ttfb_ms > 0 THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN r.sse_buffered = 1 THEN 1 ELSE 0 END),0),
+		AVG(CASE WHEN r.sse_buffered = 0 AND r.ttfb_ms > 0 THEN r.ttfb_ms END),
+		-- The same column on the buffered population, where it holds the TOTAL response time
+		-- rather than a first-byte time (proxy.go leaves the first-byte instant zero and
+		-- msSince falls back to now). For a buffered response those coincide from the client's
+		-- point of view, since nothing is written until the whole response has arrived.
+		AVG(CASE WHEN r.sse_buffered = 1 AND r.ttfb_ms > 0 THEN r.ttfb_ms END),
+		-- Breakpoint placement by location, and the requests behind it.
+		COALESCE(SUM(r.cache_bp_system),0), COALESCE(SUM(r.cache_bp_tools),0),
+		COALESCE(SUM(r.cache_bp_messages),0), COALESCE(SUM(r.cache_bp_blocks),0),
+		COALESCE(SUM(CASE WHEN r.cache_bp_system + r.cache_bp_tools
+			+ r.cache_bp_messages + r.cache_bp_blocks > 0 THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(r.fresh_input + r.cache_read + r.cache_write),0),
+		-- Coverage for the two new columns. A streaming request that carries neither a TTFB
+		-- nor the buffered flag predates the capture; counting those apart is what keeps a
+		-- history of zeros from reading as a measurement of zero.
+		COALESCE(SUM(CASE WHEN r.ttfb_ms > 0 OR r.sse_buffered = 1 THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN r.stream = 1 THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN r.cache_ttl <> '' THEN 1 ELSE 0 END),0),
 		-- The SAVING half of the keep-alive ledger: the per-request credit the write path
 		-- computed while it still had the session's gap and the ping's own refreshed-token
 		-- count in hand. The COST half cannot be summed here — this query excludes ping rows
@@ -348,11 +478,19 @@ func (d *DB) Overview(f Filter) (*Overview, error) {
 		&o.PrefixChangeCost, &o.PrefixChangeRequests, &o.PrefixChangeCostAll, &o.PrefixChangeRequestsAll,
 		&cgAvg, &upAvg, &o.Expands, &o.ExpandTokens, &o.Reverts, &o.Passthroughs,
 		&o.SafetyCost.CGLatencyMsTotal,
+		&o.SSEStreamed, &o.SSEBuffered, &ttfbAvg, &upBufAvg,
+		&o.Breakpoints.System, &o.Breakpoints.Tools, &o.Breakpoints.Messages,
+		&o.Breakpoints.Blocks, &o.Breakpoints.Requests, &o.BilledInputTokens,
+		&o.SSERecorded, &o.SSEStreamRows, &o.CacheTTLRecorded,
 		&o.KeepAliveSavedUSD, &o.KeepAliveMissesAvoided, &o.CacheWrite1h)
 	if err != nil {
 		return nil, err
 	}
 	o.CGLatencyMsAvg, o.UpstreamMsAvg = cgAvg.Float64, upAvg.Float64
+	o.TTFBMsAvgStreamed, o.TotalMsAvgBuffered = ttfbAvg.Float64, upBufAvg.Float64
+	if n := o.SSEStreamed + o.SSEBuffered; n > 0 {
+		o.SSEBufferedPct = float64(o.SSEBuffered) / float64(n) * 100
+	}
 	o.SavedGross = o.TokensBefore - o.TokensAfter
 	o.SavedAdjusted = o.SavedUnique - int64(o.ExpandTokens)
 	if o.SavedUnique > 0 {
@@ -374,6 +512,60 @@ func (d *DB) Overview(f Filter) (*Overview, error) {
 	}
 	if o.ReplayProjectedTokens > 0 {
 		o.ReplayRealizedPct = float64(o.ReplayTokens) / float64(o.ReplayProjectedTokens) * 100
+	}
+	// Which cache TTL tier each request asked for. A map rather than columns because ""
+	// (no cache_control at all) is a real third answer that must not be folded into 5m.
+	ttl, err := d.countBy(cond, args, "cache_ttl")
+	if err != nil {
+		return nil, err
+	}
+	o.CacheTTL = ttl
+	// The MODAL breakpoint placement, not the mean: 1.5 breakpoints in a system block is not
+	// a thing any request did, and an average across locations describes no prompt at all.
+	var bs, bt, bm, bb int64
+	if err := d.sql.QueryRow(`SELECT r.cache_bp_system, r.cache_bp_tools, r.cache_bp_messages,
+			r.cache_bp_blocks, COUNT(*) AS n
+		FROM requests r WHERE `+cond+`
+		GROUP BY 1,2,3,4 ORDER BY n DESC LIMIT 1`, args...).Scan(&bs, &bt, &bm, &bb,
+		&o.Breakpoints.ModalRequests); err != nil && err != sql.ErrNoRows {
+		return nil, err
+	} else if err == nil {
+		o.Breakpoints.Modal = fmt.Sprintf("system=%d, tools=%d, messages=%d, blocks=%d", bs, bt, bm, bb)
+	}
+	// Context resets, DERIVED: a turn that arrived smaller than the previous turn of its own
+	// session. This is the bound on amortization — replay accrues only while removed content
+	// keeps being re-sent, and this is where that stops — so it belongs beside the replay
+	// ceiling that is computed by assuming it never happens.
+	if err := d.sql.QueryRow(`SELECT COUNT(*) FROM requests r WHERE `+cond+`
+		AND r.tokens_before > 0 AND r.tokens_before < (
+			SELECT p.tokens_before FROM requests p
+			WHERE p.session_id = r.session_id AND p.tokens_before > 0
+			  AND (p.ts < r.ts OR (p.ts = r.ts AND p.id < r.id))
+			ORDER BY p.ts DESC, p.id DESC LIMIT 1)`, args...).Scan(&o.CompactionResets); err != nil {
+		return nil, err
+	}
+	// The estimator check, on the only population where the two counts are comparable: requests
+	// where nothing was removed, so tokens_before and the provider's billed input describe the
+	// same prompt. A median rather than a mean, and rather than a ratio of sums, because a
+	// handful of enormous requests otherwise dominate and the figure stops describing a typical
+	// row. Computed with OFFSET over an ordered ratio, the same shape as DB.percentile — which
+	// takes a bare column name and so cannot express this ratio.
+	const ratioPop = ` AND r.tokens_before = r.tokens_after AND r.tokens_before > 0
+		AND r.token_accounting = 'complete' AND r.fresh_input + r.cache_read + r.cache_write > 0`
+	if err := d.sql.QueryRow(`SELECT COUNT(*) FROM requests r WHERE `+cond+ratioPop,
+		args...).Scan(&o.EstimatorDivergenceRows); err != nil {
+		return nil, err
+	}
+	if o.EstimatorDivergenceRows > 0 {
+		var med sql.NullFloat64
+		if err := d.sql.QueryRow(`SELECT
+			CAST(r.fresh_input + r.cache_read + r.cache_write AS REAL) / r.tokens_before AS ratio
+			FROM requests r WHERE `+cond+ratioPop+`
+			ORDER BY ratio ASC LIMIT 1 OFFSET ?`,
+			append(append([]any(nil), args...), o.EstimatorDivergenceRows/2)...).Scan(&med); err != nil {
+			return nil, err
+		}
+		o.EstimatorDivergence = med.Float64
 	}
 	if o.Requests > 0 {
 		o.ExpandRate = float64(o.Expands) / float64(o.Requests)
@@ -545,9 +737,10 @@ func (o *Overview) waterfall() []WaterfallStep {
 				"claim. Claude Code ends its big system block with a live environment snapshot, so " +
 				"the block's own breakpoint hashes the churn and the prefix never matches across " +
 				"sessions; cachesplit moves the breakpoint onto the stable half. Counted only where " +
-				"the component rewrote the prefix, the provider then read it from cache, AND it was " +
-				"the session's first request — the one that would otherwise have missed. Later turns " +
-				"hit whether or not we ever split, so they are not ours. Priced against a cache " +
+				"the component rewrote the prefix, the provider then read it from cache, AND the " +
+				"snapshot had MOVED since this session's previous request — the turn that would " +
+				"otherwise have missed. A turn whose snapshot did not move would have hit whether " +
+				"or not we ever split, so it is not ours. Priced against a cache " +
 				"MISS, which is what the counterfactual actually is: those tokens carry " +
 				"cache_control, so a miss bills them as creation at 1.25x fresh, not at 1x. A " +
 				"floor — a stable prefix serves a whole session and this counts one request of it."},
