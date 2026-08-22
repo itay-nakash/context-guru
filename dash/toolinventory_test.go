@@ -366,9 +366,9 @@ func TestRecordInventoryEndToEnd(t *testing.T) {
 	}
 	inv := ScanInventory("anthropic", ccBody(t, []string{tool("Bash", "b")}, skillsReminder,
 		[]map[string]any{{"name": "Bash", "input": map[string]any{}}}))
-	rec.RecordInventory("t1", "s1", 1000, inv)
-	rec.RecordInventory("t1", "", 1000, inv) // no session: nothing to key on, dropped
-	rec.RecordInventory("t1", "s2", 1000, nil)
+	rec.RecordInventory("t1", "s1", 1000, inv, true)
+	rec.RecordInventory("t1", "", 1000, inv, true) // no session: nothing to key on, dropped
+	rec.RecordInventory("t1", "s2", 1000, nil, true)
 	db := rec.DB()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -738,4 +738,29 @@ func quote(t *testing.T, s string) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+// The NEGATIVE is memoized too. A client sending "system": [] — or blocks with no text field
+// — sends the same empty array on every request of the session, and returning early on empty
+// text without storing anything made every one of them pay the gjson walk on the request
+// goroutine, on a function whose doc promises one hash per request on a hit.
+func TestScanSystemMemoizesTheEmptyCase(t *testing.T) {
+	body := []byte(`{"system":[],"model":"claude","messages":[]}`)
+	sysMu.Lock()
+	sysCache, sysBytes = map[uint64]*SystemPrompt{}, 0
+	sysMu.Unlock()
+	if sp := scanSystem(body); sp != nil {
+		t.Fatalf("an empty system array scanned as a prompt: %+v", sp)
+	}
+	sysMu.Lock()
+	n := len(sysCache)
+	sysMu.Unlock()
+	if n != 1 {
+		t.Errorf("sysCache holds %d entries after an empty system prompt, want 1 — the walk "+
+			"is repeated on every request", n)
+	}
+	// And the stored nil reads back as a hit, not as a fresh miss returning nil by accident.
+	if sp := scanSystem(body); sp != nil {
+		t.Errorf("the memoized negative came back as %+v", sp)
+	}
 }

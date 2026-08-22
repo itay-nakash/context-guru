@@ -692,7 +692,7 @@ already requires), in WAL mode.
 | `request_content` | before/after text, gzip-compressed and size-capped; skippable entirely |
 | `archived_sessions` | the cold-storage index — one small row per archived session, local and permanent, so the session list works while the remote is unreachable |
 | `tenant_spend` | the month-to-date spend rollup Settings and the manager's roster display; retention and archiving never touch it, so evicting request rows inside the calendar month cannot make the figure under-count. Reported only — each account bills its own provider credential, so there is nothing to cap |
-| `tool_declarations` / `tool_uses` | which tools, MCP servers and skills each session **declared**, the token weight of carrying each, and which of them it actually **invoked** — see [Tool inventory](tool-inventory.md). Names and token counts only, never a description; keyed by session and declaration-set digest rather than per request, and gated on tenant scoping rather than on content consent, because a tool or server name is an identifier of the caller's own configuration and not their transcript |
+| `tool_declarations` / `tool_uses` | which tools, MCP servers and skills each session **declared**, the token weight of carrying each, and which of them it actually **invoked** — see [Tool inventory](tool-inventory.md). Names and token counts are gated on tenant scoping rather than on content consent, because a tool or server name is an identifier of the caller's own configuration and not their transcript; keyed by session and declaration-set digest rather than per request. The one exception is `text_gz` — each declaration's own slice of the prompt, plus the system prompt on a `kind='system_prompt'` marker row — which **is** transcript-class content and rides the same operator-AND-tenant consent pair as `request_content.before_gz`. Without consent the row is still written and the column is `NULL`, so an account that declined transcript capture keeps the whole inventory feature and loses only the text |
 | `bench_runs` / `bench_tasks` | ingested harness runs and their per-task rows |
 
 Timestamps are **epoch milliseconds** everywhere. A formatted locale string cannot be
@@ -718,12 +718,18 @@ start.
 |---|---|
 | Aggregates, series, component and session rollups, request metrics | anyone who can reach the port |
 | Per-request **content** (the diff view) | loopback, or an explicit `--dashboard-trusted-cidrs` entry |
+| **Prompt text** — tool schemas, the skills listing, the system prompt (`/api/prompt`) | loopback, or a trusted CIDR |
 | Effective **configuration** | loopback, or a trusted CIDR |
 
 Aggregates are deliberately open: a proxy bound to `0.0.0.0` should still show its own
 numbers, and the point of this tool is observability. Content is gated because a
-transcript can carry a user's source code. There is **no** "disable observability in
-production" switch — for a tool whose value *is* observability, that would be backwards.
+transcript can carry a user's source code — and so is prompt text, for the same reason: a
+tool schema is whatever an SDK author wrote, and a system prompt is whatever the user, their
+`CLAUDE.md`, or something they pasted wrote. The token **weights** behind that text are
+aggregates and stay open, so the inventory page still works from any address.
+
+There is **no** "disable observability in production" switch — for a tool whose value *is*
+observability, that would be backwards.
 
 ### On a hosted instance
 
