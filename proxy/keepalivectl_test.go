@@ -62,9 +62,9 @@ func TestASaveFromAStalePageIsRefused(t *testing.T) {
 			before.ConfigYAML, after.ConfigYAML)
 	}
 
-	// The SAME body with a base that matches is accepted, and `extract` survives because the
-	// client did not claim to have drawn it... it did claim it, so it is removed. `linecap` was
-	// NOT claimed, so it survives at its own index. Both halves of the rule in one save.
+	// The SAME body with a base that matches is accepted. `extract` IS claimed in
+	// pipeline_known and absent from `pipeline`, so it is removed; `linecap` is not claimed, so it
+	// survives at its own index. Both halves of the rule in one save.
 	ok := `{"config":{"pipeline":["format","toon"],` +
 		`"pipeline_known":["format","toon","extract"],` +
 		`"pipeline_base":["format","linecap","extract"],` +
@@ -160,6 +160,30 @@ func TestArmingIgnoresAPostedPerPingBudget(t *testing.T) {
 	}
 	if got, has := out["max_usd_per_ping"].(float64); has && got == 99 {
 		t.Error("a posted per-ping budget of $99 was accepted; the guard is the account's own")
+	}
+	// The reported ceiling is the ENFORCED one, and this is the assertion that was missing.
+	//
+	// "not 99" passes on a raw 0, which is exactly the defect: an account that configured no
+	// ceiling stores 0, the request path resolves that to the default through
+	// CachePolicy.Ceiling(), and reporting the raw 0 told the operator the ceiling was $0.00 while
+	// the default was enforced. REVIEW-96 called that "worse than omitting it", the fix went in,
+	// and nothing held it there — reverting armedView to `tn.Cache.MaxUSDPerPing` left the whole
+	// package green. The number on the wire has to be a number somebody could act on.
+	got, has := out["max_usd_per_ping"].(float64)
+	if !has {
+		t.Fatal("the arm response states no per-ping ceiling at all; it is the guard the caller " +
+			"is authorizing spend against")
+	}
+	if got <= 0 {
+		t.Errorf("max_usd_per_ping = %v on an account that configured none. 0 is the document's "+
+			"\"unconfigured\" sentinel, not a ceiling: the request path resolves it to $%v and "+
+			"enforces that, so reporting 0 states a limit of nothing while infinity looks plausible "+
+			"to whoever reads it.", got, DefaultMaxUSDPerPing)
+	}
+	if got != DefaultMaxUSDPerPing {
+		t.Errorf("max_usd_per_ping = %v, want the enforced default %v — the report and the guard "+
+			"must come from the same resolver (CachePolicy.Ceiling()) or they will drift again",
+			got, DefaultMaxUSDPerPing)
 	}
 }
 
@@ -313,5 +337,30 @@ func TestArmingIsRateLimited(t *testing.T) {
 	}
 	if !limited {
 		t.Errorf("more than %d arms an hour were accepted", overrideArmsPerHour)
+	}
+}
+
+// A REORDER-ONLY stale render is refused too.
+//
+// sameNames documents itself as an ordered comparison — "order is part of a pipeline's meaning" —
+// and nothing enforced it: replacing it with a multiset comparison left the whole proxy package
+// green, so a page that rendered the same components in a different order sailed through the 409.
+// It is the same class of stale render as a page that rendered a different SET, and it silently
+// rewrites the order the components run in.
+func TestASaveFromAPageThatReorderedThePipelineIsRefused(t *testing.T) {
+	f := newMgrFixture(t)
+	mgrJar, id := f.signUpJar(t, "boss@ibm.com")
+	const stored = "pipeline:\n  - format\n  - linecap\n  - extract\nmode: sync\n"
+	setDoc(t, f, id, stored)
+	// The same three names, permuted: as a SET this matches the stored pipeline exactly.
+	body := `{"config":{"pipeline":["format","linecap","extract"],` +
+		`"pipeline_known":["format","linecap","extract"],` +
+		`"pipeline_base":["linecap","format","extract"],` +
+		`"components":{},"cache":{"keepalive":false,"head_ttl_1h":false}}}`
+	w, _ := f.do(t, http.MethodPut, "/api/me", body, mgrJar)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("a save whose pipeline_base is the stored pipeline REORDERED = %d, want 409. "+
+			"Order is part of a pipeline's meaning, so a page that rendered a different order "+
+			"rendered a different configuration: %s", w.Code, w.Body)
 	}
 }

@@ -150,6 +150,9 @@ type CachePolicy struct {
 	// cost is bimodal (p50 $0.0004, p99 $0.2275, max $0.3780) while a per-SESSION budget
 	// truncates exactly the long large-prefix sessions holding the value — capping the
 	// window's pings per session at 20 drops the net from +$164 to $92.34.
+	//
+	// Read it through Ceiling(), never directly: zero here means UNCONFIGURED, and for a spend
+	// guard that has to resolve to the default rather than to infinity.
 	MaxUSDPerPing float64
 	// MinPrefixTokens is the billed-prefix floor (the previous request's cache_read +
 	// cache_write) a session must reach before it is pinged. With the first-request skip this
@@ -298,8 +301,35 @@ func (e *kaEntry) due(now time.Time) bool {
 // after `tool_use`, and 83.7% of the recoverable dollars sit behind it.
 func (e *kaEntry) pingable() bool {
 	return e.turn >= 1 && e.prefix >= int64(e.pol.MinPrefixTokens) &&
-		(e.pol.MaxUSDPerPing <= 0 || e.pingUSD <= e.pol.MaxUSDPerPing)
+		e.pingUSD <= e.pol.Ceiling()
 }
+
+// Ceiling is the per-ping cost guard that is actually ENFORCED.
+//
+// The whole of this method is the sentinel. `MaxUSDPerPing == 0` means "nobody configured
+// one", and the shipped code read that as "no cap": `MaxUSDPerPing <= 0 || cost <= cap`. On
+// an account whose keep-alive is OFF the config builder hands the request path a zero
+// CachePolicy, and enabling one session by hand is precisely the use case a per-session
+// override exists for — so the one path where the guard was written to matter was the one
+// path that ran without it, while the arm response cheerfully reported a ceiling of $0.00.
+//
+// Zero in a money guard resolves to the DEFAULT. A caller that genuinely wants no ceiling has
+// to say so with a negative value, which is a thing somebody has to type on purpose.
+func (p CachePolicy) Ceiling() float64 {
+	switch {
+	case p.MaxUSDPerPing > 0:
+		return p.MaxUSDPerPing
+	case p.MaxUSDPerPing < 0:
+		return math.Inf(1)
+	default:
+		return DefaultMaxUSDPerPing
+	}
+}
+
+// DefaultMaxUSDPerPing mirrors config.DefaultKeepAliveMaxUSDPerPing, which this package may not
+// import (proxy does not depend on the configuration loader). They are pinned equal by
+// TestTheProxysPingCeilingDefaultMatchesTheConfigLoaders.
+const DefaultMaxUSDPerPing = 0.25
 
 // keeper runs the keep-alive. One goroutine per handler, one map, one lock.
 type keeper struct {
@@ -912,12 +942,25 @@ func (k *keeper) record1(j pingJob, u Usage, status int, ms float64) float64 {
 // invalidate the prefix — the model, the tools, `tool_choice`, the thinking parameters, any
 // system or message content — is left exactly as it was sent.
 //
-// max_tokens is 1 rather than 0. The reason is NOT that 0 is rejected alongside streaming and
-// thinking — this ping sets `stream: false` and refuses thinking-enabled sessions, so neither
-// applies to it. It is that 1 is the value every backend on this path accepts without
-// negotiation, and the difference is one output token: $0.0000076 on sonnet against the
-// $0.0073 the read itself costs, i.e. a tenth of a percent. Not worth a compatibility risk on
-// the one request that must not fail for a surprising reason.
+// max_tokens is 1 rather than 0, and the reason is now MEASURED rather than assumed.
+//
+// `max_tokens: 0` is the provider's documented cache pre-warm shape, and on THIS gateway it is
+// MODEL-DEPENDENT, which is the whole reason 1 wins:
+//
+//   - aws/claude-sonnet-5: 200, `cache_read_input_tokens: 5851`, `cache_creation_input_tokens: 0`,
+//     `output_tokens: 0` — a full cache read for no output at all.
+//   - claude-haiku-4-5:    **400**, `max_tokens: must be greater than or equal to 1`.
+//
+// So the cheaper shape is real on some routes and a hard failure on others, and the routing is not
+// this function's to know: `model` comes from the caller's own body. A ping that 400s is a cache
+// entry allowed to lapse, which is the one outcome this request exists to prevent.
+//
+// The prize for taking that risk is ONE output token: $0.0000076 against the $0.0073304 the read
+// itself costs on a 48k-token prefix, i.e. 0.1% of a ping. The docs additionally list four bodies
+// 0 is rejected for — `stream: true`, extended thinking, structured outputs, and `tool_choice` of
+// type `tool` or `any`. This ping forces `stream: false` and refuses thinking-enabled sessions, but
+// it resends the caller's body verbatim and does not touch `tool_choice`, because touching it would
+// change the hashed prefix and miss the entry. 0.1% does not buy that many ways to fail.
 //
 // stream is false so the response is one small JSON body with its usage block in it, rather
 // than an SSE stream this would have to read to the end to price.
