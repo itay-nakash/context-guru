@@ -3,147 +3,386 @@ package proxy
 import (
 	"bufio"
 	"bytes"
-	"strings"
+	"io"
+	"net/http"
+	"time"
 
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
-// The expand continuation loop has to inspect a whole response to see whether the model
-// called ONLY the expand tool. For a streaming response that meant buffering the stream,
-// and because the expand tool is advertised from the first offload onward, EVERY response
-// in a session was buffered from that point. Measured in production over ~37h:
+// The expand continuation loop has to see a whole response to know whether the model called
+// ONLY the expand tool. For a streaming response that first meant buffering the entire
+// stream, and because the tool is advertised for any tools-bearing client, every response in
+// a session was buffered. Measured in production over ~37h:
 //
 //	sse_streamed 2,779 · sse_buffered 1,393        -> 33.4% of responses
-//	sse_ttfb_ms_avg           7,918 ms
-//	sse_ttfb_ms_avg_buffered 28,998 ms             -> ~21 SECONDS of extra time to first byte
 //
-// against a whole-pipeline cg_added_ms_avg of 154 ms.
+// against a whole-pipeline cg_added_ms_avg of 154 ms. (The buffered set is also
+// later-in-session and longer-generating, so the raw ttfb gap between the two buckets is
+// mostly generation time, not buffering — what buffering definitely costs is holding a whole
+// response in memory and forbidding the client any early byte. Measured end to end on this
+// box, 23 of 30 real streaming responses were buffered before the peek and 0 of 30 after, on
+// byte-identical request bodies.)
 //
-// Read that production gap carefully, because it is confounded and this comment used to
-// over-claim from it: the buffered set is later-in-session, larger-prefix, longer-generating
-// requests (buffering starts at the first offload), so most of the 21 s is what those
-// responses take to generate, not what buffering added. What buffering definitely adds is
-// holding an entire response in memory and forbidding the client any early byte — measured
-// end to end on this box, 23 of 30 real streaming responses were buffered before this change
-// and 0 of 30 after, on byte-identical request bodies. (Those 30 are about the introduction
-// of THIS file, not about the later change that made every tools-bearing request advertise
-// the expand tool — this file is unchanged by that commit; what changed is how often the
-// peek runs.)
+// The upstream DOES stream, so that cost is real. An older comment here claimed the opposite
+// ("that gateway does not stream either, ttfb/wall 1.000 on 6 of 6 turns"); it was wrong, and
+// two independent re-measurements say so. With no proxy in the path, 22 of 22 responses came
+// back as text/event-stream with ttfb/wall 0.47-0.78 (p50 0.58-0.68). Timestamping every
+// event of 39 more turns on two models (aws/claude-sonnet-5 n=36, aws/claude-opus-4-7 n=3):
+// the first event lands at a MEDIAN of 0.49 of wall, range 0.23-0.81, and the deltas stream
+// across the rest. Individual
+// turns do read 1.000 when generation finishes fast enough to arrive in one burst, which is
+// the likeliest thing the original 6 turns caught.
 //
-// CORRECTED 2026-08: the gateway DOES stream, and the claim that used to sit here — "that
-// gateway does not stream either, ttfb/wall 1.000 on 6 of 6 turns" — was wrong. Re-measured
-// with no proxy in the path, 22 of 22 responses came back as text/event-stream with 38
-// events and ttfb/wall ran 0.47-0.78 (p50 0.58-0.68), direct and through the proxy alike.
-// Individual turns DO read 1.000 when generation finishes fast enough to arrive in one
-// burst, which is the likeliest thing the original 6 turns caught. So this change does
-// improve the client's first byte here, and the peek is nearly free for a different reason
-// than the old comment gave: the gap it adds is first-byte to first content_block_start,
-// measured at a MEDIAN of 0.0 ms over 22 streams (mean 17.4, p95 3.3, max 379.4), because
-// in 18 of the 22 both events arrived in the SAME TCP segment.
+// The first fix decided from the FRONT of the stream: buffer up to the first
+// content_block_start, and stream the rest unless the response OPENED with a call to the
+// expand tool. That removed the buffering — and removed the interception with it, because a
+// tool_use is almost never the first block. A turn opens with thinking or with text and calls
+// its tools after. Production, over 1,687 streamed responses:
 //
-// An end-to-end paired measurement of that gap does NOT resolve (n=9, mean +804 ms, 95% CI
-// -223..+1,831; per-pair sd 1.57 s, so a 50 ms effect would need ~3,800 pairs). The direct
-// figure above is the resolved one; no direction should be quoted from the end-to-end run.
+//	sse_expand_after_stream 22 · sse_buffered 1
 //
-// So decide from the FRONT of the stream instead. In the Anthropic dialect the first
-// content_block_start arrives early and names the block's type and, for a tool_use, the
-// tool. Buffer only up to that event: if the response does not OPEN with a call to the
-// expand tool, it cannot be intercepted from its first block, so flush the peek and stream
-// the remainder.
+// so the loop missed ~22 calls for each one it caught, and each miss handed a client a
+// tool_use for a tool only this proxy implements — `No such tool available:
+// context_guru_expand`. (An earlier comment blamed extended thinking and claimed it was on
+// for 100% of captured traffic. It is on for about half of it, and it is not the cause: a
+// leading `text` block does exactly the same thing.)
 //
-// The honest limit, stated because it is a real behaviour change. A response that opens
-// with thinking or text and calls expand LATER is streamed through, so the client receives
-// the model's raw expand tool_use instead of the proxy resolving it. That outcome already
-// exists on other live paths (`otherTools`; `Continuation` returning !ok; the round cap;
-// AggregateSSE failing; and every non-Anthropic SSE response, which is never peeked at all),
-// so it is within the design's failure envelope rather than new. `got == 0` is NO LONGER one
-// of them: a call that resolves nothing now continues with a placeholder tool_result instead
-// of replaying the model's own call — but it is not free, and the peek
-// deliberately does not pretend otherwise: streamFrom counts every streamed response that
-// turned out to name the expand tool, so the rate is a number on /stats
-// (sse_expand_after_stream) rather than an argument here.
+// Peeking FURTHER — decide at the first tool_use block instead of the first block — was
+// measured and rejected. Both arms are derivable from one response's event timeline, so the
+// comparison is paired by construction with no proxy restart inside the arm: forwarding from
+// the first event against forwarding from the first tool_use block. Over 36 sonnet turns,
+// deciding at the first tool_use withholds 98.3% +/- 2.1% of the streaming span on
+// tool-calling turns, 99.0% +/- 1.6% with thinking on, and 100% on a turn with no tool_use at
+// all, where the decision point becomes message_stop; +3.2 s to +4.5 s of client wait per
+// response. Note that peek-further >= this is an identity of the construction, so the sign is
+// not evidence; the magnitudes and the prose-only case are. It would pay that on nearly every
+// response to intercept the ~1.3% that call expand. Rows in
+// docs/results/expand-splice-2026-08.
 //
-// The reason it decides on the first block INSTEAD of skipping past thinking: extended
-// thinking is enabled on 100% of the captured production traffic, and a thinking block is
-// where most of a reasoning turn's tokens are. Buffering through it would keep most of the
-// 21 seconds, which is the entire thing being fixed.
+// So decide per BLOCK instead of per response, which is the upgrade path this file used to
+// name: forward events as they arrive, stop at the content_block_start that calls the expand
+// tool, run the continuation, and splice round 2's blocks into the same stream with their
+// indices remapped. The client keeps its stream — the reasoning and prose ahead of the tool
+// call are most of a turn's tokens and are already on the wire — and it never receives the
+// one block that is ours to answer.
 //
-// The upgrade path that removes the trade-off, when the counter says it is worth it: stop
-// forwarding at the expand block instead of at the first block, run the continuation, and
-// splice round 2's content_block events into the same stream with their indices remapped.
-// That keeps the stream AND the interception; it costs index rewriting, message_start
-// suppression, and a defined fallback for a mid-splice failure (forward the buffered
-// remainder verbatim — exactly today's behaviour).
+// The honest limits:
+//
+//   - The model can batch expand alongside a tool only the CLIENT implements. The proxy
+//     cannot answer half a batch, so the withheld events are handed back as they arrived and
+//     the client does see the raw call. Counted (sse_expand_after_stream), never silent.
+//   - Same for a stream that will not reconstruct, a Continuation that will not build, and
+//     the round cap. (`got == 0` is NOT one of them: a call that resolves nothing continues
+//     with a placeholder tool_result, so that turn completes.)
+//   - A block the model generated AFTER the expand call is withheld with it and, on a
+//     successful continuation, never reaches the client — while the continuation DID send it
+//     back upstream, so the model believes it said something the client never saw. The
+//     realistic shape is thinking interleaved after a tool call.
+//   - Non-Anthropic event streams are not inspected at all: AggregateSSE only reconstructs
+//     the Anthropic dialect, so there is nothing the loop could read even if we held the
+//     bytes.
+//   - The forwarded bytes are retained until the round ends, because Continuation needs the
+//     whole assistant turn — bounded by sseRetainMaxBytes. Measured on a 2.25 MB round, the
+//     largest a 128K-output model typically produces: the RETAINED bytes are what the old
+//     whole-response buffering held, and it now applies to every tools-bearing streaming
+//     response rather than only marker-bearing ones (33.4%), since injection stopped
+//     requiring markers. Allocation is the separate number, and the two must not be
+//     conflated. Reading events one at a time churns more than buffering the response whole
+//     did, and the ladder is measured recorder-free so the numbers are one unit: 9.60x the
+//     stream per-event, 8.01x once the event buffer is reused, 4.81x once the substring
+//     pre-filters skip the parse — against 3.16x for the whole-response buffering this
+//     replaced. So a halving, and still 1.52x more than what it replaced.
+//
+// Every one of those paths ends at the same place on the NEXT request, so they are closed
+// there instead: expand.RepairToolResults replaces the client's `No such tool available` with
+// the content the model asked for, so the error never reaches the model even when the block
+// could not be withheld.
 
-// ssePeekMaxBytes bounds the peek. A message_start plus the first content_block_start is a
-// few hundred bytes; this is orders of magnitude above that, so hitting it means the stream
-// is not the dialect we can read. Then we buffer, which is the old behaviour — fail open.
-const ssePeekMaxBytes = 64 << 10
+// sseSplicer joins the rounds of an expand continuation into ONE client event stream.
+//
+// Round 1's events are forwarded as they arrive and forwarding stops at the expand call.
+// The continuation's blocks are then written into the same open response, renumbered to
+// follow the blocks already sent and with their message_start dropped, because a client sees
+// one message per turn. If the loop cannot answer after all, handBack writes the withheld
+// events through the same transform — which, for a round whose blocks were not renumbered,
+// is byte-for-byte the stream as it arrived: exactly the old pass-through.
+type sseSplicer struct {
+	w        http.ResponseWriter
+	flush    http.Flusher
+	headers  bool      // response headers and status are on the wire
+	msgStart bool      // the client has its message_start
+	ended    bool      // a message_stop has gone out: the client's turn is closed
+	blocks   int       // content blocks the client holds
+	base     int       // index offset applied to the round being forwarded
+	first    time.Time // when the client got its first byte
+}
 
-// sseVerdict is what a bounded peek concluded about a streaming response.
-type sseVerdict int
+func newSSESplicer(w http.ResponseWriter) *sseSplicer {
+	f, _ := w.(http.Flusher)
+	return &sseSplicer{w: w, flush: f}
+}
 
-const (
-	// sseStreamable: the response cannot be a lone expand call from its first block.
-	sseStreamable sseVerdict = iota
-	// sseMustBuffer: it opens with a call to the expand tool, or the peek could not read
-	// the stream at all. Either way, buffer and let the loop inspect the whole thing.
-	sseMustBuffer
-)
+// round starts an upstream round. Its blocks are numbered from the end of what the client
+// already holds, and only the first round's headers and status are sent — by the time a
+// continuation answers, the response is long open.
+func (sp *sseSplicer) round(resp *http.Response) {
+	sp.base = sp.blocks
+	if sp.headers {
+		return
+	}
+	copyHeaders(sp.w.Header(), resp.Header)
+	sp.w.WriteHeader(resp.StatusCode)
+	sp.headers = true
+}
 
-// peekSSE reads events from br until the first content_block_start decides the verdict,
-// or until the stream ends or the bound is hit. Every byte it consumes is returned in
-// head, so the caller can either write it out (and stream the rest) or concatenate it with
-// the remainder (and buffer). It never discards input.
-func peekSSE(br *bufio.Reader, expandTool string) (head []byte, v sseVerdict) {
-	var buf bytes.Buffer
-	for buf.Len() < ssePeekMaxBytes {
-		line, err := br.ReadBytes('\n')
-		buf.Write(line) // including a final partial line, and including on error
-		if d, decided := sseLineVerdict(line, expandTool); decided {
-			return buf.Bytes(), d
+// sseRetainMaxBytes bounds what one round may retain. pass keeps the round's bytes because
+// Continuation needs the whole assistant turn, and the peek this replaced had its own bound
+// (an unreadable or oversized preamble bailed out at 64 KB) — removing it left one
+// pathological stream, a runaway generation or an upstream that never sends message_stop,
+// retained in full with nothing to stop it. This is that bound, restored at the only place it
+// can now live.
+//
+// The number is the first power of two above the largest round a model can legitimately
+// produce, so it never fires on real traffic and only ever catches pathology. Re-derive it if
+// it ever looks tight, because the input that moves is not ours: this proxy never caps
+// max_tokens, it only reads it, so the ceiling is whatever the UPSTREAM allows and it changes
+// when the upstream does. Measured against the gateway this deployment fronts, which accepts
+// max_tokens up to 128,000 (200,000 is refused with "the maximum allowed number of output
+// tokens"), and an event stream runs ~35 bytes per output
+// token — ~4 bytes of text plus ~123 bytes of framing per delta of ~4 tokens — so a
+// full-length response is ~4.5 MB, which is 3.4x under the bound. A stream that emitted ONE
+// token per delta would pay that framing per TOKEN instead, ~127 bytes, and reach ~16.3 MB:
+// a margin of about 3%, not headroom.
+//
+// That margin is deliberately not treated as a cliff, because overshoot is graceful by
+// construction. Past the bound the round is forwarded whole, the call is counted, and the
+// repair answers it next request — which is precisely the behaviour of every release before
+// the splice existed. A bound that occasionally gives up on the largest imaginable stream
+// costs one interception; no bound at all costs the process.
+//
+// Past it the round is forwarded whole and nothing is intercepted, so the feature degrades
+// rather than breaking: the client gets the model's own expand call, it is counted, and
+// expand.RepairToolResults answers it on the next request.
+const sseRetainMaxBytes = 16 << 20
+
+// pass forwards this round's events until the one that calls the expand tool, and returns
+// the round's whole event stream — forwarded and withheld together — because the
+// continuation loop reconstructs the assistant turn from all of it. withheld is the
+// deciding event and everything after it: the caller either answers it or hands it back.
+//
+// Past sseRetainMaxBytes it returns whole=nil: the turn can no longer be rebuilt, so nothing
+// can be intercepted, and everything is forwarded as it arrives. found still reports whether
+// the response called expand, because the client then receives that call and the caller has
+// to count it.
+func (sp *sseSplicer) pass(body io.Reader, expandTool string) (whole, withheld []byte, found bool) {
+	br := bufio.NewReader(body)
+	// One event buffer for the round, not one per event: a 2.25 MB round is ~19,000 events.
+	// Worth doing and not where the money was — recorder-free, per-event churn is 9.60x the
+	// stream and reuse alone takes it to 8.01x; the substring pre-filters below are what reach
+	// 4.81x (8.54x incl_recorder). Every consumer of ev is done with it before the next read
+	// overwrites it.
+	var buf, ev bytes.Buffer
+	cut := -1     // where withholding began; -1 = forwarding
+	over := false // past the bound: the turn cannot be rebuilt
+	for {
+		e, err := readSSEEvent(br, &ev)
+		if len(e) > 0 {
+			sent := false
+			if startsExpandCall(e, expandTool) {
+				found = true
+				if !over && cut < 0 {
+					cut = buf.Len()
+				}
+			}
+			if !over {
+				buf.Write(e)
+				if buf.Len() > sseRetainMaxBytes {
+					// Nothing is dropped: whatever was already withheld goes to the client
+					// now, and the rest of the stream follows it event by event. The flush
+					// includes THIS event, so it must not also be forwarded below.
+					if cut >= 0 {
+						sp.handBack(buf.Bytes()[cut:])
+						cut, sent = -1, true
+					}
+					over, buf = true, bytes.Buffer{}
+				}
+			}
+			if cut < 0 && !sent {
+				sp.forward(e)
+			}
 		}
 		if err != nil {
-			// EOF or a read error before any content_block_start. Nothing can be
-			// intercepted (there is no tool_use block), and a mid-stream error is the
-			// caller's to surface — streaming the bytes we hold reproduces it.
-			return buf.Bytes(), sseStreamable
+			if over {
+				return nil, nil, found
+			}
+			whole = buf.Bytes()
+			if cut < 0 {
+				return whole, nil, found
+			}
+			return whole, whole[cut:], found
 		}
 	}
-	return buf.Bytes(), sseMustBuffer // unreadable/oversized preamble: old behaviour
 }
 
-// sseLineVerdict decides on one SSE line, or reports that it decides nothing.
-//
-// `message_stop` before any content_block_start is a decision: an empty message has no
-// tool call in it. An `error` event likewise — the loop has nothing to inspect and the
-// client needs to see the error as it arrived.
-func sseLineVerdict(line []byte, expandTool string) (sseVerdict, bool) {
-	i := bytes.IndexByte(line, ':')
-	if i < 0 || !bytes.Equal(bytes.TrimSpace(line[:i]), []byte("data")) {
-		return sseStreamable, false
-	}
-	payload := strings.TrimSpace(string(line[i+1:]))
-	if payload == "" || payload == "[DONE]" {
-		return sseStreamable, false
-	}
-	ev := gjson.Parse(payload)
-	switch ev.Get("type").String() {
-	case "content_block_start":
-		cb := ev.Get("content_block")
-		if cb.Get("type").String() == "tool_use" && cb.Get("name").String() == expandTool {
-			return sseMustBuffer, true // this is the case the loop exists for
+// handBack sends events the splice withheld — the fail-open path, and the one that hands a
+// client the model's own expand call when nothing else can be done with it.
+func (sp *sseSplicer) handBack(withheld []byte) {
+	br := bufio.NewReader(bytes.NewReader(withheld))
+	var ev bytes.Buffer
+	for {
+		e, err := readSSEEvent(br, &ev)
+		if len(e) > 0 {
+			sp.forward(e)
 		}
-		return sseStreamable, true
-	case "message_stop", "error":
-		return sseStreamable, true
+		if err != nil {
+			return
+		}
 	}
-	return sseStreamable, false
 }
 
-// sseNamesExpandTool reports whether a chunk of a STREAMED response mentions the expand
-// tool, which means the peek let through a response the loop would have intercepted. It is
-// an upper bound: the model could write the name in prose. Cheap enough to run per chunk.
-func sseNamesExpandTool(p []byte, expandTool string) bool {
-	return bytes.Contains(p, []byte(expandTool))
+// forward sends one complete event, transformed as the splice requires.
+func (sp *sseSplicer) forward(ev []byte) {
+	ev, ok := sp.rewrite(ev)
+	if !ok {
+		return
+	}
+	if sp.first.IsZero() {
+		sp.first = time.Now()
+	}
+	sp.w.Write(ev)
+	if sp.flush != nil {
+		sp.flush.Flush()
+	}
+}
+
+// rewrite drops a second message_start and shifts block indices past the blocks the client
+// already has. With no offset to apply it returns the event untouched — byte-for-byte,
+// which is what keeps a response that never calls expand an exact pass-through.
+func (sp *sseSplicer) rewrite(ev []byte) ([]byte, bool) {
+	// With no offset to apply, the only events that can change what the client holds are a
+	// message_start (de-duplicated) and a content_block_start (counted) — one per block, so
+	// counting starts alone is exact. Every delta of a long turn skips the parse below, which
+	// is not a micro-optimisation: a 2.25 MB round is ~18,750 events and building each
+	// event's payload string cost 1.6x the stream, twice over.
+	if sp.base == 0 && !bytes.Contains(ev, []byte("_start")) && !bytes.Contains(ev, []byte("message_stop")) {
+		return ev, true
+	}
+	payload := sseEventPayload(ev)
+	if payload == "" {
+		return ev, true
+	}
+	p := gjson.Parse(payload)
+	switch p.Get("type").String() {
+	case "message_start":
+		if sp.msgStart {
+			return nil, false
+		}
+		sp.msgStart = true
+	case "message_stop":
+		sp.ended = true
+	case "content_block_start", "content_block_delta", "content_block_stop":
+		idx := int(p.Get("index").Int()) + sp.base
+		if idx >= sp.blocks {
+			sp.blocks = idx + 1
+		}
+		if sp.base == 0 {
+			break
+		}
+		np, err := sjson.Set(payload, "index", idx)
+		if err != nil {
+			break // fail open: an event we cannot renumber goes as it came
+		}
+		ev = bytes.Replace(ev, []byte(payload), []byte(np), 1)
+	}
+	return ev, true
+}
+
+// readSSEEvent reads one complete Server-Sent Event into ev: every line up to and including
+// the blank line that terminates it, verbatim, framing included. On a read error it returns
+// whatever it holds — a partial final event still has to be forwarded, or the stream loses
+// its tail. ev is the caller's, reset here and valid until the next call.
+func readSSEEvent(br *bufio.Reader, ev *bytes.Buffer) ([]byte, error) {
+	ev.Reset()
+	for {
+		line, err := br.ReadBytes('\n')
+		ev.Write(line)
+		if err != nil {
+			return ev.Bytes(), err
+		}
+		if len(bytes.TrimRight(line, "\r\n")) == 0 {
+			return ev.Bytes(), nil
+		}
+	}
+}
+
+// sseEventPayload returns the JSON carried by an event's data: line, or "" if it has none.
+func sseEventPayload(ev []byte) string {
+	for _, line := range bytes.Split(ev, []byte("\n")) {
+		i := bytes.IndexByte(line, ':')
+		if i < 0 || !bytes.Equal(bytes.TrimSpace(line[:i]), []byte("data")) {
+			continue
+		}
+		p := string(bytes.TrimSpace(line[i+1:]))
+		if p == "[DONE]" {
+			return ""
+		}
+		return p
+	}
+	return ""
+}
+
+// startsExpandCall reports whether this event OPENS a call to the expand tool — the one
+// block a client must never receive, because only this proxy implements the tool.
+func startsExpandCall(ev []byte, expandTool string) bool {
+	if !bytes.Contains(ev, []byte("content_block_start")) {
+		return false // cheap reject: the parse below is the expensive half
+	}
+	p := gjson.Parse(sseEventPayload(ev))
+	if p.Get("type").String() != "content_block_start" {
+		return false
+	}
+	cb := p.Get("content_block")
+	return cb.Get("type").String() == "tool_use" && cb.Get("name").String() == expandTool
+}
+
+// terminate closes the client's turn if nothing has. A continuation round is not obliged to
+// carry a message_stop — it can come back empty, truncated, or in another dialect — and the
+// round whose terminator the splice withheld is the only other place one exists. Without
+// this the client is left with a half-open message, which is worse than the leaked tool_use
+// it replaced: on main those rounds cannot arise at all.
+func (sp *sseSplicer) terminate(withheld []byte) {
+	if sp.ended || !sp.msgStart {
+		return
+	}
+	// Only the CLOSING events, never the content: the withheld bytes begin with the expand
+	// call, which is the one block the client must not receive. So this closes the message
+	// with the model's own message_delta and message_stop and invents nothing.
+	br := bufio.NewReader(bytes.NewReader(withheld))
+	var ev bytes.Buffer
+	for {
+		e, err := readSSEEvent(br, &ev)
+		if len(e) > 0 {
+			switch gjson.Parse(sseEventPayload(e)).Get("type").String() {
+			case "message_delta", "message_stop":
+				sp.forward(e)
+			}
+		}
+		if err != nil {
+			if !sp.ended {
+				// The withheld round had no closer either — it was truncated too, so there
+				// are no closing events anywhere to forward. The turn DID fail, and an
+				// `error` event is how this protocol says so: the client gets a diagnosable
+				// end instead of a socket that stops mid-message. Not a synthetic
+				// message_stop — no stop_reason in the enum means "truncated", and end_turn
+				// would tell the client a broken turn finished normally.
+				sp.forward([]byte("event: error\ndata: {\"type\":\"error\",\"error\":" +
+					"{\"type\":\"api_error\",\"message\":\"upstream ended the turn " +
+					"without a terminator\"}}\n\n"))
+				sp.ended = true
+			}
+			return
+		}
+	}
 }

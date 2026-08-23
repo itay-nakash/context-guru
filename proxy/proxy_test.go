@@ -394,7 +394,7 @@ func TestExpandSSELoop(t *testing.T) {
 	}
 	// The counters have to say what happened: round 1 opened with the expand call, so it
 	// was buffered, and sse_buffered is sticky for the whole client request even though
-	// round 2 streamed. If this ever reads streamed=1/buffered=0 the peek has started
+	// round 2 streamed. If this ever reads streamed=1/buffered=0 the splice has started
 	// letting real expand calls through, which is the failure this whole path guards.
 	var snap metrics.Snapshot
 	stresp, _ := http.Get(srv.URL + "/stats")
@@ -514,6 +514,61 @@ const (
 		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 )
 
+// The proxy flushes per SSE EVENT, so one Read returns one event. "Did the client get this
+// while the upstream was still generating" is therefore a question about the bytes that
+// arrive BEFORE the upstream is released, not about a single Read — hence a background
+// reader plus a client-side deadline shorter than the upstream's own fallback. A test that
+// just kept reading would be satisfied by the fallback firing and would pass on a fully
+// buffering proxy.
+func sseChunks(r io.Reader) <-chan []byte {
+	ch := make(chan []byte, 256)
+	go func() {
+		defer close(ch)
+		buf := make([]byte, 4096)
+		for {
+			n, err := r.Read(buf)
+			if n > 0 {
+				c := make([]byte, n)
+				copy(c, buf[:n])
+				ch <- c
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	return ch
+}
+
+// collectUntil accumulates chunks until want has been seen or d elapses.
+func collectUntil(ch <-chan []byte, want string, d time.Duration) (string, bool) {
+	deadline := time.After(d)
+	var got strings.Builder
+	for {
+		select {
+		case c, ok := <-ch:
+			if !ok {
+				return got.String(), strings.Contains(got.String(), want)
+			}
+			got.Write(c)
+			if strings.Contains(got.String(), want) {
+				return got.String(), true
+			}
+		case <-deadline:
+			return got.String(), false
+		}
+	}
+}
+
+// drain returns everything left on the channel once the response ends.
+func drain(ch <-chan []byte) string {
+	var got strings.Builder
+	for c := range ch {
+		got.Write(c)
+	}
+	return got.String()
+}
+
 // TestMarkerFreeSSEStreamsThrough is the failing-test proof for issue #26. The
 // upstream sends the head of an event-stream, then blocks until the test says the
 // client has already seen bytes. If context-guru buffers the response, nothing
@@ -553,36 +608,24 @@ func TestMarkerFreeSSEStreamsThrough(t *testing.T) {
 	// buffering proxy cannot return anything here at all — it deadlocks until the
 	// upstream's own 5s escape hatch fires, and then delivers head+tail in one go,
 	// which is what the "last" assertion below detects.
-	buf := make([]byte, 4096)
-	n, rerr := resp.Body.Read(buf)
-	first := string(buf[:n])
+	// The expand tool is advertised on every tools-bearing request (expand.InjectAuto is
+	// session-stable, so the tools array never changes shape mid-session), which means EVERY
+	// Anthropic stream is inspected. This assertion was weakened once, to "forwarding ended at
+	// the first content_block_start", because a bounded peek had to hold the deciding event
+	// before it could decide. Splicing decides per event, so the original claim is back:
+	// the model's first delta reaches the client while the upstream is still generating.
+	ch := sseChunks(resp.Body)
+	first, ok := collectUntil(ch, "first", 2*time.Second)
 	close(release)
-	if n == 0 {
-		t.Fatalf("first read returned no bytes: %v", rerr)
-	}
-	// The peek's boundary, asserted explicitly rather than assumed: the expand tool is now
-	// advertised on every tools-bearing request (expand.InjectAuto is session-stable, so the
-	// tools array never changes shape mid-session), which means EVERY Anthropic stream is
-	// peeked. What must still hold is that the peek ENDS at the first content_block_start and
-	// the remainder streams — not that the very first delta arrives in the first read, which
-	// is what this asserted while marker-free requests skipped the peek entirely.
-	if !strings.Contains(first, "content_block_start") {
-		t.Fatalf("first read did not reach the peek boundary, got %q", first)
+	if !ok {
+		t.Fatalf("marker-free SSE response was BUFFERED: the client received nothing until "+
+			"the upstream had finished (issue #26), got %q", first)
 	}
 	if strings.Contains(first, "last") {
-		t.Fatal("marker-free SSE response was BUFFERED: the client received the whole " +
-			"stream at once, after the upstream had finished (issue #26 — hasMarkers " +
-			"matched the expand tool description we inject ourselves)")
+		t.Fatal("the client received the upstream's tail before it was written")
 	}
-	rest, _ := io.ReadAll(resp.Body)
-	// Nothing may be DROPPED at the peek boundary: the first delta is behind it now, so it
-	// has to arrive in the remainder. A peek that swallowed it would still pass every
-	// assertion above.
-	whole := first + string(rest)
-	if !strings.Contains(whole, "first") {
-		t.Fatalf("the first delta was lost across the peek boundary, whole=%q", whole)
-	}
-	if !strings.Contains(string(rest), "last") {
+	rest := drain(ch)
+	if !strings.Contains(rest, "last") {
 		t.Fatalf("stream did not complete, tail=%q", rest)
 	}
 
@@ -603,9 +646,9 @@ func TestMarkerFreeSSEStreamsThrough(t *testing.T) {
 // 33.4% of responses buffered, sse_ttfb_ms_avg_buffered 28,998 ms against 7,918 ms
 // streamed, ~21 seconds of extra time to first byte.
 //
-// A response that OPENS with a text block cannot be intercepted from its first block, so
-// the bounded peek flushes and streams. The upstream here blocks before its tail, so a
-// buffering proxy cannot answer at all — the "last" assertion is what tells the two apart.
+// A response that opens with a text block streams as it arrives; only the block that calls the
+// expand tool is withheld. The upstream here blocks before its tail, so a buffering proxy
+// cannot answer at all — the "last" assertion is what tells the two apart.
 func TestMarkerBearingSSEStreamsWhenItOpensWithText(t *testing.T) {
 	release := make(chan struct{})
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -632,25 +675,18 @@ func TestMarkerBearingSSEStreamsWhenItOpensWithText(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	buf := make([]byte, 4096)
-	n, rerr := resp.Body.Read(buf)
-	first := string(buf[:n])
+	ch := sseChunks(resp.Body)
+	first, ok := collectUntil(ch, "first", 2*time.Second)
 	close(release)
-	if n == 0 {
-		t.Fatalf("first read returned no bytes: %v", rerr)
-	}
-	// The peek stops AT the content_block_start it decided on and flushes there, so that
-	// event is what proves the response streamed: it reached the client while the upstream
-	// was still blocked on `release`.
-	if !strings.Contains(first, "content_block_start") {
-		t.Fatalf("expected the flushed peek, got %q", first)
+	if !ok {
+		t.Fatalf("a marker-bearing SSE response that opens with TEXT was buffered whole; "+
+			"the model's first delta must reach the client while the upstream is still "+
+			"generating, got %q", first)
 	}
 	if strings.Contains(first, "last") {
-		t.Fatal("a marker-bearing SSE response that opens with TEXT was buffered whole; " +
-			"the peek exists so it is not")
+		t.Fatal("the client received the upstream's tail before it was written")
 	}
-	rest, _ := io.ReadAll(resp.Body)
-	whole := first + string(rest)
+	whole := first + drain(ch)
 	for _, want := range []string{"first", "last", "message_stop"} {
 		if !strings.Contains(whole, want) {
 			t.Fatalf("the streamed response lost %q; peek + remainder must be the whole "+
@@ -768,6 +804,11 @@ func TestExpandSSEMultiRoundCapped(t *testing.T) {
 	}
 	if snap.SSEBufferedPct != 100 {
 		t.Fatalf("buffered_pct must be a share of requests (want 100), got %v", snap.SSEBufferedPct)
+	}
+	// And the cap hands the client the model's own expand call, which is the one thing that
+	// must never be silent: it is the same leak as any other round the loop cannot answer.
+	if snap.SSEExpandAfterStream != 1 {
+		t.Fatalf("the round cap gives the client our own tool_use and must count it: %+v", snap)
 	}
 }
 
