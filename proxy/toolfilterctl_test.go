@@ -56,8 +56,10 @@ func TestToolFilterExcludeRoundTrip(t *testing.T) {
 		t.Fatalf("server exclusion not stored: %q", doc)
 	}
 
-	// RECOVERY: re-including both empties the list, which takes the component back out of
-	// the pipeline rather than leaving a pass over every request that removes nothing.
+	// RECOVERY: re-including both empties the LIST. The component stays in the pipeline, because
+	// it now ships in the default one with an empty list — taking it out would write an explicit
+	// pipeline diverging from the default to no effect, since a filter with nothing to remove
+	// already removes nothing. What must not survive is the NAME.
 	for _, name := range []string{`{"kind":"tool","name":"Workflow","action":"include"}`,
 		`{"kind":"mcp_server","server":"playwright","action":"include"}`} {
 		if w, _ = f.do(t, "POST", "/api/toolfilter", name, jar); w.Code != http.StatusOK {
@@ -67,8 +69,16 @@ func TestToolFilterExcludeRoundTrip(t *testing.T) {
 	_, me = f.do(t, "GET", "/api/me", "", jar)
 	tn, _ = me["tenant"].(map[string]any)
 	doc, _ = tn["effective_config_yaml"].(string)
-	if strings.Contains(doc, "Workflow") || strings.Contains(doc, "toolfilter") {
-		t.Errorf("re-including left the filter configured: %q", doc)
+	if strings.Contains(doc, "Workflow") || strings.Contains(doc, "mcp__playwright") {
+		t.Errorf("re-including left a name in the removal list: %q", doc)
+	}
+	// And the component is STILL there, which is the half a revert to the old
+	// `withComponent(..., len(names) > 0)` would break silently: the list would be right, the
+	// account's pipeline would explicitly omit a component the default ships, and nothing would
+	// notice until the default changed under it.
+	if !strings.Contains(doc, "toolfilter") {
+		t.Errorf("re-including took toolfilter out of the pipeline; it ships in the default one "+
+			"and an empty list already removes nothing: %q", doc)
 	}
 
 	// The audit trail recorded the configuration changes.
@@ -231,16 +241,19 @@ func TestToolFilterGrantsNothingElse(t *testing.T) {
 	}
 }
 
-// TestToolFilterRefusesWhatCannotBeRemoved: a provider-side tool and a skill are not elements
-// of `tools` we can drop, so the answer is a reason rather than a stored configuration the
-// filter would silently decline to act on.
+// TestToolFilterRefusesWhatCannotBeRemoved: a provider-side tool is resolved by its `type` and
+// the skills LISTING is one indivisible block of prose, so the answer for those is a reason
+// rather than a stored configuration the filter would silently decline to act on.
+//
+// A SKILL is now accepted and is asserted in TestToolFilterStoresASkillUnderItsOwnPrefix.
 func TestToolFilterRefusesWhatCannotBeRemoved(t *testing.T) {
 	f := ctlFixture(t)
 	w, _ := f.signUp(t, "boss@ibm.com", "l")
 	jar := w.Result().Cookies()
 	for _, body := range []string{
 		`{"kind":"server_tool","name":"web_search","action":"exclude"}`,
-		`{"kind":"skill","name":"dataviz","action":"exclude"}`,
+		`{"kind":"skill_listing","name":"","action":"exclude"}`,
+		`{"kind":"skill","name":"not a skill name","action":"exclude"}`,
 		`{"kind":"tool","name":"","action":"exclude"}`,
 		`{"kind":"tool","name":"Workflow","action":"maybe"}`,
 		`{"kind":"mcp_server","server":"","action":"exclude"}`,
@@ -309,5 +322,74 @@ func TestToolFilterAnswersInTheCallersOwnScope(t *testing.T) {
 	}
 	if !hasExcluded(out, "Workflow") {
 		t.Errorf("the answer to a successful save does not list the exclusion: %v", out)
+	}
+}
+
+// A SKILL goes into the stored list under its own prefix, and comes back out described the way the
+// inventory describes it.
+//
+// Two different strings, deliberately, and the mismatch is the bug this test exists to hold shut.
+// The CONFIG needs `skill__<name>`, because a skill is removed from prose in a transcript message
+// while a tool is removed from the `tools` array and a bare name cannot say which mechanism is
+// meant. The PAGE matches an exclusion against an inventory row by (kind, name), and a row's name
+// is the skill's own — so answering with the prefixed form would leave every skill's switch
+// looking untouched after a write that had in fact landed.
+func TestToolFilterStoresASkillUnderItsOwnPrefix(t *testing.T) {
+	// The MANAGER fixture with the dashboard read hook wired, because the mapping under test is
+	// the one the page consumes: ToolFilterDoc.Excluded. The no-dashboard fallback answers with
+	// the raw config list by design and would not exercise it.
+	f := newMgrFixture(t)
+	f.h.API().SetToolFilterState(f.h.DashToolFilter())
+	w, _ := f.signUp(t, "boss@ibm.com", "l")
+	jar := w.Result().Cookies()
+
+	w, out := f.do(t, "POST", "/api/toolfilter",
+		`{"kind":"skill","name":"dataviz","action":"exclude"}`, jar)
+	if w.Code != http.StatusOK {
+		t.Fatalf("exclude a skill = %d %s", w.Code, w.Body)
+	}
+	// The wire answer names the skill, not the config string.
+	if !hasExcluded(out, "dataviz") {
+		t.Fatalf("the answer does not list the skill as `dataviz`: %v", out)
+	}
+	if hasExcluded(out, "skill__dataviz") {
+		t.Error("the answer leaked the config form; a page matching on it will never match a row")
+	}
+	// The stored document carries the PREFIXED form, builds, and runs the component.
+	_, me := f.do(t, "GET", "/api/me", "", jar)
+	tn, _ := me["tenant"].(map[string]any)
+	doc, _ := tn["effective_config_yaml"].(string)
+	if !strings.Contains(doc, "skill__dataviz") {
+		t.Fatalf("the stored configuration does not carry `skill__dataviz`: %q", doc)
+	}
+	names, ok, reason := removedFrom(doc)
+	if !ok || len(names) != 1 || names[0] != "skill__dataviz" {
+		t.Fatalf("removedFrom(%q) = %v ok=%v %q", doc, names, ok, reason)
+	}
+	if !strings.Contains(doc, "toolfilter") {
+		t.Error("the component is not in the pipeline, so the removal would never run")
+	}
+
+	// A plugin skill's name carries a colon, which the config charset allows and a naive
+	// validator would not.
+	if w, _ = f.do(t, "POST", "/api/toolfilter",
+		`{"kind":"skill","name":"ponytail:ponytail","action":"exclude"}`, jar); w.Code != http.StatusOK {
+		t.Fatalf("exclude a plugin skill = %d %s", w.Code, w.Body)
+	}
+
+	// RECOVERY: re-including empties the list. The component stays (see the round-trip test).
+	for _, body := range []string{
+		`{"kind":"skill","name":"dataviz","action":"include"}`,
+		`{"kind":"skill","name":"ponytail:ponytail","action":"include"}`,
+	} {
+		if w, _ = f.do(t, "POST", "/api/toolfilter", body, jar); w.Code != http.StatusOK {
+			t.Fatalf("include = %d %s", w.Code, w.Body)
+		}
+	}
+	_, me = f.do(t, "GET", "/api/me", "", jar)
+	tn, _ = me["tenant"].(map[string]any)
+	doc, _ = tn["effective_config_yaml"].(string)
+	if strings.Contains(doc, "skill__") {
+		t.Errorf("re-including left a skill in the removal list: %q", doc)
 	}
 }

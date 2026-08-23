@@ -1,5 +1,7 @@
 package dash
 
+import "strings"
+
 // How a user actually gets rid of a capability they are paying to carry, and which of the
 // things they carry are safe to get rid of at all.
 //
@@ -15,6 +17,21 @@ package dash
 // in the prompt and only blocks the call, so it saves nothing at all. Every snippet this file
 // emits is therefore the bare form, and the distinction is stated to the reader rather than
 // assumed, because "I denied it and my prompt did not shrink" is the obvious next bug report.
+//
+// HOW EACH CLAIM WAS CHECKED, because a dashboard that guesses a command gets the guess pasted.
+// Every mechanism below was run through a proxy against Claude Code 2.1.241 and the resulting
+// declaration set read back off the wire, rather than inferred from the settings schema:
+//
+//   - a bare name in `permissions.deny` drops the declaration. Denying `mcp__plan__make_plan`
+//     and `WebSearch` left `mcp__plan__review_plan` and `WebFetch` in the array and removed the
+//     two named ones — so the rule works per MCP TOOL, not only per server, and works on a
+//     built-in.
+//   - `skillOverrides: {"<skill>": "off"}` drops a PLAIN skill's listing entry.
+//   - it does NOT drop a PLUGIN skill's entry. `superpowers:systematic-debugging` set to "off"
+//     in the same file as `claude-api` survived while `claude-api` vanished. Worth stating
+//     because the settings schema reads as though it should work (the override map is keyed by
+//     the same name the listing prints), and the honest answer came from the wire.
+//   - `claude mcp remove <server>` removes a hand-added server. Confirmed by the owner directly.
 //
 // Two consequences worth keeping in view:
 //
@@ -148,7 +165,16 @@ func RemovalFor(kind, name, server string) Removal {
 			Effect:       "Hides the skill from the listing, so its entry stops being sent.",
 			Note: "Denying a skill with `Skill(" + name + ")` instead would NOT save anything — a " +
 				"scoped rule blocks the call but leaves the entry in the prompt. Deleting " +
-				"`~/.claude/skills/" + name + "/` also works and is permanent.",
+				"`~/.claude/skills/" + name + "/` also works and is permanent. " +
+				// The middle setting, because on a real listing most of an entry's weight is its
+				// description: measured here, entries run 38-295 tokens and the name is a
+				// handful of them. So there is a large partial saving available to somebody who
+				// wants to keep the skill, and the page offering only all-or-nothing was hiding
+				// the option that most readers actually want.
+				"If you want to KEEP this skill and still stop paying for most of it, set it to " +
+				"\"name-only\" instead of \"off\": that lists the name without the description, " +
+				"which is nearly all of the weight. \"user-invocable-only\" hides it from the " +
+				"model while leaving /" + name + " working for you.",
 		}
 	case name == "EndConversation":
 		// Documented exception: a deny rule cannot remove this one while any other tool
@@ -240,11 +266,24 @@ func isPluginServer(server string) bool {
 
 // splitPluginSkill splits a "<plugin>:<skill>" skill name. A personal or project skill has no
 // colon and is managed by skillOverrides; a plugin's skill is managed by its plugin.
+//
+// A colon is NOT enough, because two different things wear one: a plugin skill is
+// `<plugin>:<skill>` and a DIRECTORY-SCOPED skill is `<path>:<skill>` — Claude Code lists those as
+// e.g. `apps/web:deploy`. Treating the second as the first emitted
+// `claude plugin disable apps/web`, which names no plugin and silently does nothing: the worst
+// output this file can produce, because it gets pasted and appears to succeed.
+//
+// A `/` in the prefix is the discriminator: a path segment can contain one and a plugin name
+// cannot. A directory-scoped skill therefore falls through to the plain skillOverrides mechanism,
+// which is keyed by the same name the listing prints.
 func splitPluginSkill(name string) (plugin, skill string, ok bool) {
 	for i := 0; i < len(name); i++ {
 		if name[i] == ':' {
 			if i == 0 || i == len(name)-1 {
 				return "", "", false
+			}
+			if strings.ContainsRune(name[:i], '/') {
+				return "", "", false // a directory scope, not a plugin
 			}
 			return name[:i], name[i+1:], true
 		}

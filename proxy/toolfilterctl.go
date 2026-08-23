@@ -26,6 +26,7 @@ import (
 
 	"github.com/rossoctl/context-guru/config"
 	"github.com/rossoctl/context-guru/dash"
+	"github.com/rossoctl/context-guru/internal/skills"
 	"github.com/rossoctl/context-guru/tenant"
 )
 
@@ -147,11 +148,17 @@ func (h *Handler) ctlToolFilter(w http.ResponseWriter, r *http.Request) {
 		f.Components[toolFilterComponent] = map[string]any{}
 	}
 	f.Components[toolFilterComponent]["remove"] = names
-	// The component runs LAST, after cachesplit: it edits the top-level `tools` array rather
-	// than a message, so its position among the message reducers is meaningless, and appending
-	// keeps an existing order untouched. An empty list leaves the pipeline entirely — a
-	// component with nothing to remove is a pass over every request for nothing.
-	f.Pipeline = withComponent(f.Pipeline, toolFilterComponent, len(names) > 0)
+	// ADDED when absent, and never REMOVED. `toolfilter` now ships in the default pipeline with
+	// an empty removal list, so naming a tool is a settings change and not a pipeline change —
+	// and an emptied list that took the component back out would write an explicit pipeline
+	// DIVERGING from the default, for no gain: a component with nothing to remove already does
+	// nothing. The add stays because an account whose stored pipeline predates that default does
+	// not have it, and without the add that account's first exclusion would save nothing and
+	// report success.
+	//
+	// Position is meaningless here either way: the rewrite lives in apply, not in the component,
+	// because `tools` is a top-level field the message pipeline never sees.
+	f.Pipeline = withComponent(f.Pipeline, toolFilterComponent, true)
 	// This route models exactly one component, so it claims exactly one. Without the claim
 	// ApplyForm preserves anything the stored pipeline runs and this omission is not sent —
 	// which is the rule that stops a stale settings page dropping a component it cannot see,
@@ -213,9 +220,20 @@ func declConfigName(kind, name, server string) (string, error) {
 	case dash.KindServerTool:
 		return "", errors.New("a provider-side tool is resolved by the provider from its " +
 			"type, not by a schema we send, so it cannot be removed here")
-	case dash.KindSkill, dash.KindSkillListing:
-		return "", errors.New("a skill is declared as prose inside the transcript rather than " +
-			"as a tool, so removing one is not supported yet")
+	case dash.KindSkill:
+		if name == "" {
+			return "", errors.New("no skill name")
+		}
+		if !skills.ValidName(name) {
+			// The listing is the authority for what may be cut out of a real request, so a name
+			// that could not have come from one is refused rather than written into a config that
+			// would match nothing forever.
+			return "", errors.New("that is not a skill name")
+		}
+		return skills.RemovePrefix + name, nil
+	case dash.KindSkillListing:
+		return "", errors.New("the skills listing is one indivisible block of prose — remove the " +
+			"individual skills instead, and the listing shrinks with them")
 	case dash.KindTool, dash.KindMCPTool, "":
 		if name == "" {
 			return "", errors.New("no declaration name")

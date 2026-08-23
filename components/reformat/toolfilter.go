@@ -7,6 +7,7 @@ import (
 
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/components"
+	"github.com/rossoctl/context-guru/internal/skills"
 )
 
 func init() { components.Register("toolfilter", newToolfilter) }
@@ -17,9 +18,14 @@ func init() { components.Register("toolfilter", newToolfilter) }
 // show that a declaration was not used in the sessions it captured, and an unused tool is
 // not the same thing as an unwanted one.
 type toolfilterConfig struct {
-	// Remove names the tool and MCP-server declarations to stop sending. Exact declaration
-	// names as the inventory reports them, plus the bare form `mcp__<server>` for a whole
-	// MCP server. An empty list is a no-op, which is what the shipped default is.
+	// Remove names the declarations to stop sending, in three shapes, all of them exact and
+	// none of them a pattern:
+	//
+	//   - `<tool>` — one tool or MCP tool, by the name the inventory reports;
+	//   - `mcp__<server>` — a whole MCP server, every tool it declares;
+	//   - `skill__<skill>` — one skill, removed from the listing prose rather than from `tools`.
+	//
+	// An empty list is a no-op, which is what the shipped default is.
 	Remove []string `yaml:"remove"`
 }
 
@@ -27,6 +33,10 @@ type toolfilterConfig struct {
 // field the pipeline never sees (components operate on `messages`), so the rewrite lives in
 // apply — the same arrangement toolschema and cachesplit use. apply reads the list back
 // through Removed().
+//
+// The skills half lives there too, for a different reason: the listing IS in `messages`, but it
+// sits in the cached prefix, and every rewrite of the prefix has to happen before any byte offset
+// into the body is taken. Same place, same list, same counters. See apply.filterSkillListing.
 type Toolfilter struct{ remove []string }
 
 func newToolfilter(raw []byte) (components.Component, error) {
@@ -59,11 +69,15 @@ func newToolfilter(raw []byte) (components.Component, error) {
 	return Toolfilter{remove: out}, nil
 }
 
-// validDeclName accepts the charset a tool, MCP or skill name is drawn from. No globs, no
-// wildcards: a pattern that matches more tomorrow than it did today is exactly the
-// non-deterministic removal this component refuses to offer.
+// validDeclName accepts the charset a tool, MCP or skill name is drawn from, plus the two
+// prefixes that select a mechanism. No globs, no wildcards: a pattern that matches more tomorrow
+// than it did today is exactly the non-deterministic removal this component refuses to offer.
+//
+// The length bound is applied to the NAME, after the prefix, so `skill__` does not eat seven
+// characters of a legitimate one.
 func validDeclName(n string) bool {
-	if len(n) > 128 {
+	n = strings.TrimPrefix(n, skills.RemovePrefix)
+	if n == "" || len(n) > 128 {
 		return false
 	}
 	for _, r := range n {
@@ -92,10 +106,21 @@ func (Toolfilter) Reformat(_ *schemas.BifrostChatRequest, rep *components.Report
 	return nil
 }
 
+// ponytail: this component records NO gate, so a configured name the prose gate declines is
+// invisible in /stats — the one inconsistency GROUND-TRUTH already notes against toolfilter
+// ("no gates recorded"). rep.Gate("prose_referenced") is the right home for it and the plumbing is
+// the cost: the decision is made in apply, so the count has to reach Ctx the way FilteredDecls
+// does, which means a fourth return value on filterDeclarations and filterSkillListing and their
+// 31 call sites, 28 of them in tests. Deferred deliberately rather than duplicating
+// proseReferenced at a second site, which is how the two would drift. The user-facing half is
+// already handled: the page states the condition instead of promising an outcome it has not
+// checked (dash/ui/tools.js, the opted-out row and the skills panel).
+
 func init() {
 	components.RegisterFields("toolfilter", toolfilterConfig{}, []components.Field{
 		{Key: "remove", Type: components.FieldStrings,
-			Hint: "declaration names to stop sending (`mcp__<server>` removes a whole MCP server); " +
-				"a name still described in the system prompt's prose is kept regardless"},
+			Hint: "declaration names to stop sending: a tool name, `mcp__<server>` for a whole MCP " +
+				"server, or `skill__<skill>` for one skill's listing entry; a name still described " +
+				"in the system prompt's prose is kept regardless"},
 	})
 }
