@@ -25,14 +25,25 @@ import (
 // responses take to generate, not what buffering added. What buffering definitely adds is
 // holding an entire response in memory and forbidding the client any early byte — measured
 // end to end on this box, 23 of 30 real streaming responses were buffered before this change
-// and 0 of 30 after, on byte-identical request bodies.
+// and 0 of 30 after, on byte-identical request bodies. (Those 30 are about the introduction
+// of THIS file, not about the later change that made every tools-bearing request advertise
+// the expand tool — this file is unchanged by that commit; what changed is how often the
+// peek runs.)
 //
-// And the honest negative result: on the IBM gateway this deployment talks to, the client
-// sees NO time-to-first-byte improvement, because that gateway does not stream either.
-// Measured with no proxy in the path at all — straight client to gateway, `stream: true` —
-// ttfb/wall was 1.000 on 6 of 6 turns. Our first byte cannot precede theirs. So this change
-// removes context-guru's own contribution to the problem and pays off on an upstream that
-// streams; it does not fix that upstream.
+// CORRECTED 2026-08: the gateway DOES stream, and the claim that used to sit here — "that
+// gateway does not stream either, ttfb/wall 1.000 on 6 of 6 turns" — was wrong. Re-measured
+// with no proxy in the path, 22 of 22 responses came back as text/event-stream with 38
+// events and ttfb/wall ran 0.47-0.78 (p50 0.58-0.68), direct and through the proxy alike.
+// Individual turns DO read 1.000 when generation finishes fast enough to arrive in one
+// burst, which is the likeliest thing the original 6 turns caught. So this change does
+// improve the client's first byte here, and the peek is nearly free for a different reason
+// than the old comment gave: the gap it adds is first-byte to first content_block_start,
+// measured at a MEDIAN of 0.0 ms over 22 streams (mean 17.4, p95 3.3, max 379.4), because
+// in 18 of the 22 both events arrived in the SAME TCP segment.
+//
+// An end-to-end paired measurement of that gap does NOT resolve (n=9, mean +804 ms, 95% CI
+// -223..+1,831; per-pair sd 1.57 s, so a 50 ms effect would need ~3,800 pairs). The direct
+// figure above is the resolved one; no direction should be quoted from the end-to-end run.
 //
 // So decide from the FRONT of the stream instead. In the Anthropic dialect the first
 // content_block_start arrives early and names the block's type and, for a tool_use, the
@@ -43,8 +54,11 @@ import (
 // The honest limit, stated because it is a real behaviour change. A response that opens
 // with thinking or text and calls expand LATER is streamed through, so the client receives
 // the model's raw expand tool_use instead of the proxy resolving it. That outcome already
-// exists on two live paths (`otherTools`, and `got == 0` when nothing resolves), so it is
-// within the design's failure envelope rather than new — but it is not free, and the peek
+// exists on other live paths (`otherTools`; `Continuation` returning !ok; the round cap;
+// AggregateSSE failing; and every non-Anthropic SSE response, which is never peeked at all),
+// so it is within the design's failure envelope rather than new. `got == 0` is NO LONGER one
+// of them: a call that resolves nothing now continues with a placeholder tool_result instead
+// of replaying the model's own call — but it is not free, and the peek
 // deliberately does not pretend otherwise: streamFrom counts every streamed response that
 // turned out to name the expand tool, so the rate is a number on /stats
 // (sse_expand_after_stream) rather than an argument here.

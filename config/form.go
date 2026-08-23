@@ -178,21 +178,42 @@ type ExtractLLMForm struct {
 // DefaultExtractLLMForm is what the settings page pre-fills. The sweep on, the hot path
 // off: the cold turn is the regime where our own measurements say a model call pays, and
 // the per-output pass on a warm cache is the one they say loses.
+//
+// These are housellm's values with two documented exceptions — AllowOnCachingBackend
+// (below) and cold_cache.max_calls, which this form does not model at all, so an account
+// prefilled from here gets the component's own default of 4 rather than housellm's 20.
+// housellm is the one extract_llm configuration this service has actually run and measured,
+// so the form offers what production runs rather than a second opinion about it. Six values
+// changed from what this function returned before. Two are the interesting ones and NEITHER
+// is a spend change, because `per_output: false` puts the whole hot path out of reach
+// (extract_llm.go:1168 switches on `sweeping`; the per-request and per-session caps are the
+// other arm of that if/else):
+//
+//	AllowOnCachingBackend stays FALSE, and it is the one value that deliberately does NOT
+//	  match housellm. There the flag is inert, because `per_output: false` means nothing
+//	  prompt-cached ever reaches the check it lifts (see config.presetConfigs). Here it
+//	  would not stay inert: `per_output` is a CHECKBOX on this page, so pre-arming the flag
+//	  puts the net-negative combination one tick away — extract_econ.go:333 prices it at
+//	  break-even ~30,500 tokens/output against a largest-observed 2,053, and this repo has a
+//	  guard test whose whole point is that no default ships it. A prefill must not pre-arm
+//	  something that only becomes live when somebody changes a different field.
+//	TriggerMinTokens 20000 and ContextMessages 2, from the same measured config: a higher
+//	  pressure bar so most turns still make no call, and a shorter context window per call.
+//	MaxPerSession 0, read by the component as UNLIMITED, and MaxPerRequest 4. An operator
+//	  decision, and inert while per_output is off: the sweep bounds itself with
+//	  cold_cache.max_calls, which this form does not model. What bounds a long session here
+//	  is that cap, the pressure trigger and the economic gate.
 func DefaultExtractLLMForm() ExtractLLMForm {
 	return ExtractLLMForm{
 		PerOutput: false, ColdEnabled: true, SizeTrigger: false,
-		MinTokens: 2000, MaxPerRequest: 2, MaxPerSession: 20,
-		Aggressiveness: "medium", Context: "recent", ContextMessages: 7,
-		ColdMinTokens: 1000,
+		MinTokens: 3000, MaxPerRequest: 4, MaxPerSession: 0,
+		Aggressiveness: "medium", Context: "recent", ContextMessages: 2,
+		ColdMinTokens: 3000,
 		// incoming, not config: on the hosted service there is no operator-configured
 		// compaction model, so `source: config` is a component that can never make a call.
 		ModelSource: "incoming", ModelName: "claude-haiku-4-5",
 		Strategy: "code", EveryNRequests: 1,
-		TriggerMinTokens: 3000,
-		// Left FALSE: the component's own measurements say it loses money on a caching
-		// backend, and a default that starts spending is not this form's call. It is a
-		// FIELD now, so the operator who wants it can see it and tick it, which is the part
-		// that was missing — it was invisible, not just off.
+		TriggerMinTokens:      20000,
 		AllowOnCachingBackend: false,
 	}
 }

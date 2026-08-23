@@ -79,8 +79,25 @@ Absolutes (`min_request_tokens`, etc.) still win; when the window is unknown, fr
 absolutes apply (backward compatible). This lets one config generalize across models/benchmarks.
 
 **Reversibility in practice.** The `context_guru_expand` tool is advertised on outgoing requests
-(`INJECT_EXPAND=auto|always|never`, default `auto` = only when the request already declares
-tools, carries a `<<cg:HASH>>` marker, and the store persists), so Offload markers are genuinely recoverable — not just described in marker text. Every
+(`INJECT_EXPAND=auto|always|never`, default `auto` = whenever the request already declares
+tools and the store persists), so Offload markers are genuinely recoverable — not just described in marker text.
+Both conditions are properties of the **session**, not of the turn, so the `tools` array a session
+sends is byte-identical on every request in it. That matters more than it looks: `tools` sits ahead of
+`system` and `messages` in the provider's prompt-cache hash, so the first request carrying a **new**
+tools array re-creates the **entire** prefix at the write rate. `auto` used to also require a marker on
+the request, which made the array grow on the first offloading turn and shrink again on the next turn
+that carried none.
+
+Measured on a real 7-turn session: the old behaviour flipped once, when the first marker appeared, and
+that turn billed **write 43,359 / read 0** against the 40,320-token prefix the earlier turns had built.
+After the change, one tools hash across all seven turns and that turn billed write 163 / read 43,135.
+Paired sessions run in both arm orders: **35.4% and 35.3%** off input cost, with total input tokens
+*up* 313 — the same bytes, repriced from 1.25× to 0.1×. Worth knowing the shape of the win: alternating
+back to a previous tools array still **reads**, because the provider keeps both lineages alive within
+the TTL, so the cost is one full-prefix write per *new* variant rather than one per flip. A session that
+never offloads saves nothing.
+
+Every
 offloader also applies a **marker-inclusive** never-worse check per message, so a rewrite never grows a
 message by the marker's tokens.
 

@@ -631,16 +631,36 @@ the compaction.
 
 ## Default configuration
 
-Every new tenant starts on `codesmart` minus the LLM extractor (and minus `codesafe`'s
-blind `collapse`):
+Every new tenant starts on **`house`** — the structural offloaders with no model call
+anywhere in the path:
 
 ```yaml
-pipeline: [format, toon, textclean, dedup, cmdfilter, extract, cachesplit]
+pipeline: [format, dedup, toon, cmdfilter, searchfold, textclean, extract, cachesplit, toolfilter]
 components:
   extract:
     min_tokens: 400
 mode: sync
 ```
+
+**`housellm`** is the same pipeline with `extract_llm` inserted before `extract`, applied
+per account on request. It calls a cheap model (`claude-haiku-4-5`, on the caller's own
+credential and endpoint) when the economic gate says the expected saving beats the priced
+cost of the call — and **only on a turn whose prompt cache has expired**, never on
+prompt-cached traffic. That is what `per_output: false` means, and it is the brake: a cold
+turn is about to re-bill its whole transcript at the write rate, so a token removed there is
+the most valuable one there is. On warm turns the same removal is worth a tenth as much and
+the component stays out of the way. It is offered by name rather than turned on for everyone because those calls
+spend the caller's money.
+
+**Changed 2026-08-23:** `searchfold` and `toolfilter` joined the default, and `dedup` moved
+ahead of `toon`. `toolfilter` ships with an empty removal list, so it is a no-op until an
+account names a tool, MCP server or skill to stop sending — it is in the default so that
+naming one is a settings change rather than a pipeline change. `toon` stays in this order at
+the operator's request even though it acted 0 times on 5,752 measured requests; it is
+lossless, so what it costs is latency, never content. `linecap` is **not** here. Its 20.3% is
+gross reach, not incremental value: measured on the same corpus, adding it to this pipeline is
+worth +0.797 pp (+152,615 tokens), because the offloaders ahead of it have already taken most
+of what it would have caught.
 
 `textclean` was added on 2026-08-20 and is the reason to re-read this section if you last
 saw it earlier. It strips ANSI escapes and carriage-return redraws from tool output, which

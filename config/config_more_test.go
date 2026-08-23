@@ -149,8 +149,17 @@ func TestLosslessFoldsAreInEveryWorkingPreset(t *testing.T) {
 // toon acted 0 times on 5,752 production requests and converted 0 candidates in 11.67M
 // measured tokens, at 1.53 ms + one TextTokens call per tool message. It stays REGISTERED
 // (tabular traffic can opt in) but no preset may pay for it by default.
+//
+// house/housellm are exempt because an operator asked for toon in them explicitly, knowing
+// the number above. The measurement is not retracted and the rule still holds everywhere
+// else: what an exemption buys is that adding toon to a THIRD preset still has to be a
+// decision somebody makes here, rather than something that quietly spreads.
 func TestToonIsInNoPreset(t *testing.T) {
+	byOperatorRequest := map[string]bool{"house": true, "housellm": true}
 	for name, pipeline := range presets {
+		if byOperatorRequest[name] {
+			continue
+		}
 		for _, c := range pipeline {
 			if c == "toon" {
 				t.Errorf("preset %q still ships toon: %v", name, pipeline)
@@ -158,8 +167,33 @@ func TestToonIsInNoPreset(t *testing.T) {
 		}
 	}
 	for name, doc := range presetConfigs {
+		if byOperatorRequest[name] {
+			continue
+		}
 		if strings.Contains(doc, "toon") {
 			t.Errorf("rich preset %q still ships toon", name)
+		}
+	}
+	// The exemption list may not name a preset that does not exist, and may not name one
+	// that no longer ships toon. The first would silently widen the rule the next time
+	// somebody adds a preset with that name; the second leaves a standing permission for a
+	// component nobody is running any more, which is how an exemption outlives its reason.
+	// Asserted because the first version of this check only covered the first case.
+	for name := range byOperatorRequest {
+		p, ok := presets[name]
+		if !ok {
+			t.Errorf("toon exemption names %q, which is not a preset", name)
+			continue
+		}
+		has := false
+		for _, c := range p {
+			if c == "toon" {
+				has = true
+			}
+		}
+		if !has {
+			t.Errorf("preset %q is exempted from the toon rule but no longer runs toon; "+
+				"drop the exemption rather than leaving a standing permission", name)
 		}
 	}
 }

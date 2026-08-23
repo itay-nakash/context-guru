@@ -274,7 +274,18 @@ func (c *Config) applyPreset() error {
 	// thresholds). Decode it into a scratch Config, then use its values only where the
 	// user didn't specify (pipeline; per-component config merged with user override).
 	if doc, ok := presetConfigs[c.Preset]; ok {
-		var pc Config
+		// Decoded into the TWO fields applyPreset actually carries, not into a full Config.
+		// With KnownFields(true) that turns "a preset declared a field this function ignores"
+		// from a silent discard into a load error, which TestEveryPresetBuilds already
+		// catches for every preset. The alternative — a test listing the ignored fields by
+		// hand — is correct only until somebody adds a top-level Config field, because
+		// KnownFields would happily accept it. `cache:` is the one that made this worth
+		// closing: it carries the keep-alive, so a preset declaring it would look like it
+		// spends the caller's money per ping and in fact do nothing at all.
+		var pc struct {
+			Pipeline   []string             `yaml:"pipeline"`
+			Components map[string]yaml.Node `yaml:"components"`
+		}
 		dec := yaml.NewDecoder(bytes.NewReader([]byte(doc)))
 		dec.KnownFields(true)
 		if err := dec.Decode(&pc); err != nil {
@@ -397,6 +408,29 @@ var presets = map[string][]string{
 	// /compact?preset=) resolving them.
 	"codesmart": {"format", "textclean", "searchfold", "dedup", "failed_run", "cmdfilter", "extract_llm", "extract", "linecap", "cachesplit"},
 	"codesafe":  {"format", "textclean", "searchfold", "dedup", "failed_run", "cmdfilter", "extract", "collapse", "linecap", "cachesplit"},
+	// house / housellm are the SERVICE configs: `house` is what every account runs unless
+	// it says otherwise (tenant.DefaultConfigYAML is this document), `housellm` is the same
+	// pipeline with the compaction-model pass added, applied per account on request.
+	//
+	// The component ORDER here is the operator's, not this file's usual rule. Two
+	// deliberate deviations, recorded so nobody "fixes" them by reading the comments above:
+	//
+	//	toon runs, against the measurement in TestToonIsInNoPreset (0 acts on 5,752
+	//	  production requests, 0 convertible candidates in 11.67M tokens, 1.53 ms and one
+	//	  TextTokens call per tool message). It is a Reformat, so the cost is latency, never
+	//	  content. If tabular traffic ever arrives it is already in the path.
+	//	dedup and cmdfilter run BEFORE searchfold and textclean, so the lossless trio no
+	//	  longer leads. Downstream token counts are therefore taken after two offloaders
+	//	  have already edited the messages, which makes the per-component attribution in
+	//	  /stats less honest than in `general` — the totals are unaffected.
+	//
+	// linecap is absent. Its 20.3% figure is GROSS reach — the share of shipped tokens its
+	// rules touch — and not what adding it to this pipeline is worth. Measured incrementally
+	// on the same 1,795-request corpus, house vs house+linecap: +152,615 tokens, +0.797 pp,
+	// 14.5% of what was reachable. Real, and an order of magnitude short of "the largest
+	// deterministic lever", which is what the gross number reads as.
+	"house":    {"format", "dedup", "toon", "cmdfilter", "searchfold", "textclean", "extract", "cachesplit", "toolfilter"},
+	"housellm": {"format", "dedup", "toon", "cmdfilter", "searchfold", "textclean", "extract_llm", "extract", "cachesplit", "toolfilter"},
 }
 
 // presetConfigs carries FULL config docs for presets whose behavior depends on tuned
@@ -435,6 +469,73 @@ components:
 components:
   collapse:
     max_tokens: 3000`,
+	// house: the service default, deterministic all the way through — no model call, so it
+	// adds no upstream spend and no latency to anyone else's agent on a shared box.
+	// tenant.DefaultConfigYAML is this pipeline with `mode: sync`, and a test there asserts
+	// the two cannot drift apart.
+	"house": `pipeline: [format, dedup, toon, cmdfilter, searchfold, textclean, extract, cachesplit, toolfilter]
+components:
+  extract:
+    min_tokens: 400`,
+	// housellm: house plus the compaction-model pass, as measured on this service.
+	//
+	// allow_on_caching_backend is TRUE here and nowhere else in this file, and it is INERT
+	// as this preset ships. Read that before changing per_output.
+	//
+	// The flag only ever lifts one check: `if val.cached && !allowCached` in
+	// extract_econ.go's gate. With `per_output: false` the sole path into that gate is the
+	// cold sweep, and the cold branch returns `cached: false` by construction
+	// (extract_econ.go:145 — an EXPIRED prefix is about to be re-billed at 1.25x fresh, so a
+	// token removed there is the most valuable token there is, not the least). So the check
+	// the flag disables is unreachable, and `per_output: false` is the actual brake.
+	// Production agrees: 0 caching-backend declines across the measured window, where every
+	// suppression was "saving below call cost".
+	//
+	// It stays because it is the account configuration this preset was asked to carry, and
+	// because it costs nothing while per_output is off. What it must not become is a live
+	// flag: turn `per_output` on and the hot path reaches that gate with `cached: true`, the
+	// decline no longer fires, and extract_econ.go:333 records what our own measurements say
+	// happens then — net-negative even with the gate working, break-even ~30,500
+	// tokens/output against a largest-observed 2,053. TestNoDefaultConfigRunsExtractLLMOnCachingBackend
+	// includes this preset so that combination cannot ship by accident.
+	//
+	// llm_max_per_session: 0 is UNLIMITED, by operator decision — and it is INERT here for
+	// the same reason allow_on_caching_backend is. extract_llm.go:1168 splits on `sweeping`:
+	// the sweep consults cold_cache.max_calls, the hot path consults llm_max_per_request and
+	// llm_max_per_session, and they are the two arms of one if/else. With `per_output: false`
+	// only the sweep runs, so NEITHER per-request nor per-session is ever read at any value.
+	//
+	// So the only thing bounding spend here is `cold_cache.max_calls: 20` — calls per
+	// TTL-expiry sweep — plus the economic gate and the 20,000-token pressure trigger. 0
+	// there would mean the built-in 4 and -1 would mean unlimited: a different knob with a
+	// different zero, which is exactly why it is stated rather than left to be inferred from
+	// the per-session one.
+	"housellm": `pipeline: [format, dedup, toon, cmdfilter, searchfold, textclean, extract_llm, extract, cachesplit, toolfilter]
+components:
+  extract:
+    min_tokens: 400
+  extract_llm:
+    aggressiveness: medium
+    allow_on_caching_backend: true
+    cold_cache:
+      enabled: true
+      max_calls: 20
+      min_tokens: 3000
+    context: recent
+    context_messages: 2
+    economic_gate: true
+    fire_on: pressure
+    llm_every_n_requests: 1
+    llm_max_per_request: 4
+    llm_max_per_session: 0
+    min_tokens: 3000
+    model:
+      model: claude-haiku-4-5
+      source: incoming
+    per_output: false
+    strategy: code
+    trigger:
+      min_request_tokens: 20000`,
 	// agentdiet: the published AgentDiet baseline at the paper's tuned hyperparameters
 	// (a=2, b=1, θ=500) and the authors' artifact apply-gate (saved >= 400 || keep <
 	// 0.8). Routed to the CHEAP model because the method's economics depend on the

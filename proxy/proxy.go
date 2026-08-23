@@ -1076,11 +1076,28 @@ func (h *Handler) chat(provider bschemas.ModelProvider, static upstream, pick fu
 			// Skipped in observe mode: nothing was offloaded, so there is nothing to
 			// recover, and injecting a tool declaration would MODIFY the request — which is
 			// precisely the one thing observe mode promises never to do.
-			// Skipped on a bypassed request too: bypass promises a byte-identical forward,
-			// nothing was offloaded on this turn, and on an agent-compaction request an
-			// advertised expand tool is actively harmful — the summarizer may call it, and a
-			// tool_use with no text replayed to the client counts as a FAILED compaction
-			// (three of those and Claude Code disables auto-compact for the session).
+			// Skipped on a bypassed request too, and this one DOES cost cache sometimes. The
+			// earlier claim here — that a bypassed request is a compaction whose prefix is its
+			// own, so skipping is free — is true for a real compaction and false for a false
+			// positive, and isAgentCompaction has a reachable one: it fires on any last message
+			// with role "user" containing a compaction phrase (agentcompaction.go:71-77), and in
+			// the Anthropic dialect a tool_result IS a user-role message. So a tool output that
+			// quotes one of those phrases — a session reading the docs page, or reading this
+			// file — makes an ordinary mid-conversation turn bypass, lose the expand tool, and
+			// flip the tools array against the very prefix it shares.
+			//
+			// Measured on the dashboard: bypassed rows carry prefix_change at 26.7% against
+			// 1.44% for non-bypassed, an 18.6x enrichment, with zero cold_start and 22 of 30
+			// mid-session. n=30, so treat the RATE as indicative and the mechanism as
+			// established.
+			//
+			// Not fixed here, deliberately: the fix is to stop the detector matching a
+			// tool_result (require the phrase in a text block), which changes what bypass means
+			// for every caller of it, not just for this injection. That belongs in its own
+			// change with its own measurement — the check it needs is a phrase count in a
+			// capture against bypassed=1 rows. Injecting into a bypassed request instead is not
+			// the answer: bypass promises a byte-identical forward, and breaking that to save a
+			// prefix trades a documented guarantee for an unmeasured gain.
 			if tn.Mode != components.ModeObserve && !bypassed {
 				im := h.opts.InjectExpand
 				if im == "" {
@@ -1166,8 +1183,13 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 	// straight to a client that has no such tool. Reading the outgoing body rather than
 	// trusting Inject's return value also covers a request that already carried the tool.
 	//
-	// Since injection now requires markers (expand.Inject, InjectAuto), this keeps the
-	// documented fast path: no offload yet → no tool → no buffering, zero added latency.
+	// Injection no longer requires markers (expand.Inject, InjectAuto): the tools array has
+	// to be byte-stable across a session or every change to it costs the whole cached prefix.
+	// So for a tools-bearing client this is true from the FIRST turn, and the old "no offload
+	// yet → no tool → no buffering" fast path is gone with it. What replaced it is narrower
+	// and does the same job: peekSSE withholds only a response that OPENS with an expand
+	// call, so a normal answer still streams after a bounded peek rather than being buffered
+	// whole (see ssepeek.go). Non-Anthropic dialects are not peeked at all.
 	advertised := expand.HasTool(string(provider), body)
 	// SSE accounting is PER CLIENT REQUEST, not per upstream round: one client request
 	// that drives several expand rounds waited for all of them, so timing a single
@@ -1399,10 +1421,24 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 		lg.Debug("cg.expand", "round", round, "calls", len(calls),
 			"resolved", got, "unresolved", len(calls)-got)
 		next, ok := expand.Continuation(string(provider), body, msg, resolved)
-		if got == 0 || !ok {
-			writeRaw(w, resp, respBody) // nothing recovered; return the model's own call
+		if !ok {
+			writeRaw(w, resp, respBody) // malformed shapes — fail open, replay verbatim
 			return
 		}
+		// got == 0 CONTINUES, and that is the change that let the expand tool be advertised
+		// on every request in a session (expand.InjectAuto). `resolved` already carries a
+		// placeholder for every unresolved id, so the continuation is well formed whether
+		// anything came back or not, and the model gets to finish its turn by reading "that
+		// id is no longer available" — which is a turn that completes.
+		//
+		// Replaying the raw response here instead handed the CLIENT a bare tool_use for a
+		// tool the client does not implement. On an agent's own compaction request that
+		// reads as a summary that came back empty, and three of those disable auto-compact
+		// for the session — so the advertise condition was narrowed to marker-bearing turns
+		// to avoid ever reaching this line. It bought that safety with the whole prompt-cache
+		// prefix, on every turn where the marker set changed. The cost of paying it here
+		// instead is one bounded upstream round (maxExpandRounds still caps the loop), and
+		// only when a model asks for an id that has aged out of the store.
 		body = next // loop: re-invoke with the originals in hand
 	}
 }
