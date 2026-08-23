@@ -111,6 +111,66 @@ func TestTheRemovalCommandIsInTheActionableList(t *testing.T) {
 	}
 }
 
+// TestTheRemovalSwitchIsNotRoleGated pins the assumption POST /api/toolfilter now rests on.
+//
+// That route accepts a plain account because this page OFFERS a plain account the switch: the
+// tab is mounted unconditionally, and the only thing that disables a checkbox is a provider-side
+// row or a proxy that reports no control. The route's permission was written to match. If a
+// role gate is ever added here, the two ends disagree in the direction that is invisible on
+// screen — every account still sees the analysis, managers still see a working switch, and a
+// user's switch silently does nothing but alert — which is the exact defect the route gate was.
+//
+// A static check because there is no DOM here, and a grep for the role helpers is enough: they
+// are the only way this view could learn a caller's role, since it is handed a report and a
+// control document and neither carries one.
+func TestTheRemovalSwitchIsNotRoleGated(t *testing.T) {
+	src := readUI(t, "ui/tools.js")
+	for _, gate := range []string{"isManager(", "wideScope(", "'manager'", `"manager"`} {
+		if strings.Contains(src, gate) {
+			t.Errorf("the Inventory view consults %s. Its switch is offered to every account "+
+				"and POST /api/toolfilter accepts every account to match; gating the control on "+
+				"a role here makes a user's switch a no-op that only alerts. Hide nothing, or "+
+				"change the route's permission with it.", gate)
+		}
+	}
+	// And every switch's disabled condition must stay about the ROW and the PROXY, not the
+	// reader: `fixed` is a provider-side tool, `!tools.control` is a proxy offering no control.
+	//
+	// Asserted as a PROPERTY over however many conditions exist, not as a count of them. The
+	// first version of this check required exactly 2, which is what main happens to have —
+	// and the branch that moves built-in tools into their own section correctly leaves that
+	// table with no switch at all, so it has 1. A count assertion fails on that legitimate
+	// change, and fails with a message pointing at the role gate, which is the opposite of
+	// what happened. Verified against that branch's tools.js, not just this one's.
+	conds := 0
+	for _, line := range strings.Split(src, "\n") {
+		i := strings.Index(line, "disabled:")
+		if i < 0 {
+			continue
+		}
+		cond := line[i:]
+		conds++
+		if !strings.Contains(cond, "fixed") || !strings.Contains(cond, "!tools.control") {
+			t.Errorf("a switch's disabled condition is not about the row and the proxy: %s\n"+
+				"every one must gate on `fixed` (a provider-side tool) and `!tools.control` (a "+
+				"proxy offering no control), and on nothing about the reader", strings.TrimSpace(cond))
+		}
+		for _, gate := range []string{"isManager", "wideScope", "manager", "role"} {
+			if strings.Contains(cond, gate) {
+				t.Errorf("a switch's disabled condition consults %q: %s — a user's switch would "+
+					"become a no-op that only alerts, which is the defect the route gate was",
+					gate, strings.TrimSpace(cond))
+			}
+		}
+	}
+	// Zero would mean the view stopped drawing a switch at all, which passes every assertion
+	// above by having nothing to check.
+	if conds == 0 {
+		t.Error("the Inventory view declares no switch disabled condition at all; either the " +
+			"switch is gone or it moved somewhere this check cannot see")
+	}
+}
+
 func readUI(t *testing.T, name string) string {
 	t.Helper()
 	b, err := uiFS.ReadFile(name)
