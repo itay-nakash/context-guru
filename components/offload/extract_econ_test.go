@@ -1,8 +1,15 @@
 package offload
 
 import (
+	"context"
+	bschemas "github.com/maximhq/bifrost/core/schemas"
+	"github.com/rossoctl/context-guru/store"
 	"math"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/rossoctl/context-guru/components"
 	"github.com/rossoctl/context-guru/internal/cheapmodel"
@@ -498,4 +505,146 @@ func TestTheGateSeesTheWholePromptNotJustTheCandidate(t *testing.T) {
 	if callCost(p, candidate, 0) != callCost(p, candidate, promptOverheadTokens) {
 		t.Fatal("overhead 0 must fall back to promptOverheadTokens")
 	}
+}
+
+// TestSavedTokenValueAtPricesTheTailAtTheWriteRate pins the correction this change is: the
+// same request, the same rates, two candidates, and position is the only difference.
+func TestSavedTokenValueAtPricesTheTailAtTheWriteRate(t *testing.T) {
+	// A real rate card, so the assertion is about position and not about the fallback table.
+	c := &components.Ctx{CacheAware: true, MaxCachedIdx: 3, SelfRates: components.TokenRates{
+		Input: 3.00 / 1e6, CacheRead: 0.30 / 1e6, CacheWrite: 3.75 / 1e6,
+	}}
+	depth := savedTokenValueAt(c, 2) // 2 <= MaxCachedIdx: inside the live cached prefix
+	tail := savedTokenValueAt(c, 4)  // 4 > MaxCachedIdx: being written into the cache now
+
+	if !depth.cached || depth.perToken != 0.30/1e6 {
+		t.Fatalf("a candidate inside the cached prefix must be priced at the READ rate and "+
+			"reported cached: got cached=%v perToken=%g", depth.cached, depth.perToken)
+	}
+	if tail.cached || tail.perToken != 3.75/1e6 {
+		t.Fatalf("a candidate in the uncached TAIL must be priced at the cache-WRITE rate and "+
+			"NOT reported cached — it is entering the cache on this turn, not being read from "+
+			"it: got cached=%v perToken=%g", tail.cached, tail.perToken)
+	}
+	// The repeat rate is the read rate on both sides: whatever we remove, the turns that
+	// replay that removal are warm ones.
+	if tail.repeatPerToken != 0.30/1e6 || depth.repeatPerToken != 0.30/1e6 {
+		t.Fatalf("repeat rate must be the read rate on both sides: tail=%g depth=%g",
+			tail.repeatPerToken, depth.repeatPerToken)
+	}
+	if got := tail.perToken / depth.perToken; math.Abs(got-12.5) > 0.01 {
+		t.Fatalf("the tail/depth ratio is the size of the old mis-pricing and should be "+
+			"12.5x (1.25 / 0.1); got %.2fx", got)
+	}
+	// A cold sweep prices at the write rate wherever the candidate sits, because there is no
+	// live prefix for it to be inside.
+	cold := &components.Ctx{CacheAware: true, ColdCache: true, MaxCachedIdx: 3}
+	if a, b := savedTokenValueAt(cold, 1), savedTokenValueAt(cold, 9); a != b || a.cached {
+		t.Fatalf("on a cold sweep position must not change the price: %+v vs %+v", a, b)
+	}
+}
+
+// TestTheTailIsStillGatedOnItsOwnEconomics is the other half of
+// TestDefaultConfigsSpendOnlyOnTheUncachedTail, and the reason that one is a re-pricing
+// rather than an opening of the floodgates. Correcting the tail's VALUE does not remove the
+// gate: a tail candidate too small to repay a call must still be refused.
+//
+// explore is false throughout — the exploration allowance deliberately spends a bounded call
+// when no compression ratio has been observed yet, and it would mask the arithmetic here.
+func TestTheTailIsStillGatedOnItsOwnEconomics(t *testing.T) {
+	rates := components.TokenRates{Input: 3.00 / 1e6, CacheRead: 0.30 / 1e6, CacheWrite: 3.75 / 1e6}
+	c := &components.Ctx{CacheAware: true, MaxCachedIdx: 0, SelfRates: rates}
+	tail := savedTokenValueAt(c, 1)
+	depth := savedTokenValueAt(c, 0)
+	const ratio = 0.30 // a plausible observed compression ratio
+	cost := 0.012      // ~one cheap-model call
+
+	small := evaluateGate(1_200, ratio, tail, cost, false, 4, false, false)
+	if small.allow {
+		t.Fatalf("a 1,200-token tail candidate cannot repay a $%.3f call even at the write "+
+			"rate (expected saving $%.5f) — the gate must still refuse it: %q",
+			cost, small.expSaving, small.reason)
+	}
+	big := evaluateGate(200_000, ratio, tail, cost, false, 4, false, false)
+	if !big.allow {
+		t.Fatalf("a 200,000-token tail candidate must clear a $%.3f call (expected saving "+
+			"$%.5f): %q", cost, big.expSaving, big.reason)
+	}
+	// Same candidate, same size, priced as cached: the 12.5x haircut is what used to make
+	// every tail call look unaffordable, so this is the before-and-after in one assertion.
+	if d := evaluateGate(200_000, ratio, depth, cost, false, 4, false, false); d.allow {
+		t.Fatalf("priced at the READ rate the same 200,000-token candidate should not clear "+
+			"the gate; if it does, this test no longer demonstrates the mis-pricing: %q", d.reason)
+	}
+}
+
+// TestConcurrentIdenticalExtractionsCollapseToOneCall pins the single-flight fix.
+//
+// The persistent cross-session cache only helps a request that arrives after the first one
+// finished. Measured on two live sessions started together, the same 4,577-token candidate was
+// extracted twice 1.6s apart — $0.0224 for a result the system was already deriving, 54% of
+// that run's entire extraction spend. Ten colleagues on one repo through one proxy is exactly
+// that shape, so this is not a theoretical race.
+//
+// The assertion is on the MODEL CALL COUNT, not on the output: both requests must still get a
+// reduced result, and only one of them may pay for it.
+func TestConcurrentIdenticalExtractionsCollapseToOneCall(t *testing.T) {
+	// A model that blocks until released, so both goroutines are provably in flight together
+	// — a sleep would make this a timing coincidence rather than a test.
+	release := make(chan struct{})
+	var calls atomic.Int64
+	blocking := blockingModel{calls: &calls, release: release}
+
+	cfg := "strategy: code\nmin_tokens: 1\neconomic_gate: false\nmodel:\n  source: config\n" +
+		"trigger:\n  min_request_tokens: 1\n"
+	comp, err := newExtractLLM([]byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := comp.(*ExtractLLM)
+	e.mode = markerFull
+
+	pad := strings.Repeat("padding ", 200)
+	body := `[{"id":1,"name":"keep this ` + pad + `"},{"id":2,"name":"drop this ` + pad + `"}]`
+	// One shared Store, as a real proxy has, but two DIFFERENT sessions: the point is that
+	// cross-session dedup happens while the first extraction is still running.
+	st := store.NewMemory(store.Options{})
+
+	var wg sync.WaitGroup
+	for _, session := range []string{"session-A", "session-B"} {
+		wg.Add(1)
+		go func(session string) {
+			defer wg.Done()
+			req := &bschemas.BifrostChatRequest{Input: []bschemas.ChatMessage{
+				userMsg("find the keep records"), toolResultMsg(body),
+			}}
+			c := &components.Ctx{Ctx: context.Background(), Session: session, Store: st,
+				Model: components.ModelSpec{Static: blocking}, CtxWindow: 1_000_000}
+			var rep components.Report
+			if _, err := e.Offload(req, &rep, c); err != nil {
+				t.Error(err)
+			}
+		}(session)
+	}
+	// Both goroutines are now either waiting on the model or waiting on the leader. Release.
+	time.Sleep(150 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("two concurrent requests for byte-identical content made %d model calls; "+
+			"single-flight must collapse them to 1 (this race cost 54%% of a measured run's "+
+			"extraction spend)", got)
+	}
+}
+
+type blockingModel struct {
+	calls   *atomic.Int64
+	release chan struct{}
+}
+
+func (m blockingModel) Complete(context.Context, string) (string, error) {
+	m.calls.Add(1)
+	<-m.release
+	return "data = json.decode(INPUT)\nOUTPUT = json.encode([r for r in data if \"keep\" in r[\"name\"]])\n", nil
 }

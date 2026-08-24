@@ -479,64 +479,97 @@ components:
     min_tokens: 400`,
 	// housellm: house plus the compaction-model pass, as measured on this service.
 	//
-	// allow_on_caching_backend is TRUE here and nowhere else in this file, and it is INERT
-	// as this preset ships. Read that before changing per_output.
+	// WHAT THIS COMPONENT ACTUALLY DOES HERE, measured on production traffic rather than
+	// inferred from the knobs: every extraction call this service has ever made was a COLD
+	// one. 132 calls, `extraction_calls.cold = 1` on all 132, across the two accounts that
+	// ran the component before this preset existed. The hot per-output pass has never made a
+	// single call in production, and that is not a defect — it is the caching-backend guard
+	// working. Claude Code is a prompt-caching client, so a warm candidate is priced at the
+	// cache-READ rate (a 10x haircut) and extract_econ.go declines it. So:
 	//
-	// The flag only ever lifts one check: `if val.cached && !allowCached` in
-	// extract_econ.go's gate. With `per_output: false` the sole path into that gate is the
-	// cold sweep, and the cold branch returns `cached: false` by construction
-	// (extract_econ.go:145 — an EXPIRED prefix is about to be re-billed at 1.25x fresh, so a
-	// token removed there is the most valuable token there is, not the least). So the check
-	// the flag disables is unreachable, and `per_output: false` is the actual brake.
-	// Production agrees: 0 caching-backend declines across the measured window, where every
-	// suppression was "saving below call cost".
+	//	the cold sweep is the entire value of extract_llm on this service, and
+	//	cold_cache.min_tokens is the knob that decides whether it fires at all.
 	//
-	// It stays because it is the account configuration this preset was asked to carry, and
-	// because it costs nothing while per_output is off. What it must not become is a live
-	// flag: turn `per_output` on and the hot path reaches that gate with `cached: true`, the
-	// decline no longer fires, and extract_econ.go:333 records what our own measurements say
-	// happens then — net-negative even with the gate working, break-even ~30,500
-	// tokens/output against a largest-observed 2,053. TestNoDefaultConfigRunsExtractLLMOnCachingBackend
-	// includes this preset so that combination cannot ship by accident.
+	// That is why min_tokens is 1000 and not 3000. At 3000 this preset produced ZERO
+	// extractions across 3,437 requests: 3,401 warm turns recorded per_output_disabled, and
+	// on all 36 turns that DID sweep, `below_output_floor` refused every candidate. The two
+	// accounts that measured net-positive before it (+$2.21 saved against $1.01 of our own
+	// spend, 63% of calls accepted) both ran 1000. Replayed on 28 captured requests with 1h
+	// idle gaps, 1000 recovers 53,071 tokens against 45,458 at 3000, at comparable cost.
 	//
-	// llm_max_per_session: 0 is UNLIMITED, by operator decision — and it is INERT here for
-	// the same reason allow_on_caching_backend is. extract_llm.go:1168 splits on `sweeping`:
-	// the sweep consults cold_cache.max_calls, the hot path consults llm_max_per_request and
-	// llm_max_per_session, and they are the two arms of one if/else. With `per_output: false`
-	// only the sweep runs, so NEITHER per-request nor per-session is ever read at any value.
+	// per_output is TRUE and the WARM/TAIL path is now genuinely reachable, because
+	// savedTokenValueAt prices a candidate by POSITION: the tail is being written into the
+	// cache on this turn (measured: 17.2M cache_write against 9.4M fresh_input across 4,384
+	// warm requests, ~4,124 written tokens per turn), so it is worth the cache-WRITE rate,
+	// not the request-level cache-READ rate the gate used to apply to everything.
 	//
-	// So the only thing bounding spend here is `cold_cache.max_calls: 20` — calls per
-	// TTL-expiry sweep — plus the economic gate and the 20,000-token pressure trigger. 0
-	// there would mean the built-in 4 and -1 would mean unlimited: a different knob with a
-	// different zero, which is exactly why it is stated rather than left to be inferred from
-	// the per-session one.
+	// min_tokens: 8000 is that path's floor, and it is DERIVED, not chosen. Measured on real
+	// warm sessions through a local proxy, an extraction call costs ~$0.015-0.018 and the cost
+	// is OUTPUT-dominated — trimming the prompt barely moves it (context_messages 7 -> 2 -> 0
+	// gave $0.0149 / $0.0159 / $0.0179 per call). Including the 1-in-5 call that is rejected
+	// outright and pays full price for nothing, cost per ACCEPTED call was $0.0193. At the
+	// cache-write rate that needs 4,060 saved tokens to break even, and the observed reduction
+	// on accepted tail calls was ~65%, so the candidate has to be ~6,250 tokens. 8,000 carries
+	// the margin.
+	//
+	// Below that floor the path is measurably a LOSS, which is why the floor is not lower:
+	// at min_tokens 1000 real sessions made 5 warm calls, accepted 4, saved 8,718 tokens for
+	// $0.0771 — net -$0.036. Every one of those calls was allowed by the EXPLORATION budget
+	// (2 per session) rather than by the arithmetic, so a low floor buys exploration waste and
+	// not savings. At 8,000 the same corpus makes zero warm calls and loses nothing, while the
+	// cold sweep still returns net +$0.062. context_messages is 2 for the same reason it is
+	// cheap: the tail call carries the candidate, not the conversation.
+	//
+	// allow_on_caching_backend IS DELIBERATELY ABSENT, and it is now VESTIGIAL rather than
+	// load-bearing. It lifts one check — `val.cached && !allowCached` — and since
+	// savedTokenValueAt prices per candidate that check no longer fires on a warm turn at all:
+	// the tail reports cached:false (it is being written INTO the cache, at 1.25x fresh), and
+	// depth reports cached:true but the tail gate refused it long before the economic gate saw
+	// it. Leaving the key out keeps the preset honest about which brake is real. The brake is
+	// the economic gate on a correctly-priced candidate, pinned from both sides by
+	// TestDefaultConfigsSpendOnlyOnTheUncachedTail (position decides) and
+	// TestTheTailIsStillGatedOnItsOwnEconomics (size still decides), the first of which reads
+	// THIS literal rather than a copy of it.
+	//
+	// llm_max_per_session: 0 is UNLIMITED, by operator decision, and unlike the previous
+	// revision of this comment it is now genuinely live — per_output: true means
+	// extract_llm.go:1168 takes the hot arm, which reads llm_max_per_request and
+	// llm_max_per_session. What bounds spend is therefore not the session cap but
+	// eligibility: 132 calls in three days of heavy use, under a per-session cap of 40 that
+	// was never approached. llm_max_per_request: 8 is the per-turn brake.
+	//
+	// cold_cache.max_calls is now UNSET on purpose, which takes defaultColdMaxCalls — one
+	// concurrency round, 4. It was 20, and 20 was never measured; the number that WAS
+	// measured is in coldCacheConfig's own comment, where a single sweep made 27 calls,
+	// spent $0.229 and added 76.6s to a turn whose upstream took 33.5s. The sweep draws on
+	// no other cap, so this is its only brake, and 5x the documented-safe bound on the one
+	// path with a recorded latency pathology is not a default to ship. Production's mean was
+	// 4.89 calls per sweep, so 4 does bind occasionally — deliberately, because past one
+	// round the calls serialize and latency grows multiplicatively for a linear gain.
 	"housellm": `pipeline: [format, dedup, toon, cmdfilter, searchfold, textclean, extract_llm, extract, cachesplit, toolfilter]
 components:
   extract:
     min_tokens: 400
   extract_llm:
     aggressiveness: medium
-    allow_on_caching_backend: true
     cold_cache:
       enabled: true
-      max_calls: 20
-      min_tokens: 3000
+      min_tokens: 1000
     context: recent
     context_messages: 2
     economic_gate: true
     fire_on: pressure
     llm_every_n_requests: 1
-    llm_max_per_request: 4
+    llm_max_per_request: 8
     llm_max_per_session: 0
     min_tokens: 3000
     model:
       model: claude-haiku-4-5
       source: incoming
-    per_output: false
+    per_output: true
     strategy: code
     trigger:
-      min_request_tokens: 20000`,
-	// agentdiet: the published AgentDiet baseline at the paper's tuned hyperparameters
+      min_request_tokens: 3000`,
 	// (a=2, b=1, θ=500) and the authors' artifact apply-gate (saved >= 400 || keep <
 	// 0.8). Routed to the CHEAP model because the method's economics depend on the
 	// reflection model being much cheaper than the agent's — the paper's own choice was

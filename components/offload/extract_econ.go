@@ -111,12 +111,10 @@ const (
 	agentCacheWritePerMTok = 3.75
 )
 
-// savedTokenValue prices one saved token for THIS request. When the request goes to a
-// prompt-caching backend, content the agent re-sends every turn is already in the cached
-// prefix, so removing it saves the cache-read rate — the 10x haircut that sinks the
-// component's economics.
-func savedTokenValue(c *components.Ctx) tokenValue {
-	fresh, read, write := agentFreshPerMTok/1e6, agentCacheReadPerMTok/1e6, agentCacheWritePerMTok/1e6
+// agentRates resolves the three billing tiers for this request, preferring the deployment's
+// own price table over the built-in constants.
+func agentRates(c *components.Ctx) (fresh, read, write float64) {
+	fresh, read, write = agentFreshPerMTok/1e6, agentCacheReadPerMTok/1e6, agentCacheWritePerMTok/1e6
 	// The request's own model, at the rates this deployment is actually billed, beats any
 	// constant. Ctx.SelfRates comes from the same provider price table the dashboard prices
 	// requests with, so the gate's numerator and the operator's bill can no longer disagree.
@@ -134,6 +132,14 @@ func savedTokenValue(c *components.Ctx) tokenValue {
 			write = fresh * 1.25
 		}
 	}
+	return fresh, read, write
+}
+
+// savedTokenValue prices one saved token for THIS request, ignoring where in the transcript
+// it sits. It is the REQUEST-level answer and it is correct only for content in the cached
+// prefix; use savedTokenValueAt for a decision about a specific candidate.
+func savedTokenValue(c *components.Ctx) tokenValue {
+	fresh, read, write := agentRates(c)
 	if c != nil && c.CacheAware {
 		// A cache-aware turn whose cache has EXPIRED is the opposite case to a warm one: the
 		// whole prefix is about to be re-written at 1.25x fresh, so a token removed here is
@@ -150,6 +156,39 @@ func savedTokenValue(c *components.Ctx) tokenValue {
 	// No caching backend: every turn re-sends at the fresh rate, so a replay is worth as
 	// much as the first removal.
 	return tokenValue{perToken: fresh, repeatPerToken: fresh, cached: false}
+}
+
+// savedTokenValueAt prices a saved token for ONE candidate, at message index i.
+//
+// `cached` is a property of the CANDIDATE, not of the request, and conflating the two was a
+// real mis-pricing rather than a rounding choice. On a warm turn the tail — everything past
+// the provider's last cached index — is NOT in the cache: it is being written into it on this
+// very turn. MEASURED on this deployment across 4,384 warm requests, the tail is billed as
+// cache_creation, not as fresh input (17.2M cache_write tokens against 9.4M fresh_input,
+// averaging 4,124 written tokens per warm turn). So a token removed from the tail saves
+// 1.25x fresh, which is 12.5x what savedTokenValue reported for it.
+//
+// That understatement is what silenced the hot path. The `val.cached && !allowCached` decline
+// in evaluateGate was refusing tail candidates on the strength of a value computed as though
+// they were already cached, and the ~30,500-token break-even quoted against it is explicitly
+// the CACHED break-even — the two facts compounded into "extraction cannot pay on a caching
+// backend", which is true at depth and was never established for the tail.
+//
+// Depth is unchanged: a candidate inside the live cached prefix really is worth the read rate,
+// and removing it additionally forces a suffix re-write, which is why the tail gate stops it
+// before this function is ever consulted.
+func savedTokenValueAt(c *components.Ctx, i int) tokenValue {
+	v := savedTokenValue(c)
+	// A cold sweep already prices at the write rate, and a non-caching backend at fresh;
+	// neither has a cached prefix to be inside, so position cannot change the answer.
+	if v.cold || c == nil || !c.CacheAware {
+		return v
+	}
+	if !c.TailOnly(i) {
+		return v // inside the live cached prefix: the read rate is the honest one
+	}
+	_, read, write := agentRates(c)
+	return tokenValue{perToken: write, repeatPerToken: read, cached: false}
 }
 
 // priorCallCost is a last-resort per-call cost estimate (~the Terminal-Bench average).
@@ -293,14 +332,54 @@ type gateDecision struct {
 // distribution rather than an aggregate that a few long sessions dominate (max 215 against a
 // median of 12). Upgrade to a per-session decay fit only if a measurement shows the estimate is
 // still what misprices calls.
+// The late-session DISCOUNT below used to run the wrong way, and that is the only thing
+// corrected here. Session length on this deployment is heavy-tailed — 6,744 sessions, median
+// 1 turn, mean 5.5, max 6,024 — and in a heavy tail the expected REMAINING length grows with
+// the length so far. Measured, as median turns still to come:
+//
+//	turns so far     1     3     5    10    20    40    80   160
+//	median remaining 2    16    19    34    59   112   147   242
+//
+// Monotonically increasing at every step. The old prior returned 4 and then dropped to 3 once
+// turnsSoFar >= 20, "because fewer turns remain to amortize over" — the one place the data
+// says the opposite: a transcript that has already reached 20 messages has a median 59 still
+// to come. So the gate was cheapest exactly where amortization is most real.
+//
+// The realized multiplier is the check: saved_gross/saved_unique over ALL extract_llm rows is
+// 54.6x in aggregate and 16.6x at the per-session median, against the 5.0x the first-sighting
+// prior implies. Both say the prior is LOW, not high.
+//
+// DELIBERATELY CONSERVATIVE, and deliberately narrow. The measurement would justify much
+// larger numbers, but the early-turn and recurring values are left exactly as they were:
+//
+//   - The early value stays 4. A first-message candidate is the one whose removal is least
+//     likely to be replayed (median remaining 2), so the measurement does not argue for
+//     raising it and short sessions are where a wrong prior wastes money fastest.
+//   - `seenBefore` stays a flat 6. Every published break-even figure in
+//     docs/components/extract_llm.md is quoted for recurring content, and
+//     TestBreakEvenSizesMatchTheDocumentedVerdict pins them; moving it would invalidate that
+//     documentation as a side effect of a change about turn counts.
+//   - Only the >=20 band moves, from 3 to a rising 5/8/12, and 12 is the top of the 4.0-12.0
+//     min..median band this file already documents. The cap is a cap, not an extrapolation:
+//     the median remaining at 160 messages is 242, and pricing that honestly is a separate
+//     change needing its own measurement of the churn it would license.
+//
+// ponytail: a step function over a measured table, not a fitted decay. Upgrade to a fit only
+// if a measurement shows these steps are what misprices calls.
 func expectedReuses(seenBefore bool, turnsSoFar int) float64 {
 	if seenBefore {
-		return 6 // already recurred once, so at or above the observed median
+		return 6 // already recurred once; the documented break-evens are quoted at this
 	}
-	if turnsSoFar >= 20 {
-		return 3 // late in a long session: fewer turns remain to amortize over
+	switch {
+	case turnsSoFar < 20:
+		return 4 // unchanged: the observed minimum
+	case turnsSoFar < 40:
+		return 5
+	case turnsSoFar < 80:
+		return 8
+	default:
+		return 12 // the top of the documented min..median band, capped not extrapolated
 	}
-	return 4 // the observed minimum
 }
 
 // evaluateGate decides whether one candidate output is worth an extraction call.
