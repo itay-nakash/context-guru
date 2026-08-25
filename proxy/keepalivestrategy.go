@@ -185,6 +185,16 @@ func viewStrategy(s tenant.Strategy, now time.Time) strategyView {
 
 // ctlListKeepAliveStrategies lists every strategy.
 func (h *Handler) ctlListKeepAliveStrategies(w http.ResponseWriter, r *http.Request) {
+	actor, err := h.webPrincipal(r)
+	if err != nil {
+		code, msg := statusOf(err)
+		ctlErr(w, code, msg)
+		return
+	}
+	if !actor.IsManager() {
+		ctlErr(w, http.StatusForbidden, "manager only")
+		return
+	}
 	list, err := h.registry().ListStrategies()
 	if err != nil {
 		ctlErr(w, http.StatusInternalServerError, "could not list keep-alive strategies")
@@ -218,6 +228,10 @@ func (h *Handler) ctlCreateKeepAliveStrategy(w http.ResponseWriter, r *http.Requ
 	if err != nil {
 		code, msg := statusOf(err)
 		ctlErr(w, code, msg)
+		return
+	}
+	if !actor.IsManager() {
+		ctlErr(w, http.StatusForbidden, "manager only")
 		return
 	}
 	var in strategyIn
@@ -284,6 +298,10 @@ func (h *Handler) ctlPatchKeepAliveStrategy(w http.ResponseWriter, r *http.Reque
 		ctlErr(w, code, msg)
 		return
 	}
+	if !actor.IsManager() {
+		ctlErr(w, http.StatusForbidden, "manager only")
+		return
+	}
 	id := r.PathValue("id")
 	cur, err := h.registry().StrategyByID(id)
 	if err != nil {
@@ -346,7 +364,16 @@ func (h *Handler) ctlPatchKeepAliveStrategy(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if err := h.registry().AuditWrite(actor.ID, actor.ID, id, "updated", "updated: "+s.Name); err != nil {
-		ctlErr(w, http.StatusInternalServerError, "updated, but the audit log could not be written")
+		// An update we cannot account for is an update we do not keep — the same refusal
+		// ctlCreateKeepAliveStrategy makes when its own audit write fails. Reverted to the
+		// pre-patch values fetched above, rather than left standing with no audit row.
+		_, _ = h.registry().UpdateStrategy(actor.ID, id, tenant.StrategyPatch{
+			Name: &cur.Name, IdleSeconds: &cur.IdleSeconds, MaxPings: &cur.MaxPings,
+			MinPrefixTokens: &cur.MinPrefixTokens, MaxUSDPerPing: &cur.MaxUSDPerPing,
+			Windows: &cur.Windows, Target: &cur.Target, Active: &cur.Active,
+		})
+		ctlErr(w, http.StatusInternalServerError,
+			"could not record this in the audit log, so the update was not applied")
 		return
 	}
 	h.keeper.loadStrategies()
@@ -361,6 +388,10 @@ func (h *Handler) ctlDeleteKeepAliveStrategy(w http.ResponseWriter, r *http.Requ
 	if err != nil {
 		code, msg := statusOf(err)
 		ctlErr(w, code, msg)
+		return
+	}
+	if !actor.IsManager() {
+		ctlErr(w, http.StatusForbidden, "manager only")
 		return
 	}
 	// No body to read, so readJSON's cross-site guard does not cover it: check directly,
