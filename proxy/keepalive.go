@@ -17,6 +17,7 @@ import (
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/dash"
 	"github.com/rossoctl/context-guru/internal/modelinfo"
+	"github.com/rossoctl/context-guru/tenant"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -262,6 +263,12 @@ type kaEntry struct {
 	// stopped means this session will not be pinged again: a ping wrote instead of reading,
 	// or the upstream refused in a way that repeating cannot fix.
 	stopped bool
+	// appliedStrategy is the id of the manager-controlled keep-alive strategy that
+	// resolved this entry's policy, "" when none matched (account config or a session
+	// override supplied it instead). Resolved once, at record time, alongside the
+	// session override — see keeper.applyStrategy in keepalivestrategy.go — and tagged
+	// onto the ping's own dash.Event by record1, never onto the real request it rescues.
+	appliedStrategy string
 	// timer is the HARD retention deadline. A scheduled deadline rather than a check inside the
 	// sweep, because the requirement is that a quiet process still drops the credential on
 	// time: with no request and no other activity the sweep is the only thing that would ever
@@ -358,6 +365,13 @@ type keeper struct {
 	// deliberately so — an authorization to spend that silently survives a restart is worse
 	// than one that does not. See keepaliveoverride.go.
 	overrides map[string]sessionOverride
+	// strategies is the manager-controlled keep-alive strategy list, loaded from the
+	// tenant registry at process start and replaced wholesale on every write through the
+	// control routes — never mutated in place, the same pattern k.overrides itself
+	// documents for a swap under lock. UNLIKE overrides, this one IS meant to survive a
+	// restart: a strategy is a standing rule a manager expects to still be there after a
+	// deploy, so it is reloaded from SQLite at boot. See keepalivestrategy.go.
+	strategies []tenant.Strategy
 
 	// send performs one ping. A field so tests can drive the whole policy — timing, caps,
 	// limits, the write-instead-of-read guard — without a network.
@@ -392,6 +406,10 @@ func newKeeper(h *Handler) *keeper {
 		overrides: map[string]sessionOverride{}, now: time.Now}
 	k.send = k.sendPing
 	k.dispatch = func(j pingJob) { go k.fire(j) }
+	// Loaded once at construction. Unlike overrides, a strategy is a standing rule a
+	// manager expects to survive a restart, so it comes from SQLite rather than starting
+	// empty — see loadStrategies.
+	k.loadStrategies()
 	return k
 }
 
@@ -535,10 +553,16 @@ func (k *keeper) record(tn *Tenancy, session string, startedAt time.Time, body [
 	// the setting off stops being retained on its very next request; anything held for a session
 	// that goes quiet instead is dropped by the hard deadline below, within (K+1)x X.
 	pol := tn.Cache
-	// A per-session manual override, if one is armed and unexpired. The ONE hook this feature
-	// has in the request path: everything below reads `pol` and neither knows nor cares where
-	// it came from. An override may switch the mechanism ON for a session whose account default
-	// is off — that is the point of it, and the arming request is the consent act — but it may
+	// The manager-controlled strategy layer, resolved once here and generalizing the one
+	// hook the session override already had — see keepalivestrategy.go's applyStrategy.
+	// A matching ACTIVE strategy forces KeepAlive on and replaces Idle/MaxPings/
+	// MinPrefixTokens/MaxUSDPerPing; it sits ABOVE account config and BELOW a session
+	// override, which still wins on top and still cannot widen MaxUSDPerPing.
+	pol, applied := k.applyStrategy(tn.ID, pol, k.now())
+	// A per-session manual override, if one is armed and unexpired. Everything below reads
+	// `pol` and neither knows nor cares where it came from. An override may switch the
+	// mechanism ON for a session whose account default (or no matching strategy) leaves it
+	// off — that is the point of it, and the arming request is the consent act — but it may
 	// not widen the per-ping cost guard, and it cannot reach around the kill switch or the
 	// no-audit-sink refusal above.
 	pol = k.overrideFor(tn.ID, session, pol)
@@ -595,7 +619,7 @@ func (k *keeper) record(tn *Tenancy, session string, startedAt time.Time, body [
 		provider: provider, model: model, route: route, preset: tn.Preset,
 		agent: r.UserAgent(), pol: pol, prefix: prefix,
 		pingUSD: k.projectedPingUSD(model, prefix),
-		hdr:     hdr, auth: auth,
+		hdr:     hdr, auth: auth, appliedStrategy: applied,
 	}
 	k.mu.Lock()
 	defer k.mu.Unlock()
@@ -888,6 +912,7 @@ func (k *keeper) record1(j pingJob, u Usage, status int, ms float64) float64 {
 	// and the race detector is right to insist.
 	k.mu.Lock()
 	model, provider, route, preset, agent := e.model, e.provider, e.route, e.preset, e.agent
+	appliedStrategy := e.appliedStrategy
 	k.mu.Unlock()
 	var price modelinfo.Price
 	priced := false
@@ -898,6 +923,10 @@ func (k *keeper) record1(j pingJob, u Usage, status int, ms float64) float64 {
 		TS: k.now().UnixMilli(), TenantID: j.tenant, Model: model,
 		Provider: string(provider), Route: route, Preset: preset,
 		Status: status, KeepAlive: true,
+		// Which manager-controlled strategy resolved this PING's policy, "" when none did
+		// — tagged on the ping's own row, never on the real request it later rescues, since
+		// only the ping's policy resolution ever consults the strategy list.
+		KeepAliveStrategyID: appliedStrategy,
 	}
 	ev.SessionID = j.session
 	ev.Agent = dash.AgentFor(agent)

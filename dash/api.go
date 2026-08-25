@@ -240,6 +240,9 @@ func (a *API) routes() []route {
 	// The keep-alive tab's reads, declared beside their handlers in keepaliveapi.go and
 	// appended here for the same reason: this table is what both scoping tests walk.
 	rs = append(rs, a.keepAliveRoutes()...)
+	// The manager-controlled keep-alive strategy ledger, declared beside its handler in
+	// keepalivestrategy.go and appended here for the same reason.
+	rs = append(rs, a.keepAliveStrategyRoutes()...)
 	// The KV-cache TTL analysis and strategy simulator, declared beside its handlers in
 	// kvcacheapi.go and appended here for the same reason.
 	return append(rs, a.kvCacheRoutes()...)

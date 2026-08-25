@@ -119,7 +119,10 @@ func (h *Handler) ctlRoutes() []ctlRoute {
 	// The keep-alive's write half, declared beside its handlers in keepalivectl.go and appended
 	// here for the same reason the dashboard's are: this table is what gate enforces and what
 	// TestEveryControlRouteEnforcesItsScope walks.
-	return append(rs, h.keepAliveCtlRoutes()...)
+	rs = append(rs, h.keepAliveCtlRoutes()...)
+	// The manager-controlled keep-alive strategy routes, declared beside their handlers in
+	// keepalivestrategy.go and appended here for the same reason.
+	return append(rs, h.keepAliveStrategyCtlRoutes()...)
 }
 
 // grafanaUserHeader carries the authorized manager's address from this endpoint to
