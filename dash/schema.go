@@ -129,6 +129,15 @@ CREATE TABLE IF NOT EXISTS requests (
   -- reason cachesplit_saved_usd is: those tokens carry cache_control, so a miss bills them
   -- as creation at 1.25x rather than at 1.0x.
   keepalive_saved_usd REAL   NOT NULL DEFAULT 0,
+  -- Which manager-controlled keep-alive STRATEGY, if any, resolved a PING row's policy —
+  -- see proxy/keepalivestrategy.go's resolution chain and kaEntry.appliedStrategy. Set
+  -- only on a ping row; the real request a ping later rescues carries no strategy id,
+  -- because only the ping's own policy resolution ever consults the strategy list.
+  -- NULLABLE, unlike every other column here but temperature/top_p: a row written before
+  -- this feature existed reads NULL rather than a fabricated "no strategy" answer, and it
+  -- is never backfilled — there is no way to know which pre-feature pings would have
+  -- matched a strategy that did not exist yet.
+  keepalive_strategy_id TEXT,
   -- What the declaration filter stopped carrying on this request: the token weight of the
   -- tools[] elements it removed under the account's opt-in list. Written ONLY by the filter
   -- itself (apply.Trace.FilteredDeclTokens), never derived from the tool inventory — the
@@ -553,6 +562,7 @@ var additiveColumns = []struct{ table, column, ddl string }{
 	{"requests", "keepalive", "INTEGER NOT NULL DEFAULT 0"},
 	{"requests", "keepalive_pings", "INTEGER NOT NULL DEFAULT 0"},
 	{"requests", "keepalive_saved_usd", "REAL NOT NULL DEFAULT 0"},
+	{"requests", "keepalive_strategy_id", "TEXT"},
 	{"tool_declarations", "text_gz", "BLOB"},
 	{"tool_declarations", "text_hash", "TEXT"},
 	{"request_components", "gates", "TEXT NOT NULL DEFAULT ''"},

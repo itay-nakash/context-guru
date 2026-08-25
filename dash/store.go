@@ -287,9 +287,10 @@ func (d *DB) insertBatch(evs []*Event) error {
 		expands, expand_tokens, reverts, token_accounting, cache_miss_reason, uncompressed_reason,
 		reasoning_effort, thinking_mode, thinking_budget, temperature, top_p, max_tokens, stream,
 		tool_choice, tools, system_blocks,
-		cache_bp_system, cache_bp_tools, cache_bp_messages, cache_bp_blocks, stop_reason
+		cache_bp_system, cache_bp_tools, cache_bp_messages, cache_bp_blocks, stop_reason,
+		keepalive_strategy_id
 	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
-		?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+		?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		return err
 	}
@@ -322,6 +323,13 @@ func (d *DB) insertBatch(evs []*Event) error {
 
 	spend := map[spendKey]float64{}
 	for _, e := range evs {
+		// nil, not "", when no strategy applied — so the column stores SQL NULL and stays
+		// distinguishable from a row written before this feature existed either way; see
+		// the keepalive_strategy_id column comment in schema.go.
+		var strategyID any
+		if e.KeepAliveStrategyID != "" {
+			strategyID = e.KeepAliveStrategyID
+		}
 		res, err := reqStmt.Exec(
 			e.TS, e.TenantID, e.SessionID, e.Model, e.Provider, e.Agent, e.Preset, e.Mode, e.Route, e.Status,
 			boolInt(e.Bypassed), boolInt(e.CacheAware),
@@ -336,6 +344,7 @@ func (d *DB) insertBatch(evs []*Event) error {
 			e.ReasoningEffort, e.ThinkingMode, e.ThinkingBudget, e.Temperature, e.TopP, e.MaxTokens,
 			boolInt(e.Stream), e.ToolChoice, e.Tools, e.SystemBlocks,
 			e.CacheBPSystem, e.CacheBPTools, e.CacheBPMessages, e.CacheBPBlocks, e.StopReason,
+			strategyID,
 		)
 		if err != nil {
 			return err

@@ -28,6 +28,7 @@
     <button role="tab" class="tab" data-view="settings" data-testid="tab-settings" data-account hidden>Settings</button>
     <button role="tab" class="tab" data-view="feedback" data-testid="tab-feedback" data-account hidden>Feedback</button>
     <button role="tab" class="tab" data-view="tenants" data-testid="tab-tenants" data-manager hidden>Tenants</button>
+    <button role="tab" class="tab" data-view="strategies" data-testid="tab-strategies" data-manager hidden>Strategies</button>
     <button role="tab" class="tab" data-view="config" data-testid="tab-config" data-manager data-local-ok>Config</button>
   </nav>
   <div class="topbar-right">
@@ -251,6 +252,17 @@
        numbers that answer "is this working", then one labelled group per subject. Twenty
        tiles in one flat grid is twenty things of equal importance, i.e. no hierarchy. -->
   <div id="tiles"></div>
+
+  <!-- A small callout, for every user — not just managers — reusing GET /api/keepalive's
+       already-computed ledger. Hidden until the keep-alive has actually run on this
+       account (keepalive_recorded_from), so a zero here never reads as a measurement. -->
+  <div class="panel" id="overview-keepalive-panel" hidden>
+    <h2>Keep-alive savings</h2>
+    <p class="note">What the idle keep-alive has spent and avoided on your own traffic.
+      The full picture, including whether you are in the losing majority, is on the
+      Keep-alive tab.</p>
+    <div id="overview-keepalive-tiles"></div>
+  </div>
 
   <div class="panel">
     <h2>Savings percentage</h2>
@@ -819,6 +831,28 @@
     <p class="muted small">Metrics and configuration for every account. To read an
       account's transcripts, pick it in the selector and open a request or session diff.</p>
     <div id="tenants-list" data-testid="tenants-list" tabindex="0"></div>
+  </div>
+</section>
+
+<!-- Strategies: manager-controlled keep-alive rules that run above every tenant's own
+     account switch and below a per-session override. See
+     docs/superpowers/specs/2026-08-25-keepalive-strategies-design.md. Built entirely in
+     JS (renderStrategyForm/loadStrategies in app.js), the same way the Feedback form and
+     the Tenant editor are — an empty mount point here, so the fields, the window
+     builder and the account picker cannot drift from the validation the control route
+     itself enforces. -->
+<section class="view" id="view-strategies" hidden>
+  <div class="panel">
+    <h2 id="strategy-form-title">New strategy</h2>
+    <p class="note">A durable rule: "only during Israel business hours", or a service-wide
+      policy. It forces the keep-alive on for whatever it targets, whenever a manager's
+      own account switch or a session override does not already say otherwise.</p>
+    <form id="strategy-form" data-testid="strategy-form" novalidate></form>
+  </div>
+
+  <div class="panel">
+    <div class="card-head"><h2>Strategies</h2><span class="muted" id="strategies-count"></span></div>
+    <div id="strategies-list" data-testid="strategies-list" tabindex="0"></div>
   </div>
 </section>
 

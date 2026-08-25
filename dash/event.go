@@ -198,6 +198,14 @@ type Event struct {
 	// KeepAliveSavedUSD is the cache re-creation this request avoided because a ping kept
 	// its prefix alive.
 	KeepAliveSavedUSD float64 `json:"keepalive_saved_usd"`
+	// KeepAliveStrategyID is which manager-controlled strategy resolved a PING row's
+	// policy (see proxy/keepalivestrategy.go) — "" on every row but a ping's own, and ""
+	// even on a ping when no strategy matched (account config or a session override
+	// supplied the policy instead). Written as SQL NULL, not '', when empty — see
+	// dash/schema.go's keepalive_strategy_id column — so a row from before this feature
+	// existed is distinguishable from a ping this feature deliberately attributed to
+	// nothing.
+	KeepAliveStrategyID string `json:"keepalive_strategy_id,omitempty"`
 	// SinceLastMs is the gap from this session's previous REAL request, in milliseconds.
 	// Not persisted — AttributeCache already turns it into cache_miss_reason — but the
 	// keep-alive credit needs the raw number: the whole claim is that the gap exceeded the
