@@ -1287,6 +1287,29 @@ var migrations = []string{
 	// retired key is absent from the aggregate rather than misfiled into it.
 	`ALTER TABLE feedback DROP COLUMN wanted;
 	 ALTER TABLE feedback ADD COLUMN agent TEXT NOT NULL DEFAULT '';`,
+
+	// v8: manager-controlled keep-alive strategies (see
+	// docs/superpowers/specs/2026-08-25-keepalive-strategies-design.md and
+	// proxy/keepalivestrategy.go). A standing rule a manager expects to survive a
+	// deploy, unlike a per-session override (proxy/keepaliveoverride.go, deliberately
+	// memory-only) — so this is written through to SQLite on every create/update/delete
+	// and reloaded at boot, the same durability class as a tenant's own config document.
+	`CREATE TABLE keepalive_strategies (
+	   id                TEXT PRIMARY KEY,
+	   name              TEXT    NOT NULL,
+	   idle_seconds      INTEGER NOT NULL DEFAULT 0,
+	   max_pings         INTEGER NOT NULL DEFAULT 0,
+	   min_prefix_tokens INTEGER NOT NULL DEFAULT 0,
+	   max_usd_per_ping  REAL    NOT NULL DEFAULT 0,
+	   windows_json      TEXT    NOT NULL DEFAULT '[]',
+	   target_json       TEXT    NOT NULL DEFAULT '{}',
+	   active            INTEGER NOT NULL DEFAULT 0,
+	   created_by        TEXT    NOT NULL DEFAULT '',
+	   created_at        INTEGER NOT NULL,
+	   updated_by        TEXT    NOT NULL DEFAULT '',
+	   updated_at        INTEGER NOT NULL
+	 );
+	 CREATE INDEX idx_keepalive_strategies_active ON keepalive_strategies(active);`,
 }
 
 func migrate(db *sql.DB) error {

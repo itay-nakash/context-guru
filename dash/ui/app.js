@@ -1901,6 +1901,9 @@ async function loadOverview(opts = {}) {
     }, 'Fills in from the first captured request: every row is counted as exact, estimated or unmeasured.');
     renderSeries(s.buckets || []);
     paintFreshness();
+    // Not awaited: its own request, on its own failure path, so a slow or failed
+    // keep-alive ledger never delays or blanks the rest of Overview.
+    loadOverviewKeepAlive();
     // Restore the offset after the repaint. Even swapping in place, a group that gained or
     // lost a tile changes the document height by a row, and the reader should not have to
     // find their place again because a number rolled over.
@@ -1911,6 +1914,35 @@ async function loadOverview(opts = {}) {
     // the old code replaced the tiles with an error state, so one blip wiped the numbers.
     if (!first) { markDirty(); return; }
     errorState($('#tiles'), 'Could not load statistics', err);
+  }
+}
+
+/**
+ * loadOverviewKeepAlive is the Overview tab's small keep-alive callout, for every user —
+ * not just managers. It reuses the account's own already-computed GET /api/keepalive
+ * ledger (the same one the Keep-alive tab's verdict panel reads): no new backend call,
+ * no arithmetic here.
+ *
+ * Hidden until the mechanism has actually run on this account (keepalive_recorded_from):
+ * a zero on a callout nobody can dismiss is worse than no callout, and this dashboard's
+ * own rule is that a zero must never be shown where it could be an absence.
+ */
+async function loadOverviewKeepAlive() {
+  const panel = $('#overview-keepalive-panel');
+  if (!panel) return;
+  try {
+    const o = await api('keepalive');
+    if (!o.keepalive_recorded_from) { panel.hidden = true; return; }
+    panel.hidden = false;
+    const host = clear($('#overview-keepalive-tiles'));
+    host.appendChild(tileGroup(null, null, [
+      tile('ov-ka-pings', 'Keep-alive pings', num(o.pings), usd(o.ping_usd) + ' spent on your key'),
+      tile('ov-ka-saved', 'Re-creations avoided', usd(o.saved_usd), 'a ceiling — see the Keep-alive tab',
+        o.saved_usd > 0 ? 'good' : ''),
+      tile('ov-ka-net', 'Net', usd(o.net_usd), 'avoided − spent', o.net_usd < 0 ? 'bad' : 'good'),
+    ]));
+  } catch (e) {
+    if (!aborted(e)) panel.hidden = true; // best-effort: Overview must not depend on this
   }
 }
 
@@ -6905,10 +6937,320 @@ async function loadArchive() {
 // unreachable / never-archived states are rendered identically wherever they are
 // reached, and a modal alert is not a state a user can read a session id out of.
 
+// ── strategies (manager) ─────────────────────────────────────────────────────
+//
+// Manager-controlled keep-alive strategies: a durable rule that runs above every
+// tenant's own account switch and below a per-session override — see
+// docs/superpowers/specs/2026-08-25-keepalive-strategies-design.md. The routes
+// themselves (proxy/keepalivestrategy.go) are the control plane, like the tenant
+// roster's, so every write here goes through ctl() rather than api().
+//
+// The form is built once in JS (buildStrategyForm), the same way the Feedback form is:
+// the fields, the window builder and the account picker live here so they cannot drift
+// from the validation the control route itself enforces.
+
+const strategyForm = {
+  editingID: '', // '' = creating a new one
+  windows: [],   // the windows accumulated for the form currently open
+  tenants: [],   // the roster, for the account picker; loaded once
+};
+
+const STRATEGY_DAYS = [
+  [0, 'Sun'], [1, 'Mon'], [2, 'Tue'], [3, 'Wed'], [4, 'Thu'], [5, 'Fri'], [6, 'Sat'],
+];
+
+function dayLabel(days) {
+  if (!days || !days.length) return 'every day';
+  return [...days].sort((a, b) => a - b).map((d) => STRATEGY_DAYS[d][1]).join(',');
+}
+function windowLabel(w) {
+  return `${dayLabel(w.days)} ${w.start}–${w.end} ${w.tz || 'Asia/Jerusalem'}`;
+}
+
+async function loadStrategies() {
+  const form = $('#strategy-form');
+  if (!form.dataset.built) {
+    try {
+      strategyForm.tenants = (await ctl('/api/tenants')).tenants || [];
+    } catch (_) { strategyForm.tenants = []; /* the picker still works for "every account" */ }
+    buildStrategyForm(form);
+    form.dataset.built = '1';
+  }
+  const host = clear($('#strategies-list'));
+  loadingState(host);
+  try {
+    const out = await ctl('/api/keepalive/strategies');
+    const rows = out.strategies || [];
+    $('#strategies-count').textContent = `${rows.length} strateg${rows.length === 1 ? 'y' : 'ies'}`;
+    renderStrategiesList(clear(host), rows);
+  } catch (e) {
+    clear(host);
+    errorState(host, 'Could not list strategies', e);
+  }
+}
+
+/** buildStrategyForm draws a fresh create form. editStrategy repaints it pre-filled. */
+function buildStrategyForm(form) {
+  clear(form);
+  strategyForm.editingID = '';
+  strategyForm.windows = [];
+  $('#strategy-form-title').textContent = 'New strategy';
+
+  const name = el('input', { type: 'text', id: 'sf-name', maxlength: '64', required: 'required' });
+  const idle = el('input', { type: 'number', id: 'sf-idle', value: '280', min: '1' });
+  const pings = el('input', { type: 'number', id: 'sf-pings', value: '1', min: '1' });
+  const prefix = el('input', { type: 'number', id: 'sf-prefix', value: '20000', min: '0' });
+  const usdCap = el('input', { type: 'number', id: 'sf-usd', value: '0', min: '0', step: '0.01' });
+  const active = el('input', { type: 'checkbox', id: 'sf-active', checked: 'checked' });
+
+  const targetAll = el('input', { type: 'radio', name: 'sf-target-mode', value: 'all', checked: 'checked' });
+  const targetList = el('input', { type: 'radio', name: 'sf-target-mode', value: 'list' });
+  const targetIDs = el('select', {
+    id: 'sf-target-ids', 'data-testid': 'sf-target-ids', multiple: 'multiple', size: '5', disabled: 'disabled',
+  }, ...strategyForm.tenants.map((t) => el('option', { value: t.id }, t.label ? `${t.email} · ${t.label}` : t.email)));
+  const syncTargetDisabled = () => { targetIDs.disabled = !targetList.checked; };
+  targetAll.addEventListener('change', syncTargetDisabled);
+  targetList.addEventListener('change', syncTargetDisabled);
+
+  const dayBoxes = STRATEGY_DAYS.map(([v, label]) => el('label', { class: 'comp' },
+    el('input', { type: 'checkbox', value: String(v), 'data-testid': 'sf-day-' + v }), ' ' + label));
+  const winStart = el('input', { type: 'time', value: '09:00', 'data-testid': 'sf-window-start' });
+  const winEnd = el('input', { type: 'time', value: '18:00', 'data-testid': 'sf-window-end' });
+  const winTZ = el('input', { type: 'text', value: 'Asia/Jerusalem', 'data-testid': 'sf-window-tz' });
+  const winList = el('ul', { id: 'sf-windows-list', 'data-testid': 'sf-windows-list' });
+  const windowsField = el('fieldset', { class: 'field' },
+    el('legend', {}, 'Windows (at least one; each is checked in its own timezone)'));
+
+  const paintWindows = () => {
+    clear(winList);
+    strategyForm.windows.forEach((w, i) => {
+      winList.appendChild(el('li', {}, windowLabel(w) + ' ',
+        el('button', {
+          type: 'button', class: 'ghost small', 'data-testid': 'sf-window-remove-' + i,
+          onclick: () => { strategyForm.windows.splice(i, 1); paintWindows(); },
+        }, 'Remove')));
+    });
+  };
+
+  const addWindow = el('button', {
+    type: 'button', class: 'ghost small', 'data-testid': 'sf-window-add',
+    onclick: () => {
+      const days = dayBoxes
+        .map((box, i) => (box.querySelector('input').checked ? i : -1))
+        .filter((i) => i >= 0);
+      if (!winStart.value || !winEnd.value) {
+        fieldError(windowsField, 'Give this window a start and an end.');
+        return;
+      }
+      fieldError(windowsField, '');
+      strategyForm.windows.push({
+        days, start: winStart.value, end: winEnd.value, tz: winTZ.value.trim() || 'Asia/Jerusalem',
+      });
+      // Days are per-window, not sticky across additions — a manager building "9-12
+      // weekdays" and "14-18 weekends" would otherwise have the second Add silently
+      // reuse the first window's days.
+      for (const box of dayBoxes) box.querySelector('input').checked = false;
+      paintWindows();
+    },
+  }, 'Add window');
+
+  windowsField.appendChild(el('div', { class: 'comp-grid' }, ...dayBoxes));
+  windowsField.appendChild(el('label', {}, 'Start ', winStart));
+  windowsField.appendChild(el('label', {}, 'End ', winEnd));
+  windowsField.appendChild(el('label', {}, 'Timezone ', winTZ));
+  windowsField.appendChild(addWindow);
+  windowsField.appendChild(winList);
+  windowsField.appendChild(el('p', { class: 'field-error', role: 'alert', hidden: true }));
+
+  const status = el('p', { class: 'field-error', role: 'alert', hidden: true, 'data-testid': 'sf-status' });
+  const submit = el('button', { type: 'submit', class: 'primary', 'data-testid': 'sf-submit' }, 'Create strategy');
+  const cancel = el('button', {
+    type: 'button', class: 'ghost', hidden: true, 'data-testid': 'sf-cancel',
+    onclick: () => buildStrategyForm(form),
+  }, 'Cancel edit');
+
+  form.appendChild(el('div', { class: 'field' }, el('label', { for: 'sf-name' }, 'Name'), name));
+  form.appendChild(el('div', { class: 'field' }, el('label', { for: 'sf-idle' }, 'Idle seconds'), idle));
+  form.appendChild(el('div', { class: 'field' }, el('label', { for: 'sf-pings' }, 'Max pings'), pings));
+  form.appendChild(el('div', { class: 'field' },
+    el('label', { for: 'sf-prefix' }, 'Min prefix tokens'), prefix));
+  form.appendChild(el('div', { class: 'field' },
+    el('label', { for: 'sf-usd' }, 'Max $/ping (0 = default)'), usdCap));
+  form.appendChild(el('div', { class: 'field' }, el('label', {}, active, ' Active')));
+  form.appendChild(el('fieldset', { class: 'field' },
+    el('legend', {}, 'Target'),
+    el('label', {}, targetAll, ' Every account'),
+    el('label', {}, targetList, ' Pick accounts'),
+    el('label', {}, 'Accounts (used only with "Pick accounts")', targetIDs)));
+  form.appendChild(windowsField);
+  form.appendChild(el('div', { class: 'actions' }, submit, cancel, status));
+
+  // editStrategy calls this fresh build and then overwrites the fields — simpler than a
+  // second code path that patches an existing DOM tree field by field.
+  form._fill = (s) => {
+    strategyForm.editingID = s.id;
+    strategyForm.windows = (s.windows || []).map((w) => ({ ...w }));
+    $('#strategy-form-title').textContent = 'Edit: ' + s.name;
+    name.value = s.name;
+    idle.value = String(s.idle_seconds);
+    pings.value = String(s.max_pings);
+    prefix.value = String(s.min_prefix_tokens);
+    usdCap.value = String(s.max_usd_per_ping);
+    active.checked = !!s.active;
+    if (s.target && s.target.mode === 'list') {
+      targetList.checked = true;
+      for (const o of targetIDs.options) o.selected = (s.target.tenant_ids || []).includes(o.value);
+    } else {
+      targetAll.checked = true;
+    }
+    syncTargetDisabled();
+    paintWindows();
+    submit.textContent = 'Save changes';
+    cancel.hidden = false;
+  };
+
+  form.onsubmit = async (ev) => {
+    ev.preventDefault();
+    status.hidden = true;
+    if (strategyForm.windows.length === 0) {
+      fieldError(windowsField, 'Add at least one window; a strategy with none can never fire.');
+      return;
+    }
+    fieldError(windowsField, '');
+    const body = {
+      name: name.value.trim(),
+      idle_seconds: Number(idle.value) || 0,
+      max_pings: Number(pings.value) || 0,
+      min_prefix_tokens: Number(prefix.value) || 0,
+      max_usd_per_ping: Number(usdCap.value) || 0,
+      active: active.checked,
+      windows: strategyForm.windows,
+      target: targetList.checked
+        ? { mode: 'list', tenant_ids: Array.from(targetIDs.selectedOptions).map((o) => o.value) }
+        : { mode: 'all' },
+    };
+    submit.disabled = true;
+    try {
+      const editing = strategyForm.editingID;
+      const path = editing ? '/api/keepalive/strategies/' + editing : '/api/keepalive/strategies';
+      await ctl(path, { method: editing ? 'PATCH' : 'POST', body: JSON.stringify(body) });
+      buildStrategyForm(form);
+      loadStrategies();
+    } catch (e) {
+      status.textContent = e.message;
+      status.hidden = false;
+      submit.disabled = false;
+    }
+  };
+}
+
+function editStrategy(s) {
+  const form = $('#strategy-form');
+  buildStrategyForm(form);
+  form._fill(s);
+  form.scrollIntoView({ block: 'start', behavior: 'smooth' });
+}
+
+async function toggleStrategyActive(s) {
+  try {
+    await ctl('/api/keepalive/strategies/' + s.id, {
+      method: 'PATCH', body: JSON.stringify({ active: !s.active }),
+    });
+    loadStrategies();
+  } catch (e) { alert(e.message); }
+}
+
+async function deleteStrategy(s) {
+  if (!confirm(`Delete "${s.name}"? Anything it already pinged is not un-pinged; it just ` +
+    'stops matching new requests.')) return;
+  try {
+    await ctl('/api/keepalive/strategies/' + s.id, { method: 'DELETE' });
+    loadStrategies();
+  } catch (e) { alert(e.message); }
+}
+
+/** openStrategyLedger shows one strategy's per-tenant economics, in the shared drawer. */
+async function openStrategyLedger(s) {
+  const body = openDrawer('Strategy: ' + s.name, null);
+  loadingState(body, 2);
+  try {
+    const led = await api('keepalive/strategies/' + s.id + '/ledger');
+    clear(body);
+    body.appendChild(tileGroup(null, null, [
+      tile('sl-pings', 'Pings', num(led.pings)),
+      tile('sl-ping-usd', 'Ping cost', usd(led.ping_usd)),
+      tile('sl-saved', 'Saved (ceiling, whole account credit)', usd(led.saved_usd)),
+      tile('sl-net', 'Net', usd(led.net_usd), null, led.net_usd < 0 ? 'bad' : 'good'),
+    ]));
+    body.appendChild(el('p', { class: 'note' },
+      'Saved is each tenant’s WHOLE keep-alive credit in its history, not only the ' +
+      'share this strategy’s own pings produced — see the design doc’s attribution ' +
+      'caveat. A tenant running more than one strategy, or a session override, will show more ' +
+      'here than this strategy alone earned.'));
+    if (!led.tenants || !led.tenants.length) {
+      emptyState(body, 'No pings under this strategy yet', '');
+      return;
+    }
+    const tbl = el('table', { class: 'grid' },
+      el('thead', {}, el('tr', {},
+        el('th', {}, 'Account'), el('th', { class: 'num' }, 'Pings'),
+        el('th', { class: 'num' }, 'Ping cost'), el('th', { class: 'num' }, 'Saved'),
+        el('th', { class: 'num' }, 'Net'))));
+    const tbody = el('tbody');
+    for (const r of led.tenants) {
+      tbody.appendChild(el('tr', {},
+        el('td', {}, el('code', { class: 'clip' }, r.tenant_id)),
+        el('td', { class: 'num' }, num(r.pings)),
+        el('td', { class: 'num' }, usd(r.ping_usd)),
+        el('td', { class: 'num' }, usd(r.saved_usd)),
+        el('td', { class: 'num ' + (r.net_usd < 0 ? 'bad-text' : 'good-text') }, usd(r.net_usd))));
+    }
+    tbl.appendChild(tbody);
+    body.appendChild(el('div', { class: 'tblwrap', tabindex: '0' }, tbl));
+  } catch (e) {
+    clear(body);
+    errorState(body, 'Could not read this strategy’s ledger', e);
+  }
+}
+
+function renderStrategiesList(host, rows) {
+  if (!rows.length) {
+    emptyState(host, 'No strategies yet', 'Create one above.');
+    return;
+  }
+  const tbl = el('table', { class: 'grid' },
+    el('thead', {}, el('tr', {},
+      el('th', {}, 'Name'), el('th', {}, 'Windows'), el('th', {}, 'Target'),
+      el('th', {}, 'Idle / pings'), el('th', {}, 'State'),
+      el('th', {}, el('span', { class: 'vh' }, 'Row actions')))));
+  const body = el('tbody');
+  for (const s of rows) {
+    body.appendChild(el('tr', { class: s.active ? '' : 'revoked' },
+      el('td', {}, s.name),
+      el('td', {}, (s.windows || []).map(windowLabel).join('; ') || '—'),
+      el('td', {}, s.target && s.target.mode === 'list'
+        ? `${(s.target.tenant_ids || []).length} account(s)` : 'every account'),
+      el('td', {}, `${s.idle_seconds}s / ${s.max_pings}`),
+      el('td', {},
+        el('span', { class: 'pill ' + (s.active ? 'complete' : 'partial') }, s.active ? 'active' : 'paused'),
+        s.in_window ? el('div', { class: 'muted small' }, 'in a matching window right now') : null),
+      el('td', {}, el('div', { class: 'row-actions' },
+        el('button', { class: 'ghost small', onclick: () => toggleStrategyActive(s) },
+          s.active ? 'Pause' : 'Resume'),
+        el('button', { class: 'ghost small', onclick: () => editStrategy(s) }, 'Edit'),
+        el('button', { class: 'ghost small', onclick: () => openStrategyLedger(s) }, 'Stats'),
+        el('button', { class: 'ghost small', onclick: () => deleteStrategy(s) }, 'Delete')))));
+  }
+  tbl.appendChild(body);
+  host.appendChild(el('div', { class: 'tblwrap', tabindex: '0' }, tbl));
+}
+
 // ── wiring ─────────────────────────────────────────────────────────────────
 Object.assign(loaders, {
   setup: loadSetup, settings: loadSettings, tenants: loadTenants, archive: loadArchive,
+  strategies: loadStrategies,
 });
+UNFILTERED_VIEWS.add('strategies');
 
 function initAccounts() {
   $('#gate-tab-signin').addEventListener('click', () => {
