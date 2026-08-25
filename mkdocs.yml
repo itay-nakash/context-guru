@@ -76,6 +76,11 @@ validation:
   unrecognized_links: warn
   anchors: warn
 
+# docs/superpowers/ holds working plans/specs for the skill that authored them, not
+# published site content — keep it out of the nav-completeness check above.
+exclude_docs: |
+  superpowers/
+
 # Nav mirrors how people arrive: evaluate it (Get started) → understand it
 # (Concepts) → look a component up (Components) → run it a particular way
 # (Modes, Dashboard, Hosted) → check the claims (Results) → wire it in
