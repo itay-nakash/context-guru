@@ -187,3 +187,7 @@ deploy/eval-containers/sweep-results*.csv
 
 # MkDocs build output
 site/
+
+# Personal/local operator notes — deployment-host facts, not repo documentation.
+# Never pushed.
+CLAUDE.local.md

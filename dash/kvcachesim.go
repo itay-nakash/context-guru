@@ -3,6 +3,7 @@ package dash
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"time"
 
@@ -64,15 +65,17 @@ type KVCacheSimConfig struct {
 // domain had gained since (the two keep-alive arms, the extend-to-1h arm and the exact ceiling)
 // were unreachable from the dashboard while looking perfectly present in the code.
 const (
-	KVStrategyNoCache     = kvcache.StrategyNoCache
-	KVStrategyFixed5m     = kvcache.StrategyFixed5m
-	KVStrategyFixed1h     = kvcache.StrategyFixed1h
-	KVStrategyKeepAlive5m = kvcache.StrategyKeepAlive5m
-	KVStrategyKeepAlive1h = kvcache.StrategyKeepAlive1h
-	KVStrategyExtend1h    = kvcache.StrategyExtend1h
-	KVStrategyObserved    = kvcache.StrategyObserved
-	KVStrategyHistorical  = kvcache.StrategyHistorical
-	KVStrategyOptimal     = kvcache.StrategyOptimal
+	KVStrategyNoCache         = kvcache.StrategyNoCache
+	KVStrategyFixed5m         = kvcache.StrategyFixed5m
+	KVStrategyFixed1h         = kvcache.StrategyFixed1h
+	KVStrategyKeepAlive5m     = kvcache.StrategyKeepAlive5m
+	KVStrategyKeepAlive5mOnce = kvcache.StrategyKeepAlive5mOnce
+	KVStrategyKeepAlive1h     = kvcache.StrategyKeepAlive1h
+	KVStrategyKeepAlive1hOnce = kvcache.StrategyKeepAlive1hOnce
+	KVStrategyExtend1h        = kvcache.StrategyExtend1h
+	KVStrategyObserved        = kvcache.StrategyObserved
+	KVStrategyHistorical      = kvcache.StrategyHistorical
+	KVStrategyOptimal         = kvcache.StrategyOptimal
 	// KVStrategyCustom is the one arm that is NOT in kvcache's registry, because it cannot be
 	// built from a name: it carries the page's own thresholds and the in-process Predictor
 	// seam. It is offered beside the registry's arms and scored identically.
@@ -125,14 +128,15 @@ func isUnbuildable(name string) bool { return name == kvcache.StrategyReplay }
 
 // KVCacheDefaultStrategies is what the page runs when the caller names none.
 //
-// Seven arms, and each earns its place: the two bounds (no-cache below, optimal above), the two
-// fixed tiers, the cheapest keep-alive arm, the policy already in force, and the one arm that
-// learns from the account's own history. `optimal` is in the DEFAULT set on purpose — it is the
-// only figure that says how much headroom exists at all, and an arm nobody sees by default is
-// one nobody compares against — and it is marked Unreachable so no surface can present it as a
-// result.
+// Nine arms, and each earns its place: the two bounds (no-cache below, optimal above), the two
+// fixed tiers, the repeated 5-minute keep-alive arm alongside both single-ping counterparts (see
+// KeepAlive.Once), the policy already in force, and the one arm that learns from the account's
+// own history. `optimal` is in the DEFAULT set on purpose — it is the only figure that says how
+// much headroom exists at all, and an arm nobody sees by default is one nobody compares against
+// — and it is marked Unreachable so no surface can present it as a result.
 var KVCacheDefaultStrategies = []string{KVStrategyNoCache, KVStrategyFixed5m, KVStrategyFixed1h,
-	KVStrategyKeepAlive5m, KVStrategyObserved, KVStrategyHistorical, KVStrategyOptimal}
+	KVStrategyKeepAlive5m, KVStrategyKeepAlive5mOnce, KVStrategyKeepAlive1hOnce,
+	KVStrategyObserved, KVStrategyHistorical, KVStrategyOptimal}
 
 // kvCacheDefaultBaseline is the arm every saving is measured against when the caller names none,
 // and it comes from the REGISTRY rather than from a constant here.
@@ -366,6 +370,18 @@ func kvCacheAssumptions(cfg KVCacheSimConfig) KVCacheAssumptions {
 			"Negative where the strategy costs more, and shown that way — never clamped to zero."},
 		{"Percentage savings", "absolute_savings ÷ baseline_cost × 100",
 			"Undefined, not 0%, when the baseline is zero."},
+		{"Raising the TTL from five minutes to an hour", "write_1h_usd − write_5m_usd",
+			"What the longer hold costs, on the SAME write — the price of the extra 45 minutes " +
+				"of coverage, before anything it might save is counted."},
+		{"Saved per prevented miss", "late_5m_usd − keep_alive_usd",
+			"What one five-minute miss costs beyond what a hit at the same tier would have. The " +
+				"ping overhead is in both terms and cancels, leaving the write-versus-read gap."},
+		{"One 5m miss vs one 1h write", "late_5m_usd − write_1h_usd",
+			"SIGNED. Negative means paying for the 1-hour tier up front costs more than eating " +
+				"the one five-minute miss it would have prevented."},
+		{"Prevented misses to break even", "⌈raise_5m_to_1h_usd ÷ saved_per_miss_usd⌉",
+			"How many five-minute misses raising the TTL has to prevent before it pays for " +
+				"itself. Undefined, not zero, when saved_per_miss_usd is not positive."},
 	}
 	a.Notes = []string{
 		"Every timestamp, hour and time-of-day band on this page is UTC. The store carries no " +
@@ -420,6 +436,17 @@ type KVCachePriceCost struct {
 	// span: the creation plus MaxPings refreshes. The two numbers a strategy chooses between.
 	Hold5m float64 `json:"hold_5m_usd"`
 	Hold1h float64 `json:"hold_1h_usd"`
+	// Raise5mTo1h is what the longer hold costs on the SAME write: Write1h − Write5m.
+	Raise5mTo1h float64 `json:"raise_5m_to_1h_usd"`
+	// SavedPerMiss is what one five-minute miss costs beyond a hit at the same tier: Late5m −
+	// KeepAlive. The ping overhead is in both terms and cancels.
+	SavedPerMiss float64 `json:"saved_per_miss_usd"`
+	// SavedVs1hWrite is Late5m − Write1h, SIGNED: negative means paying for the 1-hour tier up
+	// front costs more than the one 5-minute miss it would have prevented.
+	SavedVs1hWrite float64 `json:"saved_vs_1h_write_usd"`
+	// BreakevenMisses is how many prevented 5-minute misses pay for raising the TTL, or nil when
+	// SavedPerMiss or Raise5mTo1h is not positive — undefined, not zero.
+	BreakevenMisses *int64 `json:"breakeven_misses"`
 }
 
 // KVCachePriceView is /api/kvcache/pricing: the editable rates, the assumptions, and what
@@ -467,6 +494,13 @@ func kvCachePriceView(models []string, prefix int64, p modelinfo.Pricer,
 			c.Late1h = m.RecreateCost(prefix, kvcache.TTL1h, sem)
 			c.Hold5m = m.HoldCost(prefix, kvcache.TTL5m, k, sem)
 			c.Hold1h = m.HoldCost(prefix, kvcache.TTL1h, k, sem)
+			c.Raise5mTo1h = c.Write1h - c.Write5m
+			c.SavedPerMiss = c.Late5m - c.KeepAlive
+			c.SavedVs1hWrite = c.Late5m - c.Write1h
+			if c.SavedPerMiss > 0 && c.Raise5mTo1h > 0 {
+				n := int64(math.Ceil(c.Raise5mTo1h / c.SavedPerMiss))
+				c.BreakevenMisses = &n
+			}
 		}
 		out.Costs = append(out.Costs, c)
 	}

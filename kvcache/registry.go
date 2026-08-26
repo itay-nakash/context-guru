@@ -40,6 +40,11 @@ const (
 	StrategyFixed1h     = "fixed-1h"
 	StrategyKeepAlive5m = "keepalive-5m"
 	StrategyKeepAlive1h = "keepalive-1h"
+	// StrategyKeepAlive5mOnce and StrategyKeepAlive1hOnce hold at their tier and refresh with
+	// exactly ONE keep-alive per idle span, then let the entry lapse. See KeepAlive.Once and
+	// PingCapper.
+	StrategyKeepAlive5mOnce = "keepalive-5m-once"
+	StrategyKeepAlive1hOnce = "keepalive-1h-once"
 	// StrategyExtend1h writes at the cheap tier and extends to an hour only when a
 	// conversation actually goes quiet.
 	StrategyExtend1h   = "keepalive-5m-to-1h"
@@ -58,7 +63,9 @@ var registry = []StrategySpec{
 	{Name: StrategyFixed5m, Description: Fixed5m().Describe(), Baseline: true},
 	{Name: StrategyFixed1h, Description: Fixed1h().Describe()},
 	{Name: StrategyKeepAlive5m, Description: KeepAlive5m().Describe()},
+	{Name: StrategyKeepAlive5mOnce, Description: KeepAlive5mOnce().Describe()},
 	{Name: StrategyKeepAlive1h, Description: KeepAlive1h().Describe()},
+	{Name: StrategyKeepAlive1hOnce, Description: KeepAlive1hOnce().Describe()},
 	{Name: StrategyExtend1h, Description: Extend1h{}.Describe()},
 	{Name: StrategyObserved, Description: "Replay the tier each request actually asked for; " +
 		"where no tier was recorded, assume the provider's default and count the row as " +
@@ -98,8 +105,12 @@ func NewStrategy(name string, reqs []*Request, cfg Config) (Strategy, error) {
 		return Fixed1h(), nil
 	case StrategyKeepAlive5m:
 		return KeepAlive5m(), nil
+	case StrategyKeepAlive5mOnce:
+		return KeepAlive5mOnce(), nil
 	case StrategyKeepAlive1h:
 		return KeepAlive1h(), nil
+	case StrategyKeepAlive1hOnce:
+		return KeepAlive1hOnce(), nil
 	case StrategyExtend1h:
 		return Extend1h{}, nil
 	case StrategyObserved:
@@ -126,27 +137,57 @@ func NewStrategy(name string, reqs []*Request, cfg Config) (Strategy, error) {
 // spent to hold the entry past its own lifetime. On the production corpus this is the only
 // hand-written arm that beats the shipped 5-minute policy, and it does so without consulting
 // any statistics at all — which is the measurement any learned arm has to be compared with.
-type KeepAlive struct{ TTL TTL }
+type KeepAlive struct {
+	TTL TTL
+	// Once caps this arm's OWN schedule at exactly one keep-alive per idle span, refreshing
+	// the entry once and then letting it lapse rather than pinging it for as long as
+	// cfg.MaxPings allows. See PingCap.
+	Once bool
+}
 
 // KeepAlive5m and KeepAlive1h are the two shipped keep-alive arms.
 func KeepAlive5m() KeepAlive { return KeepAlive{TTL: TTL5m} }
 func KeepAlive1h() KeepAlive { return KeepAlive{TTL: TTL1h} }
 
-func (k KeepAlive) Name() string { return "keepalive-" + k.TTL.Label() }
+// KeepAlive5mOnce and KeepAlive1hOnce are the same two arms, capped to a single keep-alive
+// per idle span — the cheap end of "does pinging help at all" against the repeated-ping
+// arms above, at whatever the window's MaxPings is otherwise configured to.
+func KeepAlive5mOnce() KeepAlive { return KeepAlive{TTL: TTL5m, Once: true} }
+func KeepAlive1hOnce() KeepAlive { return KeepAlive{TTL: TTL1h, Once: true} }
+
+func (k KeepAlive) Name() string {
+	if k.Once {
+		return "keepalive-" + k.TTL.Label() + "-once"
+	}
+	return "keepalive-" + k.TTL.Label()
+}
 func (k KeepAlive) Decide(Observation) Action {
 	if k.TTL == TTL1h {
 		return ActionPing1h
 	}
 	return ActionPing5m
 }
+
+// PingCap implements PingCapper: 1 when Once is set, 0 (no cap of its own) otherwise.
+func (k KeepAlive) PingCap() int {
+	if k.Once {
+		return 1
+	}
+	return 0
+}
+
 func (k KeepAlive) Describe() string {
+	suffix := ""
+	if k.Once {
+		suffix = " Capped to a single keep-alive per idle span, then lets the entry lapse."
+	}
 	if k.TTL == TTL1h {
 		return "Hold every prefix at the 1-hour tier and refresh it with keep-alives while " +
 			"idle. Costs 2.0x input to create, and needs one twelfth as many refreshes as the " +
-			"5-minute arm to hold the same span."
+			"5-minute arm to hold the same span." + suffix
 	}
 	return "Hold every prefix at the 5-minute tier and refresh it with keep-alives while " +
-		"idle. The cheapest tier to create, refreshed at 0.1x."
+		"idle. The cheapest tier to create, refreshed at 0.1x." + suffix
 }
 
 // Extend1h writes every prefix at the CHEAP five-minute tier and buys the long hold only if

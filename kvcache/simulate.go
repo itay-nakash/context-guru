@@ -374,6 +374,11 @@ type groupAcc struct{ g Group }
 // request's own successor. It is not mutated.
 func Simulate(reqs []*Request, s Strategy, cfg Config) *Result {
 	cfg = cfg.withDefaults(reqs)
+	if pc, ok := s.(PingCapper); ok {
+		if n := pc.PingCap(); n > 0 && n < cfg.MaxPings {
+			cfg.MaxPings = n
+		}
+	}
 	sem := cfg.Semantics
 	out := &Result{Strategy: s.Name(), Decisions: map[Action]int64{},
 		StatsLevels: map[string]int64{}, ByUser: []Group{}, ByModel: []Group{},

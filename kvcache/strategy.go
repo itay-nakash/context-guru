@@ -176,6 +176,12 @@ type Describer interface {
 	Describe() string
 }
 
+// PingCapper is an optional interface: a strategy that caps its OWN keep-alive schedule below
+// the window's MaxPings. PingCap returns the cap, or 0 for "no cap of its own".
+type PingCapper interface {
+	PingCap() int
+}
+
 // Predictor is the seam a LEARNED model plugs into.
 //
 // It answers exactly the question a TTL decision needs — will this conversation come back
