@@ -1046,7 +1046,29 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 		// of the few parts of this component that unambiguously pays. A metric that argues for
 		// optimizing something already working is worse than no metric.
 		metrics.RecordExtractionCacheLookup(false)
-		if huge := e.trigger.IsHuge(sz, c.CtxWindow); !c.CacheAware && !fires && !huge {
+		// The operator's REQUEST-level trigger, now honored on WARM caching turns.
+		//
+		// This condition used to carry `!c.CacheAware`, and that spelling was too broad. What
+		// legitimately bypasses a request-size threshold is a COLD SWEEP: on a cold turn the
+		// whole transcript re-bills at the cache-write rate whatever the request's size, so the
+		// request-level threshold answers the wrong question and the sweep brings its own floor
+		// (e.cold.MinTokens, set above). That is why `sweeping` already overrides the cadence
+		// gate and the pressure gate — this check simply had not been given the same treatment.
+		//
+		// `c.CacheAware` is true on warm caching turns as well as cold ones, so the old spelling
+		// also discarded the threshold on every warm turn, where it means exactly what the
+		// operator wrote. And it could ONLY discard operator configuration: Trigger's zero value
+		// fires always (see components/trigger.go — "a zero field is no constraint"), so `!fires`
+		// is reachable only when min_request_tokens / min_request_frac / min_messages was set and
+		// not met. There is no derived value in `fires` for a cache carve-out to protect; the
+		// derived pressure trigger is separate and gates the model earlier via shouldFire.
+		//
+		// Found by the housellm cold-sweep preset test, which fails if `sweeping` is dropped
+		// here — the sweep is the part of the old carve-out that was carrying real weight.
+		//
+		// IsHuge still overrides, unchanged: a single output that large is worth a call whatever
+		// the request-level threshold says.
+		if huge := e.trigger.IsHuge(sz, c.CtxWindow); !fires && !huge && !sweeping {
 			rep.Gate("request_trigger_not_fired")
 			continue
 		}
