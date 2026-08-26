@@ -163,6 +163,14 @@ type CachePolicy struct {
 	// it on request size. Passed through to apply.Opts — see apply/headttl.go.
 	HeadTTL1h        bool
 	HeadTTLMinTokens int
+	// PredictorID optionally names a registered predictor (see predictorFor and
+	// knownPredictorIDs in keepalivestrategy.go) that pingable() must also clear before a
+	// ping fires. "" (every account today, and every strategy created before this field
+	// existed) means no predictor gate at all — unchanged behaviour.
+	PredictorID string
+	// PredictorThreshold is the minimum probability PredictorID must return. Ignored
+	// while PredictorID is "".
+	PredictorThreshold float64
 }
 
 // on reports whether this policy can ping at all.
@@ -251,6 +259,10 @@ type kaEntry struct {
 	// prefix is what the previous request billed (cache_read + cache_write) — the size of the
 	// entry a ping would refresh, and therefore the input to both the gate and the cost guard.
 	prefix int64
+	// stopReason is the request that established this entry's own terminal stop reason
+	// (Usage.StopReason) — present tense, not a prediction. Read only by pol.PredictorID's
+	// gate in pingable(); "" on every entry until a strategy actually names a predictor.
+	stopReason string
 	// pingUSD is the projected cost of one ping on that prefix, from the model's own read
 	// rate. Checked against pol.MaxUSDPerPing before anything is sent.
 	pingUSD float64
@@ -303,12 +315,34 @@ func (e *kaEntry) due(now time.Time) bool {
 //   - **A projected ping cost inside budget.** Ping cost is bimodal (p50 $0.0004, p99 $0.2275,
 //     max $0.3780), so the outlier to refuse is one ping and not a session's total.
 //
-// Deliberately NOT gated on the previous turn's `stop_reason`. `end_turn` looks like a
-// session-end signal and is the opposite — P(gap > 300s) is 37.15% after it against 0.74%
-// after `tool_use`, and 83.7% of the recoverable dollars sit behind it.
+// The unconditional default is DELIBERATELY not gated on the previous turn's
+// `stop_reason`. `end_turn` looks like a session-end signal and is the opposite — P(gap >
+// 300s) is 37.15% after it against 0.74% after `tool_use`, and 83.7% of the recoverable
+// dollars sit behind it. That finding is exactly why StopReasonPredictor below does not
+// exclude end_turn either — it excludes the two clusters that finding never addressed.
+//
+// A strategy naming a PredictorID (opt-in, see kvcache.knownPredictorIDs and
+// docs/results/kv-ttl-predictor-arms.md) adds ONE more condition on top of everything
+// above: the named predictor's probability at this entry's own stop_reason must clear the
+// strategy's tuned threshold. No PredictorID (every account today, and every strategy
+// that predates this field) means this whole block is skipped and behaviour is byte-for-
+// byte what it always was.
 func (e *kaEntry) pingable() bool {
-	return e.turn >= 1 && e.prefix >= int64(e.pol.MinPrefixTokens) &&
-		e.pingUSD <= e.pol.Ceiling()
+	if e.turn < 1 || e.prefix < int64(e.pol.MinPrefixTokens) || e.pingUSD > e.pol.Ceiling() {
+		return false
+	}
+	if e.pol.PredictorID == "" {
+		return true
+	}
+	p, ok := predictorFor(e.pol.PredictorID)
+	if !ok {
+		// An unknown predictor id can only reach a live entry if knownPredictorIDs and this
+		// switch drift apart. Fail toward NOT SPENDING — refuse the ping — rather than
+		// silently pinging on a rule that does not exist; the money is the thing to protect
+		// here, unlike the request path itself, which always fails open.
+		return false
+	}
+	return p(e.stopReason) >= e.pol.PredictorThreshold
 }
 
 // Ceiling is the per-ping cost guard that is actually ENFORCED.
@@ -617,7 +651,7 @@ func (k *keeper) record(tn *Tenancy, session string, startedAt time.Time, body [
 	e := &kaEntry{
 		tenant: tn.ID, session: session, startedAt: startedAt, body: owned, up: up,
 		provider: provider, model: model, route: route, preset: tn.Preset,
-		agent: r.UserAgent(), pol: pol, prefix: prefix,
+		agent: r.UserAgent(), pol: pol, prefix: prefix, stopReason: u.StopReason,
 		pingUSD: k.projectedPingUSD(model, prefix),
 		hdr:     hdr, auth: auth, appliedStrategy: applied,
 	}

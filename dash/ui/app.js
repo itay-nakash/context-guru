@@ -6959,6 +6959,14 @@ const STRATEGY_DAYS = [
   [0, 'Sun'], [1, 'Mon'], [2, 'Tue'], [3, 'Wed'], [4, 'Thu'], [5, 'Fri'], [6, 'Sat'],
 ];
 
+// STRATEGY_PREDICTORS mirrors proxy's knownPredictorIDs (keepalivestrategy.go) — the
+// server is the actual source of truth and refuses anything not in that map, so this
+// list only has to be right, not authoritative.
+const STRATEGY_PREDICTORS = [
+  { id: 'stop-reason-gated', label: 'Stop-reason gate — ping only on end_turn/max_tokens/refusal '
+    + '(measured +1.54% vs fixed-5m, see the KV-cache page)' },
+];
+
 function dayLabel(days) {
   if (!days || !days.length) return 'every day';
   return [...days].sort((a, b) => a - b).map((d) => STRATEGY_DAYS[d][1]).join(',');
@@ -7002,6 +7010,20 @@ function buildStrategyForm(form) {
   const prefix = el('input', { type: 'number', id: 'sf-prefix', value: '20000', min: '0' });
   const usdCap = el('input', { type: 'number', id: 'sf-usd', value: '0', min: '0', step: '0.01' });
   const active = el('input', { type: 'checkbox', id: 'sf-active', checked: 'checked' });
+
+  // Predictor gate: optional, on top of the windows above. "" means no gate at all —
+  // every strategy created before this field existed, and every strategy that leaves it
+  // unset, behaves exactly as before. The option list is short and server-validated
+  // (STRATEGY_PREDICTORS mirrors proxy's own knownPredictorIDs) rather than free text,
+  // since an unregistered id is refused at save time either way.
+  const predictor = el('select', { id: 'sf-predictor', 'data-testid': 'sf-predictor' },
+    el('option', { value: '' }, 'None — windows only (default)'),
+    ...STRATEGY_PREDICTORS.map((p) => el('option', { value: p.id }, p.label)));
+  const predictorThreshold = el('input', {
+    type: 'number', id: 'sf-predictor-threshold', value: '0.5', min: '0', max: '1', step: '0.01',
+    disabled: 'disabled',
+  });
+  predictor.addEventListener('change', () => { predictorThreshold.disabled = !predictor.value; });
 
   const targetAll = el('input', { type: 'radio', name: 'sf-target-mode', value: 'all', checked: 'checked' });
   const targetList = el('input', { type: 'radio', name: 'sf-target-mode', value: 'list' });
@@ -7078,6 +7100,10 @@ function buildStrategyForm(form) {
     el('label', { for: 'sf-usd' }, 'Max $/ping (0 = default)'), usdCap));
   form.appendChild(el('div', { class: 'field' }, el('label', {}, active, ' Active')));
   form.appendChild(el('fieldset', { class: 'field' },
+    el('legend', {}, 'Predictor gate (optional, in addition to the windows below)'),
+    el('label', { for: 'sf-predictor' }, 'Predictor'), predictor,
+    el('label', { for: 'sf-predictor-threshold' }, 'Minimum probability'), predictorThreshold));
+  form.appendChild(el('fieldset', { class: 'field' },
     el('legend', {}, 'Target'),
     el('label', {}, targetAll, ' Every account'),
     el('label', {}, targetList, ' Pick accounts'),
@@ -7097,6 +7123,9 @@ function buildStrategyForm(form) {
     prefix.value = String(s.min_prefix_tokens);
     usdCap.value = String(s.max_usd_per_ping);
     active.checked = !!s.active;
+    predictor.value = s.predictor_id || '';
+    predictorThreshold.value = String(s.predictor_threshold || 0.5);
+    predictorThreshold.disabled = !predictor.value;
     if (s.target && s.target.mode === 'list') {
       targetList.checked = true;
       for (const o of targetIDs.options) o.selected = (s.target.tenant_ids || []).includes(o.value);
@@ -7124,6 +7153,8 @@ function buildStrategyForm(form) {
       min_prefix_tokens: Number(prefix.value) || 0,
       max_usd_per_ping: Number(usdCap.value) || 0,
       active: active.checked,
+      predictor_id: predictor.value,
+      predictor_threshold: predictor.value ? (Number(predictorThreshold.value) || 0) : 0,
       windows: strategyForm.windows,
       target: targetList.checked
         ? { mode: 'list', tenant_ids: Array.from(targetIDs.selectedOptions).map((o) => o.value) }
@@ -7186,7 +7217,9 @@ async function openStrategyLedger(s) {
       'Saved is each tenant’s WHOLE keep-alive credit in its history, not only the ' +
       'share this strategy’s own pings produced — see the design doc’s attribution ' +
       'caveat. A tenant running more than one strategy, or a session override, will show more ' +
-      'here than this strategy alone earned.'));
+      'here than this strategy alone earned. This ledger is also ALL TIME — unlike Overview ' +
+      'or the Keep-Alive tab, it ignores whatever date range the dashboard is set to, so a ' +
+      'lower or higher number here than those pages show is not a discrepancy.'));
     if (!led.tenants || !led.tenants.length) {
       emptyState(body, 'No pings under this strategy yet', '');
       return;
@@ -7218,6 +7251,11 @@ function renderStrategiesList(host, rows) {
     emptyState(host, 'No strategies yet', 'Create one above.');
     return;
   }
+  host.appendChild(el('p', { class: 'note' },
+    'Each strategy’s “Stats” drawer shows pings and cost, which are exact and additive ' +
+    'across strategies, and a Saved figure, which is not: a tenant matching more than ' +
+    'one strategy is counted under each one. Compare against the Overview or Keep-Alive ' +
+    'tab’s total, not against a sum of these rows’ Saved figures.'));
   const tbl = el('table', { class: 'grid' },
     el('thead', {}, el('tr', {},
       el('th', {}, 'Name'), el('th', {}, 'Windows'), el('th', {}, 'Target'),
@@ -7227,7 +7265,11 @@ function renderStrategiesList(host, rows) {
   for (const s of rows) {
     body.appendChild(el('tr', { class: s.active ? '' : 'revoked' },
       el('td', {}, s.name),
-      el('td', {}, (s.windows || []).map(windowLabel).join('; ') || '—'),
+      el('td', {}, (s.windows || []).map(windowLabel).join('; ') || '—',
+        s.predictor_id
+          ? el('div', { class: 'muted small' }, 'gated: ' + s.predictor_id
+            + ' ≥ ' + s.predictor_threshold)
+          : null),
       el('td', {}, s.target && s.target.mode === 'list'
         ? `${(s.target.tenant_ids || []).length} account(s)` : 'every account'),
       el('td', {}, `${s.idle_seconds}s / ${s.max_pings}`),

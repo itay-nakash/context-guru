@@ -1310,6 +1310,16 @@ var migrations = []string{
 	   updated_at        INTEGER NOT NULL
 	 );
 	 CREATE INDEX idx_keepalive_strategies_active ON keepalive_strategies(active);`,
+
+	// v9: a strategy may optionally name a PREDICTOR that gates its pings in addition to
+	// its time windows (see kvcache.Predictor and docs/results/kv-ttl-predictor-*.md).
+	// predictor_id '' (the default) means "no predictor gate" — the strategy behaves
+	// exactly as it did through v8, schedule-only. predictor_threshold is the minimum
+	// ReuseProbability the named predictor must return for a ping to fire; meaningless
+	// and ignored while predictor_id is ''. Both additive with defaults, so every
+	// existing strategy keeps behaving identically after this migration.
+	`ALTER TABLE keepalive_strategies ADD COLUMN predictor_id        TEXT NOT NULL DEFAULT '';
+	 ALTER TABLE keepalive_strategies ADD COLUMN predictor_threshold REAL NOT NULL DEFAULT 0;`,
 }
 
 func migrate(db *sql.DB) error {

@@ -66,23 +66,36 @@ type Strategy struct {
 	Windows         []Window
 	Target          Target
 	Active          bool
-	CreatedBy       string
-	CreatedAt       time.Time
-	UpdatedBy       string
-	UpdatedAt       time.Time
+	// PredictorID optionally names a registered kvcache.Predictor that must also clear
+	// PredictorThreshold before a ping fires, on top of the window/target match above.
+	// "" (the default) means no predictor gate at all — a strategy with an empty
+	// PredictorID behaves exactly as every strategy did before this field existed.
+	// Resolving the id to an actual Predictor implementation, and refusing an unknown
+	// one, is proxy's job (this package only stores the reference); see
+	// proxy/keepalivestrategy.go.
+	PredictorID string
+	// PredictorThreshold is the minimum probability PredictorID must return for a ping
+	// to fire. Ignored while PredictorID is "".
+	PredictorThreshold float64
+	CreatedBy          string
+	CreatedAt          time.Time
+	UpdatedBy          string
+	UpdatedAt          time.Time
 }
 
 // StrategyPatch is a sparse update, matching Patch's own pointer convention: a nil
 // field is left alone.
 type StrategyPatch struct {
-	Name            *string
-	IdleSeconds     *int
-	MaxPings        *int
-	MinPrefixTokens *int
-	MaxUSDPerPing   *float64
-	Windows         *[]Window
-	Target          *Target
-	Active          *bool
+	Name               *string
+	IdleSeconds        *int
+	MaxPings           *int
+	MinPrefixTokens    *int
+	MaxUSDPerPing      *float64
+	Windows            *[]Window
+	Target             *Target
+	Active             *bool
+	PredictorID        *string
+	PredictorThreshold *float64
 }
 
 // ErrNoStrategy names no keep-alive strategy.
@@ -169,6 +182,24 @@ func (w Window) contains(now time.Time) (bool, error) {
 	return mins >= start && mins < end, nil
 }
 
+// ValidatePredictor checks only this strategy's own shape: a threshold in [0,1], and only
+// when a predictor is actually named — an unset PredictorID with a nonzero, unused
+// threshold left over from a previous edit is not an error, since it is ignored either
+// way. Whether PredictorID actually NAMES a registered kvcache.Predictor is not knowable
+// here (this package has no registry of them) — that check belongs to the caller that
+// does, exactly as an unknown strategy name is refused by kvcache.NewStrategy rather than
+// silently defaulted. See proxy/keepalivestrategy.go.
+func (s Strategy) ValidatePredictor() error {
+	if s.PredictorID == "" {
+		return nil
+	}
+	if s.PredictorThreshold < 0 || s.PredictorThreshold > 1 {
+		return fmt.Errorf("tenant: a predictor threshold must be between 0 and 1, got %v",
+			s.PredictorThreshold)
+	}
+	return nil
+}
+
 // Validate checks the target's own shape: a known mode, and at least one tenant id for
 // a list-target strategy (an empty list matches nothing, which is never what was meant).
 func (t Target) Validate() error {
@@ -243,11 +274,13 @@ func (r *Registry) CreateStrategy(actorID string, s Strategy) (Strategy, error) 
 	s.CreatedAt, s.UpdatedAt = now, now
 	if _, err := r.db.Exec(`INSERT INTO keepalive_strategies
 	  (id,name,idle_seconds,max_pings,min_prefix_tokens,max_usd_per_ping,windows_json,
-	   target_json,active,created_by,created_at,updated_by,updated_at)
-	  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	   target_json,active,predictor_id,predictor_threshold,created_by,created_at,
+	   updated_by,updated_at)
+	  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		s.ID, s.Name, s.IdleSeconds, s.MaxPings, s.MinPrefixTokens, s.MaxUSDPerPing,
-		string(windowsJSON), string(targetJSON), boolInt(s.Active),
-		s.CreatedBy, s.CreatedAt.UnixMilli(), s.UpdatedBy, s.UpdatedAt.UnixMilli()); err != nil {
+		string(windowsJSON), string(targetJSON), boolInt(s.Active), s.PredictorID,
+		s.PredictorThreshold, s.CreatedBy, s.CreatedAt.UnixMilli(), s.UpdatedBy,
+		s.UpdatedAt.UnixMilli()); err != nil {
 		return Strategy{}, err
 	}
 	return s, nil
@@ -286,6 +319,12 @@ func (r *Registry) UpdateStrategy(actorID, id string, p StrategyPatch) (Strategy
 	if p.Active != nil {
 		s.Active = *p.Active
 	}
+	if p.PredictorID != nil {
+		s.PredictorID = *p.PredictorID
+	}
+	if p.PredictorThreshold != nil {
+		s.PredictorThreshold = *p.PredictorThreshold
+	}
 	s.UpdatedBy, s.UpdatedAt = actorID, time.Now()
 	windowsJSON, err := json.Marshal(s.Windows)
 	if err != nil {
@@ -297,10 +336,11 @@ func (r *Registry) UpdateStrategy(actorID, id string, p StrategyPatch) (Strategy
 	}
 	if _, err := r.db.Exec(`UPDATE keepalive_strategies SET
 	  name=?, idle_seconds=?, max_pings=?, min_prefix_tokens=?, max_usd_per_ping=?,
-	  windows_json=?, target_json=?, active=?, updated_by=?, updated_at=? WHERE id=?`,
+	  windows_json=?, target_json=?, active=?, predictor_id=?, predictor_threshold=?,
+	  updated_by=?, updated_at=? WHERE id=?`,
 		s.Name, s.IdleSeconds, s.MaxPings, s.MinPrefixTokens, s.MaxUSDPerPing,
-		string(windowsJSON), string(targetJSON), boolInt(s.Active), s.UpdatedBy,
-		s.UpdatedAt.UnixMilli(), s.ID); err != nil {
+		string(windowsJSON), string(targetJSON), boolInt(s.Active), s.PredictorID,
+		s.PredictorThreshold, s.UpdatedBy, s.UpdatedAt.UnixMilli(), s.ID); err != nil {
 		return Strategy{}, err
 	}
 	return s, nil
@@ -349,7 +389,8 @@ func (r *Registry) ListStrategies() ([]Strategy, error) {
 }
 
 const strategyCols = `id,name,idle_seconds,max_pings,min_prefix_tokens,max_usd_per_ping,
-	windows_json,target_json,active,created_by,created_at,updated_by,updated_at`
+	windows_json,target_json,active,predictor_id,predictor_threshold,created_by,created_at,
+	updated_by,updated_at`
 
 func scanStrategy(sc scanner) (Strategy, error) {
 	var out Strategy
@@ -357,8 +398,8 @@ func scanStrategy(sc scanner) (Strategy, error) {
 	var active int
 	var createdAt, updatedAt int64
 	if err := sc.Scan(&out.ID, &out.Name, &out.IdleSeconds, &out.MaxPings, &out.MinPrefixTokens,
-		&out.MaxUSDPerPing, &windowsJSON, &targetJSON, &active, &out.CreatedBy, &createdAt,
-		&out.UpdatedBy, &updatedAt); err != nil {
+		&out.MaxUSDPerPing, &windowsJSON, &targetJSON, &active, &out.PredictorID,
+		&out.PredictorThreshold, &out.CreatedBy, &createdAt, &out.UpdatedBy, &updatedAt); err != nil {
 		return Strategy{}, err
 	}
 	if windowsJSON != "" {

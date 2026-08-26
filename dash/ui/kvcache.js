@@ -472,11 +472,19 @@ kvPanel('Cache prices',
   kvHost('kv-pricing'));
 
 // 5. The simulator.
-kvPanel('What a different TTL strategy would have cost',
+const kvSimPanel = kvPanel('What a different TTL strategy would have cost',
   'Each strategy is replayed against exactly this history. At every request it is given only '
   + 'what was knowable at that moment — never how long the gap turned out to be — and the real '
   + 'next-request time is used only to score the decision afterwards.',
   kvHost('kv-arms'), kvHost('kv-sim'));
+kvSimPanel.appendChild(el('h3', {}, 'What actually predicts a rescue'));
+kvSimPanel.appendChild(el('p', { class: 'note' },
+  'From an offline model fit on this deployment’s own history — see '
+  + 'docs/results/kv-ttl-predictor-arms.md. STATIC: unlike every number above, this is not '
+  + 'recomputed from the rows in this window; it is the offline study’s own measured ranking, '
+  + 'echoed here so the arm above (stop-reason-gated) can be checked against the finding that '
+  + 'justifies it.'));
+kvSimPanel.appendChild(kvHost('kv-features'));
 
 // 6. The dataset itself.
 const kvTablePanel = kvPanel('Every request in the analysis',
@@ -1138,6 +1146,43 @@ function renderKVSim() {
 }
 
 /**
+ * renderKVFeatureImportance shows each model's own top-5, side by side. Two separate lists,
+ * not one table with a shared row per rank: the two models only agree on ranks 1-2 and
+ * diverge from rank 3 on, so a shared row would have to invent a score for a feature one
+ * model never ranked. See KVCacheFeatureImportance's own doc comment.
+ */
+function renderKVFeatureImportance() {
+  const host = clear($('#kv-features'));
+  const fi = kvc.sim && kvc.sim.feature_importance;
+  if (!fi) { loadingState(host, 2); return; }
+  const cols = el('div', { class: 'grid-2' });
+  for (const [label, ranks, unit] of [
+    ['Logistic regression', fi.logistic_regression, '|standardized coef|'],
+    ['Gradient-boosted trees', fi.gradient_boosted, 'importance'],
+  ]) {
+    const tbl = el('table', { class: 'tbl compact' },
+      el('thead', {}, el('tr', {}, el('th', {}, '#'), el('th', {}, 'Feature'),
+        el('th', { class: 'num' }, unit))));
+    const body = el('tbody');
+    for (const r of ranks || []) {
+      body.appendChild(el('tr', {},
+        el('td', {}, num(r.rank)), el('td', {}, r.feature),
+        el('td', { class: 'num' }, r.score.toFixed(3))));
+    }
+    tbl.appendChild(body);
+    cols.appendChild(el('div', {}, el('h4', {}, label), tbl));
+  }
+  host.appendChild(cols);
+  if (fi.logistic_regression && fi.gradient_boosted
+      && fi.logistic_regression[0] && fi.gradient_boosted[0]
+      && fi.logistic_regression[0].feature === fi.gradient_boosted[0].feature) {
+    host.appendChild(el('p', { class: 'hint' },
+      'Both models agree on the top feature: ',
+      el('code', {}, fi.logistic_regression[0].feature), '.'));
+  }
+}
+
+/**
  * kvPingNote separates the two ways a keep-alive can be more than a refresh.
  *
  * An UPGRADE is a policy buying a hold it chose — the entry was moved to the one-hour tier
@@ -1407,6 +1452,7 @@ async function kvLoadSim() {
   }
   renderKVArms();
   renderKVSim();
+  renderKVFeatureImportance();
 }
 
 async function kvLoadRows() {

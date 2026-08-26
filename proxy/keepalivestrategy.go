@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/rossoctl/context-guru/kvcache"
 	"github.com/rossoctl/context-guru/tenant"
 )
 
@@ -80,6 +81,8 @@ func (k *keeper) applyStrategy(tenantID string, pol CachePolicy, now time.Time) 
 	pol.MaxPings = best.MaxPings
 	pol.MinPrefixTokens = best.MinPrefixTokens
 	pol.MaxUSDPerPing = best.MaxUSDPerPing
+	pol.PredictorID = best.PredictorID
+	pol.PredictorThreshold = best.PredictorThreshold
 	return pol, best.ID
 }
 
@@ -125,6 +128,52 @@ func validStrategyBounds(idle time.Duration, pings, minPrefix int, maxUSDPerPing
 	return nil
 }
 
+// knownPredictorIDs is the set of predictor names a strategy is allowed to reference —
+// kept in lockstep with predictorFor's switch by TestKnownPredictorIDsMatchPredictorFor,
+// so accepting a strategy at creation time can never promise a gate that pingable() does
+// not actually know how to evaluate.
+//
+// "stop-reason-gated" is the first and, so far, only entry: write the five-minute tier on
+// every request, ping while idle only when the request just served's own stop_reason
+// clusters as kvcache.ClusterActuallyDone. Measured (docs/results/kv-ttl-predictor-arms.md)
+// as +1.54% vs fixed-5m pooled (CI95 [0.60%, 2.79%]), not statistically distinguishable
+// from a trained logistic regression on the same window — which is why it is a rule
+// rather than a model: predictorFor never runs anything heavier than kvcache.ClusterOf in
+// the hot path.
+var knownPredictorIDs = map[string]bool{"stop-reason-gated": true}
+
+// predictorFor resolves a predictor id to a probability function over the entry's own
+// stop_reason, and reports whether the id is known. This is the whole production-safe
+// predictor class: a rule, or (a future entry) a portable logistic-regression dot product
+// — never an embedded model or a call out of the hot path. See kaEntry.stopReason and
+// CachePolicy.PredictorID/PredictorThreshold for where the result is used.
+func predictorFor(id string) (func(stopReason string) float64, bool) {
+	switch id {
+	case "stop-reason-gated":
+		return func(stopReason string) float64 {
+			if kvcache.ClusterOf(stopReason) == kvcache.ClusterActuallyDone {
+				return 1.0
+			}
+			return 0.0
+		}, true
+	}
+	return nil, false
+}
+
+// validPredictorRef checks predictorID against knownPredictorIDs (empty is always
+// valid — "no predictor gate") and the threshold's own shape.
+func validPredictorRef(predictorID string, threshold float64) error {
+	s := tenant.Strategy{PredictorID: predictorID, PredictorThreshold: threshold}
+	if err := s.ValidatePredictor(); err != nil {
+		return err
+	}
+	if predictorID != "" && !knownPredictorIDs[predictorID] {
+		return fmt.Errorf("%q is not a registered predictor; no predictor-gated strategies "+
+			"can be created yet", predictorID)
+	}
+	return nil
+}
+
 // validWindows checks that a strategy has at least one window (one with no schedule can
 // never fire, which is never what a manager who created it meant) and that each one is
 // individually valid.
@@ -156,20 +205,22 @@ func (h *Handler) keepAliveStrategyCtlRoutes() []ctlRoute {
 // "currently in a matching window: yes/no" the design doc asks the list route for, so the
 // UI's at-a-glance state needs no arithmetic of its own.
 type strategyView struct {
-	ID              string          `json:"id"`
-	Name            string          `json:"name"`
-	IdleSeconds     int             `json:"idle_seconds"`
-	MaxPings        int             `json:"max_pings"`
-	MinPrefixTokens int             `json:"min_prefix_tokens"`
-	MaxUSDPerPing   float64         `json:"max_usd_per_ping"`
-	Windows         []tenant.Window `json:"windows"`
-	Target          tenant.Target   `json:"target"`
-	Active          bool            `json:"active"`
-	CreatedBy       string          `json:"created_by"`
-	CreatedAt       int64           `json:"created_at"`
-	UpdatedBy       string          `json:"updated_by"`
-	UpdatedAt       int64           `json:"updated_at"`
-	InWindow        bool            `json:"in_window"`
+	ID                 string          `json:"id"`
+	Name               string          `json:"name"`
+	IdleSeconds        int             `json:"idle_seconds"`
+	MaxPings           int             `json:"max_pings"`
+	MinPrefixTokens    int             `json:"min_prefix_tokens"`
+	MaxUSDPerPing      float64         `json:"max_usd_per_ping"`
+	Windows            []tenant.Window `json:"windows"`
+	Target             tenant.Target   `json:"target"`
+	Active             bool            `json:"active"`
+	PredictorID        string          `json:"predictor_id"`
+	PredictorThreshold float64         `json:"predictor_threshold"`
+	CreatedBy          string          `json:"created_by"`
+	CreatedAt          int64           `json:"created_at"`
+	UpdatedBy          string          `json:"updated_by"`
+	UpdatedAt          int64           `json:"updated_at"`
+	InWindow           bool            `json:"in_window"`
 }
 
 func viewStrategy(s tenant.Strategy, now time.Time) strategyView {
@@ -177,6 +228,7 @@ func viewStrategy(s tenant.Strategy, now time.Time) strategyView {
 		ID: s.ID, Name: s.Name, IdleSeconds: s.IdleSeconds, MaxPings: s.MaxPings,
 		MinPrefixTokens: s.MinPrefixTokens, MaxUSDPerPing: s.MaxUSDPerPing,
 		Windows: s.Windows, Target: s.Target, Active: s.Active,
+		PredictorID: s.PredictorID, PredictorThreshold: s.PredictorThreshold,
 		CreatedBy: s.CreatedBy, CreatedAt: msOrZero(s.CreatedAt),
 		UpdatedBy: s.UpdatedBy, UpdatedAt: msOrZero(s.UpdatedAt),
 		InWindow: s.InWindow(now),
@@ -210,14 +262,16 @@ func (h *Handler) ctlListKeepAliveStrategies(w http.ResponseWriter, r *http.Requ
 
 // strategyIn is a create request's body.
 type strategyIn struct {
-	Name            string          `json:"name"`
-	IdleSeconds     int             `json:"idle_seconds"`
-	MaxPings        int             `json:"max_pings"`
-	MinPrefixTokens int             `json:"min_prefix_tokens"`
-	MaxUSDPerPing   float64         `json:"max_usd_per_ping"`
-	Windows         []tenant.Window `json:"windows"`
-	Target          tenant.Target   `json:"target"`
-	Active          bool            `json:"active"`
+	Name               string          `json:"name"`
+	IdleSeconds        int             `json:"idle_seconds"`
+	MaxPings           int             `json:"max_pings"`
+	MinPrefixTokens    int             `json:"min_prefix_tokens"`
+	MaxUSDPerPing      float64         `json:"max_usd_per_ping"`
+	Windows            []tenant.Window `json:"windows"`
+	Target             tenant.Target   `json:"target"`
+	Active             bool            `json:"active"`
+	PredictorID        string          `json:"predictor_id"`
+	PredictorThreshold float64         `json:"predictor_threshold"`
 }
 
 // ctlCreateKeepAliveStrategy creates a strategy: validated at least as strictly as an
@@ -252,10 +306,15 @@ func (h *Handler) ctlCreateKeepAliveStrategy(w http.ResponseWriter, r *http.Requ
 		ctlErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err := validPredictorRef(in.PredictorID, in.PredictorThreshold); err != nil {
+		ctlErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	s, err := h.registry().CreateStrategy(actor.ID, tenant.Strategy{
 		Name: in.Name, IdleSeconds: in.IdleSeconds, MaxPings: in.MaxPings,
 		MinPrefixTokens: in.MinPrefixTokens, MaxUSDPerPing: in.MaxUSDPerPing,
 		Windows: in.Windows, Target: in.Target, Active: in.Active,
+		PredictorID: in.PredictorID, PredictorThreshold: in.PredictorThreshold,
 	})
 	if err != nil {
 		ctlErr(w, http.StatusBadRequest, err.Error())
@@ -279,14 +338,16 @@ func (h *Handler) ctlCreateKeepAliveStrategy(w http.ResponseWriter, r *http.Requ
 // strategyPatchIn is an update request's body: pointers, so "not sent" and "set to
 // zero/empty" are different things, matching tenant.Patch's own convention.
 type strategyPatchIn struct {
-	Name            *string          `json:"name"`
-	IdleSeconds     *int             `json:"idle_seconds"`
-	MaxPings        *int             `json:"max_pings"`
-	MinPrefixTokens *int             `json:"min_prefix_tokens"`
-	MaxUSDPerPing   *float64         `json:"max_usd_per_ping"`
-	Windows         *[]tenant.Window `json:"windows"`
-	Target          *tenant.Target   `json:"target"`
-	Active          *bool            `json:"active"`
+	Name               *string          `json:"name"`
+	IdleSeconds        *int             `json:"idle_seconds"`
+	MaxPings           *int             `json:"max_pings"`
+	MinPrefixTokens    *int             `json:"min_prefix_tokens"`
+	MaxUSDPerPing      *float64         `json:"max_usd_per_ping"`
+	Windows            *[]tenant.Window `json:"windows"`
+	Target             *tenant.Target   `json:"target"`
+	Active             *bool            `json:"active"`
+	PredictorID        *string          `json:"predictor_id"`
+	PredictorThreshold *float64         `json:"predictor_threshold"`
 }
 
 // ctlPatchKeepAliveStrategy updates any field; takes effect on the next request that
@@ -341,6 +402,12 @@ func (h *Handler) ctlPatchKeepAliveStrategy(w http.ResponseWriter, r *http.Reque
 	if in.Active != nil {
 		next.Active = *in.Active
 	}
+	if in.PredictorID != nil {
+		next.PredictorID = *in.PredictorID
+	}
+	if in.PredictorThreshold != nil {
+		next.PredictorThreshold = *in.PredictorThreshold
+	}
 	idle := time.Duration(next.IdleSeconds) * time.Second
 	if err := validStrategyBounds(idle, next.MaxPings, next.MinPrefixTokens, next.MaxUSDPerPing); err != nil {
 		ctlErr(w, http.StatusBadRequest, err.Error())
@@ -354,10 +421,15 @@ func (h *Handler) ctlPatchKeepAliveStrategy(w http.ResponseWriter, r *http.Reque
 		ctlErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err := validPredictorRef(next.PredictorID, next.PredictorThreshold); err != nil {
+		ctlErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	s, err := h.registry().UpdateStrategy(actor.ID, id, tenant.StrategyPatch{
 		Name: in.Name, IdleSeconds: in.IdleSeconds, MaxPings: in.MaxPings,
 		MinPrefixTokens: in.MinPrefixTokens, MaxUSDPerPing: in.MaxUSDPerPing,
 		Windows: in.Windows, Target: in.Target, Active: in.Active,
+		PredictorID: in.PredictorID, PredictorThreshold: in.PredictorThreshold,
 	})
 	if err != nil {
 		ctlErr(w, http.StatusBadRequest, err.Error())
@@ -371,6 +443,7 @@ func (h *Handler) ctlPatchKeepAliveStrategy(w http.ResponseWriter, r *http.Reque
 			Name: &cur.Name, IdleSeconds: &cur.IdleSeconds, MaxPings: &cur.MaxPings,
 			MinPrefixTokens: &cur.MinPrefixTokens, MaxUSDPerPing: &cur.MaxUSDPerPing,
 			Windows: &cur.Windows, Target: &cur.Target, Active: &cur.Active,
+			PredictorID: &cur.PredictorID, PredictorThreshold: &cur.PredictorThreshold,
 		})
 		ctlErr(w, http.StatusInternalServerError,
 			"could not record this in the audit log, so the update was not applied")

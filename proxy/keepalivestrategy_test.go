@@ -184,6 +184,73 @@ func TestValidStrategyBounds(t *testing.T) {
 	}
 }
 
+// knownPredictorIDs and predictorFor are two separate lists by construction (a map a
+// strategy is validated against, a switch pingable() actually evaluates), and nothing
+// forces them to agree except this test — the exact drift a Strategy naming a "known"
+// predictor pingable() cannot actually run would produce.
+func TestKnownPredictorIDsMatchPredictorFor(t *testing.T) {
+	for id := range knownPredictorIDs {
+		if _, ok := predictorFor(id); !ok {
+			t.Errorf("%q is in knownPredictorIDs but predictorFor does not recognise it", id)
+		}
+	}
+	for _, id := range []string{"stop-reason-gated", "not-a-real-one"} {
+		_, wantOK := knownPredictorIDs[id]
+		_, gotOK := predictorFor(id)
+		if gotOK != wantOK {
+			t.Errorf("predictorFor(%q) ok=%v, knownPredictorIDs says %v", id, gotOK, wantOK)
+		}
+	}
+}
+
+// applyStrategy must carry PredictorID/PredictorThreshold from the matched strategy onto
+// the resolved policy — the one thing that makes the whole opt-in gate reachable at all.
+func TestApplyStrategyCopiesPredictorFields(t *testing.T) {
+	k, _, clock := testKeeper(t, Limits{})
+	now := clock.now()
+	s := tenant.Strategy{
+		ID: "s1", Active: true, Target: tenant.Target{Mode: tenant.TargetAll},
+		Windows:     []tenant.Window{{Start: "00:00", End: "23:59"}},
+		IdleSeconds: 280, MaxPings: 1,
+		PredictorID:        "stop-reason-gated",
+		PredictorThreshold: 0.5,
+	}
+	k.setStrategies([]tenant.Strategy{s})
+	got, applied := k.applyStrategy("t1", CachePolicy{}, now)
+	if applied != "s1" {
+		t.Fatalf("applied = %q, want %q", applied, "s1")
+	}
+	if got.PredictorID != "stop-reason-gated" || got.PredictorThreshold != 0.5 {
+		t.Errorf("predictor fields did not carry through: %+v", got)
+	}
+}
+
+func TestValidPredictorRef(t *testing.T) {
+	if err := validPredictorRef("", 0); err != nil {
+		t.Errorf("no predictor named (the default) was refused: %v", err)
+	}
+	if err := validPredictorRef("", 99); err != nil {
+		t.Errorf("an unused threshold with no predictor named was refused: %v", err)
+	}
+	if err := validPredictorRef("stop_reason", 0.5); err == nil {
+		t.Error("an unregistered predictor id was accepted; knownPredictorIDs is " +
+			"deliberately empty until the runtime gating hook exists")
+	}
+	if err := validPredictorRef("", -0.5); err != nil {
+		t.Errorf("an out-of-range threshold with no predictor named was refused: %v", err)
+	}
+	if orig := knownPredictorIDs["stop_reason"]; !orig {
+		knownPredictorIDs["stop_reason"] = true
+		defer delete(knownPredictorIDs, "stop_reason")
+	}
+	if err := validPredictorRef("stop_reason", 1.5); err == nil {
+		t.Error("a registered predictor with an out-of-range threshold was accepted")
+	}
+	if err := validPredictorRef("stop_reason", 0.5); err != nil {
+		t.Errorf("a registered predictor with a valid threshold was refused: %v", err)
+	}
+}
+
 // A strategy created through the control route is visible to the keeper's own
 // resolution on the very next call, with no restart — "no re-push needed, since matching
 // is live" — and a manager-only gate refuses a plain user. Update and delete take

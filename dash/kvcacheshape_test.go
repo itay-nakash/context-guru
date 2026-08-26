@@ -174,6 +174,21 @@ func TestThePageIsTheRightShapeOnProductionLikeTraffic(t *testing.T) {
 				s.AbsoluteUSD, base, cost[s.Strategy])
 		}
 	}
+	// The stop_reason gate is in the default set, and the feature-importance panel that
+	// justifies it is on the wire and non-empty in both rankings — the two things that
+	// make this page actually show what predicts a rescue, not just simulate arms nobody
+	// can explain.
+	if _, ok := cost[KVStrategyStopReasonGated]; !ok {
+		t.Error("stop-reason-gated is not among the default arms")
+	}
+	fi := sim.FeatureImportance
+	if len(fi.LogisticRegression) == 0 || len(fi.GradientBoosted) == 0 {
+		t.Fatal("feature importance is empty on one or both models")
+	}
+	if fi.LogisticRegression[0].Feature != fi.GradientBoosted[0].Feature {
+		t.Errorf("the two models' top feature disagrees (%q vs %q); the measured finding is "+
+			"that they agree on it", fi.LogisticRegression[0].Feature, fi.GradientBoosted[0].Feature)
+	}
 }
 
 // productionShaped builds a dataset with the live snapshot's own shape, deterministically.

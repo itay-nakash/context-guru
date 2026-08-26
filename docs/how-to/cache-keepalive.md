@@ -193,6 +193,37 @@ duration of the ping itself, because `net/http`'s header map holds strings and a
 cannot be overwritten — so the window is one request instead of the whole idle hold, which is
 the part that was worth closing.
 
+## Gating pings on stop_reason (opt-in, per strategy)
+
+Every ping above fires unconditionally — `pingable()` never asks *why* the previous turn
+ended, deliberately, because excluding `end_turn` (the naive reading of "the turn looks
+over") would exclude 83.7% of the recoverable dollars. What that decision never added is
+the other half: `docs/results/kv-ttl-predictor-features.md` and
+`docs/results/kv-ttl-predictor-arms.md` measured that `tool_use`/`stop_sequence`-preceded
+gaps land in the addressable 5m–1h band only 0.0–0.6% of the time (20x under the ~8%
+one-ping break-even), while `end_turn`/`max_tokens`/`refusal`-preceded gaps land there
+11.7–43.3% of the time — and the unconditional schedule pings on all of them equally.
+
+A manager-controlled strategy (the Strategies tab; see
+`docs/superpowers/specs/2026-08-25-keepalive-strategies-design.md` for the underlying
+model) can now name a predictor: `predictor_id: "stop-reason-gated"` plus a
+`predictor_threshold` adds
+one more condition on top of the strategy's own windows — a ping only fires when the
+request that would be refreshed itself ended on `end_turn`, `max_tokens`, or `refusal`.
+Measured pooled at +1.54% vs `fixed-5m` (CI95 [0.60%, 2.79%]) — real, and statistically
+indistinguishable from a trained logistic regression on the same window, which is why it
+ships as a rule (`kvcache.ClusterOf`, a plain string-set lookup) rather than a model: the
+whole production-safe predictor class this repo supports is a switch of small functions
+like this one, never an embedded model in the ping's hot path.
+
+**Opt-in, not a fleet-wide default.** A strategy with no `predictor_id` — which is every
+strategy that predates this field — behaves exactly as before. Setting one is a per-
+strategy decision a manager makes deliberately, the same audited, DCO'd path every other
+strategy field goes through. Per-tenant heterogeneity is real (0.76%–41.4% band rate even
+conditioned on `end_turn` alone) — the pooled gain in the arms study is carried almost
+entirely by a few tenants, so scope a gated strategy to the tenants it actually helps
+rather than applying it blind, until a per-tenant-tuned version exists.
+
 ## Related
 
 - [Measuring savings](measure-savings.md) — how the ledger separates the provider's cache
