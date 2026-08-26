@@ -487,6 +487,53 @@ func TestAnOverrideOnAKeepAliveOffAccountStillHasAPingCeiling(t *testing.T) {
 	}
 }
 
+// With no PredictorID at all (every account today, and every strategy that predates the
+// field), pingable() must behave EXACTLY as it did before the predictor gate existed —
+// this is the regression the whole opt-in design rests on.
+func TestPingableWithNoPredictorNamedIsUnchanged(t *testing.T) {
+	base := CachePolicy{KeepAlive: true, Idle: time.Second, MaxPings: 1}
+	for _, reason := range []string{"tool_use", "end_turn", "stop", ""} {
+		e := &kaEntry{turn: 1, prefix: 1_000_000, pol: base, stopReason: reason}
+		if !e.pingable() {
+			t.Errorf("stop_reason=%q with no PredictorID was refused; the gate must not run "+
+				"at all when PredictorID is empty", reason)
+		}
+	}
+}
+
+// With PredictorID naming the shipped stop_reason gate, pingable() must ping ONLY on the
+// actually-done cluster — the whole point of wiring docs/results/kv-ttl-predictor-arms.md's
+// finding into production.
+func TestPingableGatesOnTheNamedPredictor(t *testing.T) {
+	gated := CachePolicy{KeepAlive: true, Idle: time.Second, MaxPings: 1,
+		PredictorID: "stop-reason-gated", PredictorThreshold: 0.5}
+	cases := []struct {
+		reason string
+		want   bool
+	}{
+		{"tool_use", false}, {"stop_sequence", false}, {"stop", false}, {"", false},
+		{"end_turn", true}, {"max_tokens", true},
+	}
+	for _, c := range cases {
+		e := &kaEntry{turn: 1, prefix: 1_000_000, pol: gated, stopReason: c.reason}
+		if got := e.pingable(); got != c.want {
+			t.Errorf("stop_reason=%q: pingable() = %v, want %v", c.reason, got, c.want)
+		}
+	}
+}
+
+// An unknown predictor id must refuse to ping rather than silently letting the entry
+// through unconditionally — the fail-toward-not-spending direction, since the money is
+// what a broken or drifted predictor reference could otherwise waste.
+func TestPingableRefusesAnUnknownPredictorID(t *testing.T) {
+	e := &kaEntry{turn: 1, prefix: 1_000_000, stopReason: "end_turn",
+		pol: CachePolicy{KeepAlive: true, Idle: time.Second, MaxPings: 1,
+			PredictorID: "not-a-real-predictor"}}
+	if e.pingable() {
+		t.Error("an unregistered predictor id let a ping through; it must refuse instead")
+	}
+}
+
 // worst_case_pings is a CEILING, so it counts one ping per idle interval and not K per span.
 //
 // A span ends the instant a real request arrives. The worst case is therefore not a session

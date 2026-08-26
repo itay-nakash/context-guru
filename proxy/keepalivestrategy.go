@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/rossoctl/context-guru/kvcache"
 	"github.com/rossoctl/context-guru/tenant"
 )
 
@@ -80,6 +81,8 @@ func (k *keeper) applyStrategy(tenantID string, pol CachePolicy, now time.Time) 
 	pol.MaxPings = best.MaxPings
 	pol.MinPrefixTokens = best.MinPrefixTokens
 	pol.MaxUSDPerPing = best.MaxUSDPerPing
+	pol.PredictorID = best.PredictorID
+	pol.PredictorThreshold = best.PredictorThreshold
 	return pol, best.ID
 }
 
@@ -125,16 +128,37 @@ func validStrategyBounds(idle time.Duration, pings, minPrefix int, maxUSDPerPing
 	return nil
 }
 
-// knownPredictorIDs is the set of predictor names a strategy is allowed to reference.
+// knownPredictorIDs is the set of predictor names a strategy is allowed to reference —
+// kept in lockstep with predictorFor's switch by TestKnownPredictorIDsMatchPredictorFor,
+// so accepting a strategy at creation time can never promise a gate that pingable() does
+// not actually know how to evaluate.
 //
-// Empty for now, DELIBERATELY: the runtime predictor-gating hook (kvcache.Predictor
-// wired into due()/pingable()) does not exist yet, so accepting an arbitrary
-// predictor_id here would let a manager create a strategy that references something
-// that can never resolve to anything — silently inert, and indistinguishable from a
-// typo. The data model (tenant.Strategy.PredictorID/PredictorThreshold) is ready ahead
-// of the hook on purpose; this map is what turns it on, one name at a time, once each
-// predictor is actually wired into the ping decision. See docs/results/kv-ttl-predictor-*.md.
-var knownPredictorIDs = map[string]bool{}
+// "stop-reason-gated" is the first and, so far, only entry: write the five-minute tier on
+// every request, ping while idle only when the request just served's own stop_reason
+// clusters as kvcache.ClusterActuallyDone. Measured (docs/results/kv-ttl-predictor-arms.md)
+// as +1.54% vs fixed-5m pooled (CI95 [0.60%, 2.79%]), not statistically distinguishable
+// from a trained logistic regression on the same window — which is why it is a rule
+// rather than a model: predictorFor never runs anything heavier than kvcache.ClusterOf in
+// the hot path.
+var knownPredictorIDs = map[string]bool{"stop-reason-gated": true}
+
+// predictorFor resolves a predictor id to a probability function over the entry's own
+// stop_reason, and reports whether the id is known. This is the whole production-safe
+// predictor class: a rule, or (a future entry) a portable logistic-regression dot product
+// — never an embedded model or a call out of the hot path. See kaEntry.stopReason and
+// CachePolicy.PredictorID/PredictorThreshold for where the result is used.
+func predictorFor(id string) (func(stopReason string) float64, bool) {
+	switch id {
+	case "stop-reason-gated":
+		return func(stopReason string) float64 {
+			if kvcache.ClusterOf(stopReason) == kvcache.ClusterActuallyDone {
+				return 1.0
+			}
+			return 0.0
+		}, true
+	}
+	return nil, false
+}
 
 // validPredictorRef checks predictorID against knownPredictorIDs (empty is always
 // valid — "no predictor gate") and the threshold's own shape.
