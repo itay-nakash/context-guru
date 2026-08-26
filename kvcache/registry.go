@@ -50,8 +50,11 @@ const (
 	StrategyExtend1h   = "keepalive-5m-to-1h"
 	StrategyObserved   = "observed-policy"
 	StrategyHistorical = "historical-probability"
-	StrategyOptimal    = "optimal"
-	StrategyReplay     = "replay"
+	// StrategyStickySession1h commits a whole conversation to the 1-hour or the 5-minute
+	// tier at its first request and never revisits the choice. See StickySession1h.
+	StrategyStickySession1h = "sticky-session-1h"
+	StrategyOptimal         = "optimal"
+	StrategyReplay          = "replay"
 )
 
 // registry is the ordered arm list. The ORDER is the presentation order and it is
@@ -71,6 +74,7 @@ var registry = []StrategySpec{
 		"where no tier was recorded, assume the provider's default and count the row as " +
 		"uncovered.", NeedsDataset: true},
 	{Name: StrategyHistorical, Description: HistoricalProbability{}.Describe()},
+	{Name: StrategyStickySession1h, Description: NewStickySession1h().Describe()},
 	{Name: StrategyReplay, Description: "Replay an explicit action supplied per request. The " +
 		"seam a policy decided elsewhere — an offline predictor, a hand-written experiment — " +
 		"is scored through.", NeedsDataset: true},
@@ -118,6 +122,8 @@ func NewStrategy(name string, reqs []*Request, cfg Config) (Strategy, error) {
 	case StrategyHistorical:
 		return HistoricalProbability{Semantics: cfg.Semantics, PingIdle: cfg.PingIdle,
 			MaxPings: cfg.MaxPings}, nil
+	case StrategyStickySession1h:
+		return NewStickySession1h(), nil
 	case StrategyOptimal:
 		return NewOptimal(reqs, cfg), nil
 	case StrategyReplay:

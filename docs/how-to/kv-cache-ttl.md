@@ -151,6 +151,7 @@ error from `NewStrategy`, never a silent default.
 | `keepalive-5m-to-1h` | writes cheap, and **extends to an hour only if a keep-alive comes due** |
 | `observed-policy` | replays the tier each request actually asked for |
 | `historical-probability` | the account's own closed gaps against two thresholds |
+| `sticky-session-1h` | commits a whole conversation to 1h or 5m at its first request, once, and never revisits it |
 | `replay` | an action list decided elsewhere — the seam an offline model is scored through |
 | `optimal` | the cheapest sequence that exists. **Unreachable: it reads the future** |
 
@@ -413,6 +414,82 @@ fixtures plus 450 randomised trajectories. The figures above are from the fixed 
   `Result.PingsOnOpenSpans`, because they rest on an assumption the closed spans do not need.
 - A model with no rates contributes to **no** dollar figure and is counted in
   `Result.Unpriced`. An unpriced model is not a free one.
+
+## The sticky whole-session arm, and a real haiku-4-5 measurement
+
+`kvcache.StickySession1h` (`kvcache/sticky.go`) answers a different question from every arm
+above it: not "what is the cheapest thing to do on this request", but "what is the cheapest
+thing to have committed this WHOLE SESSION to, decided once and never revisited." Every other
+arm here (bar the fixed tiers) is free to re-decide every turn on the freshest statistics —
+`historical-probability` genuinely does. That is not a realistic model of a deployment that
+cannot renegotiate an existing hold: once a conversation's entry has been created at a tier, a
+later request cannot downgrade or upgrade it in place, so a strategy that keeps re-deciding is
+answering a question production cannot act on. `StickySession1h` decides at
+`Observation.Turn == 1` — using `Stats.ReuseWithin(user, model, bucket, Horizon1h)` against a
+break-even derived from `Pricing`, `(Write1h-Write5m)/(Write5m-CacheRead)` — the same
+write-versus-recreate ratio `cacheinject.go`'s own TTL doc derives from the multipliers
+(`(2.0-1.25)/(1.25-0.1) = 65.2%`) and `dash/kvcachesim.go`'s `Raise5mTo1h`/`SavedPerMiss`
+restate as a miss count — and then holds that one decision, per `(user, conversation, model)`
+key, for every later turn regardless of how the account's own history moves in the meantime.
+It falls back to the 5-minute tier through `Stats`'s usual ladder, and outright (rather than
+guessing) at `LevelNone` or on an unpriced model. It is registered, tested against the same
+"never beats `optimal`" and "never sees the future" invariants as every other arm
+(`kvcache/sticky_test.go`), and `go build ./... && go vet ./... && go test ./kvcache/...
+./dash/...` are clean with it in the registry.
+
+**Its simulated performance on this deployment's own dataset is not reported here.** Scoring
+it against the production window needs the same aggregate-only DB access pattern the
+predictor-features workstream used, and improvising a second path to that data was
+deliberately avoided. It is built, tested, and registered — unscored on live data.
+
+### The real number: `cache_write_1h` is actually granted on `claude-haiku-4-5`
+
+The predictor-features doc already found that `cache_ttl='ephemeral_1h'` was requested on
+17.7% of live requests and `cache_write_1h > 0` on **zero** of them — this gateway silently
+downgrades a requested 1-hour TTL on `aws/claude-sonnet-5`, the model carrying nearly all of
+this deployment's spend. Every 1h-vs-5m saving simulated above, and everything `sticky-session-1h`
+would report against that traffic, is therefore a simulation of a tier the gateway does not
+actually grant on that model — not a measurement.
+
+`claude-haiku-4-5` is different, and this was checked with a real session rather than assumed.
+A single-tenant `context-guru-proxy` was run locally (`deploy/harbor/run-proxy.sh`'s pattern,
+`CG_MODEL=aws/claude-haiku-4-5`, a dedicated port and dashboard DB — never port 4000, which the
+live multi-tenant service owns) with `pipeline: [cacheinject]` and `components: {cacheinject:
+{ttl: "1h"}}`, so every request actually asked for the hourly tier. Three real turns went
+through it, with a genuine wall-clock gap between turns 2 and 3 (392 s — inside the 5m–1h band
+a five-minute TTL cannot survive but a one-hour one can):
+
+| turn | gap since previous | cache_read | cache_write | `cache_write_1h` | billed cost (real) |
+|---|---:|---:|---:|---:|---:|
+| 1 (cold) | — | 0 | 8,453 | **8,453** | $0.017124 |
+| 2 | 13 s | 8,453 | 64 | **64** | $0.0012013 |
+| 3 | **392 s** | 8,517 | 67 | **67** | $0.0012687 |
+
+`cache_write_1h` matches `cache_write` exactly on all three rows — unlike sonnet-5, the
+requested hourly tier was genuinely honoured, and turn 3's 392-second gap — well past the
+five-minute mark — still hit the cache instead of paying a recreate. **Total real, measured
+cost for the trajectory: $0.019594.**
+
+The five-minute counterfactual is computed by hand from these SAME real token counts (not
+simulated ones), using `Pricing.RecreateCost`'s reasoning for turn 3: at a 300 s lifetime, turn
+3's 392 s gap lapses the entry, so instead of reading 8,517 and writing 67 it would write all
+8,584 fresh. The rates themselves are recovered exactly from the three real costs above
+(`$1.00`/`$5.00` per M input/output, `0.1x` read, `2.0x` 1h-write — Claude Haiku 4.5's own list
+price, no operator override in play) with the 5-minute write assumed at the documented `1.25x`
+multiple, since no 5m write occurred in this real run to confirm it independently:
+
+| turn | at 1h (real) | at 5m (hand-computed from the real tokens) |
+|---|---:|---:|
+| 1 | $0.017124 | $0.0107843 |
+| 2 | $0.0012013 | $0.0011533 |
+| 3 | $0.0012687 | $0.011013 (full recreate: 8,584 tokens written, not 8,517 read + 67 written) |
+| **total** | **$0.019594** | **$0.0229506** |
+
+The 1-hour tier was **14.6% cheaper** than the 5-minute tier would have been on this exact
+3-turn, one-gap trajectory — a real, small, single-session number, not a corpus-wide claim.
+It is offered as a sanity check that the sticky arm's underlying trade is real on at least one
+model this gateway actually grants it on, not as a substitute for scoring `sticky-session-1h`
+against production traffic.
 
 ## Related
 

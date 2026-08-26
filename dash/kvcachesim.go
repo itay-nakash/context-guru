@@ -75,6 +75,7 @@ const (
 	KVStrategyExtend1h        = kvcache.StrategyExtend1h
 	KVStrategyObserved        = kvcache.StrategyObserved
 	KVStrategyHistorical      = kvcache.StrategyHistorical
+	KVStrategyStickySession1h = kvcache.StrategyStickySession1h
 	KVStrategyOptimal         = kvcache.StrategyOptimal
 	// KVStrategyCustom is the one arm that is NOT in kvcache's registry, because it cannot be
 	// built from a name: it carries the page's own thresholds and the in-process Predictor
