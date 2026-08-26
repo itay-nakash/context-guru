@@ -212,6 +212,11 @@ type KVCacheSimulation struct {
 	// something else.
 	Unknown []string `json:"unknown,omitempty"`
 
+	// FeatureImportance is what predicts a keep-alive rescue, from the offline predictor
+	// study — see kvCacheFeatureImportance for why this is STATIC data rather than
+	// something this simulation computes.
+	FeatureImportance KVCacheFeatureImportance `json:"feature_importance"`
+
 	Scanned   int64 `json:"scanned"`
 	Total     int64 `json:"total"`
 	Truncated bool  `json:"truncated"`
@@ -230,7 +235,7 @@ func (d *DB) KVCacheSimulate(f Filter, o KVCacheOptions, p modelinfo.Pricer,
 	out := &KVCacheSimulation{Baseline: cfg.Baseline, Results: []*kvcache.Result{},
 		Savings: []kvcache.Savings{}, Scanned: int64(len(rows)), Total: total,
 		Truncated: int64(len(rows)) < total, Assumptions: kvCacheAssumptions(cfg),
-		Arms: KVCacheArms()}
+		Arms: KVCacheArms(), FeatureImportance: kvCacheFeatureImportance()}
 	out.Pricing = kvcache.NewPriceList(context.Background(), modelsOf(rows), p,
 		cfg.Multipliers, cfg.Overrides)
 
@@ -412,6 +417,58 @@ func kvCacheAssumptions(cfg KVCacheSimConfig) KVCacheAssumptions {
 			"absent where either population is under 20 rows.",
 	}
 	return a
+}
+
+// KVCacheFeatureRank is one feature at one rank in ONE model's own top-5 — not a row
+// scored by both models, which is the mistake this type exists to prevent: the two models
+// agree on ranks 1-2 and diverge from rank 3 on, so a single table with one column per
+// model would have to fabricate a score for a feature that model never ranked at all.
+type KVCacheFeatureRank struct {
+	Rank    int     `json:"rank"`
+	Feature string  `json:"feature"`
+	Score   float64 `json:"score"`
+}
+
+// KVCacheFeatureImportance holds each model's own top-5, from the offline predictor study —
+// see kvCacheFeatureImportance for the source and why this is static data.
+type KVCacheFeatureImportance struct {
+	// LogisticRegression's Score is the standardized coefficient's magnitude.
+	LogisticRegression []KVCacheFeatureRank `json:"logistic_regression"`
+	// GradientBoosted's Score is the tree model's own importance. Same training data, same
+	// label as LogisticRegression, fit purely for this comparison — never scored as a
+	// policy (see docs/results/kv-ttl-predictor-arms.md).
+	GradientBoosted []KVCacheFeatureRank `json:"gradient_boosted"`
+}
+
+// kvCacheFeatureImportance is the two models' top-5 feature rankings from
+// docs/results/kv-ttl-predictor-arms.md, both fit offline on the live deployment's
+// 66,779-request, 17-tenant capture (2026-08-26), predicting P(next request lands in the
+// 5m-1h band).
+//
+// STATIC, deliberately: unlike every other number on this page, a feature importance comes
+// from a model FIT, not from replaying this window's own rows through a formula — there is
+// no live computation to run per request, and the production-safe arm this ranking
+// justifies (StopReasonGated) is a rule, not a model, for exactly that reason (see
+// kvcache.StopReasonGated's own doc comment). Re-running the offline study on a fresher
+// window is how this table gets refreshed; it does not silently drift because nothing here
+// recomputes it from cfg or from the rows this simulation happens to be replaying.
+func kvCacheFeatureImportance() KVCacheFeatureImportance {
+	return KVCacheFeatureImportance{
+		LogisticRegression: []KVCacheFeatureRank{
+			{Rank: 1, Feature: "turn", Score: 2.99},
+			{Rank: 2, Feature: "stop_cluster=still_working", Score: 2.09},
+			{Rank: 3, Feature: "user_id=t02", Score: 1.16},
+			{Rank: 4, Feature: "user_id=t04", Score: 1.08},
+			{Rank: 5, Feature: "user_id=t01", Score: 0.92},
+		},
+		GradientBoosted: []KVCacheFeatureRank{
+			{Rank: 1, Feature: "turn", Score: 0.198},
+			{Rank: 2, Feature: "stop_cluster=still_working", Score: 0.197},
+			{Rank: 3, Feature: "request_hour_sin", Score: 0.150},
+			{Rank: 4, Feature: "user_id=t01", Score: 0.093},
+			{Rank: 5, Feature: "previous_gap_seconds", Score: 0.064},
+		},
+	}
 }
 
 // ── the pricing panel ──────────────────────────────────────────────────────
