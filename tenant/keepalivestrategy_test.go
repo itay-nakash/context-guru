@@ -99,6 +99,29 @@ func TestTargetValidate(t *testing.T) {
 	}
 }
 
+func TestValidatePredictor(t *testing.T) {
+	if err := (Strategy{}).ValidatePredictor(); err != nil {
+		t.Errorf("no predictor named (the default) was refused: %v", err)
+	}
+	if err := (Strategy{PredictorID: "stop_reason", PredictorThreshold: 0}).ValidatePredictor(); err != nil {
+		t.Errorf("a threshold of exactly 0 was refused: %v", err)
+	}
+	if err := (Strategy{PredictorID: "stop_reason", PredictorThreshold: 1}).ValidatePredictor(); err != nil {
+		t.Errorf("a threshold of exactly 1 was refused: %v", err)
+	}
+	if err := (Strategy{PredictorID: "stop_reason", PredictorThreshold: -0.01}).ValidatePredictor(); err == nil {
+		t.Error("a negative threshold was accepted")
+	}
+	if err := (Strategy{PredictorID: "stop_reason", PredictorThreshold: 1.01}).ValidatePredictor(); err == nil {
+		t.Error("a threshold above 1 was accepted")
+	}
+	// A nonsense threshold left over from a previous edit is not an error when no
+	// predictor is actually named -- it is unused either way.
+	if err := (Strategy{PredictorThreshold: 99}).ValidatePredictor(); err != nil {
+		t.Errorf("an unused threshold with no predictor named was refused: %v", err)
+	}
+}
+
 func TestStrategyMatchesRequiresActiveTargetAndWindow(t *testing.T) {
 	loc := jerusalem(t)
 	inWindow := time.Date(2026, 6, 1, 12, 0, 0, 0, loc) // a Monday, no DST edge involved

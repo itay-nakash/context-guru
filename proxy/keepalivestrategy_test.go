@@ -184,6 +184,32 @@ func TestValidStrategyBounds(t *testing.T) {
 	}
 }
 
+func TestValidPredictorRef(t *testing.T) {
+	if err := validPredictorRef("", 0); err != nil {
+		t.Errorf("no predictor named (the default) was refused: %v", err)
+	}
+	if err := validPredictorRef("", 99); err != nil {
+		t.Errorf("an unused threshold with no predictor named was refused: %v", err)
+	}
+	if err := validPredictorRef("stop_reason", 0.5); err == nil {
+		t.Error("an unregistered predictor id was accepted; knownPredictorIDs is " +
+			"deliberately empty until the runtime gating hook exists")
+	}
+	if err := validPredictorRef("", -0.5); err != nil {
+		t.Errorf("an out-of-range threshold with no predictor named was refused: %v", err)
+	}
+	if orig := knownPredictorIDs["stop_reason"]; !orig {
+		knownPredictorIDs["stop_reason"] = true
+		defer delete(knownPredictorIDs, "stop_reason")
+	}
+	if err := validPredictorRef("stop_reason", 1.5); err == nil {
+		t.Error("a registered predictor with an out-of-range threshold was accepted")
+	}
+	if err := validPredictorRef("stop_reason", 0.5); err != nil {
+		t.Errorf("a registered predictor with a valid threshold was refused: %v", err)
+	}
+}
+
 // A strategy created through the control route is visible to the keeper's own
 // resolution on the very next call, with no restart — "no re-push needed, since matching
 // is live" — and a manager-only gate refuses a plain user. Update and delete take
