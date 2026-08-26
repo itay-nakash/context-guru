@@ -7186,7 +7186,9 @@ async function openStrategyLedger(s) {
       'Saved is each tenant’s WHOLE keep-alive credit in its history, not only the ' +
       'share this strategy’s own pings produced — see the design doc’s attribution ' +
       'caveat. A tenant running more than one strategy, or a session override, will show more ' +
-      'here than this strategy alone earned.'));
+      'here than this strategy alone earned. This ledger is also ALL TIME — unlike Overview ' +
+      'or the Keep-Alive tab, it ignores whatever date range the dashboard is set to, so a ' +
+      'lower or higher number here than those pages show is not a discrepancy.'));
     if (!led.tenants || !led.tenants.length) {
       emptyState(body, 'No pings under this strategy yet', '');
       return;
@@ -7218,6 +7220,11 @@ function renderStrategiesList(host, rows) {
     emptyState(host, 'No strategies yet', 'Create one above.');
     return;
   }
+  host.appendChild(el('p', { class: 'note' },
+    'Each strategy’s “Stats” drawer shows pings and cost, which are exact and additive ' +
+    'across strategies, and a Saved figure, which is not: a tenant matching more than ' +
+    'one strategy is counted under each one. Compare against the Overview or Keep-Alive ' +
+    'tab’s total, not against a sum of these rows’ Saved figures.'));
   const tbl = el('table', { class: 'grid' },
     el('thead', {}, el('tr', {},
       el('th', {}, 'Name'), el('th', {}, 'Windows'), el('th', {}, 'Target'),
