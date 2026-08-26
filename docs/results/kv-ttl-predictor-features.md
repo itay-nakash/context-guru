@@ -7,8 +7,11 @@ the 5m–1h band a keep-alive can rescue, or beyond an hour where nothing helps?
 already found the exact ceiling and the two arms it tried before this one. Read it first.
 
 Every number below is from the live deployment, measured **read-only** via
-`sudo -u cg python3 ... file:/var/lib/context-guru/cg.db?mode=ro&immutable=1` (no copy, no
-chown — the DB's owner never changes) on 2026-08-26: 66,779 non-ping requests, 17 tenants,
+`sudo -u cg python3 ... file:/var/lib/context-guru/cg.db?mode=ro` (no copy, no chown — the
+DB's owner never changes, and no `&immutable=1`: that flag skips SQLite's own
+change-detection and throws intermittent "database disk image is malformed" errors
+against this live, actively-checkpointing WAL database) on 2026-08-26: 66,779 non-ping
+requests, 17 tenants,
 15,359 sessions, 51,420 observed inter-request gaps, spanning `ts_min`=2026-08-17 07:08 UTC
 to `ts_max`=2026-08-26 09:20 UTC. Tenant identifiers are pseudonymized (`t01`..`t17`) in
 everything that follows — the real ids never left the DB's own account.
