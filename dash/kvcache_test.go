@@ -590,7 +590,7 @@ func TestPingScheduleMatchesTheKeepAliveTab(t *testing.T) {
 func TestKVCacheRoutesAnswerOnAnEmptyDatabase(t *testing.T) {
 	a, _ := newTestAPI(t, Options{})
 	for _, path := range []string{"/api/kvcache", "/api/kvcache/rows",
-		"/api/kvcache/simulate", "/api/kvcache/pricing"} {
+		"/api/kvcache/simulate", "/api/kvcache/pricing", "/api/kvcache/suggest"} {
 		w, body := get(t, a, path, "")
 		if w.Code != http.StatusOK {
 			t.Errorf("%s -> %d: %s", path, w.Code, w.Body.String())
