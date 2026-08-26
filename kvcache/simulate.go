@@ -467,7 +467,7 @@ func Simulate(reqs []*Request, s Strategy, cfg Config) *Result {
 			User: r.User, Conversation: r.ConversationID, Model: r.Model, RequestID: r.ID,
 			Now: r.TS, HourUTC: r.HourUTC, Bucket: r.Bucket,
 			CachedTokens: r.CachedContext, TTL: st.tier, ExpiresAt: st.expires,
-			Turn: st.turn + 1, Stats: hist, Pricing: price,
+			Turn: st.turn + 1, Stats: hist, Pricing: price, StopReason: r.StopReason,
 		}
 		if st.turn > 0 {
 			o.SinceLastMs = r.TS - st.lastTS

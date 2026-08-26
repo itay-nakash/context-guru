@@ -146,6 +146,29 @@ func TestBucketsAreUTCSixHourBands(t *testing.T) {
 	}
 }
 
+func TestClusterOf(t *testing.T) {
+	for reason, want := range map[string]StopReasonCluster{
+		"tool_use":       ClusterStillWorking,
+		"stop_sequence":  ClusterStillWorking,
+		"tool_calls":     ClusterStillWorking,
+		"length":         ClusterStillWorking,
+		"content_filter": ClusterStillWorking,
+		"end_turn":       ClusterActuallyDone,
+		"max_tokens":     ClusterActuallyDone,
+		"refusal":        ClusterActuallyDone,
+		"stop":           ClusterLooksDoneIsnt,
+		"":               ClusterLooksDoneIsnt,
+		// An unrecognised reason (a future API addition, an untested dialect) must fall
+		// through to the cluster that is NOT worth pinging on, never be guessed into the
+		// high-value one on a name never measured against it.
+		"some_future_reason_nobody_has_seen_yet": ClusterLooksDoneIsnt,
+	} {
+		if got := ClusterOf(reason); got != want {
+			t.Errorf("ClusterOf(%q) = %q, want %q", reason, got, want)
+		}
+	}
+}
+
 func TestTTLLifetimes(t *testing.T) {
 	if TTL5m.Lifetime() != 5*time.Minute || TTL1h.Lifetime() != time.Hour || TTLNone.Lifetime() != 0 {
 		t.Fatal("a tier's lifetime is wrong")

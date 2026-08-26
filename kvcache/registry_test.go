@@ -240,6 +240,65 @@ func TestKeepAliveArmsPingAndTheHourlyOnePingsLess(t *testing.T) {
 	}
 }
 
+// StopReasonGated must ping ONLY on the actually-done cluster, and write (never ping) on
+// the other two — the whole point of the arm, measured in
+// docs/results/kv-ttl-predictor-arms.md as statistically indistinguishable from a trained
+// model at a fraction of the mechanism.
+func TestStopReasonGatedPingsOnlyOnTheActuallyDoneCluster(t *testing.T) {
+	const start = int64(1_786_967_311_185)
+	reasons := []string{"tool_use", "stop_sequence", "end_turn", "max_tokens", "stop", ""}
+	var reqs []*Request
+	ts := start
+	for i, reason := range reasons {
+		reqs = append(reqs, &Request{
+			ID: int64(i) + 1, User: "acct-1", ConversationID: "conv-a", TS: ts,
+			HourUTC: time.UnixMilli(ts).UTC().Hour(), Bucket: BucketAt(ts),
+			Model: "m", InputTokens: 120, OutputTokens: 45, CachedContext: 120_000,
+			MissReason: "hit", TTL: TTL5m, TTLSource: TTLSourceConfigured,
+			StopReason: reason,
+		})
+		// 290s: past the default 280s ping-idle schedule (so a ping, if this arm's action
+		// schedules one, has time to actually fire) but short of the 5-minute lifetime (so
+		// the request itself would still be a hit either way — the GATE, not the tier, is
+		// what this test isolates).
+		ts += 290_000
+	}
+	Derive(reqs)
+	in, out, cr, w5, w1 := 3.8e-6, 19e-6, 0.38e-6, 4.75e-6, 7.6e-6
+	pin, pout := int64(1), int64(1)
+	prices := NewPriceList(context.Background(), []string{"m"}, nil, Multipliers{},
+		map[string]Override{"m": {Input: &in, Output: &out, CacheRead: &cr, Write5m: &w5,
+			Write1h: &w1, PingInputTokens: &pin, PingOutputTokens: &pout}})
+	cfg := Config{Prices: prices, WindowEnd: ts}
+
+	arm := StopReasonGated{}
+	want := map[string]Action{
+		"tool_use": ActionWrite5m, "stop_sequence": ActionWrite5m,
+		"end_turn": ActionPing5m, "max_tokens": ActionPing5m,
+		"stop": ActionWrite5m, "": ActionWrite5m,
+	}
+	for _, r := range reqs {
+		o := Observation{User: r.User, Conversation: r.ConversationID, Model: r.Model,
+			StopReason: r.StopReason, Pricing: prices.For(r.Model)}
+		if got := arm.Decide(o); got != want[r.StopReason] {
+			t.Errorf("StopReasonGated.Decide(stop_reason=%q) = %q, want %q",
+				r.StopReason, got, want[r.StopReason])
+		}
+	}
+
+	// And on a full replay, it must actually SEND those pings and never beat the ceiling —
+	// the same two properties every other arm in the registry is held to.
+	res := Simulate(reqs, arm, cfg)
+	if res.Pings == 0 {
+		t.Error("StopReasonGated sent no pings at all on a dataset with actually-done turns")
+	}
+	opt := Simulate(reqs, NewOptimal(reqs, cfg), cfg)
+	if res.TotalUSD < opt.TotalUSD-1e-9 {
+		t.Errorf("StopReasonGated cost $%.6f, cheaper than the ceiling's $%.6f",
+			res.TotalUSD, opt.TotalUSD)
+	}
+}
+
 // An UNPRICED window must not be able to pass as a measurement, and least of all as a ceiling.
 //
 // The hazard is real and was hit in the browser rather than in a test: the price map is fetched

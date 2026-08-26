@@ -130,6 +130,51 @@ func BucketAt(tsMs int64) Bucket {
 	return BucketOf(time.UnixMilli(tsMs).UTC().Hour())
 }
 
+// StopReasonCluster is the three-way split of Request.StopReason that
+// docs/results/kv-ttl-predictor-features.md and kv-ttl-predictor-arms.md found: not every
+// "the turn ended" reason predicts the same thing, and a naive two-way split ("did the
+// turn end, yes/no") gets a third of the reasons backwards.
+type StopReasonCluster string
+
+const (
+	// ClusterStillWorking is a request the agent is mid-loop after: tool_use, stop_sequence,
+	// and their OpenAI-dialect equivalents. Measured band rate (the next request landing in
+	// the 5m-1h keep-alive window): 0.0-0.6%, far under the ~8% one-ping break-even.
+	ClusterStillWorking StopReasonCluster = "still_working"
+	// ClusterLooksDoneIsnt is `stop`/unset: reads like end-of-turn and isn't one. Measured
+	// band rate 2.9-6.1%, still under break-even.
+	ClusterLooksDoneIsnt StopReasonCluster = "looks_done_isnt"
+	// ClusterActuallyDone is end_turn, max_tokens, refusal: the turn is genuinely over.
+	// Measured band rate 11.7-43.3%, clearing break-even with real margin — this is the
+	// cluster proxy/keepalive.go's pingable() already keeps pinging on (commit 50e3966),
+	// and StopReasonGated's whole job is excluding the other two.
+	ClusterActuallyDone StopReasonCluster = "actually_done"
+)
+
+// stillWorkingReasons and actuallyDoneReasons are closed sets, deliberately: an unrecognised
+// stop_reason (a future API addition, a dialect this deployment has not seen yet) falls
+// through to ClusterLooksDoneIsnt — the cluster that is NOT worth pinging on — rather than
+// being guessed into the high-value cluster on a name it has never been measured against.
+var stillWorkingReasons = map[string]bool{
+	"tool_use": true, "stop_sequence": true, "tool_calls": true, "length": true,
+	"content_filter": true,
+}
+var actuallyDoneReasons = map[string]bool{
+	"end_turn": true, "max_tokens": true, "refusal": true,
+}
+
+// ClusterOf classifies a stop_reason into its measured cluster.
+func ClusterOf(stopReason string) StopReasonCluster {
+	switch {
+	case stillWorkingReasons[stopReason]:
+		return ClusterStillWorking
+	case actuallyDoneReasons[stopReason]:
+		return ClusterActuallyDone
+	default:
+		return ClusterLooksDoneIsnt
+	}
+}
+
 // Conversation identifies one trajectory, and it is a PAIR.
 //
 // A session id is client-supplied, so two accounts can present the same one — by accident
@@ -200,6 +245,14 @@ type Request struct {
 	// its own classification (cold_start|ttl_expiry|prefix_change|unknown|hit).
 	Hit        bool   `json:"hit"`
 	MissReason string `json:"miss_reason"`
+
+	// StopReason is this request's own terminal stop reason
+	// (end_turn|tool_use|stop_sequence|max_tokens|...), the strongest single feature found
+	// for predicting whether the NEXT request in this conversation lands in the 5m-1h
+	// keep-alive band — see docs/results/kv-ttl-predictor-features.md and
+	// StopReasonCluster. Known at decision time (it belongs to the request just served,
+	// not a future one), so a Strategy may read it from Observation with no future leakage.
+	StopReason string `json:"stop_reason"`
 
 	// The derived half. NextTS is the next request IN THE SAME CONVERSATION, chronologically;
 	// HasNext is false on the last request of a conversation and IdleMs is then nil.

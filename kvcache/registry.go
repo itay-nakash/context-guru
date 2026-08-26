@@ -50,6 +50,12 @@ const (
 	StrategyExtend1h   = "keepalive-5m-to-1h"
 	StrategyObserved   = "observed-policy"
 	StrategyHistorical = "historical-probability"
+	// StrategyStopReasonGated writes the five-minute tier on every request but only pings
+	// while idle when the request just served's own stop_reason clusters as
+	// ClusterActuallyDone. See StopReasonGated and
+	// docs/results/kv-ttl-predictor-arms.md — measured +1.54% vs fixed-5m (CI95 [0.60%,
+	// 2.79%]), not distinguishable from a trained logistic regression on the same window.
+	StrategyStopReasonGated = "stop-reason-gated"
 	// StrategyStickySession1h commits a whole conversation to the 1-hour or the 5-minute
 	// tier at its first request and never revisits the choice. See StickySession1h.
 	StrategyStickySession1h = "sticky-session-1h"
@@ -74,6 +80,7 @@ var registry = []StrategySpec{
 		"where no tier was recorded, assume the provider's default and count the row as " +
 		"uncovered.", NeedsDataset: true},
 	{Name: StrategyHistorical, Description: HistoricalProbability{}.Describe()},
+	{Name: StrategyStopReasonGated, Description: StopReasonGated{}.Describe()},
 	{Name: StrategyStickySession1h, Description: NewStickySession1h().Describe()},
 	{Name: StrategyReplay, Description: "Replay an explicit action supplied per request. The " +
 		"seam a policy decided elsewhere — an offline predictor, a hand-written experiment — " +
@@ -122,6 +129,8 @@ func NewStrategy(name string, reqs []*Request, cfg Config) (Strategy, error) {
 	case StrategyHistorical:
 		return HistoricalProbability{Semantics: cfg.Semantics, PingIdle: cfg.PingIdle,
 			MaxPings: cfg.MaxPings}, nil
+	case StrategyStopReasonGated:
+		return StopReasonGated{}, nil
 	case StrategyStickySession1h:
 		return NewStickySession1h(), nil
 	case StrategyOptimal:
@@ -213,6 +222,45 @@ func (Extend1h) Describe() string {
 	return "Write every prefix at the 5-minute tier (1.25x input), and if a keep-alive comes " +
 		"due before it lapses, extend the context by an hour with a 1-hour write (2.0x) — so " +
 		"the long-hold premium is paid only on the conversations that actually go quiet."
+}
+
+// StopReasonGated writes the five-minute tier on every request, and pings while idle only
+// when the request JUST SERVED — the one this decision is made after, present tense, not
+// a prediction — has a stop_reason that clusters as ClusterActuallyDone.
+//
+// Every one of the keep-alive arms above pings unconditionally: KeepAlive5m spends on
+// tool_use/stop_sequence turns just as readily as on end_turn ones, even though
+// docs/results/kv-ttl-predictor-features.md measured those turns landing in the
+// addressable 5m-1h band only 0.0-0.6% of the time — 20x under the ~8% one-ping
+// break-even. This arm is that gate, and nothing else: same tier, same schedule, the only
+// difference is whether a ping fires at all on a given idle span.
+//
+// It extends, rather than revisits, proxy/keepalive.go's pingable() and its own recorded
+// decision (commit 50e3966) not to exclude end_turn from pinging — end_turn is exactly
+// where this arm KEEPS pinging. What pingable() never finished is excluding the two
+// low-value clusters (ClusterStillWorking and ClusterLooksDoneIsnt) it currently pings on
+// too. Measured on the live deployment (kv_ttl_predictor_arms.py,
+// docs/results/kv-ttl-predictor-arms.md): +1.54% vs fixed-5m pooled (CI95 [0.60%, 2.79%]),
+// not statistically distinguishable from a trained logistic regression on the same
+// window — the free rule, not the model, is the one worth shipping.
+type StopReasonGated struct{}
+
+func (StopReasonGated) Name() string { return StrategyStopReasonGated }
+
+func (StopReasonGated) Decide(o Observation) Action {
+	if ClusterOf(o.StopReason) == ClusterActuallyDone {
+		return ActionPing5m
+	}
+	return ActionWrite5m
+}
+
+func (StopReasonGated) Describe() string {
+	return "Write the five-minute tier on every request, but only keep-alive-ping while " +
+		"idle when the request just served's own stop_reason clusters as \"actually done\" " +
+		"(end_turn, max_tokens, refusal) — never on \"still working\" (tool_use, " +
+		"stop_sequence, tool_calls, length, content_filter) or \"looks done, isn't\" " +
+		"(stop, unset), both measured well under the ping break-even. Extends, rather than " +
+		"revisits, the deliberate decision already in pingable() to keep pinging on end_turn."
 }
 
 // ── the explicit-action seam ───────────────────────────────────────────────

@@ -338,7 +338,7 @@ func bucketHours(b kvcache.Bucket) (lo, hi int, ok bool) {
 const kvCacheCols = `r.id, r.ts, r.tenant_id, r.session_id, r.model, r.provider, r.agent,
 	r.cache_ttl, r.fresh_input, r.output_tokens, r.cache_read, r.cache_write, r.cache_write_1h,
 	r.cache_miss_reason, r.token_accounting, r.cost_usd, r.upstream_ms, r.keepalive,
-	r.next_ts, r.next_id`
+	r.stop_reason, r.next_ts, r.next_id`
 
 // scanKVCacheRequest reads one row and fills everything derived from it.
 //
@@ -355,7 +355,7 @@ func scanKVCacheRequest(rows interface{ Scan(...any) error }) (*kvcache.Request,
 	if err := rows.Scan(&r.ID, &r.TS, &r.User, &r.ConversationID, &r.Model, &r.Provider,
 		&r.Agent, &cacheTTL, &r.InputTokens, &r.OutputTokens, &r.CacheRead, &r.CacheWrite,
 		&r.CacheWrite1h, &missReason, &accounting, &r.CostUSD, &r.UpstreamMs, &keepAlive,
-		&nextTS, &nextID); err != nil {
+		&r.StopReason, &nextTS, &nextID); err != nil {
 		return nil, err
 	}
 	r.KeepAlive = keepAlive != 0

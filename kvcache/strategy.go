@@ -145,6 +145,11 @@ type Observation struct {
 	// Turn is how many requests this conversation has served so far, including this one.
 	Turn int
 
+	// StopReason is the request just served's own terminal stop reason — present tense,
+	// not a prediction: it belongs to the request that already happened, the same
+	// footing as CachedTokens or SinceLastMs. See StopReasonCluster/ClusterOf.
+	StopReason string
+
 	// Stats is the historical view, or nil where a caller has none. Every number it serves
 	// is accumulated from gaps that closed strictly before Now.
 	Stats Stats

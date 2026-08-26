@@ -75,6 +75,7 @@ const (
 	KVStrategyExtend1h        = kvcache.StrategyExtend1h
 	KVStrategyObserved        = kvcache.StrategyObserved
 	KVStrategyHistorical      = kvcache.StrategyHistorical
+	KVStrategyStopReasonGated = kvcache.StrategyStopReasonGated
 	KVStrategyStickySession1h = kvcache.StrategyStickySession1h
 	KVStrategyOptimal         = kvcache.StrategyOptimal
 	// KVStrategyCustom is the one arm that is NOT in kvcache's registry, because it cannot be
@@ -129,15 +130,18 @@ func isUnbuildable(name string) bool { return name == kvcache.StrategyReplay }
 
 // KVCacheDefaultStrategies is what the page runs when the caller names none.
 //
-// Nine arms, and each earns its place: the two bounds (no-cache below, optimal above), the two
+// Ten arms, and each earns its place: the two bounds (no-cache below, optimal above), the two
 // fixed tiers, the repeated 5-minute keep-alive arm alongside both single-ping counterparts (see
-// KeepAlive.Once), the policy already in force, and the one arm that learns from the account's
-// own history. `optimal` is in the DEFAULT set on purpose — it is the only figure that says how
-// much headroom exists at all, and an arm nobody sees by default is one nobody compares against
-// — and it is marked Unreachable so no surface can present it as a result.
+// KeepAlive.Once), the policy already in force, the one arm that learns from the account's own
+// history, and the stop_reason gate — measured (docs/results/kv-ttl-predictor-arms.md) as the
+// single best-justified change to the shipped mechanism: statistically indistinguishable from a
+// trained model, with no training step at all. `optimal` is in the DEFAULT set on purpose — it is
+// the only figure that says how much headroom exists at all, and an arm nobody sees by default is
+// one nobody compares against — and it is marked Unreachable so no surface can present it as a
+// result.
 var KVCacheDefaultStrategies = []string{KVStrategyNoCache, KVStrategyFixed5m, KVStrategyFixed1h,
 	KVStrategyKeepAlive5m, KVStrategyKeepAlive5mOnce, KVStrategyKeepAlive1hOnce,
-	KVStrategyObserved, KVStrategyHistorical, KVStrategyOptimal}
+	KVStrategyObserved, KVStrategyHistorical, KVStrategyStopReasonGated, KVStrategyOptimal}
 
 // kvCacheDefaultBaseline is the arm every saving is measured against when the caller names none,
 // and it comes from the REGISTRY rather than from a constant here.
