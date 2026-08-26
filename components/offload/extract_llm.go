@@ -232,7 +232,19 @@ var staticWindows = modelinfo.DefaultStatic()
 
 // inputLimit resolves the extraction model's input-token budget. Config pin first, then the
 // model's own window as DATA (modelinfo's table), then a conservative default.
-func (e *ExtractLLM) inputLimit(c *components.Ctx) int {
+//
+// effSource is the source the extraction model was ACTUALLY resolved from, which is not always
+// the configured one: ModelSpec falls back from `incoming` to the static client whenever no
+// incoming client could be built (the proxy returns nil when no usable credential is on the
+// request). Sizing the prompt by e.modelSource instead would then hand the REQUEST model's window
+// to a call that is really going to the small static model — over-estimating, on a coding agent by
+// as much as 1M against 200k, which is the direction fitsModelContext calls the costly one: the
+// request goes out, the upstream rejects it, and the round-trip buys nothing. Pass "" when the
+// effective source is not known and the configured one is used as before.
+func (e *ExtractLLM) inputLimit(c *components.Ctx, effSource string) int {
+	if effSource == "" {
+		effSource = e.modelSource
+	}
 	if e.modelMaxInput > 0 {
 		return e.modelMaxInput
 	}
@@ -245,7 +257,7 @@ func (e *ExtractLLM) inputLimit(c *components.Ctx) int {
 	// No pinned model. `source: config` means the host's separate cheap client, whose id we
 	// never see — stay conservative. Otherwise the extraction model IS the proxied model,
 	// and the host already resolved its window onto the Ctx.
-	if e.modelSource != "config" && c.CtxWindow > 0 {
+	if effSource != "config" && c.CtxWindow > 0 {
 		return c.CtxWindow
 	}
 	return unknownModelInputLimit
@@ -701,6 +713,9 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 		return nil, nil
 	}
 	model := e.modelClient
+	// The source the model is ACTUALLY resolved from, which the prompt budget below must be
+	// sized against rather than the configured one — see inputLimit.
+	effSource := e.modelSource
 	if model == nil {
 		// ForModel, not For: `model.model` names the model to COMPACT with even when the
 		// source is the incoming request. Without that, compaction on a coding agent runs on
@@ -709,6 +724,9 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 		// it. Same endpoint, same credential, cheap model.
 		var usedSource string
 		model, usedSource = c.Model.ForModelSource(e.modelSource, e.modelName)
+		if usedSource != "" {
+			effSource = usedSource
+		}
 		// The fallback from `incoming` to the static model is a DIFFERENT credential on a
 		// DIFFERENT endpoint, so it cannot be silent: an operator whose config says
 		// `source: incoming` would otherwise have no way to learn that none of their calls
@@ -817,7 +835,7 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 	keepIDs := extract.HarvestIdentifiers(conversationContext(req, ctxRecent, e.ctxMessages), 40)
 	// Per-call context budget (constant across this request's candidates): the extraction
 	// model's input limit, and the prompt's fixed cost around the tool output itself.
-	inputLimit := e.inputLimit(c)
+	inputLimit := e.inputLimit(c, effSource)
 	promptOverhead := extractPromptOverheadTokens + schema.TextTokens(goal)
 	// The same prompt, for the COST model rather than the window check: callCost adds the
 	// static preamble itself, so it must be given only the variable part.

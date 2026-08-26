@@ -117,20 +117,29 @@ func TestExtractLLMInputLimit(t *testing.T) {
 		name      string
 		yaml      string
 		ctxWindow int
+		effSource string
 		want      int
 	}{
-		{"config pin wins", "model_max_input_tokens: 4096\nmodel:\n  model: claude-haiku-4-5\n", 200_000, 4096},
-		{"pinned model resolved from the table", "model:\n  model: claude-haiku-4-5\n", 0, 200_000},
-		{"unnameable pinned model falls back", "model:\n  model: qwen3-coder-30b-local\n", 999_999, unknownModelInputLimit},
-		{"incoming model uses the host-resolved window", "", 128_000, 128_000},
-		{"incoming model, window unknown", "", 0, unknownModelInputLimit},
-		{"source config hides the model id", "model:\n  source: config\n", 128_000, unknownModelInputLimit},
+		{"config pin wins", "model_max_input_tokens: 4096\nmodel:\n  model: claude-haiku-4-5\n", 200_000, "", 4096},
+		{"pinned model resolved from the table", "model:\n  model: claude-haiku-4-5\n", 0, "", 200_000},
+		{"unnameable pinned model falls back", "model:\n  model: qwen3-coder-30b-local\n", 999_999, "", unknownModelInputLimit},
+		{"incoming model uses the host-resolved window", "", 128_000, "", 128_000},
+		{"incoming model, window unknown", "", 0, "", unknownModelInputLimit},
+		{"source config hides the model id", "model:\n  source: config\n", 128_000, "", unknownModelInputLimit},
+		// `source: incoming` that FELL BACK to the static client. The call is going to the
+		// small config model, so the proxied model's window is the wrong budget — sizing the
+		// prompt by it over-estimates and the upstream rejects the request.
+		{"incoming fell back to config: window is not the request model's",
+			"model:\n  source: incoming\n", 1_000_000, "config", unknownModelInputLimit},
+		// The same config that did NOT fall back keeps using the host-resolved window.
+		{"incoming that stayed incoming keeps the window",
+			"model:\n  source: incoming\n", 1_000_000, "incoming", 1_000_000},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			e := newCtxGuardComponent(t, &silentModel{}, tc.yaml)
 			c := &components.Ctx{Ctx: context.Background(), CtxWindow: tc.ctxWindow}
-			if got := e.inputLimit(c); got != tc.want {
+			if got := e.inputLimit(c, tc.effSource); got != tc.want {
 				t.Fatalf("inputLimit = %d, want %d", got, tc.want)
 			}
 		})
