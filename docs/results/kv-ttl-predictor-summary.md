@@ -296,11 +296,11 @@ Everything above is one query away — no need to trust this page's numbers on f
 - **`sticky-session-1h` is built, tested, and registered — unscored on this deployment's live
   (sonnet-5-heavy) traffic.** The one real number (14.6% cheaper) is from a single 3-turn
   haiku-4-5 session, not this corpus.
-- **The Strategies-tab-vs-Overview labeling fix is proposed, not applied.** The
-  reconciliation doc's diagnosis (two real, unlabeled gaps: cross-strategy double counting,
-  and the strategy ledger's lack of a `since`/`until` filter) is complete, but the concrete UI
-  fix it proposes — one sentence on the Strategies list page, an "(all time)" label on the
-  ledger drawer — has not been made.
+- **The Strategies-tab-vs-Overview labeling fix has been applied** (this line in the earlier
+  draft of this doc was stale). Both notes the reconciliation doc proposed are live in
+  `dash/ui/app.js`: one line above the Strategies list table stating pings/cost are additive
+  across strategies but Saved is not, and an "(all time, ignores whatever date range the
+  dashboard is set to)" label in the ledger drawer.
 - **1h-tier findings are simulated for the traffic that carries this deployment's spend**
   (`aws/claude-sonnet-5`) and can only be live-verified on `claude-haiku-4-5`, which the
   gateway actually honours a 1-hour TTL on.
