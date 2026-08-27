@@ -64,22 +64,40 @@ func TestNoToolRoleOnAnthropicWireAfterCountChange(t *testing.T) {
 	// summarize changes the count; extract_llm rewrites a RETAINED tool output in the same turn.
 	// strategy: deterministic keeps this hermetic -- the reduction is a real rewrite of the kept
 	// message's bytes with no model reply to stub.
-	cfg := pipe(t, "pipeline: [summarize, extract_llm]\ncomponents:\n"+
-		"  summarize: {keep_last: 3, start_from_message: 0, min_tokens: 1}\n"+
-		"  extract_llm: {strategy: deterministic, min_tokens: 1, economic_gate: false, "+
-		"allow_on_caching_backend: true}\n")
+	const comps = "components:\n" +
+		"  summarize: {keep_last: 3, start_from_message: 0, min_tokens: 1}\n" +
+		"  extract_llm: {strategy: deterministic, min_tokens: 1, economic_gate: false, " +
+		"allow_on_caching_backend: true}\n"
+
+	// Both the reduced pipeline and the one this was reported against. cachesplit is not a
+	// spectator: it is a no-op in Reformat and the split it names happens inside THIS package,
+	// which rewrites the envelope before the rebuild runs and changes the rebuild's control flow
+	// (a declined rebuild is still forwarded when systemSplit is set). So a fix verified only
+	// without it is not verified for the configuration that produced the live 400.
+	for _, tc := range []struct{ name, pipeline string }{
+		{"summarize+extract_llm", "pipeline: [summarize, extract_llm]\n"},
+		{"reported: summarize+extract_llm+cachesplit", "pipeline: [summarize, extract_llm, cachesplit]\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			checkNoToolRole(t, tc.pipeline+comps, body, len(msgs))
+		})
+	}
+}
+
+func checkNoToolRole(t *testing.T, yaml string, body []byte, inCount int) {
+	t.Helper()
+	cfg := pipe(t, yaml)
 	p, _ := cfg.Build(nil)
 	out, changed := apply.BodyWithModel(context.Background(), p,
 		store.NewMemory(store.Options{}), bschemas.Anthropic, body, "", false,
 		components.ModelSpec{Incoming: stubModel{resp: "essential facts"}})
 	if !changed {
-		t.Fatal("neither component acted, so the rebuild never ran -- assertion is vacuous")
+		t.Fatal("no component acted, so the rebuild never ran -- assertion is vacuous")
 	}
-
 	arr := gjson.GetBytes(out, "messages").Array()
 
 	// PRECONDITION 1: the count must actually have changed, or rebuildCountChanged never ran.
-	if len(arr) == len(msgs) {
+	if len(arr) == inCount {
 		t.Fatalf("message count unchanged (%d), so the count-change rebuild never ran", len(arr))
 	}
 	// Count both shapes in ONE pass, because they are alternatives rather than independent
