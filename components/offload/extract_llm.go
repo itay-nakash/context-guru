@@ -232,7 +232,27 @@ var staticWindows = modelinfo.DefaultStatic()
 
 // inputLimit resolves the extraction model's input-token budget. Config pin first, then the
 // model's own window as DATA (modelinfo's table), then a conservative default.
-func (e *ExtractLLM) inputLimit(c *components.Ctx) int {
+//
+// effSource is the source the extraction model was ACTUALLY resolved from, which is not always
+// the configured one: ModelSpec falls back from `incoming` to the static client whenever no
+// incoming client could be built (the proxy returns nil when no usable credential is on the
+// request). Sizing the prompt by e.modelSource instead would then hand the REQUEST model's window
+// to a call that is really going to the small static model — over-estimating, on a coding agent by
+// as much as 1M against 200k, which is the direction fitsModelContext calls the costly one: the
+// request goes out, the upstream rejects it, and the round-trip buys nothing. Pass "" when the
+// effective source is not known and the configured one is used as before.
+//
+// A CONFIG-PINNED client needs no correction and never reaches the effSource branch, which is worth
+// stating because it looks like a second path that could resurrect the mismatch: Offload threads
+// effSource only through the `model == nil` branch, so a client resolved from e.modelClient keeps
+// the configured source. It is safe because modelConfig.Client() requires model.model to be
+// non-empty, so e.modelName is always set whenever e.modelClient is, and the e.modelName != ""
+// branch below (the static-table lookup) short-circuits before effSource or CtxWindow is consulted.
+// Raised in review on #110; recorded here so the next reader need not re-derive it.
+func (e *ExtractLLM) inputLimit(c *components.Ctx, effSource string) int {
+	if effSource == "" {
+		effSource = e.modelSource
+	}
 	if e.modelMaxInput > 0 {
 		return e.modelMaxInput
 	}
@@ -245,7 +265,7 @@ func (e *ExtractLLM) inputLimit(c *components.Ctx) int {
 	// No pinned model. `source: config` means the host's separate cheap client, whose id we
 	// never see — stay conservative. Otherwise the extraction model IS the proxied model,
 	// and the host already resolved its window onto the Ctx.
-	if e.modelSource != "config" && c.CtxWindow > 0 {
+	if effSource != "config" && c.CtxWindow > 0 {
 		return c.CtxWindow
 	}
 	return unknownModelInputLimit
@@ -701,6 +721,9 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 		return nil, nil
 	}
 	model := e.modelClient
+	// The source the model is ACTUALLY resolved from, which the prompt budget below must be
+	// sized against rather than the configured one — see inputLimit.
+	effSource := e.modelSource
 	if model == nil {
 		// ForModel, not For: `model.model` names the model to COMPACT with even when the
 		// source is the incoming request. Without that, compaction on a coding agent runs on
@@ -709,6 +732,9 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 		// it. Same endpoint, same credential, cheap model.
 		var usedSource string
 		model, usedSource = c.Model.ForModelSource(e.modelSource, e.modelName)
+		if usedSource != "" {
+			effSource = usedSource
+		}
 		// The fallback from `incoming` to the static model is a DIFFERENT credential on a
 		// DIFFERENT endpoint, so it cannot be silent: an operator whose config says
 		// `source: incoming` would otherwise have no way to learn that none of their calls
@@ -817,7 +843,7 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 	keepIDs := extract.HarvestIdentifiers(conversationContext(req, ctxRecent, e.ctxMessages), 40)
 	// Per-call context budget (constant across this request's candidates): the extraction
 	// model's input limit, and the prompt's fixed cost around the tool output itself.
-	inputLimit := e.inputLimit(c)
+	inputLimit := e.inputLimit(c, effSource)
 	promptOverhead := extractPromptOverheadTokens + schema.TextTokens(goal)
 	// The same prompt, for the COST model rather than the window check: callCost adds the
 	// static preamble itself, so it must be given only the variable part.
@@ -1046,7 +1072,29 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 		// of the few parts of this component that unambiguously pays. A metric that argues for
 		// optimizing something already working is worse than no metric.
 		metrics.RecordExtractionCacheLookup(false)
-		if huge := e.trigger.IsHuge(sz, c.CtxWindow); !c.CacheAware && !fires && !huge {
+		// The operator's REQUEST-level trigger, now honored on WARM caching turns.
+		//
+		// This condition used to carry `!c.CacheAware`, and that spelling was too broad. What
+		// legitimately bypasses a request-size threshold is a COLD SWEEP: on a cold turn the
+		// whole transcript re-bills at the cache-write rate whatever the request's size, so the
+		// request-level threshold answers the wrong question and the sweep brings its own floor
+		// (e.cold.MinTokens, set above). That is why `sweeping` already overrides the cadence
+		// gate and the pressure gate — this check simply had not been given the same treatment.
+		//
+		// `c.CacheAware` is true on warm caching turns as well as cold ones, so the old spelling
+		// also discarded the threshold on every warm turn, where it means exactly what the
+		// operator wrote. And it could ONLY discard operator configuration: Trigger's zero value
+		// fires always (see components/trigger.go — "a zero field is no constraint"), so `!fires`
+		// is reachable only when min_request_tokens / min_request_frac / min_messages was set and
+		// not met. There is no derived value in `fires` for a cache carve-out to protect; the
+		// derived pressure trigger is separate and gates the model earlier via shouldFire.
+		//
+		// Found by the housellm cold-sweep preset test, which fails if `sweeping` is dropped
+		// here — the sweep is the part of the old carve-out that was carrying real weight.
+		//
+		// IsHuge still overrides, unchanged: a single output that large is worth a call whatever
+		// the request-level threshold says.
+		if huge := e.trigger.IsHuge(sz, c.CtxWindow); !fires && !huge && !sweeping {
 			rep.Gate("request_trigger_not_fired")
 			continue
 		}

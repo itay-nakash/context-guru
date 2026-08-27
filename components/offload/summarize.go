@@ -148,8 +148,9 @@ func (*Summarize) NeedsModel() bool            { return true }
 
 func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Report, c *components.Ctx) ([]string, error) {
 	msgs := req.Input
-	// Keep msg0 (system/first) + the last keepLast; summarize the span between.
-	start, end := 1, len(msgs)-s.keepLast
+	// Keep msg0 (system/first) + the last keepLast; summarize the span between — with both
+	// boundaries aligned so neither cuts inside a tool exchange. See summarizeSpan.
+	headCount, start, end := summarizeSpan(msgs, s.keepLast)
 	// Request-level trigger: don't summarize (an LLM call) until the transcript
 	// is genuinely large / deep. Zero thresholds fire always (back-compat).
 	if !s.trigger.Fires(req, c.CtxWindow) || end <= start {
@@ -169,7 +170,7 @@ func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 	// that checkpoint is still small — no LLM call, and the summary message stays
 	// byte-identical (KV-cache stable). Roll the checkpoint forward only once the
 	// tail grows past resummarize_tokens.
-	if out, keys, ok := s.tryReuse(c, msgs, start, end); ok {
+	if out, keys, ok := s.tryReuse(c, msgs, headCount, start, end); ok {
 		if len(keys) == 0 {
 			rep.Irreversible = true // reused a non-full checkpoint (nothing stashed)
 		}
@@ -221,7 +222,24 @@ func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 	}
 
 	summaryText := summaryWrapper(summary, key, mode)
-	summaryMsg := bschemas.ChatMessage{Role: bschemas.ChatMessageRoleSystem}
+	// USER, not system. The summary is injected context, and Anthropic will not accept a
+	// system-role message in the middle of `messages`: system content belongs in the
+	// top-level `system` field, and a system role inside the array must precede an
+	// assistant message or end it. This component emits [msgs[0], summary, tail...], so
+	// when msgs[0] is itself the system prompt — the normal case — a system-role summary
+	// lands at index 1 and the provider rejects the whole request:
+	//
+	//	400 messages.1: role 'system' must precede an 'assistant' message or end the array
+	//
+	// Measured on live LOCA-bench traffic: every task that triggered a summarization failed
+	// this way, including in an arm with NO other component enabled, so it is this
+	// component's own output and not a pipeline interaction. It went unnoticed because
+	// every prior measurement replayed through /compact, which never forwards upstream and
+	// therefore never has the body validated by a provider.
+	//
+	// A user-role message carrying the summary is both valid and conventional — it is what
+	// Claude Code's own compaction does.
+	summaryMsg := bschemas.ChatMessage{Role: bschemas.ChatMessageRoleUser}
 	schema.SetMessageText(&summaryMsg, summaryText)
 
 	// Checkpoint: this summary subsumes the leading span (len(span) messages from
@@ -233,8 +251,14 @@ func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 
 	// [msg0, summary, last-K] — reassign; apply.Body rebuilds losslessly.
 	out := make([]bschemas.ChatMessage, 0, 2+s.keepLast)
-	out = append(out, msgs[0], summaryMsg)
+	out = append(out, msgs[:headCount]...)
+	out = append(out, summaryMsg)
 	out = append(out, msgs[end:]...)
+	// Removing a span can orphan the tail's leading tool_result blocks; a provider rejects
+	// the whole request if it does. See dropOrphanedToolResults.
+	if repaired, n := dropOrphanedToolResults(out); n > 0 {
+		out = repaired
+	}
 	req.Input = out
 	if key != "" {
 		return []string{key}, nil
@@ -247,7 +271,7 @@ func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 // since that boundary is below resummarize_tokens. It returns the rebuilt
 // [msg0, priorSummary, msgs[boundary:]] and the (refreshed) stash key. No LLM
 // call. ok=false means "re-summarize fresh".
-func (s *Summarize) tryReuse(c *components.Ctx, msgs []bschemas.ChatMessage, start, end int) ([]bschemas.ChatMessage, []string, bool) {
+func (s *Summarize) tryReuse(c *components.Ctx, msgs []bschemas.ChatMessage, headCount, start, end int) ([]bschemas.ChatMessage, []string, bool) {
 	if s.resummarizeTokens <= 0 {
 		return nil, nil, false
 	}
@@ -274,11 +298,25 @@ func (s *Summarize) tryReuse(c *components.Ctx, msgs []bschemas.ChatMessage, sta
 			c.Store.Put(cp.Key, b)
 		}
 	}
-	summaryMsg := bschemas.ChatMessage{Role: bschemas.ChatMessageRoleSystem}
+	// USER for the same reason as the fresh-summary path above: a system role at index 1
+	// is rejected by the provider. The replayed checkpoint must match that shape exactly,
+	// or a replayed turn would emit different bytes from the turn that created it.
+	summaryMsg := bschemas.ChatMessage{Role: bschemas.ChatMessageRoleUser}
 	schema.SetMessageText(&summaryMsg, cp.SummaryMsg)
+	// The replayed boundary must respect exchange atomicity exactly as the fresh path does,
+	// or a replayed turn emits different bytes from the turn that created it.
+	for boundary < len(msgs) && msgs[boundary].Role == bschemas.ChatMessageRoleTool {
+		boundary++
+	}
 	out := make([]bschemas.ChatMessage, 0, 2+(len(msgs)-boundary))
-	out = append(out, msgs[0], summaryMsg)
+	out = append(out, msgs[:headCount]...)
+	out = append(out, summaryMsg)
 	out = append(out, msgs[boundary:]...)
+	// Removing a span can orphan the tail's leading tool_result blocks; a provider rejects
+	// the whole request if it does. See dropOrphanedToolResults.
+	if repaired, n := dropOrphanedToolResults(out); n > 0 {
+		out = repaired
+	}
 	if cp.Key != "" {
 		return out, []string{cp.Key}, true
 	}
