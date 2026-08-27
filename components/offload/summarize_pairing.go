@@ -93,6 +93,22 @@ func summarizeSpan(msgs []bschemas.ChatMessage, keepLast int) (headCount, start,
 	if end > len(msgs) {
 		end = len(msgs)
 	}
+	// CLAMP BEFORE INDEXING. A transcript shorter than keep_last makes `end` NEGATIVE, and the
+	// loop below indexes msgs[end] — `end < len(msgs)` is trivially true for a negative index, so
+	// it reads msgs[-1] and panics. With the default keep_last: 3 that is any request with fewer
+	// than three messages, i.e. the first turn or two of EVERY session, not an edge case.
+	//
+	// The old boundary was pure arithmetic and never indexed anything, so Offload's `end <= start`
+	// check caught this case cleanly; adding the tool-boundary walk moved an index read in front of
+	// that guard. Clamping to `start` restores the short-circuit: Offload sees end <= start and
+	// declines, exactly as before.
+	//
+	// It was survivable rather than visible because pipeline.runOne recovers per component, so the
+	// panic surfaced only as verdict=reverted in the logs while summarize silently did nothing on
+	// short turns. Found in review, on live sessions.
+	if end < start {
+		end = start
+	}
 	// Advance past a tail that would begin mid-exchange.
 	for end < len(msgs) && msgs[end].Role == bschemas.ChatMessageRoleTool {
 		end++
