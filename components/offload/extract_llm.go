@@ -241,6 +241,14 @@ var staticWindows = modelinfo.DefaultStatic()
 // as much as 1M against 200k, which is the direction fitsModelContext calls the costly one: the
 // request goes out, the upstream rejects it, and the round-trip buys nothing. Pass "" when the
 // effective source is not known and the configured one is used as before.
+//
+// A CONFIG-PINNED client needs no correction and never reaches the effSource branch, which is worth
+// stating because it looks like a second path that could resurrect the mismatch: Offload threads
+// effSource only through the `model == nil` branch, so a client resolved from e.modelClient keeps
+// the configured source. It is safe because modelConfig.Client() requires model.model to be
+// non-empty, so e.modelName is always set whenever e.modelClient is, and the e.modelName != ""
+// branch below (the static-table lookup) short-circuits before effSource or CtxWindow is consulted.
+// Raised in review on #110; recorded here so the next reader need not re-derive it.
 func (e *ExtractLLM) inputLimit(c *components.Ctx, effSource string) int {
 	if effSource == "" {
 		effSource = e.modelSource
