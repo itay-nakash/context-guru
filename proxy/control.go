@@ -122,7 +122,11 @@ func (h *Handler) ctlRoutes() []ctlRoute {
 	rs = append(rs, h.keepAliveCtlRoutes()...)
 	// The manager-controlled keep-alive strategy routes, declared beside their handlers in
 	// keepalivestrategy.go and appended here for the same reason.
-	return append(rs, h.keepAliveStrategyCtlRoutes()...)
+	rs = append(rs, h.keepAliveStrategyCtlRoutes()...)
+	// Strategy campaigns: bulk-create keep-alive strategies from a batch of suggest
+	// cells, declared beside their handlers in campaign.go and appended here for the
+	// same reason.
+	return append(rs, h.campaignCtlRoutes()...)
 }
 
 // grafanaUserHeader carries the authorized manager's address from this endpoint to
