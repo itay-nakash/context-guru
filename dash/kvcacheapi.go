@@ -35,6 +35,7 @@ func (a *API) kvCacheRoutes() []route {
 		{"GET /api/kvcache/rows", scopeTenant, a.kvCacheRows},
 		{"GET /api/kvcache/simulate", scopeTenant, a.kvCacheSimulate},
 		{"GET /api/kvcache/pricing", scopeTenant, a.kvCachePricing},
+		{"GET /api/kvcache/suggest", scopeTenant, a.kvCacheSuggest},
 	}
 }
 
@@ -92,6 +93,33 @@ func (a *API) kvCacheSimulate(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// An unknown arm or baseline is the caller's mistake; anything else came from the store.
 		// Reporting a database failure as 400 means no 5xx alert ever fires for it.
+		code := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "unknown baseline strategy") {
+			code = http.StatusBadRequest
+		}
+		httpErr(w, code, err.Error())
+		return
+	}
+	writeJSON(w, out)
+}
+
+// kvCacheSuggest serves the per-user, per-hour strategy suggestion: for each account's own
+// Sunday–Thursday history in each hour of the day, which arm would have cost the least.
+func (a *API) kvCacheSuggest(w http.ResponseWriter, r *http.Request) {
+	f, _, ok := a.scope(r)
+	if !ok {
+		unauthorized(w)
+		return
+	}
+	// Reads the whole dataset, same as kvCache and kvCacheSimulate — same slot, same reason.
+	if err := acquireKVCache(r.Context()); err != nil {
+		return
+	}
+	defer releaseKVCache()
+	out, err := a.rec.DB().WithContext(r.Context()).
+		KVCacheSuggest(f, kvCacheOptionsFrom(r), a.pricer, kvCacheConfigFrom(r))
+	if err != nil {
+		// An unknown baseline is the caller's mistake, same as on /api/kvcache/simulate.
 		code := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "unknown baseline strategy") {
 			code = http.StatusBadRequest

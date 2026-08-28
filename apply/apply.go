@@ -1359,7 +1359,41 @@ func rebuildCountChanged(body []byte, orig []gjson.Result, slots []slot, out []b
 	if len(covered) != len(orig) {
 		return body, false
 	}
+	// A RETAINED TOOL MESSAGE WHOSE TEXT A COMPONENT REWROTE, which byte-matching cannot see.
+	//
+	// Anthropic has no tool role: a synthetic role=tool message is this package's internal
+	// representation of a tool_result content block. The loop below matches survivors by BYTES, so
+	// a tool message that some component rewrote (format compacting indented JSON, extract_llm
+	// reducing a retained output) no longer matches its pre-image, falls through to the
+	// "new message" branch, and is marshaled from the bifrost struct — putting `"role":"tool"` on
+	// the wire, which the provider rejects outright:
+	//
+	//	400 messages: Unexpected role "tool". Allowed roles are "user" or "assistant."
+	//
+	// It needs TWO components in one turn, which is why it went unseen: one to change the count so
+	// this rebuild runs at all, and one to rewrite a tool message the first one kept. Observed as a
+	// real 400 on a live session.
+	//
+	// Fixed the same way the equal-count path already handles tool text: write the new text into
+	// the body's tool_result block, so the rebuild only ever decides WHICH messages to keep and
+	// never how to serialize one. Then match those messages by tool_call_id rather than by bytes,
+	// since their text may now legitimately differ from the pre-image. Doing only the second half
+	// would emit the original bytes and silently discard the compaction.
+	if nb, no, ok := writeBackToolText(body, orig, slots, out); ok {
+		body, orig = nb, no
+	}
 	used := make([]bool, len(slots))
+	// toolSlotByID indexes the tool-text slots so a rewritten tool message can still be
+	// recognised as a survivor. Built once; the matching loop is already O(out × slots).
+	toolSlotByID := map[string]int{}
+	for k := range slots {
+		if slots[k].kind != anthropicToolText {
+			continue
+		}
+		if id := toolCallIDAt(orig, slots[k]); id != "" {
+			toolSlotByID[id] = k
+		}
+	}
 	var parts [][]byte
 	// emitted guards against emitting one body message TWICE: several normalized
 	// messages can share a body index (an Anthropic user message with several
@@ -1372,10 +1406,21 @@ func rebuildCountChanged(body []byte, orig []gjson.Result, slots []slot, out []b
 			return body, false
 		}
 		matched := -1
-		for k := range slots {
-			if !used[k] && bytes.Equal(mb, slots[k].pre) {
+		// A synthetic tool message is identified by its tool_call_id, not its bytes: the text
+		// may have been rewritten (and written back into the body just above), and the id is
+		// what pairing actually depends on.
+		if out[i].Role == bschemas.ChatMessageRoleTool && out[i].ChatToolMessage != nil &&
+			out[i].ChatToolMessage.ToolCallID != nil {
+			if k, ok := toolSlotByID[*out[i].ChatToolMessage.ToolCallID]; ok && !used[k] {
 				matched = k
-				break
+			}
+		}
+		if matched < 0 {
+			for k := range slots {
+				if !used[k] && bytes.Equal(mb, slots[k].pre) {
+					matched = k
+					break
+				}
 			}
 		}
 		if matched < 0 {
@@ -1407,6 +1452,67 @@ func rebuildCountChanged(body []byte, orig []gjson.Result, slots []slot, out []b
 		return body, false
 	}
 	return res, true
+}
+
+// toolCallIDAt reads the tool_use_id of the tool_result block a tool-text slot points at.
+// The slot path is "messages.<i>.content.<b>.content", so the block is its parent.
+func toolCallIDAt(orig []gjson.Result, s slot) string {
+	bi, rel, ok := splitSlotPath(s.path)
+	if !ok || bi < 0 || bi >= len(orig) {
+		return ""
+	}
+	blk := strings.TrimSuffix(rel, ".content")
+	if blk == rel { // not a tool-text path
+		return ""
+	}
+	return orig[bi].Get(blk + ".tool_use_id").String()
+}
+
+// writeBackToolText splices rewritten tool-output text into the body's tool_result blocks before
+// the count-change rebuild reads them, so a retained-but-rewritten tool message can be emitted
+// from body bytes (role intact) instead of marshaled from the bifrost struct (role leaked).
+//
+// This is deliberately the SAME shape of edit the equal-count path makes — only the block's
+// `content` string changes, so the rest of the message stays byte-identical — and it is why the
+// rebuild can keep the rule "decide which messages to keep, never how to serialize one".
+//
+// Returns ok=false when nothing needed writing, so the caller keeps its original slices and no
+// body copy is made on the common path.
+func writeBackToolText(body []byte, orig []gjson.Result, slots []slot,
+	out []bschemas.ChatMessage) ([]byte, []gjson.Result, bool) {
+	byID := map[string]int{}
+	for k := range slots {
+		if slots[k].kind != anthropicToolText {
+			continue
+		}
+		if id := toolCallIDAt(orig, slots[k]); id != "" {
+			byID[id] = k
+		}
+	}
+	var wrote bool
+	for i := range out {
+		if out[i].Role != bschemas.ChatMessageRoleTool || out[i].ChatToolMessage == nil ||
+			out[i].ChatToolMessage.ToolCallID == nil {
+			continue
+		}
+		k, ok := byID[*out[i].ChatToolMessage.ToolCallID]
+		if !ok {
+			continue
+		}
+		txt := schema.MessageText(out[i])
+		if txt == slots[k].preText {
+			continue // unchanged; the original bytes already carry it
+		}
+		nb, err := sjson.SetBytes(body, slots[k].path, txt)
+		if err != nil {
+			return nil, nil, false // fail open: leave the body alone
+		}
+		body, wrote = nb, true
+	}
+	if !wrote {
+		return nil, nil, false
+	}
+	return body, gjson.GetBytes(body, "messages").Array(), true
 }
 
 // splitSlotPath splits a slot path into the body message index and the remainder of
