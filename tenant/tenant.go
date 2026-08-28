@@ -1320,6 +1320,49 @@ var migrations = []string{
 	// existing strategy keeps behaving identically after this migration.
 	`ALTER TABLE keepalive_strategies ADD COLUMN predictor_id        TEXT NOT NULL DEFAULT '';
 	 ALTER TABLE keepalive_strategies ADD COLUMN predictor_threshold REAL NOT NULL DEFAULT 0;`,
+
+	// v10: a strategy may optionally ask for the one-hour head-TTL tier, the same knob a
+	// tenant's own account config exposes (config.CacheConfig.HeadTTL1h; see
+	// apply/headttl.go). head_ttl_1h 0 (the default) means "leave the account's own
+	// setting alone" — every existing strategy keeps behaving identically after this
+	// migration. head_ttl_min_tokens is meaningless and ignored while head_ttl_1h is 0.
+	// Both additive with defaults.
+	`ALTER TABLE keepalive_strategies ADD COLUMN head_ttl_1h         INTEGER NOT NULL DEFAULT 0;
+	 ALTER TABLE keepalive_strategies ADD COLUMN head_ttl_min_tokens INTEGER NOT NULL DEFAULT 0;`,
+
+	// v11: strategy campaigns (see tenant/campaign.go and proxy/campaign.go) — a
+	// manager-created bundle that turns a batch of KV-cache suggest cells into keep-alive
+	// strategies in one shot, and freezes what each cell predicted so it can be checked
+	// against reality later. campaign_cells has no foreign-key ON DELETE behavior of its
+	// own because ArchiveCampaign never deletes a campaign row — archiving is the only
+	// removal path, and it leaves both tables in place.
+	`CREATE TABLE strategy_campaigns (
+	   id            TEXT PRIMARY KEY,
+	   name          TEXT    NOT NULL,
+	   source        TEXT    NOT NULL,
+	   baseline      TEXT    NOT NULL,
+	   min_requests  INTEGER NOT NULL DEFAULT 0,
+	   weekdays_json TEXT    NOT NULL DEFAULT '[]',
+	   status        TEXT    NOT NULL DEFAULT 'active',
+	   created_by    TEXT    NOT NULL DEFAULT '',
+	   created_at    INTEGER NOT NULL,
+	   activated_at  INTEGER NOT NULL
+	 );
+	 CREATE TABLE campaign_cells (
+	   campaign_id       TEXT    NOT NULL REFERENCES strategy_campaigns(id),
+	   tenant_id         TEXT    NOT NULL,
+	   hour_utc          INTEGER NOT NULL,
+	   requests          INTEGER NOT NULL DEFAULT 0,
+	   arm               TEXT    NOT NULL,
+	   predicted_usd     REAL    NOT NULL DEFAULT 0,
+	   baseline_usd      REAL    NOT NULL DEFAULT 0,
+	   insufficient_data INTEGER NOT NULL DEFAULT 0,
+	   activatable       INTEGER NOT NULL DEFAULT 0,
+	   skip_reason       TEXT,
+	   strategy_id       TEXT,
+	   PRIMARY KEY (campaign_id, tenant_id, hour_utc)
+	 );
+	 CREATE INDEX idx_campaign_cells_campaign ON campaign_cells(campaign_id);`,
 }
 
 func migrate(db *sql.DB) error {

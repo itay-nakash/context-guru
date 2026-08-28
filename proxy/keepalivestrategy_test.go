@@ -155,29 +155,45 @@ func TestSessionOverrideStillWinsOverAMatchingStrategy(t *testing.T) {
 }
 
 // validStrategyBounds enforces the SAME numeric bounds validOverride does, at least as
-// tightly, plus its own check on MaxUSDPerPing (which an override does not expose).
+// tightly, plus its own check on MaxUSDPerPing (which an override does not expose) and,
+// when headTTL1h is set, the wider 1h-tier idle/ping band instead of the 5m one.
 func TestValidStrategyBounds(t *testing.T) {
 	cases := []struct {
-		name          string
-		idle          time.Duration
-		pings         int
-		minPrefix     int
-		maxUSDPerPing float64
-		ok            bool
+		name             string
+		idle             time.Duration
+		pings            int
+		minPrefix        int
+		maxUSDPerPing    float64
+		headTTL1h        bool
+		headTTLMinTokens int
+		ok               bool
 	}{
-		{"in bounds", 280 * time.Second, 2, 20000, 0.25, true},
-		{"idle too low", minOverrideIdle - time.Second, 2, 0, 0, false},
-		{"idle too high", maxOverrideIdle + time.Second, 2, 0, 0, false},
-		{"idle at floor", minOverrideIdle, 2, 0, 0, true},
-		{"idle at ceiling", maxOverrideIdle, 2, 0, 0, true},
-		{"pings too low", 280 * time.Second, minOverridePings - 1, 0, 0, false},
-		{"pings too high", 280 * time.Second, maxOverridePings + 1, 0, 0, false},
-		{"negative prefix", 280 * time.Second, 2, -1, 0, false},
-		{"negative ceiling", 280 * time.Second, 2, 0, -0.01, false},
-		{"zero ceiling means default, and is fine", 280 * time.Second, 2, 0, 0, true},
+		{"in bounds", 280 * time.Second, 2, 20000, 0.25, false, 0, true},
+		{"idle too low", minOverrideIdle - time.Second, 2, 0, 0, false, 0, false},
+		{"idle too high", maxOverrideIdle + time.Second, 2, 0, 0, false, 0, false},
+		{"idle at floor", minOverrideIdle, 2, 0, 0, false, 0, true},
+		{"idle at ceiling", maxOverrideIdle, 2, 0, 0, false, 0, true},
+		{"pings too low", 280 * time.Second, minOverridePings - 1, 0, 0, false, 0, false},
+		{"pings too high", 280 * time.Second, maxOverridePings + 1, 0, 0, false, 0, false},
+		{"negative prefix", 280 * time.Second, 2, -1, 0, false, 0, false},
+		{"negative ceiling", 280 * time.Second, 2, 0, -0.01, false, 0, false},
+		{"zero ceiling means default, and is fine", 280 * time.Second, 2, 0, 0, false, 0, true},
+		{"negative head-ttl-min-tokens", 280 * time.Second, 2, 0, 0, false, -1, false},
+
+		// The 1h-tier band, only reachable while headTTL1h is set.
+		{"1h idle beyond the 5m ceiling is fine under the 1h band",
+			maxOverrideIdle + time.Second, 2, 0, 0, true, 0, true},
+		{"1h idle at its own ceiling", maxOverrideIdle1h, 2, 0, 0, true, 0, true},
+		{"1h idle past its own ceiling", maxOverrideIdle1h + time.Second, 2, 0, 0, true, 0, false},
+		{"1h idle below the shared floor", minOverrideIdle - time.Second, 2, 0, 0, true, 0, false},
+		{"1h pings at its own ceiling", 3360 * time.Second, maxOverridePings1h, 0, 0, true, 0, true},
+		{"1h pings beyond its own ceiling but under the 5m one",
+			3360 * time.Second, maxOverridePings1h + 1, 0, 0, true, 0, false},
+		{"1h negative head-ttl-min-tokens", 3360 * time.Second, 2, 0, 0, true, -1, false},
 	}
 	for _, c := range cases {
-		err := validStrategyBounds(c.idle, c.pings, c.minPrefix, c.maxUSDPerPing)
+		err := validStrategyBounds(c.idle, c.pings, c.minPrefix, c.maxUSDPerPing,
+			c.headTTL1h, c.headTTLMinTokens)
 		if (err == nil) != c.ok {
 			t.Errorf("%s: validStrategyBounds() = %v, want ok=%v", c.name, err, c.ok)
 		}
@@ -222,6 +238,69 @@ func TestApplyStrategyCopiesPredictorFields(t *testing.T) {
 	}
 	if got.PredictorID != "stop-reason-gated" || got.PredictorThreshold != 0.5 {
 		t.Errorf("predictor fields did not carry through: %+v", got)
+	}
+}
+
+// resolveHeadTTL is the request-path counterpart to applyStrategy: same matching walk,
+// but for the write-tier half of the policy rather than the ping-scheduling half.
+
+func TestResolveHeadTTLNoMatchReturnsTheAccountFallbackUnchanged(t *testing.T) {
+	k, _, clock := testKeeper(t, Limits{})
+	on, tokens := k.resolveHeadTTL("t1", clock.now(), true, 12345)
+	if !on || tokens != 12345 {
+		t.Errorf("resolveHeadTTL with no strategies = (%v, %d), want the account's own (true, 12345)",
+			on, tokens)
+	}
+	on, tokens = k.resolveHeadTTL("t1", clock.now(), false, 0)
+	if on || tokens != 0 {
+		t.Errorf("resolveHeadTTL with no strategies = (%v, %d), want the account's own (false, 0)",
+			on, tokens)
+	}
+}
+
+func TestResolveHeadTTLMatchingStrategyOverridesTheAccount(t *testing.T) {
+	k, _, clock := testKeeper(t, Limits{})
+	now := clock.now()
+	s := tenant.Strategy{
+		ID: "s1", Active: true, Target: tenant.Target{Mode: tenant.TargetAll},
+		Windows:     []tenant.Window{{Start: "00:00", End: "23:59"}},
+		IdleSeconds: 280, MaxPings: 1,
+		HeadTTL1h:        true,
+		HeadTTLMinTokens: 50000,
+	}
+	k.setStrategies([]tenant.Strategy{s})
+	on, tokens := k.resolveHeadTTL("t1", now, false, 0)
+	if !on || tokens != 50000 {
+		t.Errorf("resolveHeadTTL = (%v, %d), want the matched strategy's (true, 50000)", on, tokens)
+	}
+}
+
+// A strategy can only turn HeadTTL1h ON, never off — matching applyStrategy's own
+// pol.KeepAlive = true. A matching strategy with HeadTTL1h false must not suppress an
+// account that already opted itself in.
+func TestResolveHeadTTLCannotTurnTheAccountsOwnSettingOff(t *testing.T) {
+	k, _, clock := testKeeper(t, Limits{})
+	now := clock.now()
+	s := tenant.Strategy{
+		ID: "s1", Active: true, Target: tenant.Target{Mode: tenant.TargetAll},
+		Windows:     []tenant.Window{{Start: "00:00", End: "23:59"}},
+		IdleSeconds: 280, MaxPings: 1, HeadTTL1h: false,
+	}
+	k.setStrategies([]tenant.Strategy{s})
+	on, tokens := k.resolveHeadTTL("t1", now, true, 50000)
+	if !on || tokens != 50000 {
+		t.Errorf("resolveHeadTTL = (%v, %d), want the account's own (true, 50000) left alone", on, tokens)
+	}
+}
+
+// A nil keeper (keepalive not built into this deployment at all) must behave exactly like
+// "no strategy matched" — the account's own setting, unchanged.
+func TestResolveHeadTTLNilKeeperFallsBackToTheAccount(t *testing.T) {
+	var k *keeper
+	on, tokens := k.resolveHeadTTL("t1", time.Now(), true, 777)
+	if !on || tokens != 777 {
+		t.Errorf("resolveHeadTTL on a nil keeper = (%v, %d), want the account's own (true, 777)",
+			on, tokens)
 	}
 }
 
