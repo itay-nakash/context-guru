@@ -40,11 +40,24 @@ const camp = {
   // source:"upload" regardless of where it came from — see createCampaignFromPending's
   // own comment for why re-fetching at commit time would be the wrong choice.
   pending: null,
-  // Bumped on every openCampaignDrawer call, and checked by each async drawer render
-  // before it mutates the drawer body — so a slow fetch for a campaign the manager has
-  // since closed or moved on from can never overwrite what's now actually on screen.
-  // See renderCampaignOverview/renderCampaignTenantDrilldown.
+  // Bumped at the START of every drawer render (renderCampaignOverview,
+  // renderCampaignTenantDrilldown) — not only when the drawer first opens — and checked
+  // again once each one's fetch resolves, so a slow render that the manager has since
+  // navigated away from (a different campaign, a different tenant, or back to the
+  // overview — all inside the SAME open drawer) can never overwrite whatever's now
+  // actually on screen.
   drawerGen: 0,
+  // Bumped at the start of fetchLiveSuggestions and onUploadSuggestFile, and checked by
+  // each before writing camp.pending or #camp-preview — so a slow live-fetch and a
+  // faster file upload (or the reverse) started before it resolved can't stomp on
+  // whichever one the manager is actually looking at. createCampaignFromPending reads
+  // it too, so a create that finishes after the manager has already started a NEWER
+  // preview doesn't clear that newer one out from under them.
+  previewGen: 0,
+  // Bumped at the start of refreshCampaignsList — same shape, for the campaigns list
+  // table: whichever of two overlapping list refreshes resolves LAST otherwise wins,
+  // regardless of which one was actually started last.
+  listGen: 0,
 };
 
 async function loadCampaigns() {
@@ -82,15 +95,18 @@ function buildCampaignsSkeleton(host) {
 // ── create flow: fetch or upload, preview, name, create ────────────────────
 
 async function fetchLiveSuggestions() {
+  const gen = ++camp.previewGen;
   const btn = $('[data-testid="camp-fetch-live"]');
   const preview = clear($('#camp-preview'));
   btn.disabled = true;
   loadingState(preview, 3);
   try {
     const suggest = await api('kvcache/suggest');
+    if (gen !== camp.previewGen) return;
     camp.pending = suggest;
     renderSuggestPreview(clear(preview), suggest);
   } catch (e) {
+    if (gen !== camp.previewGen) return;
     errorState(clear(preview), 'Could not fetch live suggestions', e);
   } finally {
     btn.disabled = false;
@@ -101,9 +117,11 @@ function onUploadSuggestFile(ev) {
   const file = ev.target.files && ev.target.files[0];
   ev.target.value = ''; // lets the same file be chosen again after a fix
   if (!file) return;
+  const gen = ++camp.previewGen;
   const preview = clear($('#camp-preview'));
   const reader = new FileReader();
   reader.onload = () => {
+    if (gen !== camp.previewGen) return;
     let suggest;
     try {
       suggest = JSON.parse(reader.result);
@@ -120,7 +138,10 @@ function onUploadSuggestFile(ev) {
     camp.pending = suggest;
     renderSuggestPreview(clear(preview), suggest);
   };
-  reader.onerror = () => errorState(clear(preview), 'Could not read that file', reader.error);
+  reader.onerror = () => {
+    if (gen !== camp.previewGen) return;
+    errorState(clear(preview), 'Could not read that file', reader.error);
+  };
   reader.readAsText(file);
 }
 
@@ -183,21 +204,33 @@ function renderSuggestPreview(host, suggest) {
  * create has no idempotency/dedup on the server: two clicks (an accidental double-click,
  * or an impatient second click on a slow network) would each create a full, independent
  * set of live keep-alive strategies, not just a UI glitch.
+ *
+ * gen is captured (not bumped) at the start: starting a create does not itself start a
+ * new preview, it commits the CURRENT one. But the manager isn't prevented from
+ * starting a fresh fetch/upload while this POST is still in flight (only the Create
+ * button itself is disabled) — if that happens, #camp-preview and camp.pending already
+ * belong to that newer preview by the time this call resolves, and clearing/nulling
+ * them here would wipe out work the manager has already moved on to, even though the
+ * OLD campaign this call submitted was created successfully.
  */
 async function createCampaignFromPending(nameInput, createBtn, previewHost) {
   const name = (nameInput.value || '').trim();
   if (!name) { nameInput.focus(); return; }
+  const gen = camp.previewGen;
+  const suggest = camp.pending;
   createBtn.disabled = true;
   try {
     const created = await ctl('/api/keepalive/campaigns', {
       method: 'POST',
-      body: JSON.stringify({ name, source: 'upload', suggest: camp.pending }),
+      body: JSON.stringify({ name, source: 'upload', suggest }),
     });
-    camp.pending = null;
-    renderCreatedResult(clear(previewHost), created);
+    if (gen === camp.previewGen) {
+      camp.pending = null;
+      renderCreatedResult(clear(previewHost), created);
+    }
     await refreshCampaignsList();
   } catch (e) {
-    errorState(previewHost, 'Could not create this campaign', e);
+    if (gen === camp.previewGen) errorState(previewHost, 'Could not create this campaign', e);
   } finally {
     createBtn.disabled = false;
   }
@@ -226,14 +259,17 @@ function renderCreatedResult(host, created) {
 // ── list ─────────────────────────────────────────────────────────────────
 
 async function refreshCampaignsList() {
+  const gen = ++camp.listGen;
   const host = clear($('#campaigns-list'));
   loadingState(host, 2);
   try {
     const out = await ctl('/api/keepalive/campaigns');
+    if (gen !== camp.listGen) return;
     const rows = out.campaigns || [];
     $('#campaigns-count').textContent = `${rows.length} campaign${rows.length === 1 ? '' : 's'}`;
     renderCampaignsList(clear(host), rows);
   } catch (e) {
+    if (gen !== camp.listGen) return;
     errorState(clear(host), 'Could not list campaigns', e);
   }
 }
@@ -277,20 +313,22 @@ async function archiveCampaign(c) {
 
 /** openStrategyLedger's per-entity precedent, for a whole campaign instead of one strategy. */
 async function openCampaignDrawer(c) {
-  const gen = ++camp.drawerGen;
   const body = openDrawer('Campaign: ' + c.name, null);
-  await renderCampaignOverview(body, c.id, gen);
+  await renderCampaignOverview(body, c.id);
 }
 
 /**
- * gen is the drawer generation this render was started for (camp.drawerGen at the time
- * openCampaignDrawer was called). #drawer-body is one singleton node the drawer reuses
- * across opens — closing it does not cancel an in-flight fetch — so without this check
- * a slow fetch for a campaign the manager has since closed, or navigated away from
- * inside the SAME drawer (a tenant drill-down, or a different campaign entirely), could
- * still resolve later and silently overwrite whatever is now actually on screen.
+ * Bumps camp.drawerGen itself, at the very start, rather than taking a generation from
+ * the caller: #drawer-body is one singleton node the drawer reuses across opens AND
+ * across in-drawer navigation (a tenant drill-down, "back to overview", a different
+ * campaign entirely) — closing it, or navigating away from it, does not cancel an
+ * in-flight fetch. A gen threaded in from the CALLER (as this used to do) is only fresh
+ * at drawer-open; two navigations inside the same open drawer would share it and could
+ * still race. Bumping here means every render, including a second one inside the same
+ * drawer session, gets its own token.
  */
-async function renderCampaignOverview(body, campaignID, gen) {
+async function renderCampaignOverview(body, campaignID) {
+  const gen = ++camp.drawerGen;
   clear(body);
   loadingState(body, 3);
   let detail;
@@ -327,7 +365,7 @@ async function renderCampaignOverview(body, campaignID, gen) {
   const tbody = el('tbody');
   for (const t of tenants) {
     tbody.appendChild(el('tr', {
-      class: 'click', onclick: () => renderCampaignTenantDrilldown(body, campaignID, t.tenant_id, gen),
+      class: 'click', onclick: () => renderCampaignTenantDrilldown(body, campaignID, t.tenant_id),
     },
       el('td', {}, el('code', { class: 'clip' }, t.tenant_id)),
       el('td', { class: 'num' }, usd(t.predicted_usd)),
@@ -355,8 +393,9 @@ function hourUTCToLocalLabel(hourUTC) {
   return `${String(hourUTC).padStart(2, '0')}:00 UTC (${local} Jerusalem today)`;
 }
 
-/** See renderCampaignOverview's doc comment on gen — the same stale-render guard. */
-async function renderCampaignTenantDrilldown(body, campaignID, tenantID, gen) {
+/** See renderCampaignOverview's doc comment — bumps its own generation, same reason. */
+async function renderCampaignTenantDrilldown(body, campaignID, tenantID) {
+  const gen = ++camp.drawerGen;
   clear(body);
   loadingState(body, 3);
   let out;
@@ -372,7 +411,7 @@ async function renderCampaignTenantDrilldown(body, campaignID, tenantID, gen) {
   clear(body);
   body.appendChild(el('button', {
     class: 'ghost small', 'data-testid': 'camp-back-to-overview',
-    onclick: () => renderCampaignOverview(body, campaignID, gen),
+    onclick: () => renderCampaignOverview(body, campaignID),
   }, '← Back to overview'));
   body.appendChild(el('h3', {}, 'Tenant: ' + tenantID));
   if (out.caveat) body.appendChild(el('p', { class: 'note' }, out.caveat));
