@@ -263,6 +263,13 @@ func predictorFor(id string) (func(stopReason string) float64, bool) {
 
 // validPredictorRef checks predictorID against knownPredictorIDs (empty is always
 // valid — "no predictor gate") and the threshold's own shape.
+//
+// A named predictor paired with a threshold <= 0 is refused outright: predictorFor's
+// probability functions only ever return values in [0,1], so pingable()'s
+// `p(stopReason) >= threshold` is satisfied by EVERY possible prediction once threshold
+// hits 0 — the gate becomes a no-op that still pings on the arm's own idle/max-ping
+// schedule, exactly the "paying for a mechanism that can never actually gate anything"
+// mistake validStrategyBounds already refuses for HeadTTL1h/HeadTTLMinTokens.
 func validPredictorRef(predictorID string, threshold float64) error {
 	s := tenant.Strategy{PredictorID: predictorID, PredictorThreshold: threshold}
 	if err := s.ValidatePredictor(); err != nil {
@@ -271,6 +278,10 @@ func validPredictorRef(predictorID string, threshold float64) error {
 	if predictorID != "" && !knownPredictorIDs[predictorID] {
 		return fmt.Errorf("%q is not a registered predictor; no predictor-gated strategies "+
 			"can be created yet", predictorID)
+	}
+	if predictorID != "" && threshold <= 0 {
+		return fmt.Errorf("a strategy naming a predictor needs a positive threshold; 0 makes " +
+			"the gate a no-op, since every possible prediction satisfies \">= 0\"")
 	}
 	return nil
 }

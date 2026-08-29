@@ -339,6 +339,16 @@ func TestValidPredictorRef(t *testing.T) {
 	if err := validPredictorRef("stop_reason", 0.5); err != nil {
 		t.Errorf("a registered predictor with a valid threshold was refused: %v", err)
 	}
+	// A named predictor with a threshold <= 0 makes predictorFor's gate a no-op — every
+	// possible prediction (predictorFor only ever returns values in [0,1]) satisfies
+	// ">= 0", so the strategy would ping unconditionally while still being labeled and
+	// billed as predictor-gated.
+	if err := validPredictorRef("stop_reason", 0); err == nil {
+		t.Error("a registered predictor with a zero threshold was accepted; the gate would be a no-op")
+	}
+	if err := validPredictorRef("stop_reason", -0.1); err == nil {
+		t.Error("a registered predictor with a negative threshold was accepted")
+	}
 }
 
 // A strategy created through the control route is visible to the keeper's own
