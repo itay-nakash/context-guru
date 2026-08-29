@@ -1,7 +1,9 @@
 package tenant
 
 import (
+	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -119,5 +121,58 @@ func TestCreateCampaignRequiresANameAndAtLeastOneCell(t *testing.T) {
 	if len(list) != 0 {
 		t.Errorf("a failed create left %d campaign rows behind, want 0 (the transaction "+
 			"must have rolled back)", len(list))
+	}
+}
+
+// Two cells sharing (TenantID, HourUTC) collide on campaign_cells' own primary key,
+// since every cell in one CreateCampaign call shares the same about-to-be-generated
+// campaign_id. This must be refused up front with a clear error naming the duplicate,
+// not left to surface later as a raw SQL constraint failure — and refused before the
+// transaction ever starts, so nothing is left half-written.
+func TestCreateCampaignRejectsDuplicateTenantHourCells(t *testing.T) {
+	r := open(t, Options{})
+	_, err := r.CreateCampaign("mgr-1", Campaign{Name: "dup"}, []CampaignCell{
+		{TenantID: "t1", HourUTC: 9, Arm: "keepalive-5m", Activatable: true},
+		{TenantID: "t1", HourUTC: 9, Arm: "keepalive-5m-once", Activatable: true},
+	})
+	if err == nil {
+		t.Fatal("a campaign with two cells at the same (tenant, hour) was accepted")
+	}
+	if !strings.Contains(err.Error(), "t1") || !strings.Contains(err.Error(), "9") {
+		t.Errorf("error %q does not name the offending tenant/hour", err)
+	}
+	list, lerr := r.ListCampaigns()
+	if lerr != nil {
+		t.Fatalf("ListCampaigns: %v", lerr)
+	}
+	if len(list) != 0 {
+		t.Errorf("a rejected create left %d campaign rows behind, want 0", len(list))
+	}
+}
+
+// A cell with no skip reason must store SQL NULL, the same as StrategyID already does
+// for a non-activatable cell — not the literal empty string. Both columns are declared
+// as bare nullable TEXT in the same migration; storing "" instead of NULL on one of them
+// would make a direct `WHERE skip_reason IS NULL` query (the natural one, given the
+// schema and the sibling column's real NULL semantics) match zero rows even though most
+// cells in practice have no skip reason. Checked at the raw SQL level, since the Go API
+// (CampaignCells' sql.NullString scan) normalizes NULL and "" back to the same "" either
+// way and would not catch this on its own.
+func TestCreateCampaignStoresAnUnsetSkipReasonAsSQLNullNotEmptyString(t *testing.T) {
+	r := open(t, Options{})
+	c, err := r.CreateCampaign("mgr-1", Campaign{Name: "null-check"}, []CampaignCell{
+		{TenantID: "t1", HourUTC: 9, Arm: "fixed-5m", Activatable: true}, // baseline: no skip reason
+	})
+	if err != nil {
+		t.Fatalf("CreateCampaign: %v", err)
+	}
+	var skipReason sql.NullString
+	if err := r.db.QueryRow(`SELECT skip_reason FROM campaign_cells WHERE campaign_id = ?`,
+		c.ID).Scan(&skipReason); err != nil {
+		t.Fatalf("raw query: %v", err)
+	}
+	if skipReason.Valid {
+		t.Errorf("skip_reason = %q (valid=%v), want SQL NULL for an unset skip reason",
+			skipReason.String, skipReason.Valid)
 	}
 }

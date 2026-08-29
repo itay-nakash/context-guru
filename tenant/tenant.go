@@ -1361,8 +1361,14 @@ var migrations = []string{
 	   skip_reason       TEXT,
 	   strategy_id       TEXT,
 	   PRIMARY KEY (campaign_id, tenant_id, hour_utc)
-	 );
-	 CREATE INDEX idx_campaign_cells_campaign ON campaign_cells(campaign_id);`,
+	 );`,
+	// No separate index on campaign_cells(campaign_id): the PRIMARY KEY above already
+	// creates SQLite's own automatic unique index over (campaign_id, tenant_id,
+	// hour_utc) — leading on campaign_id, which is exactly what CampaignCells' own
+	// `WHERE campaign_id = ?` lookup needs. A second, explicit index on campaign_id
+	// alone would only duplicate it: measured (EXPLAIN QUERY PLAN against the real
+	// query), the planner never chooses such an index over the PK's own, so it would
+	// add write/storage cost on every insert for zero query benefit.
 }
 
 func migrate(db *sql.DB) error {

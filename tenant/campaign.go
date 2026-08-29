@@ -90,6 +90,22 @@ func (r *Registry) CreateCampaign(actorID string, c Campaign, cells []CampaignCe
 	if len(cells) == 0 {
 		return Campaign{}, fmt.Errorf("tenant: a campaign needs at least one cell")
 	}
+	// campaign_cells' primary key is (campaign_id, tenant_id, hour_utc), and every
+	// cell in one call shares the same about-to-be-generated campaign_id — so two
+	// cells here sharing (TenantID, HourUTC) collide on that key. The upload source
+	// accepts a hand-edited suggest payload verbatim, and a duplicated row is a
+	// plausible copy/merge artifact in one, so this is checked up front with a clear
+	// error naming the duplicate, rather than left to surface as a raw SQL constraint
+	// failure after strategies have already been created for the batch.
+	seen := map[[2]any]bool{}
+	for _, cell := range cells {
+		key := [2]any{cell.TenantID, cell.HourUTC}
+		if seen[key] {
+			return Campaign{}, fmt.Errorf(
+				"tenant: duplicate cell for tenant %q at hour %d", cell.TenantID, cell.HourUTC)
+		}
+		seen[key] = true
+	}
 	weekdaysJSON, err := json.Marshal(c.Weekdays)
 	if err != nil {
 		return Campaign{}, err
@@ -127,7 +143,8 @@ func (r *Registry) CreateCampaign(actorID string, c Campaign, cells []CampaignCe
 		  VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
 			cell.CampaignID, cell.TenantID, cell.HourUTC, cell.Requests, cell.Arm,
 			cell.PredictedUSD, cell.BaselineUSD, boolInt(cell.InsufficientData),
-			boolInt(cell.Activatable), cell.SkipReason, nullableString(cell.StrategyID)); err != nil {
+			boolInt(cell.Activatable), nullableString(cell.SkipReason),
+			nullableString(cell.StrategyID)); err != nil {
 			return Campaign{}, err
 		}
 	}
