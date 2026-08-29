@@ -135,7 +135,10 @@ func TestCampaignRealSavingsCountsDistinctActiveDays(t *testing.T) {
 	}
 }
 
-// Empty strategy or tenant lists answer with no cells rather than an invalid "IN ()".
+// Empty strategy or tenant lists answer with no cells rather than an invalid "IN ()",
+// against an EMPTY database — this only proves "correctly found nothing," not that the
+// query for the non-empty list actually still ran. TestCampaignRealSavingsHalvesRun
+// IndependentlyOfEachOther below proves the latter, against real data.
 func TestCampaignRealSavingsOnEmptyInputs(t *testing.T) {
 	db := openTestDB(t)
 	if cells, err := db.CampaignRealSavings(nil, []string{"t1"}, 0); err != nil || len(cells) != 0 {
@@ -143,5 +146,42 @@ func TestCampaignRealSavingsOnEmptyInputs(t *testing.T) {
 	}
 	if cells, err := db.CampaignRealSavings([]string{"s1"}, nil, 0); err != nil || len(cells) != 0 {
 		t.Errorf("empty tenantIDs: got %v, %v; want no cells, no error", cells, err)
+	}
+}
+
+// The cost half only needs strategyIDs and the saving half only needs tenantIDs — they
+// must run independently of each other, not both be skipped just because the OTHER
+// list happened to be empty. A campaign whose every cell resolved to a non-activatable
+// arm has strategyIDs=nil but a real, non-empty tenantIDs list, and its tenants can
+// still have real credited savings that this call must not silently omit.
+func TestCampaignRealSavingsHalvesRunIndependentlyOfEachOther(t *testing.T) {
+	db := openTestDB(t)
+	credit := kaCredit(hourUTC(1, 9), "s1", 0.10)
+	credit.TenantID = "t1"
+	if err := db.insertBatch([]*Event{credit}); err != nil {
+		t.Fatal(err)
+	}
+
+	// No strategy ids at all — the saving half must still run and find t1's credit.
+	cells, err := db.CampaignRealSavings(nil, []string{"t1"}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cells) != 1 || cells[0].SavedUSD < 0.099 || cells[0].SavedUSD > 0.101 {
+		t.Errorf("got %+v, want 1 cell with ~$0.10 saved even with no strategy ids given", cells)
+	}
+
+	ping := kaPing(hourUTC(1, 9), "s2", 0.02, 40_000, 0)
+	ping.TenantID, ping.KeepAliveStrategyID = "t2", "strat-1"
+	if err := db.insertBatch([]*Event{ping}); err != nil {
+		t.Fatal(err)
+	}
+	// No tenant ids at all — the cost half must still run and find strat-1's ping.
+	cells, err = db.CampaignRealSavings([]string{"strat-1"}, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cells) != 1 || cells[0].Pings != 1 || cells[0].PingUSD < 0.019 || cells[0].PingUSD > 0.021 {
+		t.Errorf("got %+v, want 1 cell with 1 ping at ~$0.02 even with no tenant ids given", cells)
 	}
 }

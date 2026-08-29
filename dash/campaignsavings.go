@@ -50,7 +50,7 @@ type CampaignSavingCell struct {
 // since `since` — a cell absent from the result had neither, not a cell this query
 // forgot to report.
 func (d *DB) CampaignRealSavings(strategyIDs, tenantIDs []string, since int64) ([]CampaignSavingCell, error) {
-	if len(strategyIDs) == 0 || len(tenantIDs) == 0 {
+	if len(strategyIDs) == 0 && len(tenantIDs) == 0 {
 		return []CampaignSavingCell{}, nil
 	}
 	type cellKey struct {
@@ -72,35 +72,43 @@ func (d *DB) CampaignRealSavings(strategyIDs, tenantIDs []string, since int64) (
 	// the tenant it pinged and the UTC hour it landed in. %H is a Go format verb as
 	// much as a strftime one — this string is a query parameter, never passed through
 	// fmt.Sprintf (see dash/kvcache.go's own warning about exactly this trap).
-	costArgs := make([]any, 0, len(strategyIDs)+1)
-	for _, id := range strategyIDs {
-		costArgs = append(costArgs, id)
-	}
-	costArgs = append(costArgs, since)
-	costRows, err := d.sql.Query(`SELECT tenant_id,
-			CAST(strftime('%H', ts/1000, 'unixepoch') AS INTEGER) h,
-			COUNT(*), COALESCE(SUM(cost_usd),0)
-		FROM requests WHERE keepalive = 1 AND keepalive_strategy_id IN (`+
-		placeholders(len(strategyIDs))+`) AND ts >= ?
-		GROUP BY tenant_id, h`, costArgs...)
-	if err != nil {
-		return nil, err
-	}
-	for costRows.Next() {
-		var tenantID string
-		var hour int
-		var pings int64
-		var pingUSD float64
-		if err := costRows.Scan(&tenantID, &hour, &pings, &pingUSD); err != nil {
-			costRows.Close()
+	//
+	// Gated on strategyIDs alone (not tenantIDs too): this half doesn't touch
+	// tenant_id at all, so a caller with strategies but no tenant list (or vice versa
+	// for the saving half below) must still get its own half's real answer, not an
+	// empty result — an empty answer here must mean "no matching rows," never "the
+	// caller happened to pass an empty other list."
+	if len(strategyIDs) > 0 {
+		costArgs := make([]any, 0, len(strategyIDs)+1)
+		for _, id := range strategyIDs {
+			costArgs = append(costArgs, id)
+		}
+		costArgs = append(costArgs, since)
+		costRows, err := d.sql.Query(`SELECT tenant_id,
+				CAST(strftime('%H', ts/1000, 'unixepoch') AS INTEGER) h,
+				COUNT(*), COALESCE(SUM(cost_usd),0)
+			FROM requests WHERE keepalive = 1 AND keepalive_strategy_id IN (`+
+			placeholders(len(strategyIDs))+`) AND ts >= ?
+			GROUP BY tenant_id, h`, costArgs...)
+		if err != nil {
 			return nil, err
 		}
-		c := get(tenantID, hour)
-		c.Pings, c.PingUSD = pings, pingUSD
-	}
-	costRows.Close()
-	if err := costRows.Err(); err != nil {
-		return nil, err
+		for costRows.Next() {
+			var tenantID string
+			var hour int
+			var pings int64
+			var pingUSD float64
+			if err := costRows.Scan(&tenantID, &hour, &pings, &pingUSD); err != nil {
+				costRows.Close()
+				return nil, err
+			}
+			c := get(tenantID, hour)
+			c.Pings, c.PingUSD = pings, pingUSD
+		}
+		costRows.Close()
+		if err := costRows.Err(); err != nil {
+			return nil, err
+		}
 	}
 
 	// Saving half: every REAL (non-ping) request for one of this campaign's tenants,
@@ -108,36 +116,38 @@ func (d *DB) CampaignRealSavings(strategyIDs, tenantIDs []string, since int64) (
 	// the credited saving. Not filtered by keepalive_strategy_id: the credited row
 	// carries none (only the ping does), so this is the tenant's whole credit in this
 	// cell, the same ceiling StrategyLedger already declares.
-	savingArgs := make([]any, 0, len(tenantIDs)+1)
-	for _, id := range tenantIDs {
-		savingArgs = append(savingArgs, id)
-	}
-	savingArgs = append(savingArgs, since)
-	savingRows, err := d.sql.Query(`SELECT tenant_id,
-			CAST(strftime('%H', ts/1000, 'unixepoch') AS INTEGER) h,
-			COUNT(*), COUNT(DISTINCT ts/86400000),
-			COALESCE(SUM(CASE WHEN keepalive_saved_usd > 0 THEN keepalive_saved_usd ELSE 0 END),0)
-		FROM requests WHERE keepalive = 0 AND tenant_id IN (`+
-		placeholders(len(tenantIDs))+`) AND ts >= ?
-		GROUP BY tenant_id, h`, savingArgs...)
-	if err != nil {
-		return nil, err
-	}
-	for savingRows.Next() {
-		var tenantID string
-		var hour int
-		var requests, activeDays int64
-		var savedUSD float64
-		if err := savingRows.Scan(&tenantID, &hour, &requests, &activeDays, &savedUSD); err != nil {
-			savingRows.Close()
+	if len(tenantIDs) > 0 {
+		savingArgs := make([]any, 0, len(tenantIDs)+1)
+		for _, id := range tenantIDs {
+			savingArgs = append(savingArgs, id)
+		}
+		savingArgs = append(savingArgs, since)
+		savingRows, err := d.sql.Query(`SELECT tenant_id,
+				CAST(strftime('%H', ts/1000, 'unixepoch') AS INTEGER) h,
+				COUNT(*), COUNT(DISTINCT ts/86400000),
+				COALESCE(SUM(CASE WHEN keepalive_saved_usd > 0 THEN keepalive_saved_usd ELSE 0 END),0)
+			FROM requests WHERE keepalive = 0 AND tenant_id IN (`+
+			placeholders(len(tenantIDs))+`) AND ts >= ?
+			GROUP BY tenant_id, h`, savingArgs...)
+		if err != nil {
 			return nil, err
 		}
-		c := get(tenantID, hour)
-		c.Requests, c.ActiveDays, c.SavedUSD = requests, activeDays, savedUSD
-	}
-	savingRows.Close()
-	if err := savingRows.Err(); err != nil {
-		return nil, err
+		for savingRows.Next() {
+			var tenantID string
+			var hour int
+			var requests, activeDays int64
+			var savedUSD float64
+			if err := savingRows.Scan(&tenantID, &hour, &requests, &activeDays, &savedUSD); err != nil {
+				savingRows.Close()
+				return nil, err
+			}
+			c := get(tenantID, hour)
+			c.Requests, c.ActiveDays, c.SavedUSD = requests, activeDays, savedUSD
+		}
+		savingRows.Close()
+		if err := savingRows.Err(); err != nil {
+			return nil, err
+		}
 	}
 
 	out := make([]CampaignSavingCell, 0, len(cells))
