@@ -48,6 +48,13 @@ const campaignDefaultMinPrefixTokens = 20000
 // campaignDefaultMaxPings mirrors config.DefaultKeepAliveMaxPings.
 const campaignDefaultMaxPings = 2
 
+// campaignDefaultHeadTTLMinTokens mirrors config.DefaultHeadTTLMinTokens. Every 1h-tier
+// arm needs a positive value here — see validStrategyBounds' own refusal of
+// HeadTTL1h=true paired with a zero token floor, which would silently create a
+// strategy that pings on the 1-hour schedule but never actually promotes the head to
+// the 1-hour tier.
+const campaignDefaultHeadTTLMinTokens = 50000
+
 // headTTL1hHonoredModels are the models this deployment has actually measured granting
 // the 1h cache tier rather than silently downgrading it to 5m (apply/headttl.go). A
 // campaign will not mark a 1h-tier arm activatable for a tenant whose traffic in the
@@ -72,10 +79,11 @@ type campaignArm struct {
 	// checks headTTL1hHonoredModels for this specific tenant before activating it.
 	needsModelHonoring bool
 
-	idleSeconds int
-	maxPings    int
-	predictorID string
-	headTTL1h   bool
+	idleSeconds      int
+	maxPings         int
+	predictorID      string
+	headTTL1h        bool
+	headTTLMinTokens int
 }
 
 // campaignArmFor is the single source of truth the create flow consults. idleSeconds/
@@ -98,10 +106,11 @@ func campaignArmFor(arm string) campaignArm {
 		// 3360s = kvcache.DefaultPingIdle1h — "the same margin against the one-hour
 		// lifetime" the simulator itself ships as this arm's default cadence.
 		return campaignArm{activatable: true, needsModelHonoring: true, headTTL1h: true,
-			idleSeconds: 3360, maxPings: campaignDefaultMaxPings}
+			idleSeconds: 3360, maxPings: campaignDefaultMaxPings,
+			headTTLMinTokens: campaignDefaultHeadTTLMinTokens}
 	case kvcache.StrategyKeepAlive1hOnce:
 		return campaignArm{activatable: true, needsModelHonoring: true, headTTL1h: true,
-			idleSeconds: 3360, maxPings: 1}
+			idleSeconds: 3360, maxPings: 1, headTTLMinTokens: campaignDefaultHeadTTLMinTokens}
 	}
 	return campaignArm{reason: fmt.Sprintf(
 		"%q has no live enforcement path yet — it is a simulation-only arm", arm)}
@@ -129,12 +138,23 @@ type resolvedCampaignCell struct {
 // whether tenantID's own traffic honors the 1h tier — a function rather than a
 // precomputed map so the caller can memoize per tenant however it likes and tests can
 // fake it cheaply.
+//
+// HourUTC is bounds-checked FIRST, before the arm is even resolved: the live-fetch
+// source can never produce one outside [0,23] (it's always time.Time.UTC().Hour()), but
+// the upload source accepts a hand-edited suggest payload verbatim, and an out-of-range
+// hour reaching tileHours would build a Window string like "24:00" that
+// tenant.Window.Validate rejects — silently, if nothing catches it first, producing a
+// strategy that is created successfully but can never match anything.
 func resolveCampaignCell(cell dash.KVCacheSuggestion, honorsHeadTTL1h func(tenantID string) bool,
 ) resolvedCampaignCell {
 	out := resolvedCampaignCell{
 		tenantID: cell.User, hourUTC: cell.HourUTC, requests: cell.Requests,
 		arm: cell.BestStrategy, predictedUSD: cell.SavingUSD, baselineUSD: cell.BaselineUSD,
 		insufficientData: cell.InsufficientData,
+	}
+	if cell.HourUTC < 0 || cell.HourUTC > 23 {
+		out.skipReason = fmt.Sprintf("hour_utc %d is out of range (must be 0-23)", cell.HourUTC)
+		return out
 	}
 	a := campaignArmFor(cell.BestStrategy)
 	if !a.activatable {
@@ -283,16 +303,39 @@ func hourSetKey(hours []int) string {
 // coalesced Target and the tiled Windows, at the arm's own live parameters.
 func strategyForGroup(campaignName string, g *campaignGroup, days []time.Weekday) tenant.Strategy {
 	return tenant.Strategy{
-		Name:            fmt.Sprintf("%s: %s (%d tenants)", campaignName, g.arm, len(g.tenantIDs)),
-		Active:          true,
-		Windows:         tileHours(g.hourSet, days),
-		Target:          tenant.Target{Mode: tenant.TargetList, TenantIDs: g.tenantIDs},
-		IdleSeconds:     g.config.idleSeconds,
-		MaxPings:        g.config.maxPings,
-		MinPrefixTokens: campaignDefaultMinPrefixTokens,
-		PredictorID:     g.config.predictorID,
-		HeadTTL1h:       g.config.headTTL1h,
+		Name:             fmt.Sprintf("%s: %s (%d tenants)", campaignName, g.arm, len(g.tenantIDs)),
+		Active:           true,
+		Windows:          tileHours(g.hourSet, days),
+		Target:           tenant.Target{Mode: tenant.TargetList, TenantIDs: g.tenantIDs},
+		IdleSeconds:      g.config.idleSeconds,
+		MaxPings:         g.config.maxPings,
+		MinPrefixTokens:  campaignDefaultMinPrefixTokens,
+		PredictorID:      g.config.predictorID,
+		HeadTTL1h:        g.config.headTTL1h,
+		HeadTTLMinTokens: g.config.headTTLMinTokens,
 	}
+}
+
+// validateGroupStrategy runs the same checks ctlCreateKeepAliveStrategy already runs on
+// a manually-created strategy before persisting it — defense in depth here, since a
+// strategy strategyForGroup built from campaignArmFor's own vetted constants and
+// resolveCampaignCell's hour-range check should always already be valid, but "should
+// always" is not "provably always," and the alternative to checking is trusting a
+// window/target/bounds mismatch to surface itself only much later, silently, as a
+// strategy that pings and saves nothing forever.
+func validateGroupStrategy(s tenant.Strategy) error {
+	idle := time.Duration(s.IdleSeconds) * time.Second
+	if err := validStrategyBounds(idle, s.MaxPings, s.MinPrefixTokens, s.MaxUSDPerPing,
+		s.HeadTTL1h, s.HeadTTLMinTokens); err != nil {
+		return err
+	}
+	if err := s.Target.Validate(); err != nil {
+		return err
+	}
+	if err := validWindows(s.Windows); err != nil {
+		return err
+	}
+	return validPredictorRef(s.PredictorID, s.PredictorThreshold)
 }
 
 // campaignCtlRoutes is this feature's control-plane table, appended to ctlRoutes in
@@ -488,7 +531,21 @@ func (h *Handler) ctlCreateCampaign(w http.ResponseWriter, r *http.Request) {
 	groups := coalesceCampaignCells(resolved)
 	created := make([]tenant.Strategy, 0, len(groups))
 	for _, g := range groups {
-		s, err := h.registry().CreateStrategy(actor.ID, strategyForGroup(in.Name, g, days))
+		strategy := strategyForGroup(in.Name, g, days)
+		if err := validateGroupStrategy(strategy); err != nil {
+			// Defense in depth: campaignArmFor's own constants and resolveCampaignCell's
+			// hour-range check should make this unreachable, but a coalesced strategy this
+			// deployment could not actually enforce must never be silently persisted as if
+			// it could — every cell that would have shared it becomes non-activatable with
+			// the reason, the same as any other unenforceable arm, instead of aborting the
+			// whole campaign over one bad group.
+			for _, c := range g.cells {
+				c.activatable = false
+				c.skipReason = "could not create a valid strategy: " + err.Error()
+			}
+			continue
+		}
+		s, err := h.registry().CreateStrategy(actor.ID, strategy)
 		if err != nil {
 			h.rollbackCampaignStrategies(created)
 			ctlErr(w, http.StatusInternalServerError,
@@ -520,17 +577,26 @@ func (h *Handler) ctlCreateCampaign(w http.ResponseWriter, r *http.Request) {
 			"could not record this campaign, so its strategies were not created: "+err.Error())
 		return
 	}
+	// Every strategy in `created` is live and already referenced by committed
+	// campaign_cells rows by this point, so an audit-write failure on one of them is
+	// not a reason to stop attempting the rest — unlike the create-strategy loop
+	// above, where a failure DOES stop everything (nothing downstream depends on the
+	// failed one yet). Collect failures rather than bailing on the first, so a
+	// transient error on strategy 2 of 3 doesn't also skip the attempt for strategy 3.
+	var auditFailed bool
 	for _, s := range created {
 		if err := h.registry().AuditWrite(actor.ID, actor.ID, s.ID, "",
 			"created via campaign: "+campaign.Name); err != nil {
-			// The strategies and the campaign both exist at this point; an audit-write
-			// failure here is logged by AuditWrite's own caller convention elsewhere, but
-			// unwinding a campaign that already has real cells recorded against it would
-			// discard more than it protects, unlike the single-strategy create path.
-			ctlErr(w, http.StatusInternalServerError,
-				"the campaign was created, but its audit trail could not be fully written")
-			return
+			auditFailed = true
 		}
+	}
+	if auditFailed {
+		// The strategies and the campaign both exist at this point; unwinding a
+		// campaign that already has real cells recorded against it would discard more
+		// than it protects, unlike the single-strategy create path.
+		ctlErr(w, http.StatusInternalServerError,
+			"the campaign was created, but its audit trail could not be fully written")
+		return
 	}
 	h.keeper.loadStrategies()
 	view := viewCampaign(campaign)
@@ -657,8 +723,14 @@ func (h *Handler) campaignTenantSummaries(r *http.Request, campaign tenant.Campa
 			byTenant[c.TenantID] = s
 			order = append(order, c.TenantID)
 		}
-		s.PredictedUSD += c.PredictedUSD
+		// Only count a cell's predicted saving when it actually became a strategy
+		// (StrategyID != ""): a simulation-only or model-gated-out arm's PredictedUSD
+		// is frozen for the record, but it was never attempted, so there is no
+		// "reality" a real number could ever be checked against. Summing it in here
+		// would inflate Predicted against a population Real can never match, over
+		// exactly the arms this deployment couldn't enforce in the first place.
 		if c.StrategyID != "" {
+			s.PredictedUSD += c.PredictedUSD
 			strategyIDs[c.StrategyID] = true
 		}
 	}
@@ -701,9 +773,14 @@ type campaignCellDrilldown struct {
 	RealNetUSD     float64 `json:"real_net_usd"`
 	// Normalized, present only where the denominator is nonzero — a $-per-1k-requests
 	// or $-per-active-day figure over zero of either is not a number, it is a division
-	// this response refuses to fabricate.
-	RealSavedUSDPer1kRequests float64 `json:"real_saved_usd_per_1k_requests,omitempty"`
-	RealSavedUSDPerActiveDay  float64 `json:"real_saved_usd_per_active_day,omitempty"`
+	// this response refuses to fabricate. Pointers, not omitempty float64s: the
+	// computed rate can itself legitimately be exactly 0 (real traffic, zero credited
+	// saving that hour), and omitempty on a float64 cannot tell that apart from "never
+	// computed" — the same "zero looks like absence" mistake fixed once already on
+	// campaignView's totals. nil here means genuinely not computed; a non-nil *0 means
+	// the rate really is zero.
+	RealSavedUSDPer1kRequests *float64 `json:"real_saved_usd_per_1k_requests,omitempty"`
+	RealSavedUSDPerActiveDay  *float64 `json:"real_saved_usd_per_active_day,omitempty"`
 }
 
 // ctlGetCampaignTenant is the per-user drill-down: every hour cell for one tenant in
@@ -746,10 +823,12 @@ func (h *Handler) ctlGetCampaignTenant(w http.ResponseWriter, r *http.Request) {
 			d.RealPings, d.RealPingUSD = rc.Pings, rc.PingUSD
 			d.RealSavedUSD, d.RealNetUSD = rc.SavedUSD, rc.NetUSD
 			if rc.Requests > 0 {
-				d.RealSavedUSDPer1kRequests = rc.SavedUSD / float64(rc.Requests) * 1000
+				per1k := rc.SavedUSD / float64(rc.Requests) * 1000
+				d.RealSavedUSDPer1kRequests = &per1k
 			}
 			if rc.ActiveDays > 0 {
-				d.RealSavedUSDPerActiveDay = rc.SavedUSD / float64(rc.ActiveDays)
+				perDay := rc.SavedUSD / float64(rc.ActiveDays)
+				d.RealSavedUSDPerActiveDay = &perDay
 			}
 		}
 		out = append(out, d)
@@ -791,8 +870,18 @@ func (h *Handler) campaignRealSavings(r *http.Request, campaign tenant.Campaign,
 	if err != nil {
 		return nil, campaignRealSavingsCaveat, err
 	}
+	// The cost half of CampaignRealSavings is deliberately NOT tenant-scoped (a
+	// coalesced strategy commonly targets more than one tenant, and its ping cost is
+	// exact per row regardless), so rows for every tenant that strategy touched come
+	// back here, not only tenantID's own. Filtering to tenantID here, rather than
+	// relying on the caller to have passed only one tenant in, is what keeps two
+	// tenants sharing a coalesced strategy from overwriting each other's cell in this
+	// map when both have activity in the same hour.
 	out := make(map[int]dash.CampaignSavingCell, len(rows))
 	for _, row := range rows {
+		if row.TenantID != tenantID {
+			continue
+		}
 		out[row.HourUTC] = row
 	}
 	return out, campaignRealSavingsCaveat, nil

@@ -51,6 +51,23 @@ func (k *keeper) loadStrategies() {
 	k.setStrategies(list)
 }
 
+// clockNow is the nil-safe clock resolveHeadTTL's call site in applyMode uses, so the
+// write-tier half of the policy is driven by the SAME clock as the ping-scheduling half
+// (keeper.record calls applyStrategy with k.now(), never time.Now() directly) — both
+// halves' own doc comments already assert they resolve the same matching strategy "so
+// the two can never disagree," an invariant that requires them to see the same instant,
+// not just the same code path. k.now defaults to time.Now in production (newKeeper) but
+// is swapped for a deterministic/simulated clock throughout this package's own test
+// suite, so a caller reaching for time.Now() directly is a real, if usually invisible,
+// gap between the two halves' inputs. A nil keeper (or one with no clock set, which
+// should not happen outside a test that never called newKeeper) falls back to time.Now.
+func (k *keeper) clockNow() time.Time {
+	if k == nil || k.now == nil {
+		return time.Now()
+	}
+	return k.now()
+}
+
 // bestStrategyFor resolves the highest-priority ACTIVE strategy matching tenantID at
 // `now`, if any — the one matching walk both applyStrategy (the ping-scheduling half,
 // resolved at record time) and resolveHeadTTL (the write-tier half, resolved on the
@@ -169,8 +186,15 @@ const (
 // design doc's "Model"). Checked on its own terms: non-negative, with 0 left to mean
 // "use the package default" exactly like account config does (CachePolicy.Ceiling()).
 //
-// headTTLMinTokens only needs to be non-negative — it is ignored outright while
-// headTTL1h is false, the same convention CachePolicy.HeadTTLMinTokens already follows.
+// headTTLMinTokens only needs to be non-negative while headTTL1h is false, the same
+// convention CachePolicy.HeadTTLMinTokens follows — but once headTTL1h IS set, zero is
+// refused outright rather than silently accepted: apply.Opts's own gate
+// (`o.HeadTTL1h && o.HeadTTLMinTokens > 0`) treats 0 as "never upgrade", so a strategy
+// with HeadTTL1h=true and HeadTTLMinTokens<=0 would be created successfully, ping on the
+// 1-hour schedule, and never once actually promote the head to the 1-hour tier — paying
+// the ping cost for a benefit that can never happen. There is no legitimate reason to
+// want that combination; account config's own Resolved() never lets this pairing exist
+// either (0 there means "use DefaultHeadTTLMinTokens", not "disable the upgrade").
 func validStrategyBounds(idle time.Duration, pings, minPrefix int, maxUSDPerPing float64,
 	headTTL1h bool, headTTLMinTokens int) error {
 	maxIdle, maxPings := maxOverrideIdle, maxOverridePings
@@ -197,6 +221,10 @@ func validStrategyBounds(idle time.Duration, pings, minPrefix int, maxUSDPerPing
 	}
 	if headTTLMinTokens < 0 {
 		return fmt.Errorf("the head-TTL token floor cannot be negative")
+	}
+	if headTTL1h && headTTLMinTokens <= 0 {
+		return fmt.Errorf("a strategy asking for the 1h head-TTL tier needs a positive token " +
+			"floor; 0 means the upgrade never fires, which pays the 1h ping schedule for no benefit")
 	}
 	return nil
 }

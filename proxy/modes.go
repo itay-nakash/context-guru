@@ -51,7 +51,7 @@ func (h *Handler) applyMode(r *reqInfo) ([]byte, time.Duration, apply.Trace) {
 	// is off even then — the ttl field reaches the provider, but Bedrock grants the 1h
 	// tier only for the Claude 4.5 family and silently downgrades the models this
 	// service actually runs.
-	headTTL1h, headTTLMinTokens := h.keeper.resolveHeadTTL(r.tn.ID, time.Now(),
+	headTTL1h, headTTLMinTokens := h.keeper.resolveHeadTTL(r.tn.ID, h.keeper.clockNow(),
 		r.tn.Cache.HeadTTL1h, r.tn.Cache.HeadTTLMinTokens)
 	res := apply.BodyOpts(r.ctx, r.tn.Pipe, r.tn.Store, apply.Opts{
 		Provider: r.provider, Body: r.body, Session: r.session, Tenant: r.tn.ID, Bypass: r.bypassed,

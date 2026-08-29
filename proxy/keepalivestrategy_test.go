@@ -180,16 +180,27 @@ func TestValidStrategyBounds(t *testing.T) {
 		{"zero ceiling means default, and is fine", 280 * time.Second, 2, 0, 0, false, 0, true},
 		{"negative head-ttl-min-tokens", 280 * time.Second, 2, 0, 0, false, -1, false},
 
-		// The 1h-tier band, only reachable while headTTL1h is set.
+		// The 1h-tier band, only reachable while headTTL1h is set. A positive
+		// headTTLMinTokens (50000, mirroring config.DefaultHeadTTLMinTokens) is used
+		// throughout so each case isolates the ONE bound it's actually testing —
+		// idle/pings — rather than also tripping the separate zero-token-floor refusal
+		// below.
 		{"1h idle beyond the 5m ceiling is fine under the 1h band",
-			maxOverrideIdle + time.Second, 2, 0, 0, true, 0, true},
-		{"1h idle at its own ceiling", maxOverrideIdle1h, 2, 0, 0, true, 0, true},
-		{"1h idle past its own ceiling", maxOverrideIdle1h + time.Second, 2, 0, 0, true, 0, false},
-		{"1h idle below the shared floor", minOverrideIdle - time.Second, 2, 0, 0, true, 0, false},
-		{"1h pings at its own ceiling", 3360 * time.Second, maxOverridePings1h, 0, 0, true, 0, true},
+			maxOverrideIdle + time.Second, 2, 0, 0, true, 50000, true},
+		{"1h idle at its own ceiling", maxOverrideIdle1h, 2, 0, 0, true, 50000, true},
+		{"1h idle past its own ceiling", maxOverrideIdle1h + time.Second, 2, 0, 0, true, 50000, false},
+		{"1h idle below the shared floor", minOverrideIdle - time.Second, 2, 0, 0, true, 50000, false},
+		{"1h pings at its own ceiling", 3360 * time.Second, maxOverridePings1h, 0, 0, true, 50000, true},
 		{"1h pings beyond its own ceiling but under the 5m one",
-			3360 * time.Second, maxOverridePings1h + 1, 0, 0, true, 0, false},
+			3360 * time.Second, maxOverridePings1h + 1, 0, 0, true, 50000, false},
 		{"1h negative head-ttl-min-tokens", 3360 * time.Second, 2, 0, 0, true, -1, false},
+		// The new refusal this test data exists to exercise: headTTL1h=true paired
+		// with a zero (not merely non-negative) token floor is invalid on its own,
+		// independent of every other bound — see validStrategyBounds' own doc comment
+		// on why 0 there is worse than merely "unset."
+		{"1h zero head-ttl-min-tokens is invalid on its own", 3360 * time.Second, 2, 0, 0, true, 0, false},
+		{"5m zero head-ttl-min-tokens is fine (headTTL1h is off)",
+			280 * time.Second, 2, 0, 0, false, 0, true},
 	}
 	for _, c := range cases {
 		err := validStrategyBounds(c.idle, c.pings, c.minPrefix, c.maxUSDPerPing,
