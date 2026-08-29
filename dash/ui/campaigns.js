@@ -40,6 +40,11 @@ const camp = {
   // source:"upload" regardless of where it came from — see createCampaignFromPending's
   // own comment for why re-fetching at commit time would be the wrong choice.
   pending: null,
+  // Bumped on every openCampaignDrawer call, and checked by each async drawer render
+  // before it mutates the drawer body — so a slow fetch for a campaign the manager has
+  // since closed or moved on from can never overwrite what's now actually on screen.
+  // See renderCampaignOverview/renderCampaignTenantDrilldown.
+  drawerGen: 0,
 };
 
 async function loadCampaigns() {
@@ -106,6 +111,12 @@ function onUploadSuggestFile(ev) {
       errorState(clear(preview), 'That file is not valid JSON', e);
       return;
     }
+    // JSON.parse("null") and JSON.parse("42") both succeed without throwing, so the
+    // try/catch above alone does not guarantee an object with a .cells to read.
+    if (!suggest || typeof suggest !== 'object' || Array.isArray(suggest)) {
+      errorState(clear(preview), 'That file is valid JSON, but not a suggest object', '');
+      return;
+    }
     camp.pending = suggest;
     renderSuggestPreview(clear(preview), suggest);
   };
@@ -155,7 +166,7 @@ function renderSuggestPreview(host, suggest) {
     type: 'text', maxlength: '64', placeholder: 'Campaign name', 'data-testid': 'camp-name',
   });
   const createBtn = el('button', {
-    'data-testid': 'camp-create', onclick: () => createCampaignFromPending(nameInput, host),
+    'data-testid': 'camp-create', onclick: () => createCampaignFromPending(nameInput, createBtn, host),
   }, 'Create campaign');
   host.appendChild(el('div', { class: 'row-actions', style: 'margin-top:var(--sp-3)' }, nameInput, createBtn));
 }
@@ -166,10 +177,17 @@ function renderSuggestPreview(host, suggest) {
  * rather than asking the server to re-fetch live data at commit time. Re-fetching would
  * let traffic between preview and commit change the numbers a manager just reviewed;
  * submitting exactly what was shown means "create this" always means what it says.
+ *
+ * createBtn is disabled synchronously, before the first await, and only re-enabled in a
+ * finally — the same pattern fetchLiveSuggestions already uses — because a campaign
+ * create has no idempotency/dedup on the server: two clicks (an accidental double-click,
+ * or an impatient second click on a slow network) would each create a full, independent
+ * set of live keep-alive strategies, not just a UI glitch.
  */
-async function createCampaignFromPending(nameInput, previewHost) {
+async function createCampaignFromPending(nameInput, createBtn, previewHost) {
   const name = (nameInput.value || '').trim();
   if (!name) { nameInput.focus(); return; }
+  createBtn.disabled = true;
   try {
     const created = await ctl('/api/keepalive/campaigns', {
       method: 'POST',
@@ -180,6 +198,8 @@ async function createCampaignFromPending(nameInput, previewHost) {
     await refreshCampaignsList();
   } catch (e) {
     errorState(previewHost, 'Could not create this campaign', e);
+  } finally {
+    createBtn.disabled = false;
   }
 }
 
@@ -257,21 +277,32 @@ async function archiveCampaign(c) {
 
 /** openStrategyLedger's per-entity precedent, for a whole campaign instead of one strategy. */
 async function openCampaignDrawer(c) {
+  const gen = ++camp.drawerGen;
   const body = openDrawer('Campaign: ' + c.name, null);
-  await renderCampaignOverview(body, c.id);
+  await renderCampaignOverview(body, c.id, gen);
 }
 
-async function renderCampaignOverview(body, campaignID) {
+/**
+ * gen is the drawer generation this render was started for (camp.drawerGen at the time
+ * openCampaignDrawer was called). #drawer-body is one singleton node the drawer reuses
+ * across opens — closing it does not cancel an in-flight fetch — so without this check
+ * a slow fetch for a campaign the manager has since closed, or navigated away from
+ * inside the SAME drawer (a tenant drill-down, or a different campaign entirely), could
+ * still resolve later and silently overwrite whatever is now actually on screen.
+ */
+async function renderCampaignOverview(body, campaignID, gen) {
   clear(body);
   loadingState(body, 3);
   let detail;
   try {
     detail = await ctl('/api/keepalive/campaigns/' + campaignID);
   } catch (e) {
+    if (gen !== camp.drawerGen) return;
     clear(body);
     errorState(body, 'Could not load this campaign', e);
     return;
   }
+  if (gen !== camp.drawerGen) return;
   clear(body);
   body.appendChild(tileGroup(null, null, [
     tile('camp-predicted', 'Predicted saving', usd(detail.total_predicted_usd)),
@@ -296,7 +327,7 @@ async function renderCampaignOverview(body, campaignID) {
   const tbody = el('tbody');
   for (const t of tenants) {
     tbody.appendChild(el('tr', {
-      class: 'click', onclick: () => renderCampaignTenantDrilldown(body, campaignID, t.tenant_id),
+      class: 'click', onclick: () => renderCampaignTenantDrilldown(body, campaignID, t.tenant_id, gen),
     },
       el('td', {}, el('code', { class: 'clip' }, t.tenant_id)),
       el('td', { class: 'num' }, usd(t.predicted_usd)),
@@ -324,21 +355,24 @@ function hourUTCToLocalLabel(hourUTC) {
   return `${String(hourUTC).padStart(2, '0')}:00 UTC (${local} Jerusalem today)`;
 }
 
-async function renderCampaignTenantDrilldown(body, campaignID, tenantID) {
+/** See renderCampaignOverview's doc comment on gen — the same stale-render guard. */
+async function renderCampaignTenantDrilldown(body, campaignID, tenantID, gen) {
   clear(body);
   loadingState(body, 3);
   let out;
   try {
     out = await ctl('/api/keepalive/campaigns/' + campaignID + '/tenants/' + encodeURIComponent(tenantID));
   } catch (e) {
+    if (gen !== camp.drawerGen) return;
     clear(body);
     errorState(body, 'Could not load this tenant’s drill-down', e);
     return;
   }
+  if (gen !== camp.drawerGen) return;
   clear(body);
   body.appendChild(el('button', {
     class: 'ghost small', 'data-testid': 'camp-back-to-overview',
-    onclick: () => renderCampaignOverview(body, campaignID),
+    onclick: () => renderCampaignOverview(body, campaignID, gen),
   }, '← Back to overview'));
   body.appendChild(el('h3', {}, 'Tenant: ' + tenantID));
   if (out.caveat) body.appendChild(el('p', { class: 'note' }, out.caveat));
@@ -367,8 +401,14 @@ async function renderCampaignTenantDrilldown(body, campaignID, tenantID) {
       el('td', { class: 'num' }, hasReal ? usd(cell.real_saved_usd) : el('span', { class: 'pill neutral' }, 'no data yet')),
       el('td', { class: 'num ' + (hasReal && cell.real_net_usd < 0 ? 'bad-text' : 'good-text') },
         hasReal ? usd(cell.real_net_usd) : '—'),
-      el('td', { class: 'num' }, cell.real_saved_usd_per_1k_requests ? usd(cell.real_saved_usd_per_1k_requests) : '—'),
-      el('td', { class: 'num' }, cell.real_saved_usd_per_active_day ? usd(cell.real_saved_usd_per_active_day) : '—')));
+      // != null, not truthy: the rate is a JSON pointer field on the server
+      // (proxy/campaign.go's *float64), sent only when its denominator was nonzero —
+      // but the rate ITSELF can legitimately be exactly 0 (real traffic, $0 credited
+      // that hour), which a truthy check would wrongly render as "—" (no data).
+      el('td', { class: 'num' },
+        cell.real_saved_usd_per_1k_requests != null ? usd(cell.real_saved_usd_per_1k_requests) : '—'),
+      el('td', { class: 'num' },
+        cell.real_saved_usd_per_active_day != null ? usd(cell.real_saved_usd_per_active_day) : '—')));
   }
   tbl.appendChild(tbody);
   body.appendChild(el('div', { class: 'tblwrap', tabindex: '0' }, tbl));
