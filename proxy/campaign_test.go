@@ -134,6 +134,85 @@ func TestResolveCampaignCellRejectsOutOfRangeHourUTC(t *testing.T) {
 	}
 }
 
+// A thin cell (too few requests to trust its winning arm as a pattern) must not become
+// a real, live strategy for a non-baseline arm — the suggest engine's own
+// InsufficientData flag exists specifically to warn against acting on it.
+func TestResolveCampaignCellInsufficientDataBlocksActivationForNonBaselineArms(t *testing.T) {
+	cell := dash.KVCacheSuggestion{
+		User: "t1", HourUTC: 9, BestStrategy: kvcache.StrategyKeepAlive5m, InsufficientData: true,
+	}
+	got := resolveCampaignCell(cell, func(string) bool { return true })
+	if got.activatable || got.skipReason == "" {
+		t.Errorf("got %+v, want not activatable with a reason", got)
+	}
+}
+
+// A baseline arm ("change nothing") is exempt from the insufficient-data gate: doing
+// nothing carries no risk regardless of sample size, unlike committing to a real
+// ping/write-tier schedule off a thin backtest.
+func TestResolveCampaignCellInsufficientDataDoesNotBlockBaselineArms(t *testing.T) {
+	cell := dash.KVCacheSuggestion{
+		User: "t1", HourUTC: 9, BestStrategy: kvcache.StrategyFixed5m, InsufficientData: true,
+	}
+	got := resolveCampaignCell(cell, func(string) bool { return true })
+	if !got.activatable || !got.config.baseline {
+		t.Errorf("got %+v, want an activatable baseline cell despite insufficient data", got)
+	}
+}
+
+// weekdaysFromNames must never silently produce an empty slice: tenant.Window treats
+// an empty Days as "every day matches," not "no day restricted," and PredictedUSD is
+// always backtested against Sunday-Thursday only — an omitted or fully-unparseable
+// Weekdays list must fall back to that canonical set, never to "every day."
+func TestWeekdaysFromNamesFallsBackToCanonicalWeekWhenNothingIsRecognized(t *testing.T) {
+	for _, names := range [][]string{nil, {}, {"Someday", "Otherday"}} {
+		got := weekdaysFromNames(names)
+		if len(got) != len(campaignDefaultWeekdays) {
+			t.Errorf("weekdaysFromNames(%v) = %v, want the canonical %v", names, got, campaignDefaultWeekdays)
+			continue
+		}
+		for i, d := range campaignDefaultWeekdays {
+			if got[i] != d {
+				t.Errorf("weekdaysFromNames(%v) = %v, want the canonical %v", names, got, campaignDefaultWeekdays)
+				break
+			}
+		}
+	}
+}
+
+// A duplicate (tenant, hour) cell in an uploaded payload must be refused before any
+// strategy is created for it — not left to surface only after tenant.CreateCampaign's
+// own persistence-time guard, by which point the create-strategy loop would already
+// have committed real, live keepalive_strategies rows for every other coalesced group.
+func TestCtlCreateCampaignRejectsDuplicateCellBeforeCreatingAnyStrategy(t *testing.T) {
+	f := newMgrFixture(t)
+	mgrJar, _ := f.signUpJar(t, "boss@ibm.com")
+	_, tenantA := f.signUpJar(t, "a@ibm.com")
+
+	suggest := dash.KVCacheSuggestions{
+		Cells: []dash.KVCacheSuggestion{
+			{User: tenantA, HourUTC: 9, Requests: 10, BestStrategy: kvcache.StrategyKeepAlive5m,
+				SavingUSD: 1.00, BaselineUSD: 2.00},
+			// Same (tenant, hour) again, a different arm — a plausible hand-edit artifact.
+			{User: tenantA, HourUTC: 9, Requests: 10, BestStrategy: kvcache.StrategyKeepAlive5mOnce,
+				SavingUSD: 1.00, BaselineUSD: 2.00},
+		},
+	}
+	body, _ := json.Marshal(map[string]any{"name": "dup", "source": "upload", "suggest": suggest})
+	w, _ := f.do(t, "POST", "/api/keepalive/campaigns", string(body), mgrJar)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("create = %d %s, want 400", w.Code, w.Body)
+	}
+	strategies, err := f.reg.ListStrategies()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(strategies) != 0 {
+		t.Fatalf("got %d strategies, want 0 — a rejected duplicate-cell upload must create none at all, "+
+			"not create-then-roll-back", len(strategies))
+	}
+}
+
 // tileHours must cover exactly the given hours — no gap inside a merged run, no
 // overlap or false coverage between separate runs, and hour 23 must never merge past
 // midnight into hour 0 (tenant.Window has no overnight span).
@@ -363,6 +442,56 @@ func TestCtlCreateCampaignEndToEnd(t *testing.T) {
 	}
 }
 
+// rollbackCampaignStrategies must reload the keeper after deleting, not only the
+// registry's own row: strategyForGroup marks a created strategy Active immediately, so
+// it is already matchable to live traffic the instant it exists in the keeper's
+// in-memory list — deleting it from SQLite without evicting that in-memory copy would
+// leave it pinging/toggling real traffic until some unrelated strategy mutation
+// happened to trigger the next reload.
+func TestRollbackCampaignStrategiesReloadsTheKeeperNotJustTheRegistry(t *testing.T) {
+	f := newMgrFixture(t)
+	mgrJar, _ := f.signUpJar(t, "boss@ibm.com")
+	_, tenantA := f.signUpJar(t, "a@ibm.com")
+
+	suggest := dash.KVCacheSuggestions{
+		Cells: []dash.KVCacheSuggestion{
+			{User: tenantA, HourUTC: 9, Requests: 10, BestStrategy: kvcache.StrategyKeepAlive5m,
+				SavingUSD: 1.00, BaselineUSD: 2.00},
+		},
+	}
+	body, _ := json.Marshal(map[string]any{"name": "rollback-test", "source": "upload", "suggest": suggest})
+	w, out := f.do(t, "POST", "/api/keepalive/campaigns", string(body), mgrJar)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create = %d %s", w.Code, w.Body)
+	}
+	cells, _ := out["cells"].([]any)
+	strategyID, _ := cells[0].(map[string]any)["strategy_id"].(string)
+	if strategyID == "" {
+		t.Fatal("no strategy id created")
+	}
+
+	inKeeper := func() bool {
+		f.h.keeper.mu.Lock()
+		defer f.h.keeper.mu.Unlock()
+		for _, s := range f.h.keeper.strategies {
+			if s.ID == strategyID {
+				return true
+			}
+		}
+		return false
+	}
+	if !inKeeper() {
+		t.Fatal("the created strategy is not yet visible to the keeper (create should load it)")
+	}
+
+	f.h.rollbackCampaignStrategies([]tenant.Strategy{{ID: strategyID}})
+
+	if inKeeper() {
+		t.Error("the rolled-back strategy is still in the keeper's in-memory list — " +
+			"it would keep matching live traffic despite being deleted")
+	}
+}
+
 // An empty-user suggest payload creates nothing to campaign over — a clear 400, not a
 // campaign with zero cells.
 func TestCtlCreateCampaignAllCellsExcludedIsRefused(t *testing.T) {
@@ -439,6 +568,61 @@ func TestCtlGetCampaignAggregatesPredictedAndRealPerTenant(t *testing.T) {
 	}
 }
 
+// A genuinely zero real-saving RATE (real traffic happened, but none of it was
+// credited that hour) must render as 0 on the wire, not be omitted as though it were
+// never computed at all — the *float64 fields exist specifically so a caller can tell
+// "$0 per 1k requests" apart from "no requests to divide by."
+func TestCtlGetCampaignTenantDrilldownRendersAGenuineZeroRateNotAnOmittedOne(t *testing.T) {
+	f := newMgrFixture(t)
+	mgrJar, _ := f.signUpJar(t, "boss@ibm.com")
+	_, tenantA := f.signUpJar(t, "a@ibm.com")
+
+	suggest := dash.KVCacheSuggestions{
+		Cells: []dash.KVCacheSuggestion{
+			{User: tenantA, HourUTC: 9, Requests: 10, BestStrategy: kvcache.StrategyKeepAlive5m,
+				SavingUSD: 1.00, BaselineUSD: 2.00},
+		},
+	}
+	body, _ := json.Marshal(map[string]any{"name": "zero-rate", "source": "upload", "suggest": suggest})
+	w, created := f.do(t, "POST", "/api/keepalive/campaigns", string(body), mgrJar)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create = %d %s", w.Code, w.Body)
+	}
+	campaignID, _ := created["id"].(string)
+
+	// Real traffic in the same hour, but none of it credited any keep-alive saving —
+	// Requests/ActiveDays must be nonzero while SavedUSD (and so the normalized rates)
+	// are genuinely, computably zero.
+	f.record(t, tenantA, "s1", &dash.Event{
+		TS: futureHourUTC(9), Model: "aws/claude-sonnet-5", TokenAccounting: dash.AccountingComplete,
+	})
+
+	w, out := f.do(t, "GET", "/api/keepalive/campaigns/"+campaignID+"/tenants/"+tenantA, "", mgrJar)
+	if w.Code != http.StatusOK {
+		t.Fatalf("tenant drilldown = %d %s", w.Code, w.Body)
+	}
+	cells, _ := out["cells"].([]any)
+	if len(cells) != 1 {
+		t.Fatalf("got %d cells, want 1", len(cells))
+	}
+	c := cells[0].(map[string]any)
+	if reqs, _ := c["real_requests"].(float64); reqs != 1 {
+		t.Fatalf("real_requests = %v, want 1", c["real_requests"])
+	}
+	per1k, ok := c["real_saved_usd_per_1k_requests"]
+	if !ok || per1k == nil {
+		t.Errorf("real_saved_usd_per_1k_requests is absent, want a present, genuinely-zero rate: %v", c)
+	} else if v, _ := per1k.(float64); v != 0 {
+		t.Errorf("real_saved_usd_per_1k_requests = %v, want 0", v)
+	}
+	perDay, ok := c["real_saved_usd_per_active_day"]
+	if !ok || perDay == nil {
+		t.Errorf("real_saved_usd_per_active_day is absent, want a present, genuinely-zero rate: %v", c)
+	} else if v, _ := perDay.(float64); v != 0 {
+		t.Errorf("real_saved_usd_per_active_day = %v, want 0", v)
+	}
+}
+
 // The 1h-tier model-honoring gate must work with the REAL, DB-backed check
 // (tenantHonorsHeadTTL1h), not just the fake closures every other test injects directly
 // into resolveCampaignCell. This is the actual mechanism that decides whether a
@@ -504,6 +688,103 @@ func TestCtlCreateCampaignGatesThe1hTierByRealTenantTrafficModel(t *testing.T) {
 	}
 	if len(s.Target.TenantIDs) != 1 || s.Target.TenantIDs[0] != honoredTenant {
 		t.Errorf("strategy target = %+v, want only the honored tenant", s.Target)
+	}
+}
+
+// keepalive-5m-once, stop-reason-gated, and keepalive-1h-once were, until now, only
+// ever driven through campaignArmFor/resolveCampaignCell directly in unit tests, never
+// through the real create-campaign HTTP route with an assertion on every field of the
+// resulting tenant.Strategy — precisely the gap that let stop-reason-gated ship with no
+// PredictorThreshold at all (a silent zero value that makes predictorFor's gate a
+// no-op, so the arm pinged unconditionally, identically to keepalive-5m, despite being
+// labeled and billed as the predictor-gated arm) go undetected.
+//
+// One tenant, three hours, three arms — not one tenant per arm — because self-
+// registration is rate-limited to 3/minute per client address (registrationsPerMinute)
+// and this fixture has no way to vary the address per signUpJar call; a single tenant
+// with cells at different hours resolves into separate, uncoalesced strategies just as
+// well, since coalesceCampaignCells groups by (tenant, arm) before ever looking at hours.
+func TestCtlCreateCampaignEveryArmCarriesItsOwnLiveParameters(t *testing.T) {
+	f := newMgrFixture(t)
+	mgrJar, _ := f.signUpJar(t, "boss@ibm.com")
+	_, tenantID := f.signUpJar(t, "many-arms@ibm.com")
+
+	// keepalive-1h-once needs this tenant's traffic to honor the 1h cache tier.
+	f.record(t, tenantID, "s1", &dash.Event{Model: "aws/claude-haiku-4-5"})
+
+	suggest := dash.KVCacheSuggestions{
+		Cells: []dash.KVCacheSuggestion{
+			{User: tenantID, HourUTC: 9, Requests: 10, BestStrategy: kvcache.StrategyKeepAlive5mOnce,
+				SavingUSD: 1.00, BaselineUSD: 2.00},
+			{User: tenantID, HourUTC: 10, Requests: 10, BestStrategy: kvcache.StrategyStopReasonGated,
+				SavingUSD: 1.00, BaselineUSD: 2.00},
+			{User: tenantID, HourUTC: 11, Requests: 10, BestStrategy: kvcache.StrategyKeepAlive1hOnce,
+				SavingUSD: 5.00, BaselineUSD: 10.00},
+		},
+	}
+	body, _ := json.Marshal(map[string]any{"name": "every-arm", "source": "upload", "suggest": suggest})
+	w, out := f.do(t, "POST", "/api/keepalive/campaigns", string(body), mgrJar)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create = %d %s", w.Code, w.Body)
+	}
+	cells, _ := out["cells"].([]any)
+	for _, c := range cells {
+		m := c.(map[string]any)
+		if activatable, _ := m["activatable"].(bool); !activatable {
+			t.Errorf("cell %v not activatable, want all three arms activatable here", m)
+		}
+	}
+
+	strategies, err := f.reg.ListStrategies()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(strategies) != 3 {
+		t.Fatalf("got %d strategies, want 3 (one per arm, no coalescing across arms): %+v",
+			len(strategies), strategies)
+	}
+	byIdle := map[int]tenant.Strategy{}
+	// keepalive-5m-once and stop-reason-gated share IdleSeconds=280 — disambiguated by
+	// PredictorID, which only the latter sets.
+	var once5m, gated tenant.Strategy
+	for _, s := range strategies {
+		if len(s.Target.TenantIDs) != 1 || s.Target.TenantIDs[0] != tenantID {
+			t.Fatalf("strategy %+v targets %v, want only %q", s, s.Target.TenantIDs, tenantID)
+		}
+		byIdle[s.IdleSeconds] = s
+		if s.IdleSeconds != 280 {
+			continue
+		}
+		if s.PredictorID != "" {
+			gated = s
+		} else {
+			once5m = s
+		}
+	}
+	if once5m.MaxPings != 1 {
+		t.Errorf("keepalive-5m-once strategy = %+v, want idle 280s, max 1 ping", once5m)
+	}
+	if gated.MaxPings != campaignDefaultMaxPings {
+		t.Errorf("stop-reason-gated strategy = %+v, want idle 280s, max %d pings",
+			gated, campaignDefaultMaxPings)
+	}
+	if gated.PredictorID != "stop-reason-gated" {
+		t.Errorf("stop-reason-gated strategy PredictorID = %q, want %q",
+			gated.PredictorID, "stop-reason-gated")
+	}
+	if gated.PredictorThreshold <= 0 {
+		t.Errorf("stop-reason-gated strategy PredictorThreshold = %v, want a positive value — "+
+			"0 makes the predictor gate a no-op (predictorFor never returns a negative probability)",
+			gated.PredictorThreshold)
+	}
+
+	hourOnce := byIdle[3360]
+	if hourOnce.MaxPings != 1 {
+		t.Errorf("keepalive-1h-once strategy MaxPings = %d, want 1", hourOnce.MaxPings)
+	}
+	if !hourOnce.HeadTTL1h || hourOnce.HeadTTLMinTokens <= 0 {
+		t.Errorf("keepalive-1h-once strategy = %+v, want HeadTTL1h=true with a positive HeadTTLMinTokens",
+			hourOnce)
 	}
 }
 
@@ -594,11 +875,27 @@ func TestCtlCreateCampaignOutOfRangeHourIsNotActivatedAsADeadStrategy(t *testing
 	}
 }
 
+// futureHourUTC returns an epoch-ms timestamp guaranteed to land in the given UTC hour
+// on a day strictly after "now" — so a recorded event's own UTC hour, and its
+// after-ActivatedAt-ness, never depend on what wall-clock hour the test happens to run
+// at (unlike time.Now().UnixMilli(), which mgrFixture.record defaults to when TS is 0).
+func futureHourUTC(hour int) int64 {
+	now := time.Now().UTC()
+	return time.Date(now.Year(), now.Month(), now.Day()+1, hour, 0, 0, 0, time.UTC).UnixMilli()
+}
+
 // Two tenants sharing a coalesced strategy (same arm, same hour) must never see each
 // other's real ping/saving numbers in the per-tenant drill-down: the underlying
 // CampaignRealSavings query is deliberately not tenant-scoped on its cost half (a
 // shared strategy's ping cost legitimately spans every tenant it targets), so the
 // caller must filter to the tenant actually being viewed.
+//
+// tenant B's events are pinned to hour 9 UTC (matching the suggest cells' own
+// HourUTC: 9) rather than left to default to time.Now(): without that pin, this test
+// only actually exercises the leak it claims to guard when it happens to run during
+// UTC hour 9 — any other hour, tenant B's leaked row would land under a different hour
+// key than tenant A's cell looks up, and the test would pass vacuously whether or not
+// the tenant filter this test guards is even present.
 func TestCtlGetCampaignTenantDoesNotLeakAnotherTenantsRealSavings(t *testing.T) {
 	f := newMgrFixture(t)
 	mgrJar, _ := f.signUpJar(t, "boss@ibm.com")
@@ -628,13 +925,16 @@ func TestCtlGetCampaignTenantDoesNotLeakAnotherTenantsRealSavings(t *testing.T) 
 	}
 	strategyID := strategies[0].ID
 
-	// Only tenant B pings/gets credited — tenant A has NO real traffic at all.
+	// Only tenant B pings/gets credited — tenant A has NO real traffic at all. TS pinned
+	// to UTC hour 9 (see futureHourUTC's own doc comment) so the leak this test guards
+	// is exercised regardless of what hour the suite happens to run at.
 	f.record(t, tenantB, "s1", &dash.Event{
-		KeepAlive: true, KeepAliveStrategyID: strategyID, CostUSD: 0.05,
+		TS: futureHourUTC(9), KeepAlive: true, KeepAliveStrategyID: strategyID, CostUSD: 0.05,
 		CacheRead: 40_000, Model: "aws/claude-sonnet-5", TokenAccounting: dash.AccountingComplete,
 	})
 	f.record(t, tenantB, "s1", &dash.Event{
-		KeepAliveSavedUSD: 0.30, Model: "aws/claude-sonnet-5", TokenAccounting: dash.AccountingComplete,
+		TS: futureHourUTC(9), KeepAliveSavedUSD: 0.30, Model: "aws/claude-sonnet-5",
+		TokenAccounting: dash.AccountingComplete,
 	})
 
 	w, out := f.do(t, "GET", "/api/keepalive/campaigns/"+campaignID+"/tenants/"+tenantA, "", mgrJar)
@@ -651,6 +951,90 @@ func TestCtlGetCampaignTenantDoesNotLeakAnotherTenantsRealSavings(t *testing.T) 
 	}
 	if realSaved, _ := c["real_saved_usd"].(float64); realSaved != 0 {
 		t.Errorf("tenant A's cell shows $%v real saved — tenant B's credit leaked into it: %v", realSaved, c)
+	}
+}
+
+// A tenant with zero activated cells in a campaign must show $0 real saving, not just
+// $0 predicted — even when that tenant genuinely has real, credited keep-alive saving
+// from something this campaign never created (another campaign, a manually-created
+// strategy, or any other pre-existing keep-alive mechanism). Predicted and Real must
+// describe the SAME population: a tenant this campaign never activated is a tenant it
+// gets no credit for, on either side of the comparison.
+func TestCampaignRealSavingsOnlyCoversTenantsThisCampaignActivated(t *testing.T) {
+	f := newMgrFixture(t)
+	mgrJar, _ := f.signUpJar(t, "boss@ibm.com")
+	_, tenantA := f.signUpJar(t, "a@ibm.com")
+	_, tenantB := f.signUpJar(t, "b@ibm.com")
+
+	suggest := dash.KVCacheSuggestions{
+		Cells: []dash.KVCacheSuggestion{
+			{User: tenantA, HourUTC: 9, Requests: 10, BestStrategy: kvcache.StrategyKeepAlive5m,
+				SavingUSD: 1.00, BaselineUSD: 2.00},
+			// Simulation-only: tenant B never gets a strategy from this campaign.
+			{User: tenantB, HourUTC: 14, Requests: 10, BestStrategy: kvcache.StrategyHistorical,
+				SavingUSD: 1000.00, BaselineUSD: 2000.00},
+		},
+	}
+	body, _ := json.Marshal(map[string]any{"name": "mixed-activation", "source": "upload", "suggest": suggest})
+	w, created := f.do(t, "POST", "/api/keepalive/campaigns", string(body), mgrJar)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create = %d %s", w.Code, w.Body)
+	}
+	campaignID, _ := created["id"].(string)
+	strategies, err := f.reg.ListStrategies()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(strategies) != 1 {
+		t.Fatalf("got %d strategies, want 1 (only tenant A's)", len(strategies))
+	}
+
+	// Tenant B has genuine real credited saving, entirely unrelated to this campaign
+	// (no strategy of this campaign's ever matched it), landing in hour 14 UTC — the
+	// same hour tenant B's own (non-activated) cell names, so a leak would show up
+	// exactly where a manager would look for it.
+	f.record(t, tenantB, "s1", &dash.Event{
+		TS: futureHourUTC(14), KeepAliveSavedUSD: 0.75, Model: "aws/claude-sonnet-5",
+		TokenAccounting: dash.AccountingComplete,
+	})
+
+	w, out := f.do(t, "GET", "/api/keepalive/campaigns/"+campaignID, "", mgrJar)
+	if w.Code != http.StatusOK {
+		t.Fatalf("get = %d %s", w.Code, w.Body)
+	}
+	tenants, _ := out["tenants"].([]any)
+	if len(tenants) != 2 {
+		t.Fatalf("got %d tenant summaries, want 2 (both tenants still listed)", len(tenants))
+	}
+	for _, tv := range tenants {
+		row := tv.(map[string]any)
+		if row["tenant_id"] != tenantB {
+			continue
+		}
+		if p, _ := row["predicted_usd"].(float64); p != 0 {
+			t.Errorf("tenant B predicted_usd = %v, want 0 (never activated)", p)
+		}
+		if s, _ := row["real_saved_usd"].(float64); s != 0 {
+			t.Errorf("tenant B real_saved_usd = %v, want 0 — its unrelated real credit must not "+
+				"be attributed to a campaign that never activated anything for it", s)
+		}
+		if n, _ := row["real_net_usd"].(float64); n != 0 {
+			t.Errorf("tenant B real_net_usd = %v, want 0", n)
+		}
+	}
+
+	w, out = f.do(t, "GET", "/api/keepalive/campaigns/"+campaignID+"/tenants/"+tenantB, "", mgrJar)
+	if w.Code != http.StatusOK {
+		t.Fatalf("tenant B drilldown = %d %s", w.Code, w.Body)
+	}
+	cells, _ := out["cells"].([]any)
+	if len(cells) != 1 {
+		t.Fatalf("got %d cells for tenant B, want 1", len(cells))
+	}
+	c := cells[0].(map[string]any)
+	if realSaved, _ := c["real_saved_usd"].(float64); realSaved != 0 {
+		t.Errorf("tenant B's drilldown cell shows $%v real saved despite never being activated: %v",
+			realSaved, c)
 	}
 }
 

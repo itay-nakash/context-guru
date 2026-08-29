@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"fmt"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strconv"
@@ -55,6 +56,13 @@ const campaignDefaultMaxPings = 2
 // the 1-hour tier.
 const campaignDefaultHeadTTLMinTokens = 50000
 
+// campaignDefaultPredictorThreshold is stop-reason-gated's own live threshold,
+// matching the value this codebase's own tests already use whenever they exercise this
+// predictor manually (proxy/keepaliveoverride_test.go, proxy/keepalivestrategy_test.go)
+// — see validPredictorRef's own refusal of a named predictor paired with a
+// non-positive threshold, which would make predictorFor's gate a no-op.
+const campaignDefaultPredictorThreshold = 0.5
+
 // headTTL1hHonoredModels are the models this deployment has actually measured granting
 // the 1h cache tier rather than silently downgrading it to 5m (apply/headttl.go). A
 // campaign will not mark a 1h-tier arm activatable for a tenant whose traffic in the
@@ -79,11 +87,17 @@ type campaignArm struct {
 	// checks headTTL1hHonoredModels for this specific tenant before activating it.
 	needsModelHonoring bool
 
-	idleSeconds      int
-	maxPings         int
-	predictorID      string
-	headTTL1h        bool
-	headTTLMinTokens int
+	idleSeconds int
+	maxPings    int
+	// predictorID and predictorThreshold always travel together: a predictorID with a
+	// zero threshold would make predictorFor's gate a no-op (see validPredictorRef) —
+	// pingable() ends up pinging on the arm's idle/max-ping schedule unconditionally,
+	// identically to keepalive-5m, while still being labeled and billed as the
+	// predictor-gated arm.
+	predictorID        string
+	predictorThreshold float64
+	headTTL1h          bool
+	headTTLMinTokens   int
 }
 
 // campaignArmFor is the single source of truth the create flow consults. idleSeconds/
@@ -101,7 +115,7 @@ func campaignArmFor(arm string) campaignArm {
 		return campaignArm{activatable: true, idleSeconds: 280, maxPings: 1}
 	case kvcache.StrategyStopReasonGated:
 		return campaignArm{activatable: true, idleSeconds: 280, maxPings: campaignDefaultMaxPings,
-			predictorID: "stop-reason-gated"}
+			predictorID: "stop-reason-gated", predictorThreshold: campaignDefaultPredictorThreshold}
 	case kvcache.StrategyKeepAlive1h:
 		// 3360s = kvcache.DefaultPingIdle1h — "the same margin against the one-hour
 		// lifetime" the simulator itself ships as this arm's default cadence.
@@ -166,16 +180,61 @@ func resolveCampaignCell(cell dash.KVCacheSuggestion, honorsHeadTTL1h func(tenan
 			"1h cache tier on this deployment (see apply/headttl.go)"
 		return out
 	}
+	// InsufficientData means the suggest engine itself does not trust this cell's
+	// winning arm as a pattern (too few requests to backtest from) — activating a real,
+	// live strategy off it anyway would act on exactly what that flag warns against.
+	// Baseline arms are exempt: "change nothing" carries no risk regardless of sample
+	// size, unlike committing to a real ping/write-tier schedule.
+	if cell.InsufficientData && !a.baseline {
+		out.skipReason = "too few requests in this cell to trust its recommendation as a pattern"
+		return out
+	}
 	out.activatable = true
 	out.config = a
 	return out
 }
 
-// weekdayByName converts a suggest payload's Weekdays (["Sunday", "Monday", ...]) into
-// tenant.Window's []time.Weekday. An unrecognized name is silently dropped rather than
-// erroring — the caller has no better recovery than "run with fewer restricted days",
-// and the alternative (refusing the whole campaign for one bad string in a list this
-// deployment itself generated) is a worse failure mode.
+// duplicateCampaignCell reports the first cell whose (tenantID, hourUTC) pair also
+// appears earlier in resolved, or nil if every pair is unique — the same key shape
+// tenant.CreateCampaign's own guard checks, run here up front so a duplicate is
+// refused before any strategy is created for it, not just before the campaign record
+// that would have referenced it.
+func duplicateCampaignCell(resolved []*resolvedCampaignCell) *resolvedCampaignCell {
+	seen := map[[2]any]bool{}
+	for _, c := range resolved {
+		key := [2]any{c.tenantID, c.hourUTC}
+		if seen[key] {
+			return c
+		}
+		seen[key] = true
+	}
+	return nil
+}
+
+// campaignDefaultWeekdays is the work week every suggest cell's PredictedUSD is
+// actually backtested against, on either input source: the live path always sets
+// KVCacheSuggestions.Weekdays to this exact set (dash's own kvSuggestWeekdays), and the
+// upload path accepts a hand-edited copy of that same payload. It is the fallback
+// weekdaysFromNames uses when it cannot recover any day at all from the input, rather
+// than "no restriction" — see weekdaysFromNames' own doc comment for why "every day" is
+// the one outcome that must never happen silently here.
+var campaignDefaultWeekdays = []time.Weekday{
+	time.Sunday, time.Monday, time.Tuesday, time.Wednesday, time.Thursday,
+}
+
+// weekdaysFromNames converts a suggest payload's Weekdays (["Sunday", "Monday", ...])
+// into tenant.Window's []time.Weekday. An unrecognized name is silently dropped rather
+// than erroring — the caller has no better recovery than "run with fewer restricted
+// days", and the alternative (refusing the whole campaign for one bad string in a list
+// this deployment itself generated) is a worse failure mode.
+//
+// If NOTHING is recognized — Weekdays omitted entirely by a hand-edited upload, or
+// every name in it misspelled — this returns campaignDefaultWeekdays, never an empty
+// slice: tenant.Window.contains treats an empty Days as "every day matches", not "no
+// day restricted", so a silent drop-to-empty here would create a live strategy that
+// fires on Friday and Saturday too — traffic the frozen PredictedUSD figures were never
+// backtested against (both this suggester and its own callers only ever read
+// Sunday-Thursday history). "Fewer restricted days" must have a floor.
 func weekdaysFromNames(names []string) []time.Weekday {
 	byName := map[string]time.Weekday{
 		"Sunday": time.Sunday, "Monday": time.Monday, "Tuesday": time.Tuesday,
@@ -187,6 +246,9 @@ func weekdaysFromNames(names []string) []time.Weekday {
 		if d, ok := byName[n]; ok {
 			out = append(out, d)
 		}
+	}
+	if len(out) == 0 {
+		return campaignDefaultWeekdays
 	}
 	return out
 }
@@ -303,16 +365,17 @@ func hourSetKey(hours []int) string {
 // coalesced Target and the tiled Windows, at the arm's own live parameters.
 func strategyForGroup(campaignName string, g *campaignGroup, days []time.Weekday) tenant.Strategy {
 	return tenant.Strategy{
-		Name:             fmt.Sprintf("%s: %s (%d tenants)", campaignName, g.arm, len(g.tenantIDs)),
-		Active:           true,
-		Windows:          tileHours(g.hourSet, days),
-		Target:           tenant.Target{Mode: tenant.TargetList, TenantIDs: g.tenantIDs},
-		IdleSeconds:      g.config.idleSeconds,
-		MaxPings:         g.config.maxPings,
-		MinPrefixTokens:  campaignDefaultMinPrefixTokens,
-		PredictorID:      g.config.predictorID,
-		HeadTTL1h:        g.config.headTTL1h,
-		HeadTTLMinTokens: g.config.headTTLMinTokens,
+		Name:               fmt.Sprintf("%s: %s (%d tenants)", campaignName, g.arm, len(g.tenantIDs)),
+		Active:             true,
+		Windows:            tileHours(g.hourSet, days),
+		Target:             tenant.Target{Mode: tenant.TargetList, TenantIDs: g.tenantIDs},
+		IdleSeconds:        g.config.idleSeconds,
+		MaxPings:           g.config.maxPings,
+		MinPrefixTokens:    campaignDefaultMinPrefixTokens,
+		PredictorID:        g.config.predictorID,
+		PredictorThreshold: g.config.predictorThreshold,
+		HeadTTL1h:          g.config.headTTL1h,
+		HeadTTLMinTokens:   g.config.headTTLMinTokens,
 	}
 }
 
@@ -526,6 +589,17 @@ func (h *Handler) ctlCreateCampaign(w http.ResponseWriter, r *http.Request) {
 			"no cells to campaign over — every suggest cell had no tenant, or the suggest payload was empty")
 		return
 	}
+	// Checked here, before any strategy is created — not only inside
+	// tenant.CreateCampaign's own persistence-time guard on the same (tenant, hour)
+	// pair. By the time that guard would run, the loop below has already created a
+	// real, live keepalive_strategies row for every coalesced group; rejecting only
+	// there still means a duplicate-cell upload creates-then-rolls-back strategies
+	// instead of never creating them at all.
+	if dup := duplicateCampaignCell(resolved); dup != nil {
+		ctlErr(w, http.StatusBadRequest, fmt.Sprintf(
+			"duplicate cell for tenant %q at hour %d", dup.tenantID, dup.hourUTC))
+		return
+	}
 
 	days := weekdaysFromNames(suggest.Weekdays)
 	groups := coalesceCampaignCells(resolved)
@@ -547,9 +621,9 @@ func (h *Handler) ctlCreateCampaign(w http.ResponseWriter, r *http.Request) {
 		}
 		s, err := h.registry().CreateStrategy(actor.ID, strategy)
 		if err != nil {
+			slog.Error("context-guru: could not create a campaign strategy", "err", err)
 			h.rollbackCampaignStrategies(created)
-			ctlErr(w, http.StatusInternalServerError,
-				"could not create this campaign's strategies: "+err.Error())
+			ctlErr(w, http.StatusInternalServerError, "could not create this campaign's strategies")
 			return
 		}
 		created = append(created, s)
@@ -572,9 +646,10 @@ func (h *Handler) ctlCreateCampaign(w http.ResponseWriter, r *http.Request) {
 		MinRequests: suggest.MinRequests, Weekdays: suggest.Weekdays,
 	}, cells)
 	if err != nil {
+		slog.Error("context-guru: could not record a strategy campaign", "err", err)
 		h.rollbackCampaignStrategies(created)
 		ctlErr(w, http.StatusInternalServerError,
-			"could not record this campaign, so its strategies were not created: "+err.Error())
+			"could not record this campaign, so its strategies were not created")
 		return
 	}
 	// Every strategy in `created` is live and already referenced by committed
@@ -610,11 +685,24 @@ func (h *Handler) ctlCreateCampaign(w http.ResponseWriter, r *http.Request) {
 // rollbackCampaignStrategies deletes every strategy a failed campaign create already
 // made. Best-effort: a delete error here is not reported back, since the caller is
 // already reporting the create failure that triggered it and a second error about the
-// cleanup would obscure the first.
+// cleanup would obscure the first — but it IS logged, so an orphaned row is at least
+// discoverable rather than silently unaccounted for.
+//
+// Reloads the keeper's in-memory strategy list once, after every delete attempt, no
+// matter how many succeeded: a strategy this call just created was already matchable
+// to live traffic (strategyForGroup sets Active: true, and nothing gates matching on
+// the campaign it came from), so a rolled-back strategy left in memory would keep
+// pinging and toggling KeepAlive/HeadTTL1h for its targeted tenants — invisible to
+// every control route, since neither the campaign nor its cells were ever persisted —
+// until some unrelated strategy/campaign mutation happened to trigger the next reload.
 func (h *Handler) rollbackCampaignStrategies(created []tenant.Strategy) {
 	for _, s := range created {
-		_ = h.registry().DeleteStrategy(s.ID)
+		if err := h.registry().DeleteStrategy(s.ID); err != nil {
+			slog.Error("context-guru: could not roll back a campaign strategy; it may be orphaned",
+				"strategy_id", s.ID, "err", err)
+		}
 	}
+	h.keeper.loadStrategies()
 }
 
 // resolveCampaignSuggest answers the create flow's two input modes: "live" calls
@@ -637,7 +725,13 @@ func (h *Handler) resolveCampaignSuggest(r *http.Request, in campaignCreateIn) (
 	suggest, err := h.rec.DB().WithContext(r.Context()).KVCacheSuggest(
 		f, dash.KVCacheOptions{}, h.opts.Prices, dash.KVCacheSimConfig{Baseline: baseline})
 	if err != nil {
-		return nil, err
+		// Unlike the two hand-authored errors above, this one comes from a live DB
+		// query and may carry internal detail (a raw driver error, a decode failure
+		// naming a Go field) that has no business reaching an HTTP client — logged
+		// server-side instead, same as the create-strategy/create-campaign failures
+		// below.
+		slog.Error("context-guru: could not compute live kv-cache suggestions for a campaign", "err", err)
+		return nil, fmt.Errorf("could not compute live suggestions")
 	}
 	return suggest, nil
 }
@@ -716,6 +810,15 @@ func (h *Handler) campaignTenantSummaries(r *http.Request, campaign tenant.Campa
 	byTenant := map[string]*campaignTenantSummary{}
 	var order []string
 	strategyIDs := map[string]bool{}
+	// tenantsWithStrategy is deliberately NARROWER than `order`: `order` lists every
+	// tenant any cell named, so the overview still shows a $0-predicted row for a
+	// tenant this campaign never activated, but the REAL half must only ever be read
+	// for tenants that population actually includes — otherwise a tenant with zero
+	// activated cells here, but real credited savings from something else entirely
+	// (another campaign, a manually-created strategy), would show a nonzero Real next
+	// to a correctly-$0 Predicted, exactly the two-different-populations bug the
+	// PredictedUSD gate below already closed for the other side.
+	tenantsWithStrategy := map[string]bool{}
 	for _, c := range cells {
 		s := byTenant[c.TenantID]
 		if s == nil {
@@ -732,6 +835,7 @@ func (h *Handler) campaignTenantSummaries(r *http.Request, campaign tenant.Campa
 		if c.StrategyID != "" {
 			s.PredictedUSD += c.PredictedUSD
 			strategyIDs[c.StrategyID] = true
+			tenantsWithStrategy[c.TenantID] = true
 		}
 	}
 	if h.rec != nil && len(strategyIDs) > 0 {
@@ -739,8 +843,12 @@ func (h *Handler) campaignTenantSummaries(r *http.Request, campaign tenant.Campa
 		for id := range strategyIDs {
 			ids = append(ids, id)
 		}
+		realTenants := make([]string, 0, len(tenantsWithStrategy))
+		for id := range tenantsWithStrategy {
+			realTenants = append(realTenants, id)
+		}
 		rows, err := h.rec.DB().WithContext(r.Context()).
-			CampaignRealSavings(ids, order, campaign.ActivatedAt.UnixMilli())
+			CampaignRealSavings(ids, realTenants, campaign.ActivatedAt.UnixMilli())
 		if err != nil {
 			return nil, campaignRealSavingsCaveat, err
 		}
@@ -847,18 +955,30 @@ const campaignRealSavingsCaveat = "Real saved-$ figures are a CEILING, not an ex
 // bounded to since tenantID is only used to filter which cells to bother computing —
 // the underlying query still reads every targeted tenant, since a strategy's Target
 // commonly names more than one.
+//
+// Returns nothing at all unless tenantID ITSELF has at least one activated cell in
+// this campaign — not merely "some tenant in the campaign does" — matching
+// campaignTenantSummaries' own population gate on the aggregate view. Without this, a
+// tenant whose every cell here is simulation-only or model-gated-out (so its own
+// StrategyID is always "") could still see nonzero real numbers in its drill-down as
+// long as ANY OTHER tenant in the same campaign happened to get a strategy, since the
+// old check only asked whether the campaign as a whole had created one.
 func (h *Handler) campaignRealSavings(r *http.Request, campaign tenant.Campaign,
 	cells []tenant.CampaignCell, tenantID string) (map[int]dash.CampaignSavingCell, string, error) {
-	if h.rec == nil {
+	if h.rec == nil || tenantID == "" {
 		return nil, campaignRealSavingsCaveat, nil
 	}
 	strategyIDs := map[string]bool{}
+	tenantActivated := false
 	for _, c := range cells {
 		if c.StrategyID != "" {
 			strategyIDs[c.StrategyID] = true
+			if c.TenantID == tenantID {
+				tenantActivated = true
+			}
 		}
 	}
-	if len(strategyIDs) == 0 || tenantID == "" {
+	if !tenantActivated {
 		return nil, campaignRealSavingsCaveat, nil
 	}
 	ids := make([]string, 0, len(strategyIDs))
