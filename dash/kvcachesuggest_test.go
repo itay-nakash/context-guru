@@ -197,6 +197,49 @@ func TestKVCacheSuggestNeverBeatsAnUnofferedBaseline(t *testing.T) {
 	}
 }
 
+// The exact ceiling is computed and frozen beside the winner for every cell, never as one
+// of the candidates a sweep could pick (see kvSuggestCandidates' own doc comment) — so a
+// reader always has a fixed "how much was there to capture" figure next to "how much this
+// cell's own recommendation actually captures".
+func TestKVCacheSuggestFreezesTheOptimalCeilingBesideTheWinner(t *testing.T) {
+	start := time.Date(2023, 1, 1, 9, 0, 0, 0, time.UTC).UnixMilli() // Sunday 09:00
+	var evs []*Event
+	for i := int64(0); i < 6; i++ {
+		evs = append(evs, kvEvent("heavy", "s1", "m", start+i*600_000, 0, 100_000)) // 10 min apart
+	}
+	db := seedKV(t, evs...)
+	out, err := db.KVCacheSuggest(allTenants(), KVCacheOptions{}, staticPricer{ibmSonnet},
+		KVCacheSimConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := findSuggestCell(out, "heavy", 9)
+	if c == nil {
+		t.Fatal("no cell for heavy user, hour 9")
+	}
+	if !c.OptimalKnown {
+		t.Fatalf("optimal should be priced on the same rows the baseline was: %+v", c)
+	}
+	// Nothing can cost less than the exact ceiling, including this cell's own winner.
+	if c.OptimalUSD > c.BestUSD+1e-9 {
+		t.Errorf("optimal_usd %.6f costs more than the cell's own best %.6f", c.OptimalUSD, c.BestUSD)
+	}
+	if c.OptimalSavingUSD < c.SavingUSD-1e-9 {
+		t.Errorf("optimal_saving_usd %.6f is less than the winner's own saving %.6f — the "+
+			"ceiling must never be BELOW what was actually recommended", c.OptimalSavingUSD, c.SavingUSD)
+	}
+	// A reference figure, not a result: `optimal` must never be reportable as this cell's
+	// own winner or appear in its candidate list.
+	if c.BestStrategy == KVStrategyOptimal {
+		t.Error("optimal must never be reported as a cell's own best_strategy")
+	}
+	for _, s := range c.Candidates {
+		if s.Strategy == KVStrategyOptimal {
+			t.Error("optimal must never appear among a cell's own candidates")
+		}
+	}
+}
+
 // An unresolvable baseline must fail the whole request, the same way it fails
 // /api/kvcache/simulate — not degrade into a 200 full of empty cells.
 func TestKVCacheSuggestRejectsAnUnknownBaseline(t *testing.T) {

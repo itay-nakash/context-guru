@@ -76,7 +76,9 @@ function buildCampaignsSkeleton(host) {
       'live per-tenant, per-hour recommendations, or upload a JSON file in the same shape ' +
       '(GET /api/kvcache/suggest) to hand-edit one first. Only cells whose best strategy has ' +
       'a real enforcement path on this deployment are actually activated — everything else ' +
-      'is still recorded, with a reason, never hidden.'),
+      'is still recorded, with a reason, never hidden. A fetched or uploaded payload can name ' +
+      'any tenant, and creating from it targets exactly the tenants it names, regardless of ' +
+      'who is uploading — there is no separate per-tenant confirmation step.'),
     el('div', { class: 'row-actions' },
       el('button', { class: 'ghost', 'data-testid': 'camp-fetch-live', onclick: fetchLiveSuggestions },
         'Fetch live suggestions'),
@@ -344,6 +346,11 @@ async function renderCampaignOverview(body, campaignID) {
   clear(body);
   body.appendChild(tileGroup(null, null, [
     tile('camp-predicted', 'Predicted saving', usd(detail.total_predicted_usd)),
+    // The exact ceiling on the SAME cells Predicted sums: what a policy with perfect
+    // foreknowledge of every next request would have saved, frozen at campaign-creation
+    // time right alongside Predicted (see dash.KVCacheSuggestion.OptimalSavingUSD) — how
+    // much headroom remains beyond what this campaign's own choice of arm captures.
+    tile('camp-oracle', 'Oracle ceiling (predicted)', usd(detail.total_optimal_saving_usd)),
     tile('camp-real-saved', 'Real saved (ceiling)', usd(detail.total_real_saved_usd)),
     tile('camp-real-net', 'Real net', usd(detail.total_real_net_usd), null,
       detail.total_real_net_usd < 0 ? 'bad' : 'good'),

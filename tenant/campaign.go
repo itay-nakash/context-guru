@@ -60,9 +60,14 @@ type CampaignCell struct {
 	// this hour the backtest that produced PredictedUSD was actually computed from.
 	Requests int64
 	// Arm is the suggest cell's best_strategy, verbatim.
-	Arm              string
-	PredictedUSD     float64
-	BaselineUSD      float64
+	Arm          string
+	PredictedUSD float64
+	BaselineUSD  float64
+	// OptimalSavingUSD is the suggest cell's own exact-ceiling saving over Baseline (see
+	// dash.KVCacheSuggestion.OptimalSavingUSD), frozen the same way PredictedUSD is — so a
+	// campaign's own "how much did we actually capture" figure always has a fixed "how much
+	// was there to capture" figure beside it, from the exact same backtest population.
+	OptimalSavingUSD float64
 	InsufficientData bool
 	// Activatable is false for a simulation-only arm, or a 1h-tier arm on a tenant
 	// whose model does not honor it — see proxy/campaign.go's arm-mapping table. A
@@ -139,12 +144,12 @@ func (r *Registry) CreateCampaign(actorID string, c Campaign, cells []CampaignCe
 		cell.CampaignID = c.ID
 		if _, err := tx.Exec(`INSERT INTO campaign_cells
 		  (campaign_id,tenant_id,hour_utc,requests,arm,predicted_usd,baseline_usd,
-		   insufficient_data,activatable,skip_reason,strategy_id)
-		  VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+		   insufficient_data,activatable,skip_reason,strategy_id,optimal_saving_usd)
+		  VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
 			cell.CampaignID, cell.TenantID, cell.HourUTC, cell.Requests, cell.Arm,
 			cell.PredictedUSD, cell.BaselineUSD, boolInt(cell.InsufficientData),
 			boolInt(cell.Activatable), nullableString(cell.SkipReason),
-			nullableString(cell.StrategyID)); err != nil {
+			nullableString(cell.StrategyID), cell.OptimalSavingUSD); err != nil {
 			return Campaign{}, err
 		}
 	}
@@ -203,7 +208,7 @@ func (r *Registry) ArchiveCampaign(id string) error {
 // hour — the same order the suggest payload it came from already used.
 func (r *Registry) CampaignCells(campaignID string) ([]CampaignCell, error) {
 	rows, err := r.db.Query(`SELECT campaign_id,tenant_id,hour_utc,requests,arm,predicted_usd,
-	  baseline_usd,insufficient_data,activatable,skip_reason,strategy_id
+	  baseline_usd,insufficient_data,activatable,skip_reason,strategy_id,optimal_saving_usd
 	  FROM campaign_cells WHERE campaign_id = ? ORDER BY tenant_id, hour_utc`, campaignID)
 	if err != nil {
 		return nil, err
@@ -216,7 +221,7 @@ func (r *Registry) CampaignCells(campaignID string) ([]CampaignCell, error) {
 		var skipReason, strategyID sql.NullString
 		if err := rows.Scan(&cell.CampaignID, &cell.TenantID, &cell.HourUTC, &cell.Requests,
 			&cell.Arm, &cell.PredictedUSD, &cell.BaselineUSD, &insufficientData, &activatable,
-			&skipReason, &strategyID); err != nil {
+			&skipReason, &strategyID, &cell.OptimalSavingUSD); err != nil {
 			return nil, err
 		}
 		cell.InsufficientData = insufficientData != 0

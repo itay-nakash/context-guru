@@ -800,10 +800,10 @@ func TestCampaignTenantSummariesOnlyCountsPredictedUSDForActivatedCells(t *testi
 	suggest := dash.KVCacheSuggestions{
 		Cells: []dash.KVCacheSuggestion{
 			{User: tenantA, HourUTC: 9, Requests: 10, BestStrategy: kvcache.StrategyKeepAlive5m,
-				SavingUSD: 1.00, BaselineUSD: 2.00},
+				SavingUSD: 1.00, BaselineUSD: 2.00, OptimalSavingUSD: 1.50},
 			// A big number, but simulation-only: this must be EXCLUDED from the total.
 			{User: tenantA, HourUTC: 10, Requests: 10, BestStrategy: kvcache.StrategyHistorical,
-				SavingUSD: 1000.00, BaselineUSD: 2000.00},
+				SavingUSD: 1000.00, BaselineUSD: 2000.00, OptimalSavingUSD: 1500.00},
 		},
 	}
 	body, _ := json.Marshal(map[string]any{"name": "mixed", "source": "upload", "suggest": suggest})
@@ -821,6 +821,14 @@ func TestCampaignTenantSummariesOnlyCountsPredictedUSDForActivatedCells(t *testi
 	if total < 0.99 || total > 1.01 {
 		t.Errorf("total_predicted_usd = %v, want ~1.00 (the 1000.00 simulation-only cell must be excluded)", total)
 	}
+	// The oracle ceiling must be scoped to exactly the same population as Predicted — the
+	// 1500.00 simulation-only cell's ceiling must be excluded right alongside its saving.
+	totalOptimal, _ := out["total_optimal_saving_usd"].(float64)
+	if totalOptimal < 1.49 || totalOptimal > 1.51 {
+		t.Errorf("total_optimal_saving_usd = %v, want ~1.50 (the 1500.00 simulation-only "+
+			"cell's ceiling must be excluded, matching total_predicted_usd's own population)",
+			totalOptimal)
+	}
 	tenants, _ := out["tenants"].([]any)
 	if len(tenants) != 1 {
 		t.Fatalf("got %d tenant summaries, want 1", len(tenants))
@@ -828,6 +836,9 @@ func TestCampaignTenantSummariesOnlyCountsPredictedUSDForActivatedCells(t *testi
 	row := tenants[0].(map[string]any)
 	if p, _ := row["predicted_usd"].(float64); p < 0.99 || p > 1.01 {
 		t.Errorf("tenant predicted_usd = %v, want ~1.00", p)
+	}
+	if p, _ := row["optimal_saving_usd"].(float64); p < 1.49 || p > 1.51 {
+		t.Errorf("tenant optimal_saving_usd = %v, want ~1.50", p)
 	}
 }
 

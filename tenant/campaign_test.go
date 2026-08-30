@@ -21,7 +21,8 @@ func TestCampaignCRUD(t *testing.T) {
 		MinRequests: 5, Weekdays: []string{"Sunday", "Monday"},
 	}, []CampaignCell{
 		{TenantID: "t1", HourUTC: 9, Requests: 42, Arm: "keepalive-5m",
-			PredictedUSD: 1.23, BaselineUSD: 4.56, Activatable: true, StrategyID: "strat-1"},
+			PredictedUSD: 1.23, BaselineUSD: 4.56, OptimalSavingUSD: 2.34,
+			Activatable: true, StrategyID: "strat-1"},
 		{TenantID: "t1", HourUTC: 10, Requests: 3, Arm: "sticky-session-1h",
 			InsufficientData: true, Activatable: false, SkipReason: "simulation-only arm"},
 	})
@@ -59,7 +60,7 @@ func TestCampaignCRUD(t *testing.T) {
 		t.Fatalf("got %d cells, want 2", len(cells))
 	}
 	if cells[0].HourUTC != 9 || cells[0].Arm != "keepalive-5m" || !cells[0].Activatable ||
-		cells[0].StrategyID != "strat-1" {
+		cells[0].StrategyID != "strat-1" || cells[0].OptimalSavingUSD != 2.34 {
 		t.Errorf("cell 0 = %+v", cells[0])
 	}
 	if cells[1].HourUTC != 10 || cells[1].Activatable || cells[1].StrategyID != "" ||

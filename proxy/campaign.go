@@ -138,6 +138,7 @@ type resolvedCampaignCell struct {
 	requests                  int64
 	arm                       string
 	predictedUSD, baselineUSD float64
+	optimalSavingUSD          float64
 	insufficientData          bool
 	activatable               bool
 	skipReason                string
@@ -164,7 +165,7 @@ func resolveCampaignCell(cell dash.KVCacheSuggestion, honorsHeadTTL1h func(tenan
 	out := resolvedCampaignCell{
 		tenantID: cell.User, hourUTC: cell.HourUTC, requests: cell.Requests,
 		arm: cell.BestStrategy, predictedUSD: cell.SavingUSD, baselineUSD: cell.BaselineUSD,
-		insufficientData: cell.InsufficientData,
+		optimalSavingUSD: cell.OptimalSavingUSD, insufficientData: cell.InsufficientData,
 	}
 	if cell.HourUTC < 0 || cell.HourUTC > 23 {
 		out.skipReason = fmt.Sprintf("hour_utc %d is out of range (must be 0-23)", cell.HourUTC)
@@ -416,12 +417,16 @@ func (h *Handler) campaignCtlRoutes() []ctlRoute {
 
 // campaignCellView is the wire shape for one frozen cell.
 type campaignCellView struct {
-	TenantID         string  `json:"tenant_id"`
-	HourUTC          int     `json:"hour_utc"`
-	Requests         int64   `json:"requests"`
-	Arm              string  `json:"arm"`
-	PredictedUSD     float64 `json:"predicted_usd"`
-	BaselineUSD      float64 `json:"baseline_usd"`
+	TenantID     string  `json:"tenant_id"`
+	HourUTC      int     `json:"hour_utc"`
+	Requests     int64   `json:"requests"`
+	Arm          string  `json:"arm"`
+	PredictedUSD float64 `json:"predicted_usd"`
+	BaselineUSD  float64 `json:"baseline_usd"`
+	// OptimalSavingUSD is this cell's own frozen exact-ceiling saving over BaselineUSD (see
+	// dash.KVCacheSuggestion.OptimalSavingUSD) — "how much was there to capture", beside
+	// PredictedUSD's "how much this campaign's own choice actually captured".
+	OptimalSavingUSD float64 `json:"optimal_saving_usd"`
 	InsufficientData bool    `json:"insufficient_data"`
 	Activatable      bool    `json:"activatable"`
 	SkipReason       string  `json:"skip_reason,omitempty"`
@@ -432,6 +437,7 @@ func viewCampaignCell(c tenant.CampaignCell) campaignCellView {
 	return campaignCellView{
 		TenantID: c.TenantID, HourUTC: c.HourUTC, Requests: c.Requests, Arm: c.Arm,
 		PredictedUSD: c.PredictedUSD, BaselineUSD: c.BaselineUSD,
+		OptimalSavingUSD: c.OptimalSavingUSD,
 		InsufficientData: c.InsufficientData, Activatable: c.Activatable,
 		SkipReason: c.SkipReason, StrategyID: c.StrategyID,
 	}
@@ -444,9 +450,14 @@ func viewCampaignCell(c tenant.CampaignCell) campaignCellView {
 type campaignTenantSummary struct {
 	TenantID     string  `json:"tenant_id"`
 	PredictedUSD float64 `json:"predicted_usd"`
-	RealPingUSD  float64 `json:"real_ping_usd"`
-	RealSavedUSD float64 `json:"real_saved_usd"`
-	RealNetUSD   float64 `json:"real_net_usd"`
+	// OptimalSavingUSD sums the same cells PredictedUSD does (StrategyID != "", see
+	// campaignTenantSummaries), so the two are always compared over the exact same
+	// population — this tenant's own exact-ceiling headroom beside what was actually
+	// captured.
+	OptimalSavingUSD float64 `json:"optimal_saving_usd"`
+	RealPingUSD      float64 `json:"real_ping_usd"`
+	RealSavedUSD     float64 `json:"real_saved_usd"`
+	RealNetUSD       float64 `json:"real_net_usd"`
 }
 
 // campaignView is the wire shape for one campaign, without its cells (the list route)
@@ -470,12 +481,13 @@ type campaignView struct {
 	// numeric 0 in that case: omitempty on a SLICE means "not computed", but the four
 	// float64 totals carry no omitempty at all — a genuinely zero real saving must
 	// still render as $0, not vanish and read as "unknown" (usd(undefined) -> "—").
-	Tenants           []campaignTenantSummary `json:"tenants,omitempty"`
-	TotalPredictedUSD float64                 `json:"total_predicted_usd"`
-	TotalRealPingUSD  float64                 `json:"total_real_ping_usd"`
-	TotalRealSavedUSD float64                 `json:"total_real_saved_usd"`
-	TotalRealNetUSD   float64                 `json:"total_real_net_usd"`
-	Caveat            string                  `json:"caveat,omitempty"`
+	Tenants               []campaignTenantSummary `json:"tenants,omitempty"`
+	TotalPredictedUSD     float64                 `json:"total_predicted_usd"`
+	TotalOptimalSavingUSD float64                 `json:"total_optimal_saving_usd"`
+	TotalRealPingUSD      float64                 `json:"total_real_ping_usd"`
+	TotalRealSavedUSD     float64                 `json:"total_real_saved_usd"`
+	TotalRealNetUSD       float64                 `json:"total_real_net_usd"`
+	Caveat                string                  `json:"caveat,omitempty"`
 }
 
 func viewCampaign(c tenant.Campaign) campaignView {
@@ -637,6 +649,7 @@ func (h *Handler) ctlCreateCampaign(w http.ResponseWriter, r *http.Request) {
 		cells = append(cells, tenant.CampaignCell{
 			TenantID: c.tenantID, HourUTC: c.hourUTC, Requests: c.requests, Arm: c.arm,
 			PredictedUSD: c.predictedUSD, BaselineUSD: c.baselineUSD,
+			OptimalSavingUSD: c.optimalSavingUSD,
 			InsufficientData: c.insufficientData, Activatable: c.activatable,
 			SkipReason: c.skipReason, StrategyID: c.strategyID,
 		})
@@ -793,6 +806,7 @@ func (h *Handler) ctlGetCampaign(w http.ResponseWriter, r *http.Request) {
 	view.Tenants, view.Caveat = tenants, caveat
 	for _, t := range tenants {
 		view.TotalPredictedUSD += t.PredictedUSD
+		view.TotalOptimalSavingUSD += t.OptimalSavingUSD
 		view.TotalRealPingUSD += t.RealPingUSD
 		view.TotalRealSavedUSD += t.RealSavedUSD
 		view.TotalRealNetUSD += t.RealNetUSD
@@ -834,6 +848,7 @@ func (h *Handler) campaignTenantSummaries(r *http.Request, campaign tenant.Campa
 		// exactly the arms this deployment couldn't enforce in the first place.
 		if c.StrategyID != "" {
 			s.PredictedUSD += c.PredictedUSD
+			s.OptimalSavingUSD += c.OptimalSavingUSD
 			strategyIDs[c.StrategyID] = true
 			tenantsWithStrategy[c.TenantID] = true
 		}

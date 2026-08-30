@@ -1360,6 +1360,7 @@ var migrations = []string{
 	   activatable       INTEGER NOT NULL DEFAULT 0,
 	   skip_reason       TEXT,
 	   strategy_id       TEXT,
+	   optimal_saving_usd REAL NOT NULL DEFAULT 0,
 	   PRIMARY KEY (campaign_id, tenant_id, hour_utc)
 	 );`,
 	// No separate index on campaign_cells(campaign_id): the PRIMARY KEY above already
