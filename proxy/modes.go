@@ -42,16 +42,23 @@ func (h *Handler) applyMode(r *reqInfo) ([]byte, time.Duration, apply.Trace) {
 		return r.body, time.Since(start), apply.Trace{}
 	}
 
+	// The mixed-TTL head, from this tenant's own cache policy, OR a manager-controlled
+	// strategy that matches right now and asks for the 1h tier — see
+	// keeper.resolveHeadTTL for why this is a second resolution, not just a field read
+	// off r.tn.Cache: a strategy's write-tier decision has to be visible to the request
+	// that creates the entry, not only to the ping that later refreshes it. Off for
+	// every account unless opted in (by either path); see apply/headttl.go for why it
+	// is off even then — the ttl field reaches the provider, but Bedrock grants the 1h
+	// tier only for the Claude 4.5 family and silently downgrades the models this
+	// service actually runs.
+	headTTL1h, headTTLMinTokens := h.keeper.resolveHeadTTL(r.tn.ID, h.keeper.clockNow(),
+		r.tn.Cache.HeadTTL1h, r.tn.Cache.HeadTTLMinTokens)
 	res := apply.BodyOpts(r.ctx, r.tn.Pipe, r.tn.Store, apply.Opts{
 		Provider: r.provider, Body: r.body, Session: r.session, Tenant: r.tn.ID, Bypass: r.bypassed,
 		Models: r.models, Window: r.window, CacheMode: h.opts.CacheMode,
 		SelfRates: r.rates, RatesFor: h.ratesFor(r.ctx),
-		// The mixed-TTL head, from this tenant's own cache policy. Off for every account unless
-		// opted in; see apply/headttl.go for why it is off even then — the ttl field reaches the
-		// provider, but Bedrock grants the 1h tier only for the Claude 4.5 family and silently
-		// downgrades the models this service actually runs.
-		HeadTTL1h:        r.tn.Cache.HeadTTL1h,
-		HeadTTLMinTokens: r.tn.Cache.HeadTTLMinTokens,
+		HeadTTL1h:        headTTL1h,
+		HeadTTLMinTokens: headTTLMinTokens,
 		Mode:             mode, Tracker: h.tracker,
 		// The asker a component may use to put a question to the request's own model over its
 		// cached transcript. nil on a non-Anthropic route or without an incoming client; a

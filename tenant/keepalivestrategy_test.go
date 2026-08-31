@@ -192,6 +192,66 @@ func TestStrategyPersistsAcrossReload(t *testing.T) {
 	}
 }
 
+// HeadTTL1h/HeadTTLMinTokens round-trip through create, a sparse patch, and a reload —
+// the same three checks TestStrategyCRUD and TestStrategyPersistsAcrossReload already run
+// for the older fields, extended to the two this migration added.
+func TestStrategyHeadTTLFieldsPersistAndPatch(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tenant.db")
+	r1, err := Open(path, Options{})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	created, err := r1.CreateStrategy("mgr-1", Strategy{
+		Name: "1h head", IdleSeconds: 280, MaxPings: 1, HeadTTL1h: true, HeadTTLMinTokens: 50000,
+		Windows: []Window{{Start: "09:00", End: "18:00"}},
+		Target:  Target{Mode: TargetAll},
+	})
+	if err != nil {
+		t.Fatalf("CreateStrategy: %v", err)
+	}
+	if !created.HeadTTL1h || created.HeadTTLMinTokens != 50000 {
+		t.Errorf("create did not round-trip head-TTL fields: %+v", created)
+	}
+
+	off := false
+	updated, err := r1.UpdateStrategy("mgr-2", created.ID, StrategyPatch{HeadTTL1h: &off})
+	if err != nil {
+		t.Fatalf("UpdateStrategy: %v", err)
+	}
+	if updated.HeadTTL1h {
+		t.Error("patch did not turn head_ttl_1h off")
+	}
+	if updated.HeadTTLMinTokens != 50000 {
+		t.Errorf("patch touched a field it was not given: HeadTTLMinTokens = %d", updated.HeadTTLMinTokens)
+	}
+
+	newTokens := 12345
+	updated, err = r1.UpdateStrategy("mgr-2", created.ID, StrategyPatch{HeadTTLMinTokens: &newTokens})
+	if err != nil {
+		t.Fatalf("UpdateStrategy: %v", err)
+	}
+	if updated.HeadTTLMinTokens != newTokens {
+		t.Errorf("patch did not update HeadTTLMinTokens: got %d, want %d", updated.HeadTTLMinTokens, newTokens)
+	}
+	if err := r1.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	r2, err := Open(path, Options{})
+	if err != nil {
+		t.Fatalf("re-Open: %v", err)
+	}
+	defer r2.Close()
+	reloaded, err := r2.StrategyByID(created.ID)
+	if err != nil {
+		t.Fatalf("StrategyByID after reload: %v", err)
+	}
+	if reloaded.HeadTTL1h || reloaded.HeadTTLMinTokens != newTokens {
+		t.Errorf("reload lost the patched head-TTL fields: %+v", reloaded)
+	}
+}
+
 // Create/Update/Delete round trip, including that a delete stops it matching and a
 // not-found id is reported distinctly.
 func TestStrategyCRUD(t *testing.T) {

@@ -566,6 +566,14 @@ END;
 -- matching row instead of fetching every candidate to check it.
 CREATE INDEX IF NOT EXISTS idx_requests_session_tb
   ON requests(session_id, ts DESC, id DESC, tokens_before);
+
+-- CampaignRealSavings' cost half (dash/campaignsavings.go) groups ping rows by
+-- (keepalive_strategy_id, hour-of-day) with a ts floor — today an unindexed scan of
+-- every ping row ever recorded, since neither keepalive nor keepalive_strategy_id
+-- carries an index of its own. Leading on the strategy id serves the IN (...) seek this
+-- query actually runs; ts lets it stop once it is past the campaign's own activated_at.
+CREATE INDEX IF NOT EXISTS idx_requests_keepalive_strategy
+  ON requests(keepalive_strategy_id, ts);
 `
 
 // additiveColumns are columns added to an EXISTING table without a version bump.

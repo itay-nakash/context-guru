@@ -117,6 +117,16 @@ type KVCacheSuggestion struct {
 	// figure on this cell is then 0.00 for want of a rate, not because nothing was spent.
 	Valued bool `json:"valued"`
 
+	// OptimalUSD and OptimalSavingUSD are the exact ceiling's own cost on this cell's rows,
+	// and its saving over Baseline — computed and frozen ALONGSIDE the winner, never as one
+	// of the candidates a sweep could pick (see kvSuggestCandidates' own doc comment for why
+	// `optimal` is excluded there: it reads the true next-request time). Reported so a reader
+	// always sees how much headroom remains beyond what was actually recommended, not only
+	// against the baseline.
+	OptimalUSD       float64 `json:"optimal_usd"`
+	OptimalSavingUSD float64 `json:"optimal_saving_usd"`
+	OptimalKnown     bool    `json:"optimal_known"`
+
 	// Candidates is every arm's own saving over this cell's own rows, baseline included, so the
 	// winner is checkable rather than asserted.
 	Candidates []kvcache.Savings `json:"candidates"`
@@ -263,6 +273,18 @@ func kvSuggestCell(user string, hour int, rows []*kvcache.Request, candidates []
 		return cell
 	}
 	cell.BaselineUSD = baseline.TotalUSD
+
+	// The exact ceiling, built and simulated on exactly this cell's own rows — the same
+	// population every candidate above was scored on — but never added to `candidates`:
+	// kvSuggestCandidates() excludes `optimal` for the whole suggester on purpose (it reads
+	// the true next-request time), and that must hold here too, not just for the arms an
+	// unattended sweep could pick as a winner.
+	if s := buildStrategy(KVStrategyOptimal, rows, cfg, sim); s != nil {
+		optimal := kvcache.Simulate(rows, s, sim)
+		cell.OptimalUSD = optimal.TotalUSD
+		cell.OptimalSavingUSD = kvcache.Compare(baseline, optimal).AbsoluteUSD
+		cell.OptimalKnown = baseline.Valued && optimal.Valued
+	}
 
 	var best kvcache.Savings
 	var bestResult *kvcache.Result
