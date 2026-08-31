@@ -92,6 +92,78 @@ type Remodeler interface {
 	AsModel(id string) Model
 }
 
+// Budgeter is an optional interface on a Model: the same endpoint, the same credential and the same
+// model id, with a larger REPLY budget.
+//
+// It exists because a truncated reply is the worst outcome available — full price, zero result — and
+// it is indistinguishable from a model declining to act. MEASURED (`659e7a6`): the batched
+// adjudication arm had 24 of 34 replies unparseable, and the cause was the client's default output
+// budget, not the prompt. A verdict array over a dozen items, each carrying an obligation label and a
+// verbatim quote, is simply long; a request model running adaptive thinking spends part of the budget
+// before emitting any text at all. The array was cut mid-flight, the parse failed, and the caller
+// changed nothing — misread as "the model declined" for three iterations.
+//
+// Why an interface rather than raising cheapmodel.DefaultMaxTokens: the budget a caller needs is a
+// property of what it ASKS FOR, not of the endpoint. A one-tool-output compaction reply and a
+// twelve-verdict array are different lengths, and raising the shared default would move both.
+//
+// Output tokens bill as generated, not as budgeted, so a raised ceiling costs nothing until used.
+// Optional, and callers must fall back to the client as-is: a Model implementation that does not
+// support it still works, it just keeps its own budget.
+type Budgeter interface {
+	WithMaxTokens(n int) Model
+}
+
+// PrefixUsage reports what one PrefixAsk cost, straight from the provider's usage block. It exists
+// because the whole point of a prefix ask is the cache READ, and a cache read that silently is not
+// happening looks identical to one that is — except on the bill.
+//
+// RETURNED rather than merely recorded, and that is the load-bearing part of this type. A caller
+// whose entire justification is the cache read has to be able to gate on whether the read happened,
+// which a metrics counter cannot support.
+type PrefixUsage struct {
+	CacheRead  int
+	CacheWrite int
+	Fresh      int
+	Output     int
+}
+
+// PrefixAsker completes `ask` as a trailing user message appended to the EXACT body this session
+// sent upstream on the PREVIOUS turn.
+//
+// WHY THE PREVIOUS TURN'S SENT BODY AND NOT THE INCOMING ONE. The provider's prompt cache was
+// populated by what context-guru emitted, which is the COMPACTED form. The incoming body is
+// uncompacted, so it diverges from the cached bytes at the first thing any component removed, and
+// everything after that point is a miss. Appending to the bytes actually sent is the only
+// construction that reliably reads the cache — measured at 19,595 read against 0 created.
+//
+// THE CONSEQUENCE, stated here rather than left to be rediscovered: the ask sees the transcript as of
+// the PREVIOUS turn, so the newest tool output is invisible to it. That is acceptable for the
+// judgement this serves — the missing part is tail content, which has had no turns in which to be
+// superseded and would be kept anyway — and it has the side benefit of keeping a large model call off
+// the agent's critical path.
+//
+// nil when the host cannot support it: no stashed body for this session yet, the first turn, a
+// non-Anthropic route, or the feature switched off. A caller must decide for itself what nil means;
+// see extract_llm_sweep, which DECLINES rather than falling back, because the fallback is the cost the
+// mechanism exists to avoid.
+type PrefixAsker interface {
+	Ask(ctx context.Context, session, ask string) (reply string, usage PrefixUsage, err error)
+}
+
+// ErrNoPrefix is what Ask returns on the FIRST turn of a session: nothing has been forwarded yet, so
+// there is no cached prefix to append to.
+//
+// Declared here rather than in the host so a component can tell it apart from a transport failure
+// without string matching. The distinction is worth a sentinel because the two mean opposite things to
+// an operator: "there was nothing to read yet", which every session does once and which needs no
+// attention, against "the read failed", which does.
+var ErrNoPrefix = errNoPrefix{}
+
+type errNoPrefix struct{}
+
+func (errNoPrefix) Error() string { return "no stashed prefix for this session" }
+
 // ModelSpec carries the LLM clients a NeedsModel component may use, resolved per
 // request by the host adapter. Incoming is the proxied request's own model +
 // credentials (nil when unavailable, e.g. the AuthBridge host); Static is a
@@ -254,6 +326,20 @@ type Ctx struct {
 	// -1 = unknown/first turn/cache off ⇒ no tail restriction. Only meaningful when
 	// CacheAware is true.
 	MaxCachedIdx int
+	// PrefixAsk, when non-nil, lets a component put a question to the request's own model with the
+	// previous turn's SENT body as the prefix, so the provider reads its prompt cache instead of
+	// being re-sent the transcript. See PrefixAsker for why that body and not the incoming one.
+	PrefixAsk PrefixAsker
+	// CacheTTLMs is how long this request's prompt cache is assumed to live, in milliseconds, as
+	// DERIVED from the request rather than assumed: for the Anthropic family the body declares it
+	// (a bare `ephemeral` mark is 5 minutes, an explicit `ttl: "1h"` is an hour), widened to the
+	// longest lifetime this prefix has ever asked for. 0 when unknown.
+	//
+	// Carried alongside IdleMs and ColdCache so a component can reason about where in the cache's
+	// LIFETIME this turn falls, not merely whether the entry is already gone. extract_llm_sweep
+	// needs exactly that: a prefix ask must read a cache that still EXISTS, while rewriting deep
+	// history wants one that is nearly worthless — which is a window before expiry, not after it.
+	CacheTTLMs int64
 	// FilterStats receives cmdfilter's per-filter ledger (which command families pay
 	// off, and which output shapes matched nothing). nil = not recording.
 	//
@@ -413,6 +499,21 @@ type Report struct {
 	// sat at zero on a whole workload without anyone being able to say which case each
 	// was in. Filled by the component via Gate(); rolled up into /stats per component.
 	Gates map[string]int
+	// Events counts, per named event, things this component DID rather than declined — a cache
+	// hit replayed, a candidate reached at depth, an output removed, an inventory offered.
+	//
+	// Separate from Gates because they were one map and the name lied. Everything in Gates is
+	// exported as `cg_component_gate_declines_total`, so `reapplied_same_session` (a cache HIT)
+	// and `sweep_dropped` (a removal that WORKED) were being counted as declines: anyone summing
+	// that series to gauge whether the pipeline was doing anything got the wrong SIGN, because the
+	// more a component succeeded the higher its "declines" climbed. Splitting the map rather than
+	// classifying names in the exporter puts the judgement at the call site, where the author knows
+	// which one it is, instead of in a lookup table that goes stale the next time a gate is added.
+	//
+	// A name must not appear in both maps for one component: that would mean the component cannot
+	// say whether the thing succeeded or was refused, and TestGatesAndEventsAreDisjoint pins it.
+	// Filled via Event()/EventN(); rolled up into /stats beside Gates.
+	Events map[string]int
 	// Calls records each LLM call this component made on this request. Empty for every
 	// deterministic component; one entry per model call for the two that make them.
 	//
@@ -508,6 +609,53 @@ func (r *Report) Gate(name string) {
 		r.Gates = map[string]int{}
 	}
 	r.Gates[name]++
+}
+
+// GateN records n at once, for a gate whose subject is a COUNT rather than a single candidate.
+//
+// It exists because a per-candidate loop cannot express "this many were OFFERED". The distinction is
+// not cosmetic: a live batched-adjudication arm reported 2.80 verdicts per call and that was read as
+// the batch size, when it counted what the model chose to ANSWER rather than what it was SHOWN. The
+// truncation counter was firing on 43 of 162 calls at the same time, which is arithmetically
+// impossible for batches of 2.8 — the resolution being that the model silently omitted labels.
+// Without a way to count the offer, "the batch is starved" and "the model answered for a third of the
+// batch" are the same number, and the first reading cost three iterations.
+func (r *Report) GateN(name string, n int) {
+	if r == nil || n <= 0 {
+		return
+	}
+	if r.Gates == nil {
+		r.Gates = map[string]int{}
+	}
+	r.Gates[name] += n
+}
+
+// Event records that the component DID the named thing once — a replay served, a candidate reached
+// at depth, an output removed. The counterpart to Gate, and the distinction is the whole reason both
+// exist: a decline and a success exported under one metric name called "declines" produced a series
+// whose value rose as the component worked better. See Report.Events.
+//
+// Same stability rule as Gate: the names are read off /stats and scraped by label.
+func (r *Report) Event(name string) {
+	if r == nil {
+		return
+	}
+	if r.Events == nil {
+		r.Events = map[string]int{}
+	}
+	r.Events[name]++
+}
+
+// EventN records n at once, for an event whose subject is a COUNT rather than a single candidate —
+// how many were offered, how many were removed. GateN's rationale applies unchanged.
+func (r *Report) EventN(name string, n int) {
+	if r == nil || n <= 0 {
+		return
+	}
+	if r.Events == nil {
+		r.Events = map[string]int{}
+	}
+	r.Events[name] += n
 }
 
 // Saved returns non-negative tokens saved by this component.

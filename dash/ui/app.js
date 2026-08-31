@@ -2239,26 +2239,45 @@ function syncDimPicker(dims) {
 }
 
 /**
- * gateSummary renders a component's gate counts: the reasons it turned candidates away,
- * commonest first.
+ * activitySummary renders what a component DID above what it turned away.
  *
- * This is the answer to the question the components table could not answer before —
- * "act rate 0%, why?" — and it is the difference between a Bob user concluding
- * context-guru does nothing and reading `no_filter_match 15`, which says the heuristics
- * were written for another agent's tool-output shapes.
+ * Both, because this cell used to show declines only and was therefore blind in proportion to how
+ * well a component was working: the names a component raises when it SUCCEEDS are the ones that live
+ * in `events`. Observed on real traffic — a turn that adjudicated twelve outputs and removed twelve
+ * showed an empty cell, while a turn that refused everything showed a full one.
  *
- * Three states, all different: a populated map is the reasons; an EMPTY map is "this
- * component turned nothing away"; a MISSING map is "unknown" — on a request row that means
- * it was written before the column existed, and on an aggregate row that no row in the
- * window carried gate data at all.
+ * Events lead, because "what happened" is the question a reader opens this cell with; declines
+ * answer "why did nothing happen", which is only interesting once the first is empty.
+ *
+ * Kept in ONE cell rather than adding a column: the column is intentionally unsortable (null in
+ * COMPONENT_SORT), and a new one would have to be threaded through that array and both header rows
+ * for no gain a reader can use. They stay labelled and on separate lines, so a success is never
+ * mistaken for a refusal — which is the whole point of having split them.
  */
-function gateSummary(gates) {
-  if (!gates) return el('span', { class: 'na', text: 'unknown' });
-  const all = Object.entries(gates).sort((a, b) => b[1] - a[1]);
-  if (!all.length) return el('span', { class: 'na', text: '—' });
-  const shown = all.slice(0, 2).map(([k, v]) => k + ' ' + num(v)).join(' · ');
-  const rest = all.length > 2 ? ' +' + (all.length - 2) : '';
-  return el('span', { title: all.map(([k, v]) => k + ' ' + num(v)).join('\n'), text: shown + rest });
+function activitySummary(gates, events) {
+  const parts = [];
+  const add = (label, m, cls) => {
+    if (!m) return;
+    const all = Object.entries(m).sort((a, b) => b[1] - a[1]);
+    if (!all.length) return;
+    const shown = all.slice(0, 2).map(([k, v]) => k + ' ' + num(v)).join(' · ');
+    const rest = all.length > 2 ? ' +' + (all.length - 2) : '';
+    parts.push(el('div', {
+      class: cls,
+      title: label + '\n' + all.map(([k, v]) => k + ' ' + num(v)).join('\n'),
+      text: shown + rest,
+    }));
+  };
+  add('did', events, 'did');
+  add('declined', gates, 's');
+  // Absent BOTH maps means the row predates the columns — "unknown", not "nothing happened". An
+  // empty pair means the component genuinely recorded neither, which is a dash. Conflating those
+  // two is the mistake the gates column's own comment records having made once.
+  if (!parts.length) {
+    const known = gates || events;
+    return el('span', { class: 'na', text: known ? '—' : 'unknown' });
+  }
+  return el('span', {}, ...parts);
 }
 
 /**
@@ -2585,7 +2604,7 @@ async function loadComponents() {
               + 'there is no repeat business to amortize.',
         }, c.replay_multiple ? c.replay_multiple.toFixed(1) + '×' : '—'),
         el('td', { class: 'num', text: num(c.errors) }),
-        el('td', {}, gateSummary(c.gates)),
+        el('td', {}, activitySummary(c.gates, c.events)),
         el('td', {}, el('span', { class: 'pill ' + vcls, text: vtext }))));
     }
     renderNetReconcile(components);
@@ -3289,7 +3308,7 @@ async function openRequest(id, fromURL) {
           el('td', { class: 'num', text: ms(c.duration_ms) }),
           el('td', {}, el('span', { class: 'pill ' + outcome[1], text: outcome[0] }),
             c.err ? el('div', { class: 's', text: c.err }) : null),
-          el('td', {}, gateSummary(c.gates))));
+          el('td', {}, activitySummary(c.gates, c.events))));
       });
       tbl.appendChild(tb);
       body.appendChild(el('div', { class: 'tblwrap', tabindex: '0' }, tbl));
@@ -6048,10 +6067,13 @@ function fieldText(fd, v) {
   return fd.type === 'strings' ? (Array.isArray(v) ? v.join(', ') : String(v || '')) : String(v);
 }
 
-/** XLLM_SWITCHES are the two passes extract_llm can do. Its constructor REFUSES both off
- *  ("nothing to do"), so the form must not be able to post that combination — see
- *  config.applyExtractLLMCoupling, which takes the component out of the pipeline instead. */
-const XLLM_SWITCHES = ['per_output', 'cold_cache.enabled'];
+/* extract_llm used to have TWO passes behind two switches (per_output and
+ * cold_cache.enabled) and a constructor that refused both off, so this file carried a
+ * special case that flipped one back on. THE COLD SWEEP IS ITS OWN COMPONENT NOW
+ * (extract_llm_sweep), extract_llm is unconditionally the warm/tail pass, and both follow
+ * the ordinary rule: a component runs when it is ticked in Pipeline components. The special
+ * case is gone with the thing it worked around — a checkbox that meant two different things
+ * is exactly what the split removed. */
 
 /**
  * renderComponentFields draws ONE component's whole configuration from the descriptors the
@@ -6093,7 +6115,6 @@ function renderComponentFields(name, fields, values, disabled, ctx) {
   // The one place a combination is refused client-side, and it is refused because the
   // component's constructor refuses it. Rather than redraw, the sibling switch is flipped
   // in place and the note says what happened and what to do instead.
-  const boxes = {};
   const note = el('p', { class: 'hint warn-text', role: 'status', 'data-testid': 'cfg-note-' + name });
   const effective = (key) => {
     const fd = fields.find((f) => f.key === key);
@@ -6106,18 +6127,9 @@ function renderComponentFields(name, fields, values, disabled, ctx) {
     // it alone still posts nothing, so an untouched form adds no key.
     cb.checked = !!(stated(fd.key) ? values[fd.key] : fieldDefault(fd));
     cb.disabled = disabled;
-    boxes[fd.key] = cb;
     cb.addEventListener('change', () => {
       set(fd.key, cb.checked);
       note.textContent = '';
-      if (name !== 'extract_llm' || !XLLM_SWITCHES.includes(fd.key) || cb.checked) return;
-      if (XLLM_SWITCHES.some((k) => effective(k))) return;
-      const other = XLLM_SWITCHES.find((k) => k !== fd.key);
-      set(other, true);
-      if (boxes[other]) boxes[other].checked = true;
-      note.textContent = 'extract_llm with both passes off is a component with nothing to '
-        + 'do — its own constructor refuses that, so ' + other + ' was switched back on. To '
-        + 'stop it running at all, untick extract_llm in Pipeline components above.';
     });
     return el('div', { class: 'field cfg-field' },
       el('label', { class: 'comp', for: tid(fd.key) }, cb, el('span', { class: 'comp-name' }, fd.key)),

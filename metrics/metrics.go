@@ -246,8 +246,13 @@ type compStat struct {
 	//	         components, whose value is which billing TIER a token lands in
 	//	skipped  ran and never changed anything (see the passthrough list)
 	//	idle     never ran
-	Verdict  string              `json:"verdict"`
-	Gates    map[string]int64    `json:"gates,omitempty"`
+	Verdict string           `json:"verdict"`
+	Gates   map[string]int64 `json:"gates,omitempty"`
+	// Events is the counterpart histogram: things the component DID, as against candidates it
+	// turned away. Separate because Gates is exported as `cg_component_gate_declines_total`, and a
+	// success recorded there — a replay served, an output removed — made the series rise as the
+	// component worked better. See components.Report.Events.
+	Events   map[string]int64    `json:"events,omitempty"`
 	seenKeys map[string]struct{} // content keys already counted toward SavedUnique (not serialized)
 	// pending* hold the saving credited by this component's most recent fresh report,
 	// so a discard follow-up can REVERSE it (see reverseDiscarded). Not serialized.
@@ -278,6 +283,16 @@ func (cs compStat) forSnapshot() compStat {
 		}
 		cs.Gates = g
 	}
+	// Deep-copied for the same reason Gates is, and in the same place: a shallow copy handed the
+	// live map to /stats, which raced the observe worker pool writing into it. Two copies in two
+	// loops is how the first one drifted, so both live here.
+	if len(cs.Events) > 0 {
+		ev := make(map[string]int64, len(cs.Events))
+		for k, v := range cs.Events {
+			ev[k] = v
+		}
+		cs.Events = ev
+	}
 	return cs
 }
 
@@ -306,6 +321,22 @@ func (cs *compStat) addGates(g map[string]int) {
 	}
 	for k, v := range g {
 		cs.Gates[k] += int64(v)
+	}
+}
+
+// addEvents merges one report's event histogram into the rollup. Deliberately a separate method
+// rather than a second call to addGates with a different target: the two histograms answer opposite
+// questions, and one function writing to whichever map it is handed is how they would come back
+// together.
+func (cs *compStat) addEvents(e map[string]int) {
+	if len(e) == 0 {
+		return
+	}
+	if cs.Events == nil {
+		cs.Events = make(map[string]int64, len(e))
+	}
+	for k, v := range e {
+		cs.Events[k] += int64(v)
 	}
 }
 
@@ -339,6 +370,7 @@ func (a *Aggregator) Component(r components.Report) {
 	}
 	cs.Runs++
 	cs.addGates(r.Gates)
+	cs.addEvents(r.Events)
 	cs.Saved += int64(r.Saved())
 	cs.pendingSaved, cs.pendingChanged = int64(r.Saved()), int64(len(r.ChangedIdx))
 	uniqueBefore := cs.SavedUnique
@@ -425,6 +457,7 @@ func (a *Aggregator) observeComp(r components.Report) {
 	}
 	cs.Runs++
 	cs.addGates(r.Gates)
+	cs.addEvents(r.Events)
 	cs.Saved += int64(r.Saved())
 	cs.DurationMs += r.DurationMs
 	if saved := int64(r.Saved()); saved > 0 && !r.Reverted && !r.Skipped {
@@ -566,15 +599,22 @@ func (a *Aggregator) Run(r components.RunReport) {
 // honest, bounce-adjusted figure, plus quality signals naming components that
 // never earned their place (rtk's top_passthrough idea).
 type Snapshot struct {
-	Requests      int64               `json:"requests"`
-	TokensBefore  int64               `json:"tokens_before"`
-	TokensAfter   int64               `json:"tokens_after"`
-	SavedTokens   int64               `json:"saved_tokens"`
-	SavingsPct    float64             `json:"savings_pct"`
-	WastedTokens  int64               `json:"wasted_tokens"`  // re-served via expand
-	Bounces       int64               `json:"bounces"`        // expand events
-	AdjustedSaved int64               `json:"adjusted_saved"` // saved - wasted (may be negative)
-	Components    map[string]compStat `json:"components"`
+	Requests      int64   `json:"requests"`
+	TokensBefore  int64   `json:"tokens_before"`
+	TokensAfter   int64   `json:"tokens_after"`
+	SavedTokens   int64   `json:"saved_tokens"`
+	SavingsPct    float64 `json:"savings_pct"`
+	WastedTokens  int64   `json:"wasted_tokens"`  // re-served via expand
+	Bounces       int64   `json:"bounces"`        // expand events
+	AdjustedSaved int64   `json:"adjusted_saved"` // saved - wasted (may be negative)
+	// Reversibility's two failure causes, split because they call for opposite responses.
+	// Malformed = the model invented a marker id; nothing to do. Missing = an id this proxy could
+	// have minted resolved to nothing, i.e. a cut advertised as reversible was not — a defect, and
+	// the ALERTABLE one. Neither can be inferred from WastedTokens, which counts successful
+	// re-serves and therefore reads identically whether a stash broke or expand was never called.
+	ExpandUnresolvedMalformed int64               `json:"expand_unresolved_malformed"`
+	ExpandUnresolvedMissing   int64               `json:"expand_unresolved_missing"`
+	Components                map[string]compStat `json:"components"`
 	// TopPassthrough names components that ran but never saved a token — dead
 	// weight in the pipeline, candidates to drop from the config.
 	TopPassthrough []string `json:"top_passthrough"`

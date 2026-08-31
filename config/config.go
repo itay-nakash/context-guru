@@ -430,7 +430,7 @@ var presets = map[string][]string{
 	// 14.5% of what was reachable. Real, and an order of magnitude short of "the largest
 	// deterministic lever", which is what the gross number reads as.
 	"house":    {"format", "dedup", "toon", "cmdfilter", "searchfold", "textclean", "extract", "cachesplit", "toolfilter"},
-	"housellm": {"format", "dedup", "toon", "cmdfilter", "searchfold", "textclean", "extract_llm", "extract", "cachesplit", "toolfilter"},
+	"housellm": {"format", "dedup", "toon", "cmdfilter", "searchfold", "textclean", "extract_llm", "extract_llm_sweep", "extract", "cachesplit", "toolfilter"},
 }
 
 // presetConfigs carries FULL config docs for presets whose behavior depends on tuned
@@ -487,17 +487,36 @@ components:
 	// working. Claude Code is a prompt-caching client, so a warm candidate is priced at the
 	// cache-READ rate (a 10x haircut) and extract_econ.go declines it. So:
 	//
-	//	the cold sweep is the entire value of extract_llm on this service, and
-	//	cold_cache.min_tokens is the knob that decides whether it fires at all.
+	//	the cold sweep is the entire value of the compaction-model pass on this service, and
+	//	the sweep's min_tokens is the knob that decides whether it fires at all.
 	//
-	// That is why min_tokens is 1000 and not 3000. At 3000 this preset produced ZERO
-	// extractions across 3,437 requests: 3,401 warm turns recorded per_output_disabled, and
-	// on all 36 turns that DID sweep, `below_output_floor` refused every candidate. The two
-	// accounts that measured net-positive before it (+$2.21 saved against $1.01 of our own
-	// spend, 63% of calls accepted) both ran 1000. Replayed on 28 captured requests with 1h
-	// idle gaps, 1000 recovers 53,071 tokens against 45,458 at 3000, at comparable cost.
+	// THE SWEEP IS ITS OWN COMPONENT NOW, `extract_llm_sweep`, and this preset is the migration:
+	// what was `extract_llm.cold_cache.{enabled,min_tokens}` is that component's presence in the
+	// pipeline and its `min_tokens`. It also stopped being a compaction pass pointed at deep history
+	// and became an adjudicator — a batched keep-or-drop verdict — so the figures below describe the
+	// value of sweeping this workload at all, not the yield of the mechanism that now does it. That
+	// yield is unmeasured; see docs/proposals/sweep-adjudicator.md.
 	//
-	// per_output is TRUE and the WARM/TAIL path is now genuinely reachable, because
+	// It sits immediately after extract_llm so the two work disjoint regions of the same turn: the
+	// tail pass first, then the sweep. Nothing enforces that ordering — they are gated on position and
+	// on cache state, not on each other — but reading it in the other order invites the question every
+	// time.
+	//
+	// THE SWEEP CONFIGURES ALMOST NOTHING, and that is the shape of the mechanism rather than an
+	// omission. It asks the REQUEST's own model, because only that model's prompt cache holds the
+	// transcript, so there is no `model` to name. The conversation IS the cached prefix, so there is
+	// no `context` to size. One ask covers every candidate, so there is no call cap. And the economic
+	// gate prices a per-output cheap-model call, which is not what this is. What remains is the floor
+	// and the window.
+	//
+	// The sweep's floor is 1000 and not 3000. At 3000 the old preset produced ZERO extractions
+	// across 3,437 requests: 3,401 warm turns did nothing, and on all 36 turns that DID sweep,
+	// `below_output_floor` refused every candidate. The two accounts that measured net-positive
+	// before it (+$2.21 saved against $1.01 of our own spend, 63% of calls accepted) both ran 1000.
+	// Replayed on 28 captured requests with 1h idle gaps, 1000 recovers 53,071 tokens against 45,458
+	// at 3000, at comparable cost.
+	//
+	// extract_llm's WARM/TAIL path is genuinely reachable, because
 	// savedTokenValueAt prices a candidate by POSITION: the tail is being written into the
 	// cache on this turn (measured: 17.2M cache_write against 9.4M fresh_input across 4,384
 	// warm requests, ~4,124 written tokens per turn), so it is worth the cache-WRITE rate,
@@ -531,30 +550,29 @@ components:
 	// TestTheTailIsStillGatedOnItsOwnEconomics (size still decides), the first of which reads
 	// THIS literal rather than a copy of it.
 	//
-	// llm_max_per_session: 0 is UNLIMITED, by operator decision, and unlike the previous
-	// revision of this comment it is now genuinely live — per_output: true means
-	// extract_llm.go:1168 takes the hot arm, which reads llm_max_per_request and
-	// llm_max_per_session. What bounds spend is therefore not the session cap but
+	// llm_max_per_session: 0 is UNLIMITED, by operator decision, and it is genuinely live: with the
+	// sweep gone extract_llm has only the hot arm, which reads llm_max_per_request and
+	// llm_max_per_session on every turn it fires. What bounds spend is therefore not the session cap
+	// but
 	// eligibility: 132 calls in three days of heavy use, under a per-session cap of 40 that
 	// was never approached. llm_max_per_request: 8 is the per-turn brake.
 	//
-	// cold_cache.max_calls is now UNSET on purpose, which takes defaultColdMaxCalls — one
-	// concurrency round, 4. It was 20, and 20 was never measured; the number that WAS
-	// measured is in coldCacheConfig's own comment, where a single sweep made 27 calls,
-	// spent $0.229 and added 76.6s to a turn whose upstream took 33.5s. The sweep draws on
-	// no other cap, so this is its only brake, and 5x the documented-safe bound on the one
-	// path with a recorded latency pathology is not a default to ship. Production's mean was
-	// 4.89 calls per sweep, so 4 does bind occasionally — deliberately, because past one
-	// round the calls serialize and latency grows multiplicatively for a linear gain.
-	"housellm": `pipeline: [format, dedup, toon, cmdfilter, searchfold, textclean, extract_llm, extract, cachesplit, toolfilter]
+	// The sweep's `pre_expiry_seconds` is UNSET on purpose, which takes its one-minute default: one
+	// apply.coldMargin, the only figure in this codebase with a stated purpose for clock uncertainty
+	// around cache expiry. The number that used to sit here was a per-sweep CALL cap, motivated by a
+	// production request that made 27 calls, spent $0.229 and added 76.6 s to a turn whose upstream
+	// took 33.5 s. That shape is gone: the sweep makes exactly one ask per firing turn, and what
+	// bounds it is how often the pre-expiry window comes round — at most once per cache lifetime per
+	// session.
+	//
+	// The WIDTH of that window is the one unmeasured number in this preset, and widening it is a
+	// yield/cost trade nothing has measured. See extract_llm_sweep's own comment.
+	"housellm": `pipeline: [format, dedup, toon, cmdfilter, searchfold, textclean, extract_llm, extract_llm_sweep, extract, cachesplit, toolfilter]
 components:
   extract:
     min_tokens: 400
   extract_llm:
     aggressiveness: medium
-    cold_cache:
-      enabled: true
-      min_tokens: 1000
     context: recent
     context_messages: 2
     economic_gate: true
@@ -566,10 +584,11 @@ components:
     model:
       model: claude-haiku-4-5
       source: incoming
-    per_output: true
     strategy: code
     trigger:
-      min_request_tokens: 3000`,
+      min_request_tokens: 3000
+  extract_llm_sweep:
+    min_tokens: 1000`,
 	// (a=2, b=1, θ=500) and the authors' artifact apply-gate (saved >= 400 || keep <
 	// 0.8). Routed to the CHEAP model because the method's economics depend on the
 	// reflection model being much cheaper than the agent's — the paper's own choice was

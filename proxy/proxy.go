@@ -183,6 +183,10 @@ type Handler struct {
 	agg    *metrics.Aggregator
 	opts   Options
 	client *http.Client
+	// sent holds the last body forwarded upstream per session, so a component can put a question to
+	// the request's own model with the bytes the provider's cache was populated from. See
+	// prefixask.go for the bounds and for what happens when one is hit.
+	sent *sentStash
 	// tracker owns the per-session cached-prefix boundary. Always present: every mode
 	// benefits from reading and recording it in one locked step (the previous
 	// read-then-deferred-write raced between concurrent turns of a session).
@@ -279,7 +283,8 @@ func New(pipe *components.Pipeline, st store.Store, agg *metrics.Aggregator, opt
 		c = &http.Client{Transport: upstreamTransport(opts.UpstreamHeaderTimeout)}
 	}
 	h := &Handler{pipe: pipe, store: st, agg: agg, opts: opts, client: c,
-		tracker: modes.NewTracker(0), rec: opts.Dashboard}
+		tracker: modes.NewTracker(0), rec: opts.Dashboard,
+		sent: newSentStash()}
 	if h.mode() == components.ModeObserve {
 		h.pool = modes.NewPool(opts.Observe.MaxQueue, opts.Observe.Workers)
 		h.shadow = store.NewMemory(store.Options{})
@@ -1312,6 +1317,16 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 		upStart := time.Now()
 		lastUpStart = upStart
 		resp, err := h.doUpstream(r, up, body)
+		if err == nil && resp != nil && resp.StatusCode == http.StatusOK {
+			// The bytes the provider's prompt cache is now populated from. Stashed HERE rather than
+			// anywhere earlier because only what was ACTUALLY forwarded and accepted is a valid
+			// prefix — an aborted or rejected send caches nothing, and appending to bytes the
+			// provider never saw would read no cache while looking exactly like a hit that failed.
+			// KEYED BY THE SCOPED SESSION ID, which is what serve receives (tr.Session) and what a
+			// component reads as Ctx.Session. Keying it by the raw header instead would make every
+			// Ask miss while the mechanism looked switched on.
+			h.sent.put(session, body)
+		}
 		if err != nil {
 			// LOG it, and record it on the captured row. An upstream failure used to be
 			// invisible in both places: the caller got a 502 and the operator got nothing
@@ -1514,6 +1529,11 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 				}
 				cp.noteExpand(back) // and on the dashboard row, or SavedAdjusted over-reports
 			} else {
+				// Classified as well as counted: the response loop and the request-path repair
+				// both reach here, and an id this proxy could have minted with nothing behind it
+				// is our own broken reversibility promise rather than the model inventing one.
+				// See expand/unresolved.go.
+				expand.NoteUnresolved(c.HashID)
 				resolved[c.CallID] = expand.Unavailable(c.HashID)
 			}
 		}
@@ -1730,6 +1750,12 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
 	snap.AgentDietCallTimeoutMs = offload.AgentDietCallTimeout().Milliseconds()
 	// Freeze-replay health, same layering: the counters live with the code that owns
 	// them (offload for the replay path, the store for dropped/repaired decisions).
+	// Reversibility's two failure causes, split because they need opposite responses and one of
+	// them is an alert. `missing` means this proxy removed content, said it could be had back, and
+	// then could not produce it. Nothing else in this snapshot can go non-zero for that: wasted
+	// tokens counts successful re-serves, so a broken stash was indistinguishable from a session
+	// that simply never called expand. See expand/unresolved.go.
+	snap.ExpandUnresolvedMalformed, snap.ExpandUnresolvedMissing = expand.Unresolved()
 	snap.FrozenHits, snap.FrozenMisses = offload.FrozenStats()
 	if fl, ok := h.store.(*store.Memory); ok { // process store; hosted per-tenant stores report via the dashboard
 		snap.FrozenDropped, snap.FrozenRepaired = fl.FrozenLossStats()

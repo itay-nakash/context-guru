@@ -643,14 +643,33 @@ mode: sync
 ```
 
 **`housellm`** is the same pipeline with `extract_llm` inserted before `extract`, applied
-per account on request. It calls a cheap model (`claude-haiku-4-5`, on the caller's own
-credential and endpoint) when the economic gate says the expected saving beats the priced
-cost of the call — and **only on a turn whose prompt cache has expired**, never on
-prompt-cached traffic. That is what `per_output: false` means, and it is the brake: a cold
-turn is about to re-bill its whole transcript at the write rate, so a token removed there is
-the most valuable one there is. On warm turns the same removal is worth a tenth as much and
-the component stays out of the way. It is offered by name rather than turned on for everyone because those calls
-spend the caller's money.
+per account on request, plus `extract_llm_sweep` after it. They do not share a model, a trigger, or
+a mechanism, and the differences are the point rather than tuning.
+
+`extract_llm` reduces individual tool outputs in the **uncached tail**, where a removed token is
+being written into the cache at 1.25x fresh. It calls a cheap model (`claude-haiku-4-5`, on the
+caller's own credential and endpoint) when the economic gate says the expected saving beats the
+priced cost of the call, and it **rewrites** an output — a model-written program trims it down.
+
+`extract_llm_sweep` **adjudicates instead of rewriting**, and asks a different model in a different
+way. It fires in the window just before the prompt cache expires, and asks **the request's own
+model** — over the transcript that model already holds in its cache, which is what makes the
+question affordable — which outputs are spent, in **one call covering every candidate**. It never
+sends the outputs: the ask carries an inventory (label, size, tool-call id, first line), and the
+model answers with a verdict per label. A spent output is removed whole and replaced by a short
+shape descriptor plus a marker, so `expand` still recovers it; nothing is rewritten, so nothing can
+be invented. Candidates are the **entire transcript**, not the tail: the sweep accepts invalidating
+the prefix, which is what the window buys — inside it the prefix has at most the window's width left
+to live. The economic gate does not apply, because its arithmetic prices a per-output cheap-model
+call and this is neither.
+
+It declines below a minimum inventory (10 by default), because the model's judgement is a function
+of how many candidates it compares: shown one output it scores inside the drop-everything null
+model's error bar, and at ten it cleared 100% of genuinely-spent candidates in probes. Below the
+floor a removal would be a guess, and a wrong removal costs content the agent still needs.
+
+Both are offered by name rather than turned on for everyone,
+because those calls spend the caller's money.
 
 **Changed 2026-08-23:** `searchfold` and `toolfilter` joined the default, and `dedup` moved
 ahead of `toon`. `toolfilter` ships with an empty removal list, so it is a no-op until an
@@ -786,13 +805,15 @@ else's account through the account editor — the settings page itself has no YA
 more, see below:
 
 ```yaml
+pipeline: [format, dedup, toon, cmdfilter, searchfold, textclean, extract_llm_sweep, extract, cachesplit, toolfilter]
 components:
-  extract_llm:
-    per_output: false
-    cold_cache:
-      enabled: true
-      min_tokens: 1000
+  extract_llm_sweep:
+    min_tokens: 1000
 ```
+
+The cold sweep is its own component, so asking for it means naming it in the pipeline — there is no
+`enabled` key. Leaving `extract_llm` out is how you get the sweep *without* the warm/tail pass, which
+is what `per_output: false` used to mean.
 
 **Then check what it did**, before turning on anything else. Requests tab → open a request →
 **Compaction model calls**: one row per call with its cost, its saving, its latency, whether
