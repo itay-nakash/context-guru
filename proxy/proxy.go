@@ -30,6 +30,7 @@ import (
 	"github.com/rossoctl/context-guru/components/offload"
 	"github.com/rossoctl/context-guru/dash"
 	"github.com/rossoctl/context-guru/expand"
+	"github.com/rossoctl/context-guru/internal/adjudicate"
 	"github.com/rossoctl/context-guru/internal/cheapmodel"
 	"github.com/rossoctl/context-guru/internal/logging"
 	"github.com/rossoctl/context-guru/internal/modelinfo"
@@ -1097,6 +1098,18 @@ func (h *Handler) chat(provider bschemas.ModelProvider, static upstream, pick fu
 					// and the request side caught it.
 					lg.Debug("cg.expand_repair", "restored", repaired)
 				}
+				// The same problem for the adjudication tool, and the same remedy. The client
+				// cannot execute a tool the proxy injected, so a call the AGENT made to
+				// context_guru_adjudicate comes back as "not found" and the agent loses a turn
+				// to a dead end. Not defensive: a model was directly observed calling
+				// context_guru_expand at step 2 of a run. Measured at 0 strays across ~4,900
+				// requests with the "do not call this yourself" description, so this is a cheap
+				// insurance policy on a path that should stay cold — the counter
+				// (adjudicate_stray) is what says whether it does.
+				var strays int
+				if body, strays = adjudicate.AnswerStrayCalls(string(provider), body); strays > 0 {
+					lg.Debug("cg.adjudicate_stray", "answered", strays)
+				}
 			}
 			var added time.Duration
 			body, added, tr = h.applyMode(&reqInfo{
@@ -1178,6 +1191,15 @@ func (h *Handler) chat(provider bschemas.ModelProvider, static upstream, pick fu
 				if im != expand.InjectAuto || tn.Pipe.HasOffload() {
 					body, _ = expand.Inject(string(provider), im, body, tn.Store.Persists())
 				}
+				// The adjudication tool, injected on EVERY request for the same cache reason
+				// InjectAuto exists for, not only when the sweep is about to ask: `tools` hashes
+				// before system and messages, so a tool that appears on the turn a sweep fires
+				// and disappears on the next invalidates the prefix from position zero. Merely
+				// DECLARING it is what makes the prefix ask answer in schema shape at cache-read
+				// price — measured 6 of 6 verdicts on 4 of 4 trials with no tool_choice at all,
+				// against 0 of 6 when the ask forced tool_choice:none (see
+				// cheapmodel.CompletePrefixed and internal/adjudicate).
+				body, _ = adjudicate.Inject(string(provider), body)
 			}
 		}()
 		// Load the request's one INFO line with everything the pipeline decided. serve
@@ -1801,6 +1823,11 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
 	// tokens counts successful re-serves, so a broken stash was indistinguishable from a session
 	// that simply never called expand. See expand/unresolved.go.
 	snap.ExpandUnresolvedMalformed, snap.ExpandUnresolvedMissing = expand.Unresolved()
+	// Stray calls the AGENT made to the injected adjudication tool, answered on the request path.
+	// Published because the whole justification for advertising a tool the model is told not to call
+	// is that it does not call it: measured 0 across ~4,900 requests, and a non-zero figure here says
+	// the description stopped working — which nothing else in this snapshot can reveal.
+	snap.AdjudicateStray = adjudicate.StrayAnswered()
 	snap.FrozenHits, snap.FrozenMisses = offload.FrozenStats()
 	if fl, ok := h.store.(*store.Memory); ok { // process store; hosted per-tenant stores report via the dashboard
 		snap.FrozenDropped, snap.FrozenRepaired = fl.FrozenLossStats()

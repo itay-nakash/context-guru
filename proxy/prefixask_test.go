@@ -11,7 +11,9 @@ import (
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 
 	"github.com/rossoctl/context-guru/components"
+	"github.com/rossoctl/context-guru/internal/adjudicate"
 	"github.com/rossoctl/context-guru/internal/cheapmodel"
+	"github.com/rossoctl/context-guru/internal/extract"
 )
 
 // The prefix ask exists for ONE reason: to read the provider's prompt cache instead of paying fresh
@@ -121,15 +123,73 @@ func TestCompletePrefixedAppendsWithoutDisturbingThePrefix(t *testing.T) {
 	if len(sent.System) != 1 || sent.System[0]["cache_control"] == nil {
 		t.Errorf("the prefix's cache_control was lost, so there is no entry to read: %v", sent.System)
 	}
-	// TOOL_CHOICE: NONE is required and free. It is not part of the cache key, and without it the
-	// prefix's tools make the model answer with a tool_use instead of a verdict.
-	if sent.ToolChoice == nil || sent.ToolChoice["type"] != "none" {
-		t.Errorf("tool_choice is not forced to none, so the model will answer with a tool_use: %v",
-			sent.ToolChoice)
+	// NO TOOL_CHOICE AT ALL, and this reverses what this test used to assert. Same prefix, only
+	// tool_choice varying: {"type":"none"} returned prose and 0 of 6 verdicts (free cache read, no
+	// answer); {"type":"tool",name} returned 6 of 6 but MISSED the cache and wrote 8,378 tokens against
+	// the 8,268 already there, so naming a tool participates in the key; omitting it read the same
+	// entry for free AND returned 6 of 6 on 4 of 4 trials. Setting `none` to PREVENT a tool_use is what
+	// drove the model into prose, which the caller then scored as an unparseable failure.
+	if sent.ToolChoice != nil {
+		t.Errorf("tool_choice was set (%v); `none` drives the model into prose and a named tool costs "+
+			"a fresh cache write", sent.ToolChoice)
 	}
 	// stream is the one deliberate removal: the caller wants a single JSON answer.
 	if sent.Stream != nil {
 		t.Error("stream survived, so the reply would arrive as SSE rather than one JSON answer")
+	}
+}
+
+// THE TOOL INPUT IS PREFERRED OVER TEXT. With the tool declared in the prefix the model answers by
+// calling it, and that input is already schema-shaped — which is the whole point: it removes prose,
+// partial batches, and an array truncated by the output budget. The raw input is returned so the
+// caller's existing parser reads it unchanged, and a `Read` call sitting alongside must NOT be
+// mistaken for the answer.
+func TestCompletePrefixedPrefersOurToolInputOverText(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(`{"content":[` +
+			`{"type":"thinking","thinking":"weighing the outputs"},` +
+			`{"type":"text","text":"I think output 1 is still needed."},` +
+			`{"type":"tool_use","id":"t0","name":"Read","input":{"path":"a.py"}},` +
+			`{"type":"tool_use","id":"t1","name":"` + adjudicate.ToolName + `",` +
+			`"input":{"verdicts":[{"i":1,"needed_by":"none","verdict":"drop"}]}}],` +
+			`"usage":{"input_tokens":1,"output_tokens":2,"cache_creation_input_tokens":0,` +
+			`"cache_read_input_tokens":8268}}`))
+	}))
+	t.Cleanup(srv.Close)
+	cli := cheapmodel.Anthropic{BaseURL: srv.URL, Model: "claude-sonnet-5", APIKey: "k"}
+	reply, _, err := cli.CompletePrefixed(context.Background(), []byte(prefixBodyFixture), "ASK")
+	if err != nil {
+		t.Fatalf("CompletePrefixed: %v", err)
+	}
+	if strings.Contains(reply, "I think output 1") {
+		t.Errorf("the prose text was returned in preference to the tool input: %q", reply)
+	}
+	if strings.Contains(reply, "a.py") {
+		t.Errorf("the AGENT's own Read call was mistaken for the answer: %q", reply)
+	}
+	if !strings.Contains(reply, `"verdicts"`) || !strings.Contains(reply, `"drop"`) {
+		t.Errorf("the tool input did not reach the caller verbatim: %q", reply)
+	}
+	// The existing text parser must read that input unchanged — it scans for an array that decodes,
+	// and the tool's `verdicts` array is one. This is what keeps the fix additive.
+	vs, ok := extract.ParseVerdicts(reply)
+	if !ok || len(vs) != 1 || vs[0].Label != 1 || vs[0].Verdict != "drop" {
+		t.Errorf("extract.ParseVerdicts could not read the tool input: ok=%v verdicts=%+v", ok, vs)
+	}
+}
+
+// With no tool_use in the reply the TEXT path must still work: main's parse path and its fallback are
+// untouched by this change, and a model that answers in prose anyway is read exactly as before.
+func TestCompletePrefixedStillReadsTextWhenNoToolWasCalled(t *testing.T) {
+	srv := newCapturePrefixed(t, 8268)
+	cli := cheapmodel.Anthropic{BaseURL: srv.srv.URL, Model: "m", APIKey: "k"}
+	reply, _, err := cli.CompletePrefixed(context.Background(), []byte(prefixBodyFixture), "ASK")
+	if err != nil {
+		t.Fatalf("CompletePrefixed: %v", err)
+	}
+	if reply != "[]" {
+		t.Errorf("reply = %q; the text path must survive unchanged", reply)
 	}
 }
 
