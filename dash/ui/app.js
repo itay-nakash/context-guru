@@ -2745,7 +2745,16 @@ async function loadSessions() {
         el('td', { text: firstOf(s.presets) }),
         el('td', { class: 'num', text: num(s.turns) }),
         el('td', { class: 'num', text: compact(s.tokens_before) }),
-        el('td', { class: 'num', text: compact(s.saved) }),
+        // BOTH denominators, in one cell rather than a 16th column, and in the order the
+        // <details> above the table explains them. Gross alone was the only savings figure
+        // on this row and it overstates by 27.7x overall / up to 572.9x on one session.
+        el('td', {
+          class: 'num',
+          title: 'gross ' + num(s.saved) + ' tokens: a removed span counted once per turn it '
+            + 'was absent from. unique ' + num(s.saved_unique) + ' tokens: the same text '
+            + 'counted once. Gross is the size of every request we sent; unique is how much '
+            + 'distinct text was dropped.',
+        }, compact(s.saved) + ' / ' + compact(s.saved_unique)),
         // A dollar figure over a session whose turns are not all priced is a figure with
         // a different denominator from the token columns beside it: it covers the priced
         // turns only. The dagger says so rather than letting the two read as one total.
@@ -2985,9 +2994,12 @@ function renderSide(host, rows) {
   host.appendChild(el('div', { class: 'side-scroll', tabindex: '0' }, grid));
 }
 
-function renderDiff(host, before, after, mode) {
+/** `rows` lets a caller hand in the diff it already computed. Every block used to run
+ *  the LCS TWICE — once for the toolbar tally, once here — so a large session paid for
+ *  two quadratic passes per block and got one rendering out of it. */
+function renderDiff(host, before, after, mode, rows) {
   clear(host);
-  const rows = withHunks(diffLines((before || '').split('\n'), (after || '').split('\n')));
+  rows = rows || withHunks(diffLines((before || '').split('\n'), (after || '').split('\n')));
   if (mode === 'orig') { renderOneSide(host, rows, 'a'); return; }
   if (mode === 'raw') { renderOneSide(host, rows, 'b'); return; }
   if (mode === 'side') { renderSide(host, rows); return; }
@@ -3008,10 +3020,56 @@ function renderDiff(host, before, after, mode) {
   host.appendChild(frag);
 }
 
-/** Count added/removed lines, for the toolbar's tally. */
-function diffTally(before, after) {
+/**
+ * CLIPPED matches the truncation sentinel apply.clip() appends to a trace text:
+ * "…[+2559 bytes]" at the very end of the LAST line. It means the pipeline rewrote the
+ * whole message but only the first apply.TraceTextCap bytes were captured — so the token
+ * counts in the block summary are for the full message while the text below is a prefix.
+ */
+const CLIPPED = /…\[\+(\d+) bytes\]$/;
+
+/**
+ * markClipped turns each truncation sentinel into its own `gap` row — the same op the
+ * elided-unchanged-run marker already uses, so all three renderers style it as a notice
+ * instead of tinting it like a line of transcript. Runs AFTER the diff, on the rows, so
+ * the diff itself is byte-for-byte what it was before.
+ *
+ * Returns the bytes not captured per side, for the block-level note.
+ */
+function markClipped(rows) {
+  const missing = { a: 0, b: 0 };
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const r = rows[i];
+    if (r.op === 'gap') continue;
+    const m = CLIPPED.exec(r.text || '');
+    if (!m) continue;
+    const n = Number(m[1]);
+    // op ' ' means the sentinel survived as an unchanged line, i.e. both sides carry it.
+    if (r.op === '-' || r.op === ' ') missing.a = Math.max(missing.a, n);
+    if (r.op === '+' || r.op === ' ') missing.b = Math.max(missing.b, n);
+    r.text = r.text.slice(0, -m[0].length);
+    rows.splice(i + 1, 0, { op: 'gap', text:
+      `… truncated here: ${num(n)} more bytes were not captured (the diff shows the first ` +
+      `${num(CONTENT_CAP)} bytes; token counts above are for the whole message) …` });
+  }
+  return missing;
+}
+
+/** The cap the server says actually binds, from any transcript/request answer. Defaults to
+ *  apply.TraceTextCap so a notice reads correctly before the first answer lands. */
+let CONTENT_CAP = 4000;
+
+/** Count added/removed lines, for the toolbar's tally, from rows the caller already has.
+ *
+ *  It counts the LCS result rather than deriving anything from before_tokens/after_tokens:
+ *  those are a different unit and do not track the line counts at all. Measured over 300
+ *  content rows, 0 of 300 had `(lines removed − lines added) == (before_tokens −
+ *  after_tokens)`, and the median ratio between the two is 0.0 — the common case is one
+ *  long line replaced by a marker plus a note, i.e. +1 line net for several hundred tokens
+ *  saved. So there is no arithmetic shortcut here; the saving is one pass instead of two. */
+function diffTally(rows) {
   let add = 0, del = 0;
-  for (const r of diffLines((before || '').split('\n'), (after || '').split('\n'))) {
+  for (const r of rows) {
     if (r.op === '+') add++;
     else if (r.op === '-') del++;
   }
@@ -3164,46 +3222,86 @@ function kvBand(title, testid, ...pairs) {
  */
 function diffBlock(c, components, opts = {}) {
   const saved = c.before_tokens - c.after_tokens;
-  const t = diffTally(c.before, c.after);
   const det = el('details', { class: 'diff', 'data-testid': 'diff-block' });
-  if (opts.open) det.open = true;
   det.appendChild(el('summary', {
     text: `${opts.prefix || ''}${c.path} — ${compact(c.before_tokens)} → ${compact(c.after_tokens)} tokens ` +
           (saved > 0 ? `(saved ${compact(saved)})` : '(rewritten, no token saving)'),
   }));
 
-  // tabindex: this box scrolls, and a scroll region a keyboard user cannot focus is a
-  // part of the diff they cannot reach at all (axe scrollable-region-focusable). Same
-  // reason .tblwrap carries one.
-  const bodyHost = el('div', { class: 'diffbody', tabindex: '0', role: 'group',
-    'aria-label': 'Diff of ' + c.path });
   let mode = opts.mode || 'git';
+  let bodyHost = null, rows = null;
   const buttons = [];
-  const bar = el('div', { class: 'difftoolbar' });
+
+  // Everything below the summary is built ON FIRST OPEN, not up front. A closed <details>
+  // shows none of it — not the tally, not the chips, not the diff — so building it eagerly
+  // bought nothing and cost one LCS pass plus a few hundred DOM nodes per block. On the
+  // worst session in this corpus that was 31,425 blocks × (2 LCS + ~30 nodes each), which
+  // killed the renderer in 1.9 s. Deferring it makes an unopened block a summary line.
+  const build = () => {
+    if (bodyHost) return;
+    // The ONE LCS pass. The tally and every view mode read the same rows.
+    rows = withHunks(diffLines((c.before || '').split('\n'), (c.after || '').split('\n')));
+    const missing = markClipped(rows);
+    const t = diffTally(rows);
+    const bar = el('div', { class: 'difftoolbar' });
+    for (const [m, label, testid] of DIFF_MODES) {
+      const b = el('button', {
+        class: 'ghost small', 'data-testid': testid, 'data-mode': m,
+        'aria-pressed': String(m === mode), onclick: () => setMode(m),
+      }, label);
+      buttons.push(b);
+      bar.appendChild(b);
+    }
+    bar.appendChild(el('span', { class: 'spacer' }));
+    bar.appendChild(el('span', { class: 'tally' },
+      el('span', { class: 'del', text: '−' + num(t.del) }), ' / ',
+      el('span', { class: 'add', text: '+' + num(t.add) }), ' lines'));
+    det.appendChild(bar);
+
+    const chips = attributionChips(c, components);
+    if (chips) det.appendChild(el('div', { class: 'difftoolbar' }, chips));
+
+    // The header/body disagreement, said out loud: the token counts in the summary are the
+    // whole message's, the text below is a prefix. Without this the only signal was a
+    // sentinel tinted like an ordinary transcript line.
+    if (missing.a || missing.b) {
+      det.appendChild(el('div', { class: 'state blocked', 'data-testid': 'diff-truncated',
+        role: 'note' },
+        el('div', { class: 'state-body' },
+          el('strong', { text: 'Only the first ' + num(CONTENT_CAP) + ' bytes were captured' }),
+          el('span', { text:
+            [missing.a && num(missing.a) + ' bytes of the before-text',
+              missing.b && num(missing.b) + ' bytes of the after-text'].filter(Boolean).join(' and ')
+            + ' are not in this diff. The token counts in the heading above cover the whole '
+            + 'message, so they will not match the text you can see here. '
+            + (MARKER.test(c.after || '')
+              ? 'The after-text carries a <<cg:HASH>> marker, so the full original is still '
+                + 'recoverable through the expand tool.'
+              : 'This is a capture limit, not a rewrite: nothing was lost from what was sent '
+                + 'upstream.') }))));
+    }
+
+    // tabindex: this box scrolls, and a scroll region a keyboard user cannot focus is a
+    // part of the diff they cannot reach at all (axe scrollable-region-focusable). Same
+    // reason .tblwrap carries one.
+    bodyHost = el('div', { class: 'diffbody', tabindex: '0', role: 'group',
+      'aria-label': 'Diff of ' + c.path });
+    det.appendChild(bodyHost);
+    renderDiff(bodyHost, c.before, c.after, mode, rows);
+  };
+
   const setMode = (next) => {
     mode = next;
+    // A session-wide toolbar sets .open and calls this in the same tick, and `toggle`
+    // fires asynchronously — so build here rather than trusting the event to have landed.
+    if (det.open) build();
+    if (!bodyHost) return;
     for (const b of buttons) b.setAttribute('aria-pressed', String(b.dataset.mode === next));
-    renderDiff(bodyHost, c.before, c.after, next);
+    renderDiff(bodyHost, c.before, c.after, next, rows);
   };
-  for (const [m, label, testid] of DIFF_MODES) {
-    const b = el('button', {
-      class: 'ghost small', 'data-testid': testid, 'data-mode': m,
-      'aria-pressed': String(m === mode), onclick: () => setMode(m),
-    }, label);
-    buttons.push(b);
-    bar.appendChild(b);
-  }
-  bar.appendChild(el('span', { class: 'spacer' }));
-  bar.appendChild(el('span', { class: 'tally' },
-    el('span', { class: 'del', text: '−' + num(t.del) }), ' / ',
-    el('span', { class: 'add', text: '+' + num(t.add) }), ' lines'));
-  det.appendChild(bar);
 
-  const chips = attributionChips(c, components);
-  if (chips) det.appendChild(el('div', { class: 'difftoolbar' }, chips));
-
-  det.appendChild(bodyHost);
-  renderDiff(bodyHost, c.before, c.after, mode);
+  det.addEventListener('toggle', () => { if (det.open) build(); });
+  if (opts.open) { det.open = true; build(); }
   det.setMode = setMode;
   return det;
 }
@@ -3267,7 +3365,9 @@ async function openRequest(id, fromURL) {
     // capture_blocked_by names WHICH party's gate is shut, so the empty-diff panel can
     // stop telling people to change a setting that is not theirs.
     const { request: e, content_visible: visible, content_captured: captured,
-      content_archived: archived, capture_blocked_by: blockedBy } = await res.json();
+      content_archived: archived, capture_blocked_by: blockedBy,
+      content_cap_bytes: cap } = await res.json();
+    if (cap) CONTENT_CAP = cap;
     clear(body);
 
     // Four captioned bands rather than twenty-four pairs in one grid. Same data, same
@@ -3642,22 +3742,42 @@ function dismissDrawer() {
 
 /** transcriptURL builds the route, carrying only the manager's tenant selector — never
  *  the view filters, which would silently drop turns out of the middle of a session. */
-function transcriptURL(session, fetchCold) {
+function transcriptURL(session, fetchCold, after) {
   const p = new URLSearchParams();
   if (state.filter.tenant) p.set('tenant', state.filter.tenant);
   if (fetchCold) p.set('fetch', '1');
+  if (after) p.set('after', after);
   const q = p.toString();
   return '/api/sessions/' + encodeURIComponent(session) + '/transcript' + (q ? '?' + q : '');
 }
 
-async function openSessionDiff(session, fetchCold, fromURL) {
+/**
+ * The diff drawer's pager. One session at a time, in memory.
+ *
+ * `pages[i]` is the keyset cursor for page i plus the 0-based turn number it starts at,
+ * so "turn 3" keeps meaning the third turn of the CONVERSATION on page 7, and Previous
+ * is a step back to a cursor already seen rather than a re-page from the start.
+ *
+ * ponytail: not in the URL. The router lives in another file, and a cursor pasted into a
+ * shared link would pin the reader to a page boundary of a session that has since grown —
+ * a link to a session is the honest thing to share. Move it into the hash if someone
+ * actually asks to deep-link a page.
+ */
+let diffPager = { session: null, pages: [{ cursor: '', offset: 0 }], page: 0 };
+
+async function openSessionDiff(session, fetchCold, fromURL, page) {
   // Linkable, like the request drawer: this view is the one people want to send someone.
   if (!fromURL) { state.drawer = { diff: session }; syncURL(false); }
+  // A different session resets the pager; a re-open of the same one (the cold-storage
+  // fetch button re-enters here) keeps the page you were on.
+  if (diffPager.session !== session) diffPager = { session, pages: [{ cursor: '', offset: 0 }], page: 0 };
+  if (page != null) diffPager.page = page;
+  const at = diffPager.pages[diffPager.page] || diffPager.pages[0];
   const body = openDrawer('Compaction diff · ' + (session || '(no session id)'), null);
   loadingState(body, 5);
   let out;
   try {
-    const res = await fetch(transcriptURL(session, fetchCold), { headers: { accept: 'application/json' } });
+    const res = await fetch(transcriptURL(session, fetchCold, at.cursor), { headers: { accept: 'application/json' } });
     if (!res.ok) {
       let msg = res.status + ' ' + res.statusText;
       let j = null;
@@ -3673,11 +3793,19 @@ async function openSessionDiff(session, fetchCold, fromURL) {
     errorState(clear(body), 'Could not load this session', err);
     return;
   }
-  renderSessionDiff(body, session, out);
+  // Learn the NEXT page's coordinates from the answer we just got: keyset pagination has
+  // no page numbers, so the only way forward is the cursor the server handed back.
+  if (out.next_cursor) {
+    diffPager.pages[diffPager.page + 1] = {
+      cursor: out.next_cursor, offset: at.offset + (out.requests || []).length,
+    };
+  }
+  renderSessionDiff(body, session, out, at.offset);
 }
 
-function renderSessionDiff(body, session, out) {
+function renderSessionDiff(body, session, out, offset = 0) {
   clear(body);
+  if (out.content_cap_bytes) CONTENT_CAP = out.content_cap_bytes;
   if (out.state === 'unknown_session') {
     contentBlockedState(body, 'unknown_session');
     return;
@@ -3713,16 +3841,26 @@ function renderSessionDiff(body, session, out) {
   const storedTurns = reqs.filter((e) => (e.content || []).length).length;
   const partial = storedTurns < rewrittenTurns;
 
+  // The route is paged, so every total above is a total over THIS PAGE. Saying so is not a
+  // nicety: an unlabelled "Tokens before → after" over 50 of 1,310 turns is a wrong number
+  // about the session, which is the level at which the reader is asking.
+  const total = out.total || reqs.length;
+  const paged = total > reqs.length;
+  const from = reqs.length ? offset + 1 : 0;
+  const to = offset + reqs.length;
+  const per = paged ? ' (turns ' + num(from) + '–' + num(to) + ')' : '';
+
   body.appendChild(el('div', { class: 'kv', 'data-testid': 'session-diff-summary' },
     kv('Session', session || '(none)'),
-    kv('Turns in this session', num(reqs.length)),
-    kv('Turns rewritten', num(rewrittenTurns)),
-    kv('Turns with stored text', storedTurns + ' of ' + rewrittenTurns + ' rewritten'),
-    kv('Messages rewritten' + (partial ? ' (stored turns only)' : ''), num(changed)),
-    kv('Tokens before → after', compact(before) + ' → ' + compact(after)),
-    kv('Saved (gross / unique)', compact(before - after) + ' / ' + compact(unique)),
-    kv('context-guru latency', dur(cgMs)),
-    kv('Window', reqs.length
+    kv('Turns in this session', num(total)
+      + (paged ? ' — showing ' + num(from) + '–' + num(to) : '')),
+    kv('Turns rewritten' + per, num(rewrittenTurns)),
+    kv('Turns with stored text' + per, storedTurns + ' of ' + rewrittenTurns + ' rewritten'),
+    kv('Messages rewritten' + per + (partial ? ' (stored turns only)' : ''), num(changed)),
+    kv('Tokens before → after' + per, compact(before) + ' → ' + compact(after)),
+    kv('Saved (gross / unique)' + per, compact(before - after) + ' / ' + compact(unique)),
+    kv('context-guru latency' + per, dur(cgMs)),
+    kv('Window' + per, reqs.length
       ? when(reqs[0].ts) + ' → ' + when(reqs[reqs.length - 1].ts)
       : (out.archive ? when(out.archive.first_ts) + ' → ' + when(out.archive.last_ts) : '—'))));
 
@@ -3769,7 +3907,9 @@ function renderSessionDiff(body, session, out) {
   }
 
   if (compTotals.size) {
-    body.appendChild(el('h2', { text: 'Components, across the session' }));
+    body.appendChild(el('h2', { text: paged
+      ? 'Components, across turns ' + num(from) + '–' + num(to)
+      : 'Components, across the session' }));
     const rows = Array.from(compTotals.entries()).sort((a, b) => b[1].saved - a[1].saved);
     const tbl = el('table', { class: 'tbl compact', 'data-testid': 'session-diff-components' },
       el('thead', {}, el('tr', {},
@@ -3830,6 +3970,33 @@ function renderSessionDiff(body, session, out) {
     'not a reconstructed transcript: the messages we left alone were never captured, so ' +
     'stitching them into a whole conversation would be inventing the parts we did not store.' }));
 
+  // Say the size BEFORE rendering it. A block count is the one number that predicts what
+  // this panel is about to cost, and the page it belongs to is the answer to "where is the
+  // rest of it" — a session in this corpus reaches 31,425 blocks, and the panel used to
+  // open on all of them at once with no warning and no way out.
+  const blockCount = withContent.reduce((n, e) => n + e.content.length, 0);
+  body.appendChild(el('p', { class: 'note', 'data-testid': 'diff-scale', text:
+    num(blockCount) + ' block(s) on this page, from ' + num(storedTurns) + ' stored turn(s)'
+    + (paged ? ' of ' + num(total) + ' in the session. Blocks are collapsed until you open '
+      + 'one — expanding all of them renders every line of all ' + num(blockCount) + '.'
+      : '. Blocks are collapsed until you open one.') }));
+
+  const pager = () => {
+    if (!paged) return null;
+    const prev = el('button', {
+      class: 'ghost', disabled: diffPager.page === 0,
+      onclick: () => openSessionDiff(session, false, true, diffPager.page - 1),
+    }, 'Previous turns');
+    const next = el('button', {
+      class: 'ghost', disabled: !out.next_cursor,
+      onclick: () => openSessionDiff(session, false, true, diffPager.page + 1),
+    }, 'Next turns');
+    return el('div', { class: 'pager', 'data-testid': 'diff-pager' }, prev,
+      el('span', { text: 'Turns ' + num(from) + '–' + num(to) + ' of ' + num(total) }), next);
+  };
+  const topPager = pager();
+  if (topPager) body.appendChild(topPager);
+
   // One toolbar drives every block, which is what makes (a) "the session before
   // compaction" and (b) "after" single clicks rather than N expansions.
   const blocks = [];
@@ -3850,14 +4017,17 @@ function renderSessionDiff(body, session, out) {
   bar.appendChild(el('span', { class: 'spacer' }));
   bar.appendChild(el('button', {
     class: 'ghost small',
+    title: 'Renders every line of all ' + num(blockCount) + ' blocks on this page',
     onclick: () => { for (const blk of blocks) blk.open = !blk.open; },
-  }, 'Expand / collapse all'));
+  }, 'Expand / collapse all ' + num(blockCount)));
   body.appendChild(bar);
 
   // Turn numbers come from the position in the FULL request list, not in the filtered
   // one: "turn 3" has to mean the third turn of the conversation, not the third turn
   // that happened to be rewritten.
-  const turnOf = new Map(reqs.map((e, i) => [e, i + 1]));
+  // `offset` is this page's first turn, so a turn number is the conversation's, not the
+  // page's: on page 7 the first block is "turn 301", not "turn 1".
+  const turnOf = new Map(reqs.map((e, i) => [e, offset + i + 1]));
   for (const e of withContent) {
     for (const c of e.content) {
       const blk = diffBlock(c, e.components, {
@@ -3868,6 +4038,10 @@ function renderSessionDiff(body, session, out) {
       body.appendChild(blk);
     }
   }
+  // A second pager at the bottom: the top one is 400 blocks up by the time you have read
+  // the page, and scrolling back to find Next is not a feature.
+  const botPager = pager();
+  if (botPager) body.appendChild(botPager);
 }
 
 // ── benchmarks ─────────────────────────────────────────────────────────────
