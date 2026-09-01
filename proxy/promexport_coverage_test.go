@@ -24,9 +24,12 @@ import (
 // notExportedWhy with a reason. Adding a field to Snapshot without doing one of the two
 // FAILS THE BUILD.
 //
-// EXPECTED TO FAIL ON PR #137, and that is the test working as intended: that PR adds an
-// `adjudicate_stray` field to Snapshot and exports it nowhere. The fix is to export it, or
-// to list it below with an honest reason — not to delete this test.
+// This CAUGHT PR #137, which added an `adjudicate_stray` field to Snapshot and exported it
+// nowhere — the test working exactly as intended. Resolved the way the second group below
+// prescribes: the series IS exported, as cg_adjudicate_stray_total, but sourced from
+// adjudicate.StrayAnswered() rather than off `s`, because the /stats handler fills that field
+// AFTER renderMetrics takes its snapshot, so a promLine off `s` would have exported a
+// permanent 0 while passing this test.
 //
 // What it checks is that the exporter READS the field, not that a particular series
 // renders, and NOT that the value is real: `s` in renderMetrics is the bare aggregator
@@ -76,6 +79,7 @@ var notExportedWhy = map[string]string{
 	// renderMetrics holds the bare aggregator snapshot, where those fields are zero.
 	"ExpandUnresolvedMalformed": `cg_expand_unresolved_total{reason="malformed"}, from expand.Unresolved()`,
 	"ExpandUnresolvedMissing":   `cg_expand_unresolved_total{reason="missing"}, from expand.Unresolved()`,
+	"AdjudicateStray":           "cg_adjudicate_stray_total, from adjudicate.StrayAnswered()",
 	"LLMCalls":                  "cg_llm_calls_total, from cheapmodel.Usage()",
 	"LLMInputTokens":            `cg_llm_tokens_total{direction="input"}, from cheapmodel.Usage()`,
 	"LLMOutputTokens":           `cg_llm_tokens_total{direction="output"}, from cheapmodel.Usage()`,
