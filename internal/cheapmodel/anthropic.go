@@ -18,6 +18,7 @@ import (
 	"github.com/tidwall/sjson"
 
 	"github.com/rossoctl/context-guru/components"
+	"github.com/rossoctl/context-guru/internal/adjudicate"
 )
 
 // Anthropic calls a small Anthropic model with a single user prompt and returns the
@@ -193,6 +194,10 @@ type PrefixUsage struct {
 	CacheWrite int
 	Fresh      int
 	Output     int
+	// ViaTool: the answer came back as a tool_use for adjudicate.ToolName, not as reply text. See
+	// components.PrefixUsage.ViaTool -- the field exists so the caller can COUNT which shape it got,
+	// because the text parser accepts both and therefore hides the difference.
+	ViaTool bool
 }
 
 // CompletePrefixed sends `ask` as a trailing user message appended to prefixBody — an ENTIRE
@@ -211,11 +216,36 @@ type PrefixUsage struct {
 //
 //   - appending a trailing user message to a byte-identical prefix reads the whole prefix from
 //     cache and writes nothing: 19,595 read / 0 created.
-//   - `tool_choice` is NOT part of the cache key, so forcing it to "none" is free — and necessary,
-//     because the prefix carries the agent's tools and the model will otherwise answer with a
-//     tool_use instead of the verdicts.
+//
+//   - NO `tool_choice` IS SET, and a structured-answer tool IS declared. Those two halves are ONE
+//     change: the earlier comment here claimed forcing "none" was free and necessary "because the
+//     model will otherwise answer with a tool_use instead of the verdicts", and it was RIGHT about
+//     the mechanism and WRONG about the remedy. Three arms over the same transcript and ask model,
+//     three benchmark passes each, run sequentially:
+//
+//     tool_choice       tool declared   asks replied   unusable        answered via tool_use
+//     {"type":"none"}   no              20             6  (30.0%)      0
+//     (omitted)         NO              24             14 (58.3%)      0
+//     (omitted)         yes             77             7  (9.1%)       43 (55.8%)
+//
+//     Fisher two-tailed: row 1 vs row 3 p = 0.0245, row 2 vs row 3 p = 0.0000.
+//
+//     THE MIDDLE ROW IS THE POINT, and it is the arm that had never been run before: dropping the
+//     suppression WITHOUT declaring an answer tool is worse than leaving it in. Freed to call
+//     something and offered only the agent's tools plus context_guru_expand, the model calls one of
+//     those — observed directly by logging every reply's content blocks, as
+//     `thinking,tool_use:context_guru_expand` with NO text block, which this function's text
+//     extraction reads as "" and the caller files as unusable. That arm also lost 5 asks to the 90 s
+//     llmCallTimeout, against 0 and 1 in the others. So `none` was suppressing a real failure mode;
+//     declaring a tool worth calling is what removes the mode instead of trading it for prose.
+//
+//     Forcing a NAMED tool is separately not free: it wrote a second cache entry (8,378 against the
+//     8,268 already cached), so tool_choice DOES participate in the key when it names a tool even
+//     though "none" does not. Omitting it entirely reads the prefix for free.
+//
 //   - `tools` ARE part of the key. They are therefore left exactly as the prefix had them; dropping
 //     them read a different, smaller entry (19,129) i.e. a separate cache line and a fresh write.
+//
 //   - this route REJECTS assistant prefill ("the conversation must end with a user message"), which
 //     the appended user message satisfies by construction — but it means prefixBody must not be
 //     extended any other way.
@@ -232,10 +262,6 @@ func (a Anthropic) CompletePrefixed(ctx context.Context, prefixBody []byte, ask 
 	body, err := sjson.SetBytes(prefixBody, "messages."+strconv.Itoa(n),
 		map[string]any{"role": "user", "content": ask})
 	if err != nil {
-		return "", u, err
-	}
-	// tool_choice: free (not in the cache key) and required, or the model answers with a tool_use.
-	if body, err = sjson.SetBytes(body, "tool_choice", map[string]any{"type": "none"}); err != nil {
 		return "", u, err
 	}
 	maxTok := a.MaxTokens
@@ -279,7 +305,10 @@ func (a Anthropic) CompletePrefixed(ctx context.Context, prefixBody []byte, ask 
 	}
 	var out struct {
 		Content []struct {
-			Text string `json:"text"`
+			Type  string          `json:"type"`
+			Text  string          `json:"text"`
+			Name  string          `json:"name"`
+			Input json.RawMessage `json:"input"`
 		} `json:"content"`
 		Usage struct {
 			InputTokens      int `json:"input_tokens"`
@@ -295,6 +324,21 @@ func (a Anthropic) CompletePrefixed(ctx context.Context, prefixBody []byte, ask 
 		Fresh: out.Usage.InputTokens, Output: out.Usage.OutputTokens}
 	recordUsageCache(ctx, a.Model, out.Usage.InputTokens, out.Usage.OutputTokens,
 		out.Usage.CacheCreationTok, out.Usage.CacheReadTok)
+	// OUR TOOL'S INPUT BEATS TEXT. When the prefix advertises the structured-answer tool the model uses
+	// it of its own accord, and the input arrives already schema-shaped — which removes three failure
+	// modes the text path had: prose instead of JSON, verdicts for only part of the batch, and an array
+	// cut off by the output budget mid-flight. The raw input is returned as-is, because its field names
+	// are the caller's own JSON tags and its `verdicts` array is what the existing parser scans for; the
+	// text path below is unchanged and still handles a model that answered in prose anyway.
+	//
+	// Only OUR tool, by name: the prefix carries the AGENT's tools too, and returning a `Read` call's
+	// input would replace a usable prose answer with an argument list that cannot parse.
+	for _, c := range out.Content {
+		if c.Type == "tool_use" && c.Name == adjudicate.ToolName && len(c.Input) > 0 {
+			u.ViaTool = true
+			return string(c.Input), u, nil
+		}
+	}
 	for _, c := range out.Content {
 		if c.Text != "" {
 			return c.Text, u, nil

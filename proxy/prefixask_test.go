@@ -11,7 +11,9 @@ import (
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 
 	"github.com/rossoctl/context-guru/components"
+	"github.com/rossoctl/context-guru/internal/adjudicate"
 	"github.com/rossoctl/context-guru/internal/cheapmodel"
+	"github.com/rossoctl/context-guru/internal/extract"
 )
 
 // The prefix ask exists for ONE reason: to read the provider's prompt cache instead of paying fresh
@@ -121,15 +123,90 @@ func TestCompletePrefixedAppendsWithoutDisturbingThePrefix(t *testing.T) {
 	if len(sent.System) != 1 || sent.System[0]["cache_control"] == nil {
 		t.Errorf("the prefix's cache_control was lost, so there is no entry to read: %v", sent.System)
 	}
-	// TOOL_CHOICE: NONE is required and free. It is not part of the cache key, and without it the
-	// prefix's tools make the model answer with a tool_use instead of a verdict.
-	if sent.ToolChoice == nil || sent.ToolChoice["type"] != "none" {
-		t.Errorf("tool_choice is not forced to none, so the model will answer with a tool_use: %v",
-			sent.ToolChoice)
+	// NO TOOL_CHOICE AT ALL, and this reverses what this test used to assert. Two separate findings on
+	// the same prefix with only tool_choice varying. On the CACHE: {"type":"tool",name} MISSED the entry
+	// and wrote 8,378 tokens against the 8,268 already there, so naming a tool DOES participate in the
+	// key, while omitting tool_choice read that entry for free. On the ANSWER: with the tool declared
+	// and no tool_choice, unparseable replies ran 9.1% (7 of 77 replied asks) against 30.0% (6 of 20)
+	// under main's {"type":"none"}, Fisher two-tailed p = 0.0245 — setting `none` to PREVENT a tool_use
+	// is what drove the model into prose, which the caller then scored as an unparseable failure.
+	// The "0 of 6 / 6 of 6" verdict counts this comment used to cite came from a six-item hand pass and
+	// are retracted; main returns verdicts on 71.5% of the items it asks about, not none of them.
+	if sent.ToolChoice != nil {
+		t.Errorf("tool_choice was set (%v); `none` drives the model into prose and a named tool costs "+
+			"a fresh cache write", sent.ToolChoice)
 	}
 	// stream is the one deliberate removal: the caller wants a single JSON answer.
 	if sent.Stream != nil {
 		t.Error("stream survived, so the reply would arrive as SSE rather than one JSON answer")
+	}
+}
+
+// THE TOOL INPUT IS PREFERRED OVER TEXT. With the tool declared in the prefix the model answers by
+// calling it, and that input is already schema-shaped — which is the whole point: it removes prose,
+// partial batches, and an array truncated by the output budget. The raw input is returned so the
+// caller's existing parser reads it unchanged, and a `Read` call sitting alongside must NOT be
+// mistaken for the answer.
+func TestCompletePrefixedPrefersOurToolInputOverText(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(`{"content":[` +
+			`{"type":"thinking","thinking":"weighing the outputs"},` +
+			`{"type":"text","text":"I think output 1 is still needed."},` +
+			`{"type":"tool_use","id":"t0","name":"Read","input":{"path":"a.py"}},` +
+			`{"type":"tool_use","id":"t1","name":"` + adjudicate.ToolName + `",` +
+			`"input":{"verdicts":[{"i":1,"needed_by":"none","verdict":"drop"}]}}],` +
+			`"usage":{"input_tokens":1,"output_tokens":2,"cache_creation_input_tokens":0,` +
+			`"cache_read_input_tokens":8268}}`))
+	}))
+	t.Cleanup(srv.Close)
+	cli := cheapmodel.Anthropic{BaseURL: srv.URL, Model: "claude-sonnet-5", APIKey: "k"}
+	reply, u, err := cli.CompletePrefixed(context.Background(), []byte(prefixBodyFixture), "ASK")
+	if err != nil {
+		t.Fatalf("CompletePrefixed: %v", err)
+	}
+	// REPORTED, not just used. The caller counts which reply shape it got, and it cannot infer this
+	// one: extract.ParseVerdicts reads a tool_use input and a JSON array in text identically, so a
+	// run whose declared tool is never touched looks exactly like one where it always is. That
+	// ambiguity is what left the reviewer's "0 of 5 asks used the tool" and this PR's "6 of 6"
+	// un-adjudicable against each other. See components.PrefixUsage.ViaTool.
+	if !u.ViaTool {
+		t.Error("the answer arrived as a tool_use but was not reported as one")
+	}
+	if strings.Contains(reply, "I think output 1") {
+		t.Errorf("the prose text was returned in preference to the tool input: %q", reply)
+	}
+	if strings.Contains(reply, "a.py") {
+		t.Errorf("the AGENT's own Read call was mistaken for the answer: %q", reply)
+	}
+	if !strings.Contains(reply, `"verdicts"`) || !strings.Contains(reply, `"drop"`) {
+		t.Errorf("the tool input did not reach the caller verbatim: %q", reply)
+	}
+	// The existing text parser must read that input unchanged — it scans for an array that decodes,
+	// and the tool's `verdicts` array is one. This is what keeps the fix additive.
+	vs, ok := extract.ParseVerdicts(reply)
+	if !ok || len(vs) != 1 || vs[0].Label != 1 || vs[0].Verdict != "drop" {
+		t.Errorf("extract.ParseVerdicts could not read the tool input: ok=%v verdicts=%+v", ok, vs)
+	}
+}
+
+// With no tool_use in the reply the TEXT path must still work: main's parse path and its fallback are
+// untouched by this change, and a model that answers in prose anyway is read exactly as before.
+func TestCompletePrefixedStillReadsTextWhenNoToolWasCalled(t *testing.T) {
+	srv := newCapturePrefixed(t, 8268)
+	cli := cheapmodel.Anthropic{BaseURL: srv.srv.URL, Model: "m", APIKey: "k"}
+	reply, u, err := cli.CompletePrefixed(context.Background(), []byte(prefixBodyFixture), "ASK")
+	// And the shape is reported as PROSE, so the two counters cannot both be inflated by the same
+	// reply. A ViaTool that defaulted to true would make every prose answer look like a tool answer,
+	// which is the exact confusion the field exists to remove.
+	if u.ViaTool {
+		t.Error("a text-only reply was reported as having arrived via the tool")
+	}
+	if err != nil {
+		t.Fatalf("CompletePrefixed: %v", err)
+	}
+	if reply != "[]" {
+		t.Errorf("reply = %q; the text path must survive unchanged", reply)
 	}
 }
 

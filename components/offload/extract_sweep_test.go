@@ -24,9 +24,13 @@ type fakeAsker struct {
 	reply     string
 	cacheRead int
 	err       error
-	calls     int64
-	lastAsk   atomic.Value
-	lastSess  atomic.Value
+	// viaTool reports the reply as having arrived through the proxy's structured-answer tool rather
+	// than as text, which is the one thing about a reply the parser CANNOT infer: it reads a
+	// tool_use input and a JSON array in prose identically.
+	viaTool  bool
+	calls    int64
+	lastAsk  atomic.Value
+	lastSess atomic.Value
 }
 
 func (f *fakeAsker) Ask(_ context.Context, session, ask string) (string, components.PrefixUsage, error) {
@@ -36,7 +40,8 @@ func (f *fakeAsker) Ask(_ context.Context, session, ask string) (string, compone
 	if f.err != nil {
 		return "", components.PrefixUsage{}, f.err
 	}
-	return f.reply, components.PrefixUsage{CacheRead: f.cacheRead, Fresh: 40, Output: 90}, nil
+	return f.reply, components.PrefixUsage{CacheRead: f.cacheRead, Fresh: 40, Output: 90,
+		ViaTool: f.viaTool}, nil
 }
 
 func (f *fakeAsker) ask() string  { s, _ := f.lastAsk.Load().(string); return s }
@@ -830,5 +835,73 @@ func TestSweepSendsTheInventoryAndNotTheOutputs(t *testing.T) {
 		if strings.Contains(ask, banned) {
 			t.Errorf("the ask is a compaction prompt: mentions %q", banned)
 		}
+	}
+}
+
+// The verdict tool's whole purpose is that the model ANSWERS with it, and until this counter existed
+// nothing could say whether it did. extract.ParseVerdicts reads a tool_use `input` and a JSON array in
+// reply text identically -- deliberately, so that declaring the tool is additive -- with the
+// consequence that a run where the declared tool is never touched produces the same verdicts, the same
+// savings and the same gates as one where it is used every time. That is not hypothetical: a review of
+// PR #137 measured 0 of 5 live asks using the tool while the PR claimed 6 of 6, and no published
+// figure in this repo could adjudicate between the two readings.
+func TestSweepCountsWhetherTheAnswerCameViaTheToolOrProse(t *testing.T) {
+	verdicts := `[{"i":0,"needed_by":"none","quote":"","verdict":"keep"}]`
+	for _, tc := range []struct {
+		name    string
+		viaTool bool
+		want    string
+		notWant string
+	}{
+		{"tool_use", true, "sweep_answered_via_tool", "sweep_answered_via_prose"},
+		{"prose", false, "sweep_answered_via_prose", "sweep_answered_via_tool"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			asker := &fakeAsker{reply: verdicts, cacheRead: 19595, viaTool: tc.viaTool}
+			e := newSweepSmall(t, "")
+			rep := &components.Report{}
+			if _, err := e.Offload(sweepReq(), rep,
+				preExpiryCtx("s-"+tc.name, asker, store.NewMemory(store.Options{}))); err != nil {
+				t.Fatal(err)
+			}
+			// PRECONDITION. Without it a turn that never reached the ask at all would pass both
+			// assertions below by producing neither event, which is exactly the vacuous shape this
+			// repo's convention exists to catch.
+			if rep.Events["sweep_prefix_cache_read_ok"] != 1 {
+				t.Fatalf("the prefix ask never happened, so no reply shape was observed "+
+					"(gates: %v events: %v)", rep.Gates, rep.Events)
+			}
+			if rep.Events[tc.want] != 1 {
+				t.Errorf("%s: %s = %d, want 1 (events: %v)", tc.name, tc.want,
+					rep.Events[tc.want], rep.Events)
+			}
+			if rep.Events[tc.notWant] != 0 {
+				t.Errorf("%s: %s = %d, want 0 -- the two shapes must not both be counted "+
+					"(events: %v)", tc.name, tc.notWant, rep.Events[tc.notWant], rep.Events)
+			}
+		})
+	}
+}
+
+// The FALLBACK is neither shape. fallbackAsk calls Model.Complete(), which carries no tool to declare,
+// so counting its reply as prose would report a shape that was never on offer -- and would silently
+// inflate the prose count with calls that could not have used the tool even in principle.
+func TestSweepDoesNotAttributeAReplyShapeToTheFallback(t *testing.T) {
+	// cacheRead 0 sends this down the fallback fork, which is the only way in without a real
+	// non-Anthropic route.
+	asker := &fakeAsker{reply: `[{"i":0,"needed_by":"none","quote":"","verdict":"keep"}]`, cacheRead: 0}
+	e := newSweepSmall(t, "")
+	rep := &components.Report{}
+	if _, err := e.Offload(sweepReq(), rep,
+		preExpiryCtx("s-fb", asker, store.NewMemory(store.Options{}))); err != nil {
+		t.Fatal(err)
+	}
+	if rep.Gates["sweep_prefix_cache_read_ZERO"] != 1 {
+		t.Fatalf("the fallback fork was never taken, so this asserts nothing "+
+			"(gates: %v events: %v)", rep.Gates, rep.Events)
+	}
+	if rep.Events["sweep_answered_via_tool"] != 0 || rep.Events["sweep_answered_via_prose"] != 0 {
+		t.Errorf("the fallback was attributed a reply shape it could not have had (events: %v)",
+			rep.Events)
 	}
 }

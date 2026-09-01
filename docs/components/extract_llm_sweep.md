@@ -92,10 +92,73 @@ transcript as of the previous turn, so the newest tool output is invisible to it
 content has had no turns in which to be superseded — and it keeps a large model call off the agent's
 critical path.
 
-Three construction facts, each measured and each a test: `tool_choice: none` is **not** in the cache key
-so forcing it is free, and **necessary**, or the prefix's tools make the model answer with a `tool_use`;
-`tools` **are** in the key, so stripping them reads a different, smaller entry; and the route rejects
-assistant prefill, which an appended user message satisfies by construction.
+Two construction facts, each measured and each a test: `tools` **are** in the cache key, so stripping
+them reads a different, smaller entry; and the route rejects assistant prefill, which an appended user
+message satisfies by construction.
+
+### `tool_choice`, and why the answer is a declared tool rather than a suppressed one
+
+This page previously stated the inverse of what is now measured — that forcing `tool_choice: none` was
+"free, and **necessary**, or the prefix's tools make the model answer with a `tool_use`". The second
+half of that sentence was **right about the mechanism and wrong about the remedy**, and the fix is not
+to suppress the tool call but to declare a tool worth calling.
+
+The ask carries the agent's own tools, because `tools` are in the cache key and stripping them costs
+the read. Three arms, same transcript, same ask model (`aws/claude-sonnet-5` over LOCA S2L, three tasks,
+three passes each, run sequentially):
+
+| arm | `tool_choice` | verdict tool declared | asks replied | unusable | answered via `tool_use` | verdict coverage |
+|---|---|---|---|---|---|---|
+| A | `{"type":"none"}` | no | 20 | **6 (30.0%)** | 0 | 71.5% |
+| B | omitted | **no** | 24 | **14 (58.3%)** | 0 | 41.2% |
+| C | omitted | **yes** | 77 | **7 (9.1%)** | **43 (55.8%)** | 90.9% |
+
+Fisher two-tailed: A vs C `p = 0.0245`, B vs C `p = 0.0000`, A vs B `p = 0.0755`.
+
+Arm **B is the one that had never been run**, and it is the reason the tool is declared rather than the
+`tool_choice` simply being dropped. Removing the suppression without offering an answer tool is
+**worse than either other arm**: the model, now free to call something and offered only the agent's
+tools and `context_guru_expand`, calls one of those. Directly observed on the wire by logging every
+reply's content blocks — `thinking,tool_use:context_guru_expand` with **no text block at all**, which
+the text-only extraction reads as the empty string and files as unusable. Arm B also lost 5 asks to the
+90 s `llmCallTimeout` against 0 in arm A and 1 in arm C.
+
+So the three shapes are: suppress the call and the model argues its verdicts in prose (arm A's failures);
+allow the call with nothing worth calling and the answer is lost into somebody else's tool (arm B);
+allow it and declare the right tool, and 55.8% of replies come back schema-shaped, at cache-read price,
+with the rest still read by the unchanged prose parser (arm C).
+
+`tool_choice` is not free in every form either. Naming a tool wrote a **second** cache entry (8,378
+against the 8,268 already cached), so `tool_choice` does participate in the key when it names a tool,
+even though `none` does not. Omitting it entirely is what reads the prefix for free.
+
+The residual 9.1% in arm C is dominated by a reply with a `thinking` block and no answer at all. That
+is a separate defect, present in every arm, and it is tracked apart from this component's contract.
+
+### The verdict tool is advertised only where it can be used
+
+`context_guru_adjudicate` is appended to the `tools` array of every request on the **Anthropic** route
+whose pipeline **contains `extract_llm_sweep`** — and nowhere else. It costs a measured 946 bytes at the
+head of the cacheable prefix, so both conditions matter:
+
+- **Pipeline membership.** A preset with no sweep can never adjudicate. `off` is the control arm of every
+  published comparison in this repo, and injecting there perturbed the baseline of all of them.
+- **Provider.** `prefixAskerFor` returns nil for anything but Anthropic and `cheapmodel/openai.go` has no
+  `CompletePrefixed` at all, so on the OpenAI route the definition is unreachable by construction.
+
+Neither condition varies per turn — pipeline membership is fixed per **config document**, the provider
+by the route — so the prefix stays byte-stable for every request under a given config and never flaps.
+That is the distinction the cache argument actually requires: it forbids gating on something that
+changes turn to turn, not on something fixed for the config. (Not "fixed at config load": `tenancy.go`
+rebuilds a tenant's `*Pipeline` when the config document changes, mid-session. A config change that adds
+or drops this component has already invalidated the prefix for much bigger reasons than 946 bytes.)
+
+Because the model is told not to call it and sometimes still would, a call the **agent** makes is
+answered on the response path before the client is written to — **except** when the model calls it
+alongside a *client* tool in the same assistant turn. The response loop cannot continue a turn whose
+other `tool_use` only the client can execute, so it hands that round over whole and
+`adjudicate.AnswerStrayCalls` repairs it on the next request: the agent pays one turn, the session is
+fine. `/stats` publishes `adjudicate_stray` either way — measured 0 across all three passes of arm C.
 
 ## The trigger: pre-expiry, not cold
 

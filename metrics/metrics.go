@@ -612,9 +612,14 @@ type Snapshot struct {
 	// have minted resolved to nothing, i.e. a cut advertised as reversible was not — a defect, and
 	// the ALERTABLE one. Neither can be inferred from WastedTokens, which counts successful
 	// re-serves and therefore reads identically whether a stash broke or expand was never called.
-	ExpandUnresolvedMalformed int64               `json:"expand_unresolved_malformed"`
-	ExpandUnresolvedMissing   int64               `json:"expand_unresolved_missing"`
-	Components                map[string]compStat `json:"components"`
+	ExpandUnresolvedMalformed int64 `json:"expand_unresolved_malformed"`
+	ExpandUnresolvedMissing   int64 `json:"expand_unresolved_missing"`
+	// AdjudicateStray counts tool_results rewritten because the AGENT called the proxy-injected
+	// adjudication tool. The proxy advertises that tool on every request and tells the model not to
+	// call it; this is the number that says whether the telling works (measured 0 across ~4,900
+	// requests). Non-zero is a lost agent turn per count, not a correctness failure.
+	AdjudicateStray int64               `json:"adjudicate_stray"`
+	Components      map[string]compStat `json:"components"`
 	// TopPassthrough names components that ran but never saved a token — dead
 	// weight in the pipeline, candidates to drop from the config.
 	TopPassthrough []string `json:"top_passthrough"`

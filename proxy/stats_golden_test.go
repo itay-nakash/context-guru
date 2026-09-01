@@ -19,6 +19,10 @@ import (
 // Adding a field here alongside the new key is the intended way to change it.
 var statsGoldenTopLevel = []string{
 	"actual_baseline_tokens",
+	// Stray calls the agent made to the proxy-injected adjudication tool. Added to the reviewed
+	// contract rather than loosening the assertion, per the rule above: it is the only figure that
+	// can show a "do not call this yourself" description having stopped working.
+	"adjudicate_stray",
 	"adjusted_saved",
 	// agentdiet_* are the same three fail-open figures for the `agentdiet` baseline,
 	// which owns its own per-call budget (a window of steps sits between extract_llm's

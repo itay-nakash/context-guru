@@ -30,6 +30,7 @@ import (
 	"github.com/rossoctl/context-guru/components/offload"
 	"github.com/rossoctl/context-guru/dash"
 	"github.com/rossoctl/context-guru/expand"
+	"github.com/rossoctl/context-guru/internal/adjudicate"
 	"github.com/rossoctl/context-guru/internal/cheapmodel"
 	"github.com/rossoctl/context-guru/internal/logging"
 	"github.com/rossoctl/context-guru/internal/modelinfo"
@@ -1097,6 +1098,24 @@ func (h *Handler) chat(provider bschemas.ModelProvider, static upstream, pick fu
 					// and the request side caught it.
 					lg.Debug("cg.expand_repair", "restored", repaired)
 				}
+				// The same problem for the adjudication tool, and the same remedy. The client
+				// cannot execute a tool the proxy injected, so a call the AGENT made to
+				// context_guru_adjudicate comes back as "not found" and the agent loses a turn
+				// to a dead end. Not defensive: a model was directly observed calling
+				// context_guru_expand at step 2 of a run. Measured at 0 strays across ~4,900
+				// requests with the "do not call this yourself" description, and 0 again across
+				// three further benchmark passes. This is now the BACKSTOP, for two distinct paths.
+				// The response loop answers a stray in band when the turn called proxy tools only.
+				// It DEFERS to this repair when the model co-called a client tool in the same turn
+				// (otherTools -> bail, see the response loop), because it cannot continue a turn
+				// whose other tool_use only the client can execute — on that path our tool_use does
+				// reach the client and this repair is the only thing that answers it, at a cost of
+				// one agent turn. It also catches a round the loop could not reconstruct at all.
+				// The counter (adjudicate_stray) is what says whether the description still works.
+				var strays int
+				if body, strays = adjudicate.AnswerStrayCalls(string(provider), body); strays > 0 {
+					lg.Debug("cg.adjudicate_stray", "answered", strays)
+				}
 			}
 			var added time.Duration
 			body, added, tr = h.applyMode(&reqInfo{
@@ -1177,6 +1196,36 @@ func (h *Handler) chat(provider bschemas.ModelProvider, static upstream, pick fu
 				// extra tool declaration is not a control.
 				if im != expand.InjectAuto || tn.Pipe.HasOffload() {
 					body, _ = expand.Inject(string(provider), im, body, tn.Store.Persists())
+				}
+				// The adjudication tool, on every request of a pipeline that can ACTUALLY
+				// adjudicate, and on no other.
+				//
+				// The cache argument for injecting it unconditionally is real but narrower than it
+				// was first applied. `tools` hashes before system and messages, so a tool that
+				// appears on the turn a sweep fires and vanishes on the next invalidates the prefix
+				// from position zero — the flap expand's `always` mode exists to prevent. That
+				// forbids gating on anything that varies PER TURN. It does not forbid these two
+				// conditions: pipeline membership is fixed per config DOCUMENT and the provider is
+				// fixed by the route, so both are byte-stable for every request under a given config
+				// and the prefix never flaps. "Fixed at config load" is what this used to say and it
+				// is false: tenancy.go rebuilds a tenant's *Pipeline when the config document
+				// changes, mid-session, by its own design. The conclusion survives, because a config
+				// change that adds or drops extract_llm_sweep has already invalidated the prefix for
+				// much bigger reasons than this tool's 946 bytes — but the premise had to be stated
+				// as what the code actually guarantees.
+				//
+				// Injecting it unconditionally instead cost 946 bytes (measured on the wire) at the
+				// head of the cacheable prefix of EVERY preset, including `off` — which is the
+				// control arm of every published comparison in this repo — and including presets
+				// like codesmart that contain no extract_llm_sweep and so can never adjudicate.
+				// The provider half is not cosmetic either: prefixAskerFor returns nil for anything
+				// but Anthropic and cheapmodel/openai.go has no CompletePrefixed at all, so on the
+				// OpenAI route the ~217-token definition is unreachable by construction.
+				//
+				// Kept rather than dropped because a three-way A/B showed the DECLARATION is what
+				// makes removing tool_choice:none safe; see cheapmodel.CompletePrefixed.
+				if provider == bschemas.Anthropic && tn.Pipe.Has("extract_llm_sweep") {
+					body, _ = adjudicate.Inject(string(provider), body)
 				}
 			}
 		}()
@@ -1293,7 +1342,10 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 	// and does the same job: sseSplicer withholds only the block that calls the expand tool
 	// and streams everything else as it arrives (see ssepeek.go). Non-Anthropic dialects are
 	// not inspected at all.
-	advertised := expand.HasTool(string(provider), body)
+	// Advertised covers BOTH proxy-injected tools. The response loop is what keeps a
+	// proxy-injected tool_use away from the client, and gating it on expand alone let an
+	// adjudication call stream straight through on a request that advertised only that one.
+	advertised := expand.HasTool(string(provider), body) || adjudicate.HasTool(string(provider), body)
 	// SSE accounting is PER CLIENT REQUEST, not per upstream round: one client request
 	// that drives several expand rounds waited for all of them, so timing a single
 	// round would report a healthy TTFB for a client that waited three round-trips.
@@ -1456,7 +1508,7 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 			// withheld and round 1's message_stop may be the only terminator this client
 			// will ever get (see the terminator check below).
 			prevWithheld = withheld
-			respBody, withheld, found = sp.pass(resp.Body, expand.ToolName)
+			respBody, withheld, found = sp.pass(resp.Body, expand.ToolName, adjudicate.ToolName)
 			resp.Body.Close()
 			switch {
 			case found && sp.blocks == 0:
@@ -1523,6 +1575,16 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 				writeRaw(w, resp, respBody)
 				return
 			}
+			// KNOWN CONFLATION, recorded rather than fixed. This counts "the peek withheld a
+			// proxy tool_use and handed it back", but the metric is named for expand, so an
+			// adjudicate leak (the co-call deferral below) lands in the expand bucket. Not split
+			// here for three reasons: the field is /stats-only and reaches no dashboard or alert
+			// (notExportedWhy calls it "NOT EXPORTED YET"); two of the three bail sites — a round
+			// that failed SSE aggregation, and a spent maxExpandRounds — cannot attribute the leak
+			// at all, because nothing has parsed the turn yet; and a leak can be BOTH at once, so
+			// the honest split is two counters and a new exported family with its own render and
+			// vacuity guard, which is a metrics change rather than this PR's subject. Filed
+			// separately; until then, read this counter as "proxy tool_use reached the client".
 			if withheld != nil && h.agg != nil {
 				h.agg.RecordSSEExpandAfterStream()
 			}
@@ -1551,15 +1613,41 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 			msg = agg
 		}
 
-		calls, otherTools := expand.ResponseCalls(string(provider), msg)
-		if len(calls) == 0 || otherTools {
-			bail() // normal answer (or other tools) — hand it over unchanged
+		calls, otherTools := expand.ResponseCalls(string(provider), msg, adjudicate.ToolName)
+		// Calls the AGENT made to the adjudication tool. Answered HERE, in band, whenever this turn
+		// called PROXY tools only: by the time the request-path repair runs, the client has already
+		// received a tool_use for a tool it does not implement, already answered "not found", and
+		// already lost the turn.
+		//
+		// NOT on every path, and the exception is worth more than the claim it replaces. When the model
+		// calls this tool AND a client tool in the same assistant turn, otherTools is true, the bail()
+		// below hands the round to the client whole, and our tool_use reaches it raw — exactly as it did
+		// before this change. That is a deliberate deferral, not an oversight: answering in band means
+		// continuing the turn upstream, and this loop cannot continue a turn whose other tool_use only
+		// the CLIENT can execute. It would have to invent a result for the client's tool or drop the
+		// client's call, and both are worse than one lost turn. adjudicate.AnswerStrayCalls repairs it
+		// on the NEXT request instead: the substitute answer lands, is_error clears, the client's own
+		// tool_result is untouched, and the stray is counted — so fail-open holds and the price is one
+		// agent turn, not a broken session. Pinned by TestAdjudicateStrayCoCalledWithClientToolLeaks.
+		//
+		// So AnswerStrayCalls backstops TWO different things: this co-call path, which the loop DOES
+		// see and declines, and a round the loop genuinely cannot reconstruct (SSE aggregation failed,
+		// or maxExpandRounds is spent). An earlier version of this comment said the backstop was only
+		// for "a path this loop does not see", which was false for the first of those.
+		strays := adjudicate.ResponseCallIDs(string(provider), msg)
+		if (len(calls) == 0 && len(strays) == 0) || otherTools {
+			bail() // normal answer (or a CLIENT tool) — hand it over unchanged
 			return
 		}
 		// Build a tool_result for EVERY expand call — the provider requires one per
 		// tool_call_id or the continuation is malformed. Expired/unknown ids get an
 		// explicit placeholder rather than being omitted.
 		resolved := map[string]string{}
+		// Every stray adjudication call gets the same definite, uninteresting answer, so the model can
+		// finish its turn instead of waiting on a tool nobody will run.
+		for _, id := range strays {
+			resolved[id] = adjudicate.StrayAnswer
+		}
 		got := 0
 		for _, c := range calls {
 			if orig, ok := expand.Resolve(tn.Store, c.HashID); ok {
@@ -1593,6 +1681,14 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 		if !ok {
 			bail() // malformed shapes — fail open, hand the response over unchanged
 			return
+		}
+		// Counted only once the continuation exists, NOT when the answer was composed. Incrementing
+		// before this point double-counted: a Continuation failure bails, the tool_use reaches the
+		// client after all, and the request-path repair then counts the very same stray a second time
+		// on the next turn. The counter is meant to be one-per-stray-call however it was answered.
+		if len(strays) > 0 {
+			adjudicate.NoteAnsweredInBand(len(strays))
+			lg.Debug("cg.adjudicate_stray", "answered_in_band", len(strays), "round", round)
 		}
 		// got == 0 CONTINUES, and that is the change that let the expand tool be advertised
 		// on every request in a session (expand.InjectAuto). `resolved` already carries a
@@ -1801,6 +1897,11 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
 	// tokens counts successful re-serves, so a broken stash was indistinguishable from a session
 	// that simply never called expand. See expand/unresolved.go.
 	snap.ExpandUnresolvedMalformed, snap.ExpandUnresolvedMissing = expand.Unresolved()
+	// Stray calls the AGENT made to the injected adjudication tool, answered on the request path.
+	// Published because the whole justification for advertising a tool the model is told not to call
+	// is that it does not call it: measured 0 across ~4,900 requests, and a non-zero figure here says
+	// the description stopped working — which nothing else in this snapshot can reveal.
+	snap.AdjudicateStray = adjudicate.StrayAnswered()
 	snap.FrozenHits, snap.FrozenMisses = offload.FrozenStats()
 	if fl, ok := h.store.(*store.Memory); ok { // process store; hosted per-tenant stores report via the dashboard
 		snap.FrozenDropped, snap.FrozenRepaired = fl.FrozenLossStats()
