@@ -74,6 +74,95 @@ func addressable(f Filter) (string, []any) {
 	return fmt.Sprintf(addressableCTE, cond), args
 }
 
+// kaSaved is keepalive_saved_usd with the REACHABILITY test the write path could not make,
+// applied on read.
+//
+// The credit written at capture time asks four questions (Event.keepaliveSavedUSD) and not one
+// of them is an upper bound on the idle gap: it requires that the gap EXCEEDED the provider's
+// lifetime — the floor — and then credits the row whatever the gap was, on the strength of
+// keepalive_pings alone. That column is the whole of the write path's evidence, and on real rows
+// it is not sufficient evidence. On /tmp/cg.db — 133,064 real rows, opened read-only, never
+// pruned — 7 of 105 credited rows ($11.81 of $167.28, 7.1%) carry keepalive_pings >= 1 while NO
+// ping row exists anywhere in the idle span they ended, two of them with no ping within 16.7
+// hours ($152.36 credited after the correction). On rev-keepalive's larger pre-prune corpus the
+// same query removes $59.15 of $76.46
+// (77.4%) from 179 credited rows, which is where this costs real money.
+//
+// The two figures are far apart because THE LEAK IS NOT THE SAME ONE, and a reader who assumes
+// one of them is simply wrong will draw the wrong conclusion from both. That corpus has idle gaps
+// running to 2,750 s, so its credits fail for the reason the paragraph above describes: a gap
+// longer than any ping could bridge. Production has no gap over 821.8 s against 860 s of
+// coverage, so the missing upper bound is real code with no trigger there — what leaks instead is
+// a keepalive_pings set on rows whose span held no ping at all. One test catches both, which is
+// the argument for measuring coverage rather than gating on the gap. The credit on those rows belongs to
+// whatever else refreshed the entry — another session sending byte-identical content — and not
+// to us.
+//
+// It is corrected HERE, and not in the arithmetic that computes it, for two reasons. The Event
+// cannot answer the question: it carries KeepAlive, KeepAlivePings, KeepAliveRefreshed and
+// KeepAliveStrategyID and nothing about the policy that sent the pings, and the requests table
+// has the same four columns and no (X, K) either — which is why the check is absent rather than
+// wrong. And a read-time test repairs the history already on disk: 105 rows here, with no
+// migration and no backfill, on a column whose docstring says it is never backfilled.
+//
+// The test MEASURES coverage instead of predicting it. A ping is itself a stored row
+// (keepalive = 1) with a ts and a session, so "was this row's prefix actually still under a
+// ping's 5-minute window" is a fact on disk, not an inference from a strategy's (X, K) — which
+// would assume every ping fired on schedule and would say nothing at all about the 8 credited
+// rows that carry no strategy id.
+//
+// `kp.cache_read > 0` is the second half of the test and it is the DIRECT observation rather than
+// a proxy: a ping refreshed the entry exactly when it read the entry. An earlier version asked
+// for status = 200 instead, which is weaker in both directions — it credits the 18 ping rows in
+// this corpus that returned 200 while reading nothing (a ping that arrived after the entry had
+// already expired re-CREATED it, which is why keepalive.go publishes PingsThatReadNothing and
+// PingsThatWrote beside the saving), and it refuses a ping whose refresh is visible but whose
+// status was never recorded. Both of the 502/503 ping rows here read nothing, so this subsumes
+// the status test on real data. It is also stricter: $155.47 under status = 200, $152.36 here.
+//
+// alias is the outer table's qualifier and it MUST be one: an un-aliased caller resolves
+// `ts` to the SUBQUERY's own requests row (inner scope wins in SQL), turning `kp.ts < ts` into
+// `kp.ts < kp.ts` — always false, every credit silently zeroed, no error. A test caught exactly
+// that, which is why the two un-aliased callers were given an alias rather than this an empty
+// default. The subquery's own alias is kp, which no caller uses.
+//
+// Cost, and this ORDER IS LOAD-BEARING: the probe is guarded behind `> 0` in the same AND, so it
+// runs once per CREDITED row (105 of 133,064 on the corpus above) rather than once per row in
+// scope. Measured on that 2.1 GB database, a full-table SUM goes from 141 ms to 314 ms with the
+// guard and to 61.9 SECONDS without it — 197x, same answer — which is the same shape as the
+// correlated subquery that once made Overview a 25-second page. Put the EXISTS first and this
+// becomes that bug. It seeks idx_requests_tenant_session (tenant_id, session_id, ts), which
+// already exists.
+//
+// Same reason sumBySession's row FILTER stays `keepalive_saved_usd > 0` while its VALUE is this
+// expression. The filter is a superset of the value's condition, so no contributing row is lost —
+// a session whose credit is entirely unreachable reports $0.00, and all three callers look up by
+// session id rather than treating map presence as "credited". Narrowing the filter would move the
+// EXISTS into the WHERE, once per row IN SCOPE instead of once per credited row: the 61.9s one.
+//
+// Two deliberate looseness's, both stated rather than hidden. `kp.ts <= r.ts` rather than `<`,
+// because a ping and the request it rescued can land in the same millisecond and the tie is
+// harmless — kp.keepalive = 1 makes a row matching itself impossible. And ts is the row's
+// recorded instant, where the provider measures its lifetime from the request START, so the
+// window can be overstated by one request's duration. Both make this a CEILING on coverage,
+// which is the same direction SavedUSD is already documented to err in.
+func kaSaved(alias string) string {
+	if alias == "" {
+		panic("dash: kaSaved needs a table alias; an un-aliased one resolves to the subquery")
+	}
+	col := alias + "keepalive_saved_usd"
+	// The `> 0` FIRST is not style: it short-circuits the probe to the credited rows. Measured on
+	// a 2.1 GB database, a full-table SUM is 314 ms this way and 61.9 SECONDS with the EXISTS
+	// first, for the identical answer. Do not reorder.
+	return `(CASE WHEN ` + col + ` > 0 AND EXISTS (
+			SELECT 1 FROM requests kp
+			WHERE kp.keepalive = 1 AND kp.cache_read > 0
+			  AND kp.tenant_id = ` + alias + `tenant_id AND kp.session_id = ` + alias + `session_id
+			  AND kp.ts <= ` + alias + `ts
+			  AND kp.ts + ` + strconv.FormatInt(providerCacheTTLMs, 10) + ` >= ` + alias + `ts)
+		THEN ` + col + ` ELSE 0 END)`
+}
+
 // KeepAliveCoverage is the "is this figure a measurement or an absence?" statement that
 // accompanies every number on the tab.
 //
@@ -141,8 +230,8 @@ func (d *DB) KeepAliveLedger(f Filter) (*KeepAliveLedger, error) {
 	cond, args := f.where()
 	var from sql.NullInt64
 	if err := d.sql.QueryRow(`SELECT
-		COALESCE(SUM(r.keepalive_saved_usd),0),
-		COALESCE(SUM(CASE WHEN r.keepalive_saved_usd > 0 THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(`+kaSaved("r.")+`),0),
+		COALESCE(SUM(CASE WHEN `+kaSaved("r.")+` > 0 THEN 1 ELSE 0 END),0),
 		COUNT(*)
 		FROM requests r WHERE `+cond, args...).Scan(
 		&o.SavedUSD, &o.MissesAvoided, &o.Requests); err != nil {
@@ -173,7 +262,7 @@ func (d *DB) KeepAliveLedger(f Filter) (*KeepAliveLedger, error) {
 	// The winner/loser split, per session, over the sessions the mechanism touched. Two
 	// grouped queries joined in Go for the same reason as above: the credit is on agent rows
 	// and the cost is on ping rows, and one aggregate cannot honestly see both.
-	saved, err := d.sumBySession(cond, args, "r.keepalive_saved_usd", "r.keepalive_saved_usd > 0")
+	saved, err := d.sumBySession(cond, args, kaSaved("r."), "r.keepalive_saved_usd > 0")
 	if err != nil {
 		return nil, err
 	}
@@ -228,7 +317,7 @@ func (d *DB) KeepAliveLedger(f Filter) (*KeepAliveLedger, error) {
 func (d *DB) KeepAliveNetUSDByTenant(since int64) (map[string]float64, error) {
 	out := map[string]float64{}
 	cond, args := (Filter{Since: since, TenantAll: true}).where()
-	rows, err := d.sql.Query(`SELECT r.tenant_id, COALESCE(SUM(r.keepalive_saved_usd),0)
+	rows, err := d.sql.Query(`SELECT r.tenant_id, COALESCE(SUM(`+kaSaved("r.")+`),0)
 		FROM requests r WHERE `+cond+` GROUP BY r.tenant_id`, args...)
 	if err != nil {
 		return nil, err
@@ -773,7 +862,7 @@ func (d *DB) KeepAliveSessions(f Filter, limit int) ([]*KeepAliveSessionRow, err
 		s.LastPrefix, s.Model = prefix.Int64, model.String
 	}
 	// The keep-alive halves, each from its own query. Same two-query pattern as the overview.
-	saved, err := d.sumBySession(cond, args, "r.keepalive_saved_usd", "r.keepalive_saved_usd > 0")
+	saved, err := d.sumBySession(cond, args, kaSaved("r."), "r.keepalive_saved_usd > 0")
 	if err != nil {
 		return nil, err
 	}
@@ -993,7 +1082,7 @@ func (d *DB) KeepAliveLive(f Filter, now int64, idleSeconds float64, maxPings in
 	}
 	// This session's own keep-alive history, from the same two queries the concentration table
 	// uses, so the two panels cannot disagree about what a session's pings cost.
-	saved, err := d.sumBySession(cond, args, "r.keepalive_saved_usd", "r.keepalive_saved_usd > 0")
+	saved, err := d.sumBySession(cond, args, kaSaved("r."), "r.keepalive_saved_usd > 0")
 	if err != nil {
 		return nil, err
 	}

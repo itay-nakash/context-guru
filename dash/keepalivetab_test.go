@@ -105,6 +105,12 @@ func TestPingRowsStayOutOfAgentAggregates(t *testing.T) {
 	// The keep-alive fields and the two totals they feed are the ONLY keys allowed to differ.
 	mayMove := map[string]bool{
 		"keepalive_pings": true, "keepalive_ping_usd": true, "keepalive_net_usd": true,
+		// The credit and its count move too, and that is the correction rather than a leak: a
+		// credit is only booked for a gap a ping row demonstrably covered (kaSaved), so the
+		// fixture WITHOUT pings has a credited row with no ping anywhere on its session — the
+		// impossible state that was being credited — and reads $0. Deleting the pings deletes
+		// the evidence, so it has to delete the credit.
+		"keepalive_saved_usd": true, "keepalive_misses_avoided": true,
 		// total_reduced_usd is total_saved plus the account's own removals, so it moves with the
 		// total it is built on. Allowed, and pinned to the SAME delta below rather than merely
 		// excused: if it ever moved by a different amount, the ping spend would be reaching one
@@ -127,10 +133,10 @@ func TestPingRowsStayOutOfAgentAggregates(t *testing.T) {
 	if b.KeepAlivePings != 3 {
 		t.Errorf("keepalive_pings = %d, want 3", b.KeepAlivePings)
 	}
-	// The one permitted movement, and it is exact: total_saved moves by exactly the change in
-	// the keep-alive's NET, which here is the negative of what the pings cost. The credit rows
-	// are in BOTH fixtures — they are agent rows — so the saving half does not move and the
-	// whole difference is the ping spend. That is the assertion that fails on `+= SavedUSD`.
+	// The permitted movement, and it is exact: total_saved moves by exactly the change in the
+	// keep-alive's NET. Both halves of that net move here — adding the ping rows adds their cost
+	// AND makes the credit reachable — so the assertion is the decomposition below rather than
+	// the ping spend alone. That is what fails on `+= SavedUSD`.
 	if got, want := b.TotalReducedUSD-a.TotalReducedUSD, b.TotalSavedUSD-a.TotalSavedUSD; math.Abs(got-want) > 1e-9 {
 		t.Errorf("total_reduced moved by %v while total_saved moved by %v: the ping spend is "+
 			"reaching one total and not the other", got, want)
@@ -139,9 +145,10 @@ func TestPingRowsStayOutOfAgentAggregates(t *testing.T) {
 		t.Errorf("total_saved moved by %.6f, want exactly the change in keepalive_net_usd %.6f",
 			got, want)
 	}
-	if got := b.TotalSavedUSD - a.TotalSavedUSD; math.Abs(got+b.KeepAlivePingUSD) > 1e-9 {
-		t.Errorf("total_saved moved by %.6f; the pings cost %.6f and nothing else changed, so the "+
-			"headline must fall by exactly that", got, b.KeepAlivePingUSD)
+	if got, want := b.TotalSavedUSD-a.TotalSavedUSD, b.KeepAliveSavedUSD-b.KeepAlivePingUSD; math.Abs(got-want) > 1e-9 {
+		t.Errorf("total_saved moved by %.6f; the pings earned %.6f and cost %.6f and nothing else "+
+			"changed, so the headline must move by exactly their difference %.6f",
+			got, b.KeepAliveSavedUSD, b.KeepAlivePingUSD, want)
 	}
 	// And the derived views, which have their own queries and their own chances to be wrong.
 	for _, dim := range []string{"model", "provider", "agent", "preset", "mode", "session",
@@ -1102,5 +1109,92 @@ func TestKeepAliveLatencyDiagnosticReportsTheGapAboveTheSizeThreshold(t *testing
 	}
 	if l.PerMissMs != 1000 {
 		t.Errorf("PerMissMs = %v, want 1000 (2000 - 1000)", l.PerMissMs)
+	}
+}
+
+// TestLedgerRefusesCreditOnAGapNoPingCovered is the reachability gate the capture path cannot
+// apply. keepalive_saved_usd is written on the strength of keepalive_pings > 0 and a gap that
+// EXCEEDED the provider's lifetime — a floor, with no matching ceiling — so a row whose idle span
+// contained no ping at all is credited anyway. Measured on a production corpus: 7 of 105 credited
+// rows, $11.81 of $167.28.
+//
+// Three rows, one legitimate and two not, all with the same $1.00 written to the column:
+//   - a ping 60s before the request: covered, credited.
+//   - a ping 20 minutes before: the entry it refreshed was gone 15 minutes before the request
+//     arrived, so whatever kept the prefix alive, it was not us.
+//   - no ping row on the session at all, and keepalive_pings claiming one anyway.
+func TestLedgerRefusesCreditOnAGapNoPingCovered(t *testing.T) {
+	const base = 10_000_000
+	covered := kaCredit(base, "covered", 1.00)
+	coveredPing := kaPing(base-60_000, "covered", 0.01, 40_000, 0)
+
+	stale := kaCredit(base, "stale", 1.00)
+	stalePing := kaPing(base-20*60_000, "stale", 0.01, 40_000, 0)
+
+	phantom := kaCredit(base, "phantom", 1.00) // keepalive_pings > 0, no ping row anywhere
+
+	f := newKAFixture(t, covered, coveredPing, stale, stalePing, phantom)
+	led, err := f.db.KeepAliveLedger(Filter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Absolute dollars, not a share: the uncorrected figure is $3.00 and the corrected one $1.00.
+	if led.SavedUSD < 0.99 || led.SavedUSD > 1.01 {
+		t.Errorf("SavedUSD = %v, want ~1.00 — only the row a ping actually covered "+
+			"(3.00 is the sum of the column, credit included for two gaps no ping bridged)",
+			led.SavedUSD)
+	}
+	// A row credited $0 is not a miss avoided either, or the count and the dollars disagree
+	// about how many requests the mechanism rescued.
+	if led.MissesAvoided != 1 {
+		t.Errorf("MissesAvoided = %d, want 1", led.MissesAvoided)
+	}
+	// The ping COST is untouched: both pings were sent and both were billed. Under-crediting the
+	// saving while quietly dropping the spend would flatter the same verdict from the other side.
+	if led.PingUSD < 0.019 || led.PingUSD > 0.021 {
+		t.Errorf("PingUSD = %v, want ~0.02 (both pings still cost what they cost)", led.PingUSD)
+	}
+	if led.NetUSD != led.SavedUSD-led.PingUSD {
+		t.Errorf("NetUSD %v != SavedUSD %v - PingUSD %v", led.NetUSD, led.SavedUSD, led.PingUSD)
+	}
+	// Overview's tile reads the same window from its own query, so it has to reach the same
+	// number. Correcting one and not the other is how a dashboard comes to print two answers to
+	// one question — the failure this whole sweep is cataloguing.
+	ov, err := f.db.Overview(Filter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(ov.KeepAliveSavedUSD-led.SavedUSD) > 1e-9 {
+		t.Errorf("Overview says %v saved, the keep-alive tab says %v — same rows, same window",
+			ov.KeepAliveSavedUSD, led.SavedUSD)
+	}
+	if ov.KeepAliveMissesAvoided != led.MissesAvoided {
+		t.Errorf("Overview says %d misses avoided, the tab says %d",
+			ov.KeepAliveMissesAvoided, led.MissesAvoided)
+	}
+}
+
+// A ping that read nothing refreshed nothing, so it cannot cover a gap — whatever its status.
+// Reading the entry IS the refresh, so cache_read is the evidence and the status code is only a
+// proxy for it. Both cases are real: 2 of 741 production ping rows failed 502/503, and 18 more
+// returned 200 while reading nothing, having arrived after the entry had already expired and
+// re-created it instead (the same rows keepalive.go counts as PingsThatReadNothing).
+func TestLedgerRefusesCreditFromAPingThatRefreshedNothing(t *testing.T) {
+	for name, ping := range map[string]*Event{
+		"transport failure": func() *Event {
+			p := kaPing(9_940_000, "s1", 0.01, 0, 0)
+			p.Status = 503
+			return p
+		}(),
+		"200 but read nothing": kaPing(9_940_000, "s1", 0.01, 0, 48_000),
+	} {
+		f := newKAFixture(t, kaCredit(10_000_000, "s1", 1.00), ping)
+		led, err := f.db.KeepAliveLedger(Filter{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if led.SavedUSD != 0 {
+			t.Errorf("%s: SavedUSD = %v, want 0 — that ping refreshed nothing", name, led.SavedUSD)
+		}
 	}
 }

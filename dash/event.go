@@ -184,8 +184,22 @@ type Event struct {
 	// they are away from the keyboard has to be auditable to the cent, and a ping that did
 	// not appear as a row would be spend with no owner.
 	KeepAlive bool `json:"keepalive"`
-	// KeepAlivePings is, on a REAL request, how many pings preceded it during the idle span
-	// it just ended. It is what makes the saving below attributable rather than assumed: a
+	// KeepAlivePings is, on a REAL request, how many pings the keeper DECIDED to send during the
+	// idle span it just ended — which is not the same as how many were sent, and the difference is
+	// why dash.kaSaved does not trust this column.
+	//
+	// proxy/keepalive.go increments it under the sweep's lock, before dispatch. Three paths then
+	// return without a request reaching the provider and without writing a ping row: the tenant
+	// limiter refusing spare headroom, an unusable body, and a transport error on send. All three
+	// bump skipped/failed and leave this count already raised. Measured consequence on a
+	// 133,064-row production corpus: 7 of 105 credited rows carry KeepAlivePings >= 1 with no ping
+	// row anywhere in the span, two with none within 16.7 hours.
+	//
+	// So this is dispatch intent, and only a stored ping row (keepalive = 1, status = 200) is
+	// evidence that a ping happened. The credit is gated on the latter at read time. Not fixed
+	// here: the counter is in proxy/ and the figure it feeds is already protected.
+	//
+	// It is still what makes the saving below attributable rather than assumed: a
 	// request that hits after a twenty-minute gap could have been rescued by our ping or by
 	// any other session that happened to send byte-identical content, and only this
 	// distinguishes them.
@@ -835,6 +849,22 @@ func (e *Event) keepaliveSavedUSD(p modelinfo.Price) float64 {
 // dashcapture.go hands AttributeCache. One constant rather than two literals: the miss
 // classifier and the keep-alive credit have to agree about when an entry is gone, or a row
 // can read "hit" for a gap the credit calls short.
+//
+// IT IS NOT THE ONLY TIER, and keepaliveSavedUSD's use of it above is wrong for the other one.
+// A row that wrote at the ONE-HOUR tier (requests.cache_write_1h) keeps its entry for an hour, so
+// a nine-minute gap did not outlive anything and the entry survived without help — but the gate
+// reads `SinceLastMs <= providerCacheTTLMs` and credits it. Inert today: 0 of 105 credited rows on
+// a 133,064-row production corpus have cache_write_1h > 0, and the gateway grants 1h on
+// aws/claude-haiku-4-5 while refusing it on aws/claude-sonnet-5.
+//
+// Not fixed here because the predicate does not exist yet. The 1h tier is recorded on the row
+// that WROTE the entry, not on the row being credited, and the grant can change mid-session — so
+// "is this a 1h entry" is a walk back through the session to whichever row created the prefix,
+// not a column. Anything written before that walk exists encodes a guess about which row's tier
+// counts, and a test on invented rows would certify the guess rather than check it. This is a
+// sign saying the floor is missing, not a fix.
+//
+// dash.kaSaved corrects a different defect in the same credit and does not touch this one.
 const providerCacheTTLMs int64 = 5 * 60 * 1000
 
 // baselineDeltaUSD is what the removed content would have cost had it been sent:

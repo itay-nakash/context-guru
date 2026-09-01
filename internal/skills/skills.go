@@ -72,12 +72,28 @@ func Parse(body string) Listing {
 		if !ok {
 			continue
 		}
+		// A name-only line has an empty description BY DEFINITION, so the line after it is
+		// another entry, blank, or the end of the region — never its own indented continuation.
+		// A one-word bullet inside somebody else's description usually IS followed by one, and
+		// this is the only thing that tells the two apart: no charset can, because 47 of 245 real
+		// skill names are bare words (`report`, `loop`, `gate`) with exactly the shape of a prose
+		// bullet. It lives here rather than in EntryName because only Parse has the neighbours.
+		if !strings.Contains(ln, ": ") && n+1 < len(l.Lines) && indented(l.Lines[n+1]) {
+			continue
+		}
 		if k := len(l.Entries) - 1; k >= 0 {
 			l.Entries[k].To = n
 		}
 		l.Entries = append(l.Entries, Entry{Name: name, From: n, To: len(l.Lines)})
 	}
 	return l
+}
+
+// indented reports whether a line is a continuation: leading whitespace and something after it.
+// A blank line is not one — it ends an entry with no description rather than continuing it.
+func indented(line string) bool {
+	t := strings.TrimLeft(line, " \t")
+	return t != "" && t != line
 }
 
 // Text is one entry's own text, joined the way the inventory stores and measures it.
@@ -114,30 +130,53 @@ func (l Listing) Without(drop map[string]bool) (string, int) {
 }
 
 // EntryName reads a listing line's skill name, or reports that the line is not an entry.
+//
+// The delimiter is `": "` and only `": "`, because a colon can also be part of the name — a
+// plugin skill is `plugin:skill`, a directory-scoped one `apps/web:deploy`. So the name is
+// everything up to the first `": "`, and a line with no `": "` at all is a name on its own.
+//
+// That last case is not hypothetical and is why this does not require a delimiter: a skill
+// whose description is empty is listed as a bare `- security-review`, and on a real captured
+// prompt 15 of 39 entries had that shape — one of them (`- ui-ux-pro-max:brand`) carrying a
+// colon that is the plugin separator rather than a delimiter. An unrecognised line is not
+// skipped, it is ABSORBED into the previous entry's span by Parse, so the previous entry
+// answers for a name that is not its own — and a declaration filter acting on that entry then
+// cuts every line it swallowed. One real entry swallowed 14 names.
+//
+// The charset is the whole gate on a name-only line, and it is NOT sufficient — measured, not
+// feared. A column-0 one-word bullet inside a description ("- charts", "- optional", "- Note")
+// parses as a name here and would split the entry it belongs to. There is no lexical fix: 47 of
+// 245 real skill names in production are bare words with no separator — loop, simplify, run,
+// report, tools, gate — so `- report` (a real skill) and `- Note` (prose) are the same string
+// shape, and any test that rejects one rejects the other. Tightening the charset would drop 19%
+// of real names to avoid a class of line whose incidence cannot be measured, because the listing
+// text is never stored (0 of 400,000 captured content rows carry the header).
+//
+// So the discriminator is POSITION, and it lives in Parse, which has the neighbours: a name-only
+// line whose successor is an indented continuation is prose, because a name-only entry has no
+// description to continue. That closes the realistic case — a URL on its own line inside a
+// description, which ValidName admits precisely because `plugin:skill` and `apps/web:deploy`
+// need ':' and '/'.
+//
+// ponytail: a one-word prose bullet with NO continuation after it still parses as an entry.
+// Unclosable by spelling, and measured at zero incidence: 0 of 95 installed SKILL.md files
+// contain a space-free description bullet. Upgrade path is a structurally marked listing, not a
+// narrower charset — which would drop 19% of real names. Against the alternative: leaving the
+// delimiter required drops 15 of 39 real entries and makes the removal switch cut 15 while
+// reporting 1, which is the defect this exists to fix.
 func EntryName(line string) (string, bool) {
 	if !strings.HasPrefix(line, "- ") {
 		return "", false
 	}
-	rest := line[2:]
-	i := strings.Index(rest, ":")
-	if i <= 0 {
-		return "", false
+	rest := strings.TrimRight(line[2:], " \t")
+	name := rest
+	if i := strings.Index(rest, ": "); i > 0 {
+		name = rest[:i]
 	}
-	name := rest[:i]
-	// A plugin skill is `plugin:skill` and a directory-scoped one `apps/web:deploy`, so one
-	// colon may be part of the name: take the longer candidate when the first colon is not
-	// followed by a space.
-	if !strings.HasPrefix(rest[i:], ": ") {
-		j := strings.Index(rest[i+1:], ": ")
-		if j < 0 {
-			return "", false
-		}
-		name = rest[:i+1+j]
-	}
-	if name == "" || len(name) > 128 {
-		return "", false
-	}
-	if !ValidName(name) {
+	// `- name:` — a listing that always writes the delimiter leaves a bare colon behind when
+	// the description is empty, and that colon is not part of the name.
+	name = strings.TrimSuffix(name, ":")
+	if !ValidName(name) { // rejects "" and >128 too
 		return "", false
 	}
 	return name, true
