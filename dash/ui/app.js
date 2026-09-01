@@ -99,6 +99,32 @@ function usd(v) {
   return (v < 0 ? '-' : '') + '$' + nf.format(Math.round(a));
 }
 function pct(v, digits = 1) { return v === null || v === undefined ? '—' : v.toFixed(digits) + '%'; }
+/**
+ * usdOrNA renders a dollar figure, or `n/a` WITH ITS REASON when the figure is not a
+ * measurement.
+ *
+ * It exists because usd(0) returns '$0' and a $0 is a CLAIM (BRIEF conventions, DESIGN §3.6).
+ * searchfold removed 1.76M tokens on this corpus with every one of its 488 acted rows
+ * unpriceable, and the cell read `$0` in the ordinary colour with a tooltip that said
+ * "recorded per request" — a confident zero standing in for an unknown, which is the single
+ * thing this dashboard exists to refuse. cachesplit is the same shape inverted: 8,906
+ * structural mutations, no content removed, and a `$0` that reads as "saved nothing" while
+ * /api/stats credits it separately.
+ *
+ * `known` is the CALLER's assertion that the number was computed from something, and it is a
+ * required argument rather than a defaulted one so that a new dollar cell cannot inherit the
+ * lie by omitting it. `reason` is required for the same purpose: an unreasoned `n/a` is
+ * indistinguishable from a bug and will be filed as one (DESIGN §3.6 rule 4).
+ *
+ * Returns a Node, not a string, because the reason has to reach a screen reader as well as a
+ * pointer.
+ */
+function usdOrNA(v, known, reason) {
+  if (known) return document.createTextNode(usd(v));
+  if (!reason) throw new Error('usdOrNA(): an n/a without a reason is indistinguishable from a bug');
+  return el('span', { class: 'na', title: 'not available: ' + reason,
+    'aria-label': 'not available: ' + reason }, 'n/a');
+}
 function ms(v) {
   if (!v) return '0 ms';
   return v >= 1000 ? (v / 1000).toFixed(2) + ' s' : v.toFixed(v < 10 ? 1 : 0) + ' ms';
@@ -1397,6 +1423,34 @@ function tileGroup(label, note, tiles, cls) {
   return frag;
 }
 
+/**
+ * costCoverage is the share of the window that actually contributed to a dollar figure.
+ *
+ * Every dollar sum on this page is unrestricted by `token_accounting`, so a row with no
+ * provider usage contributes $0 to it — and `costKnown` used to be `complete > 0`, meaning ONE
+ * priced request in a window unlocked five tiles presented as totals. On a 40-row window with 8
+ * complete rows, 32 rows contributed nothing to a figure labelled "Total dollars avoided".
+ *
+ * The fix is not to hide the number: a partial total is still the best available figure and
+ * hiding it would be its own dishonesty. The fix is that it never renders without saying what
+ * share of the window it covers (DESIGN §3.4 rule 1 — a figure carries its denominator, in the
+ * same block, not in a tooltip).
+ */
+function costCoverage(o) {
+  const complete = (o.accounting && o.accounting.complete) || 0;
+  const requests = o.requests || 0;
+  return { complete, requests, pct: requests > 0 ? (100 * complete) / requests : 0 };
+}
+
+/** costNote appends the coverage to a dollar tile's sub-line. Kept as a suffix rather than a
+ *  separate line so the qualifier cannot be laid out away from the number it qualifies. */
+function costNote(o, sub) {
+  const c = costCoverage(o);
+  if (!c.requests) return sub;
+  return sub + ' · priced on ' + num(c.complete) + ' of ' + num(c.requests) + ' requests ('
+    + pct(c.pct, 1) + ')';
+}
+
 function renderTiles(o) {
   const host = clear($('#tiles'));
   const exact = (o.accounting && o.accounting.complete) || 0;
@@ -1431,7 +1485,7 @@ function renderTiles(o) {
     // NOT in here — it was, under the label "compaction + provider cache", and a headline
     // number that mostly measures somebody else's mechanism is not a headline number.
     tile('total-saved-usd', 'Total dollars avoided', costKnown ? usd(o.total_saved_usd) : 'unknown',
-      'compaction + prefix cache + keep-alive + declarations dropped',
+      costNote(o, 'compaction + prefix cache + keep-alive + declarations dropped'),
       costKnown ? (o.total_saved_usd < 0 ? 'bad' : 'good') : ''),
     // The second total, beside the first and only when they differ. It is the SAME money plus
     // what the account removed itself — an MCP server they dropped, a skill they switched off.
@@ -1440,11 +1494,12 @@ function renderTiles(o) {
     // work into the figure we claim credit for would be taking it.
     costKnown && Math.abs(o.total_reduced_usd - o.total_saved_usd) > 0.00005
       ? tile('total-reduced-usd', 'Total the bill came down', usd(o.total_reduced_usd),
-        'ours + ' + usd(o.self_removed_usd) + ' you removed yourself',
+        costNote(o, 'ours + ' + usd(o.self_removed_usd) + ' you removed yourself'),
         o.total_reduced_usd < 0 ? 'bad' : 'good')
       : null,
     tile('saved-usd', 'Net dollars saved', costKnown ? usd(o.net_saved_usd) : 'unknown',
-      'baseline − actual − our spend', costKnown ? (o.net_saved_usd < 0 ? 'bad' : 'good') : ''),
+      costNote(o, 'baseline − actual − our spend'),
+      costKnown ? (o.net_saved_usd < 0 ? 'bad' : 'good') : ''),
     tile('saved-unique', 'Tokens saved (unique)', compact(o.saved_unique),
       compact(o.replay_tokens) + ' re-earned on later turns', 'accent'),
     // Risk beside value, at the SAME altitude, because on this traffic it is 22x larger than
@@ -1454,7 +1509,7 @@ function renderTiles(o) {
     // and a $157 exposure in a folded footnote is not honest about which number is bigger.
     tile('prefix-change-exposure', 'Prefix-change exposure',
       costKnown ? usd(o.prefix_change_cost_all_usd) : 'unknown',
-      num(o.prefix_change_requests_all) + ' turns re-billed · not netted',
+      costNote(o, num(o.prefix_change_requests_all) + ' turns re-billed · not netted'),
       o.prefix_change_cost_all_usd > 0 ? 'bad' : ''),
     tile('requests', 'Requests', num(o.requests), num(o.sessions) + ' sessions'),
   ], 'headline'));
@@ -1474,10 +1529,17 @@ function renderTiles(o) {
     // no JSON envelope — and the provider bills a superset with its own tokenizer. Measured on
     // this corpus the two differ by 3.2x. Without this tile beside them, four token counts and
     // a "% saved" invite being read against an invoice they are not denominated in.
+    // ONE POPULATION, and the sub-line says which. The numerator is contributed only by rows
+    // where the provider reported usage — it is identically 0 elsewhere — so dividing it by
+    // tokens_before summed over ALL rows invented a ratio across two populations and understated
+    // it by exactly the share of unmeasured rows. It printed "0.6× our count", i.e. "the
+    // provider bills LESS than we count", directly above a tooltip in the same tile saying the
+    // figure is "about three times larger". Both server sums were individually correct.
     tile('billed-input', 'Provider-billed input', compact(o.billed_input_tokens),
-      o.tokens_before > 0
-        ? (o.billed_input_tokens / o.tokens_before).toFixed(1) + '× our count'
-        : 'fresh + cache reads + writes'),
+      o.tokens_before_billed > 0
+        ? (o.billed_input_tokens / o.tokens_before_billed).toFixed(2) + '× our count, on the '
+          + num(o.billed_input_rows) + ' requests reporting provider usage'
+        : 'fresh + cache reads + writes — no request in this window reported provider usage'),
     // The check itself, as a figure rather than a footnote. A ratio of sums (the tile to the
     // left) is dominated by the largest requests; this is the median per-request ratio over the
     // only population where the two counts describe the SAME prompt — requests where nothing
@@ -1536,7 +1598,12 @@ function renderTiles(o) {
         : '', 'accent'),
   ]));
 
-  host.appendChild(tileGroup('Cost', costKnown ? 'billed, and the counterfactual' : 'no priced requests in this window', [
+  // The whole group's coverage in the group note rather than five identical tile suffixes:
+  // every figure below is summed over the window unrestricted, so each of them is a partial
+  // total and the share is the same for all of them.
+  host.appendChild(tileGroup('Cost', costKnown
+    ? costNote(o, 'billed, and the counterfactual')
+    : 'no priced requests in this window', [
     tile('cost-baseline', 'Baseline cost', costKnown ? usd(o.baseline_cost_usd) : 'unknown',
       costKnown ? 'without context-guru' : 'needs all four tiers'),
     tile('cost-actual', 'Actual cost', costKnown ? usd(o.cost_usd) : 'unknown',
@@ -2164,15 +2231,59 @@ function renderSeries(buckets) {
 
 // ── components ─────────────────────────────────────────────────────────────
 /**
- * verdict summarises whether a component earns its place, from what it saved
- * against what it cost. Order matters: a component that burned real wall time for
- * nothing is a worse finding than one that simply never fired, so the cost test
- * comes FIRST — otherwise extract_llm's 15 s of model calls for zero savings reads
- * as a bland "inert here".
+ * ERROR_RATE_BAD is the rate at which a component's own failures outrank its economics.
+ *
+ * There used to be no threshold at all: `if (c.errors > 0)` sat above every economic test, and
+ * because fail-open logs an error for each reverted run, EVERY component in a real window has
+ * some. On the 15,900-request corpus the worst rate is 0.39% (toolschema, 9 of 2,314) and all
+ * 14 rows rendered the red `errors` pill — so on a deployment saving $174 no component could
+ * ever read "earning its place", and extract_llm's $2.15 loss was indistinguishable from
+ * dedup's $66 gain. 5% is where "this component is broken" becomes the headline; below it the
+ * rate is noise and belongs in the Errors column, with its denominator, not in the verdict.
+ */
+const ERROR_RATE_BAD = 0.05;
+
+/** errRate is errors per run — the only form in which an error count is a finding. */
+function errRate(c) { return c.runs > 0 ? (c.errors || 0) / c.runs : 0; }
+
+/**
+ * actedStructuralOnly is a component that mutated requests without removing any content.
+ *
+ * cachesplit is the whole reason this predicate exists: its job is WHERE the cache breakpoint
+ * goes, so `acted_tokens` and `saved_unique` are 0 by construction and every content-shaped
+ * test below reads it as inert. Its dollars are recorded per REQUEST (`cachesplit_saved_usd`,
+ * $60.33 on this window from /api/stats) and never reach /api/components at all, so this
+ * column cannot judge it and must not try.
+ */
+function actedStructuralOnly(c) {
+  return (c.acted_structural || 0) > 0 && (c.acted_tokens || 0) === 0;
+}
+
+/**
+ * verdict summarises whether a component earns its place, from what it saved against what it
+ * cost. The precedence, in order, and every step of it was a defect once:
+ *
+ *   1. never ran            — nothing to judge.
+ *   2. error RATE over 5%   — a component failing on one request in twenty is worse news than
+ *                             any dollar figure. Thresholded, and stated WITH the rate; an
+ *                             unthresholded bare `errors` here defeated steps 3-5 for all 14
+ *                             components.
+ *   3. DOLLARS              — a component that makes LLM calls is the only kind that can be
+ *                             net-negative, and that is the most valuable thing this column
+ *                             can say. It comes before latency so extract_llm's 1h 2m of
+ *                             hot-path time for $0.09 of savings reads as `underwater -$2.15`
+ *                             rather than as a bland "inert here".
+ *   4. STRUCTURAL           — before every content test, because "removed no tokens" is
+ *                             cachesplit's normal state, not a failure. Reversed, this branch
+ *                             was unreachable and the third-largest saving on the deployment
+ *                             read `costly and inert`.
+ *   5. content economics    — latency against tokens, then act rate.
  */
 function verdict(c) {
   if (c.runs === 0) return ['—', 'neutral'];
-  if (c.errors > 0) return ['errors', 'missing'];
+  if (errRate(c) >= ERROR_RATE_BAD) {
+    return ['errors on ' + pct(errRate(c) * 100, 1) + ' of runs', 'missing'];
+  }
   // DOLLARS FIRST, where there are any. A component that makes LLM calls is the only kind
   // that can be net-negative, and until the per-call records existed this function had no
   // money to reason with — so it judged the one component that can lose money on tokens and
@@ -2188,6 +2299,11 @@ function verdict(c) {
     if (net < -0.01) return ['underwater ' + usd(net), 'missing'];
     if (net <= 0) return ['break-even', 'partial'];
     return ['net ' + usd(net), 'complete'];
+  }
+  // Consulted BEFORE the latency test below, which is what "costly and inert" is: that test
+  // asks "spent time, removed nothing", and removing nothing is this component's job.
+  if (actedStructuralOnly(c)) {
+    return [num(c.acted_structural) + ' structural mutations', 'partial'];
   }
   // Spent >1s of hot-path time and returned nothing: paid for, unused.
   if (c.saved_unique === 0 && c.duration_ms_total > 1000) return ['costly and inert', 'missing'];
@@ -2564,6 +2680,114 @@ const UNIQUE_MARK = { fabricated: '*', unknown: '?', measured: '', none: '' };
  *  every cell says how much of it is which. */
 function compSaved(c) { return (c.saved_usd || 0) + (c.saved_usd_estimated || 0); }
 
+/**
+ * savedKnown is whether this component's dollar saving is a MEASUREMENT rather than an
+ * unpriceable or inapplicable zero. Three cases, and only the last is a real $0:
+ *
+ *   - a non-zero figure                  → measured.
+ *   - zero with unpriceable rows         → the rows exist and could not be valued. searchfold
+ *                                          removed 1.76M tokens over 488 acted rows, every one
+ *                                          of them on a model with no price, and the cell read
+ *                                          `$0`.
+ *   - zero on a structural-only component→ this column does not measure what it does at all
+ *                                          (see actedStructuralOnly). `$0` there asserts
+ *                                          "saved nothing" about the third-largest saving on
+ *                                          the deployment.
+ *   - zero, priced, and it did act        → a genuine $0.
+ */
+function savedKnown(c) {
+  if (compSaved(c) !== 0) return true;
+  if (c.saved_usd_unpriced_rows > 0) return false;
+  return !actedStructuralOnly(c);
+}
+
+/** savedNAReason is why the saving is not a number, in the words the reader needs. */
+function savedNAReason(c) {
+  if (actedStructuralOnly(c)) {
+    return c.component + ' removes no content, so this column cannot value it. It mutated '
+      + num(c.acted_structural) + ' requests structurally — cache placement — and its saving is '
+      + 'recorded per request instead, as the prefix-cache figure on Overview.';
+  }
+  return num(c.saved_usd_unpriced_rows) + ' of this component\u2019s acted rows ran on a model '
+    + 'with no entry in the operator\u2019s price list, so their saving could not be valued. '
+    + 'It is missing from this figure, not zero.';
+}
+
+/**
+ * savedTitle names which parts of the figure are recorded, valued on read, and unpriceable.
+ *
+ * The unpriced clause used to be NESTED inside the `saved_usd_estimated` branch, and that field
+ * is 0 across this entire corpus — so the one disclosure that says "some of these rows could
+ * not be priced at all" was unreachable on every row that needed it. It is now a clause of its
+ * own, appended whenever there are unpriced rows, whether or not anything was estimated.
+ */
+function savedTitle(c) {
+  const parts = [c.saved_usd_estimated
+    ? usd(c.saved_usd) + ' recorded + ' + usd(c.saved_usd_estimated) + ' valued on read over '
+      + num(c.saved_usd_estimated_rows) + ' rows written before the column existed'
+    : usd(c.saved_usd) + ' recorded per request'];
+  if (c.saved_usd_unpriced_rows) {
+    parts.push(num(c.saved_usd_unpriced_rows) + ' row'
+      + (c.saved_usd_unpriced_rows === 1 ? '' : 's') + ' could not be priced at all — no model '
+      + 'price for the model they ran on, so their saving is MISSING from this figure, not zero');
+  }
+  return parts.join(' · ');
+}
+
+/** partly lists components with their unpriced row count, for the note above the table. */
+function partly(cs) {
+  return cs.map((c) => c.component + ' (' + num(c.saved_usd_unpriced_rows) + ' of '
+    + num(c.acted_tokens) + ' acted rows)').join(', ');
+}
+
+/**
+ * renderUnpricedNote is the ONE explanation a column of `n/a` is allowed to have (DESIGN §3.6
+ * rule 5) — the per-cell reasons are for detail, not for the fact that unpriced rows exist.
+ *
+ * It is level-1 visible rather than behind a `<details>`, because a missing denominator is a
+ * CAVEAT and disclosure hides derivation, never caveats (DESIGN §3.3).
+ */
+function renderUnpricedNote(components) {
+  const host = $('#components-unpriced');
+  if (!host) return;
+  clear(host);
+  const unpriced = components.filter((c) => c.saved_usd_unpriced_rows > 0);
+  const structural = components.filter((c) => actedStructuralOnly(c));
+  if (!unpriced.length && !structural.length) { host.hidden = true; return; }
+  host.hidden = false;
+  if (unpriced.length) {
+    const rows = unpriced.reduce((n, c) => n + c.saved_usd_unpriced_rows, 0);
+    // Two different outcomes and they must not be conflated. A component with SOME unpriceable
+    // rows still shows a figure — it is a lower bound, and calling it n/a would throw away a
+    // real measurement. A component with no priceable row at all has no figure to show.
+    const partial = unpriced.filter((c) => savedKnown(c));
+    const total = unpriced.filter((c) => !savedKnown(c));
+    host.appendChild(el('div', {},
+      el('strong', {}, num(rows) + ' acted rows across ' + unpriced.length + ' component'
+        + (unpriced.length === 1 ? '' : 's') + ' could not be priced'),
+      ' — the model they ran on has no entry in the operator’s price list, so their saving is '
+      + 'absent from the dollar columns rather than zero. Set MODEL_PRICES to value them.'));
+    if (partial.length) {
+      host.appendChild(el('div', {},
+        'Partly unpriced, so the dollar figure shown is a ', el('strong', {}, 'lower bound'),
+        ': ' + partly(partial) + '.'));
+    }
+    if (total.length) {
+      host.appendChild(el('div', {},
+        'No priceable row at all, so the dollar cells read ', el('span', { class: 'na' }, 'n/a'),
+        ' rather than $0: ' + partly(total) + '.'));
+    }
+  }
+  if (structural.length) {
+    host.appendChild(el('div', {},
+      el('strong', {}, structural.map((c) => c.component).join(', ')
+        + (structural.length === 1 ? ' removes' : ' remove') + ' no content'),
+      ' — ' + (structural.length === 1 ? 'its' : 'their') + ' work is where the cache breakpoint '
+      + 'goes, which this table measures in the Structural column and cannot value in dollars. '
+      + 'The saving is recorded per request and appears on Overview as the prefix-cache figure.'));
+  }
+}
+
 async function loadComponents() {
   const body = clear($('#components-body'));
   loadingRows(body, COMPONENT_SORT.length);
@@ -2627,7 +2851,7 @@ async function loadComponents() {
         // gap is named in the tooltip rather than hidden by the choice.
         el('td', {
           class: 'num',
-          title: !c.llm_calls ? '' : llmCostTitle(c),
+          title: !c.llm_calls ? 'this component makes no model calls of its own' : llmCostTitle(c),
         }, c.llm_calls ? usd(c.llm_cost_usd) + (llmCostGap(c) ? '‡' : '') : '—'),
         // A cost never travels alone. saved_usd is what this component's removals were
         // worth over the window — summed per turn, so a frozen reduction replaying across a
@@ -2639,34 +2863,36 @@ async function loadComponents() {
         // — 6 populated rows out of 100,579 on production — and the most-read tab in the
         // dashboard therefore said the product was worthless. The dagger says how much of the
         // figure is valued rather than recorded; it is never silently merged.
+        el('td', { class: 'num', title: savedKnown(c) ? savedTitle(c) : '' },
+          usdOrNA(compSaved(c), savedKnown(c), savedNAReason(c)),
+          savedKnown(c) && c.saved_usd_estimated ? '†' : null),
+        // A net whose benefit half is unknown is unknown too: subtracting a real cost from an
+        // unpriceable saving produced `$0` for searchfold and `-$0.00` for anything with a
+        // sliver of LLM cost, both of which read as measurements.
         el('td', {
-          class: 'num',
-          title: c.saved_usd_estimated
-            ? usd(c.saved_usd) + ' recorded + ' + usd(c.saved_usd_estimated) + ' valued on read '
-              + 'over ' + num(c.saved_usd_estimated_rows) + ' rows written before the column existed'
-              + (c.saved_usd_unpriced_rows
-                ? ' · ' + num(c.saved_usd_unpriced_rows) + ' rows unpriceable' : '')
-            : 'recorded per request',
-        }, usd(compSaved(c)) + (c.saved_usd_estimated ? '†' : '')),
-        el('td', {
-          class: 'num' + (c.net_usd_with_estimate < 0 ? ' warn-text' : ''),
-          title: 'AMORTIZED verdict: saved ' + usd(compSaved(c)) + ' across every turn those '
-            + 'removals stayed removed for, − own LLM cost ' + usd(c.llm_cost_usd || 0)
+          class: 'num' + (savedKnown(c) && c.net_usd_with_estimate < 0 ? ' warn-text' : ''),
+          title: !savedKnown(c) ? '' : 'AMORTIZED verdict: saved ' + usd(compSaved(c))
+            + ' across every turn those removals stayed removed for, − own LLM cost '
+            + usd(c.llm_cost_usd || 0)
             + '. The per-turn column beside this one is the same verdict without the repeat '
             + 'business, and it can have the opposite sign.',
-        }, usd(c.net_usd_with_estimate)),
+        }, usdOrNA(c.net_usd_with_estimate, savedKnown(c),
+          'the saving half of this net is not a number — ' + savedNAReason(c))),
         // The same verdict with replay excluded — the number /stats reports. It is here
         // BESIDE the amortized one, not instead of it, because the two answer different
         // questions and a component can be genuinely positive on one and negative on the
         // other. Showing only whichever is flattering is the failure mode this column exists
         // to prevent.
         el('td', {
-          class: 'num' + (c.net_usd_first_removal < 0 ? ' warn-text' : ''),
-          title: 'PER-TURN verdict: each piece of content credited ONCE at the rate it would '
-            + 'have entered the prompt at (' + usd(c.saved_usd_first_removal || 0) + ') − own '
-            + 'LLM cost ' + usd(c.llm_cost_usd || 0) + '. This is what the proxy\'s /stats '
-            + 'endpoint reports.',
-        }, c.saved_gross ? usd(c.net_usd_first_removal) : '—'),
+          class: 'num' + (savedKnown(c) && c.net_usd_first_removal < 0 ? ' warn-text' : ''),
+          title: !savedKnown(c) ? '' : 'PER-TURN verdict: each piece of content credited ONCE at '
+            + 'the rate it would have entered the prompt at ('
+            + usd(c.saved_usd_first_removal || 0) + ') − own LLM cost '
+            + usd(c.llm_cost_usd || 0) + '. This is what the proxy\'s /stats endpoint reports.',
+        }, c.saved_gross
+          ? usdOrNA(c.net_usd_first_removal, savedKnown(c),
+            'the saving half of this net is not a number — ' + savedNAReason(c))
+          : '—'),
         el('td', {
           class: 'num',
           title: c.replay_multiple > 1
@@ -2677,9 +2903,22 @@ async function loadComponents() {
             : 'Every removal this component made was of content it had not removed before, so '
               + 'there is no repeat business to amortize.',
         }, c.replay_multiple ? c.replay_multiple.toFixed(1) + '×' : '—'),
-        el('td', { class: 'num', text: num(c.errors) }),
+        // The count AND its rate. The verdict column no longer shouts `errors` below the 5%
+        // threshold (see ERROR_RATE_BAD), so this is where a sub-threshold rate stays visible —
+        // and a bare count over an unstated denominator was never a finding anyway: 41 errors
+        // means nothing until you know it is 41 of 14,057.
+        el('td', {
+          class: 'num' + (errRate(c) >= ERROR_RATE_BAD ? ' warn-text' : ''),
+          title: c.errors
+            ? num(c.errors) + ' of ' + num(c.runs) + ' runs = ' + pct(errRate(c) * 100, 2)
+              + '. Fail-open reverts the component and logs one of these per affected run, so a '
+              + 'low rate is the mechanism working, not a defect. The verdict column names '
+              + 'errors only above ' + pct(ERROR_RATE_BAD * 100, 0) + '.'
+            : 'no run of this component failed in this window',
+        }, c.errors ? num(c.errors) + ' (' + pct(errRate(c) * 100, 2) + ')' : '0'),
         el('td', {}, el('span', { class: 'pill ' + vcls, text: vtext }))));
     }
+    renderUnpricedNote(components);
     renderNetReconcile(components);
     // One measure (unique tokens saved) across up to twelve components: a magnitude
     // comparison, so ONE hue. Colouring bar N by N implied each component was a
@@ -2761,7 +3000,14 @@ async function loadSessions() {
         // A dollar figure over a session whose turns are not all priced is a figure with
         // a different denominator from the token columns beside it: it covers the priced
         // turns only. The dagger says so rather than letting the two read as one total.
-        el('td', { class: 'num' }, s.baseline_cost_usd ? usd(s.saved_usd) : '—',
+        // `—` was standing in for an uncomputable value, which DESIGN §3.6 rule 3 rules out the
+        // same way it rules out `$0`: neither carries a reason, and a dash reads as "nothing
+        // here" rather than "we cannot say". Routed through the same helper as the Components
+        // dollar cells so there is one answer to this in the codebase.
+        el('td', { class: 'num' },
+          usdOrNA(s.saved_usd, !!s.baseline_cost_usd,
+            'no turn in this session reported the provider usage a baseline cost needs, so there '
+            + 'is nothing to subtract an actual cost from'),
           s.baseline_cost_usd && s.incomplete_rows > 0
             ? el('span', {
               class: 'na small',
@@ -2771,15 +3017,19 @@ async function loadSessions() {
             }, ' †')
             : null),
         el('td', { class: 'num', text: compact(s.cache_read) + ' / ' + compact(s.cache_write) }),
-        // The keep-alive's net for this session, from its own ping rows. Blank rather than $0
-        // where it never ran: a zero would read as "it broke even here", which it did not do.
+        // The keep-alive's net for this session, from its own ping rows. `n/a` rather than $0
+        // where it never ran — a zero would read as "it broke even here", which it did not do —
+        // and rather than the `—` that was here, which carried the reason only in a title.
         el('td', {
           class: 'num ' + (s.keepalive_net_usd < 0 ? 'bad-text' : s.keepalive_net_usd > 0 ? 'good-text' : ''),
           title: s.keepalive_pings || s.keepalive_saved_usd
             ? `${num(s.keepalive_pings)} pings cost ${usd(s.keepalive_ping_usd)}; `
               + `${usd(s.keepalive_saved_usd)} of re-creations avoided (a ceiling)`
-            : 'the keep-alive did not run on this session',
-        }, s.keepalive_pings || s.keepalive_saved_usd ? usd(s.keepalive_net_usd) : '—'),
+            : '',
+        }, usdOrNA(s.keepalive_net_usd,
+          !!(s.keepalive_pings || s.keepalive_saved_usd),
+          'the keep-alive did not run on this session, so it neither spent nor avoided anything '
+          + 'here — this is an absence, not a break-even')),
         el('td', { class: 'num', text: num(s.expands) }),
         el('td', { class: 'num', text: ms(s.cg_latency_ms_avg) }),
         el('td', { text: when(s.start) }),
@@ -4048,6 +4298,73 @@ function renderSessionDiff(body, session, out, offset = 0) {
 }
 
 // ── benchmarks ─────────────────────────────────────────────────────────────
+/** BENCH_BASELINE is the harness's name for the no-compaction arm, in every run dir it
+ *  writes (`rows-off.json`). It is the arm every delta on this tab is measured against. */
+const BENCH_BASELINE = 'off';
+
+/** benchOrder puts the baseline first and leaves the rest alphabetical. A comparison table
+ *  whose reference row sorts into the middle makes the reader do the subtraction. */
+function benchOrder(arms) {
+  return arms.slice().sort((a, b) => (a.arm === BENCH_BASELINE ? -1 : b.arm === BENCH_BASELINE ? 1
+    : a.arm < b.arm ? -1 : a.arm > b.arm ? 1 : 0));
+}
+
+/** benchCostKnown: did the ingester find a cost on ANY of this arm's tasks? See
+ *  BenchArm.CostRows — a zero here is an unparsed key far more often than a free run. */
+function benchCostKnown(a) { return (a.cost_rows || 0) > 0; }
+
+function benchCostNAReason(a) {
+  return 'none of this arm’s ' + num(a.tasks) + ' task rows carried a cost the ingester could '
+    + 'read. It reads the per-task cost from an "agent_cost" key; a rows file naming it '
+    + 'otherwise parses to zero, which would render this arm as the cheapest in the study.';
+}
+
+/**
+ * benchDeltaCell is the signed difference from the baseline arm, in the cell (docs/RESULTS.md's
+ * own shape). Solve rate in percentage POINTS, cost as a percentage of the baseline's own cost —
+ * two different units, so the caller names which, and a `pt`/`%` suffix is on the value.
+ *
+ * A sign and an arrow, never colour alone (DESIGN §2.5). Direction is per-measure: more solves
+ * is good, more dollars is not.
+ */
+function benchDeltaCell(a, base, isBase, key, unit) {
+  if (isBase) return el('td', { class: 'num muted', text: '—' });
+  if (!base) {
+    return el('td', { class: 'num' }, el('span', {
+      class: 'na', title: 'not available: this run has no "' + BENCH_BASELINE + '" arm, so there '
+        + 'is nothing to compare against',
+      'aria-label': 'not available: this run has no baseline arm to compare against',
+    }, 'n/a'));
+  }
+  const costLike = unit === '%';
+  if (costLike && !(benchCostKnown(a) && benchCostKnown(base))) {
+    return el('td', { class: 'num' }, el('span', {
+      class: 'na', title: 'not available: a cost delta needs a parseable cost on both this arm '
+        + 'and the baseline',
+      'aria-label': 'not available: a cost delta needs a parseable cost on both arms',
+    }, 'n/a'));
+  }
+  let d, txt;
+  if (costLike) {
+    const b = base[key] || 0;
+    if (!b) return el('td', { class: 'num muted', text: '—' });
+    d = (100 * ((a[key] || 0) - b)) / b;
+    txt = (d > 0 ? '+' : '−') + Math.abs(d).toFixed(2) + '%';
+  } else {
+    d = 100 * ((a[key] || 0) - (base[key] || 0));
+    txt = (d > 0 ? '+' : '−') + Math.abs(d).toFixed(1) + ' pt';
+  }
+  // Cheaper is better; more solved is better. One flag, both directions.
+  const good = costLike ? d < 0 : d > 0;
+  const arrow = d === 0 ? '' : d > 0 ? ' ▲' : ' ▼';
+  return el('td', {
+    class: 'num ' + (Math.abs(d) < 0.005 ? '' : good ? 'good-text' : 'bad-text'),
+    title: 'against the "' + base.arm + '" baseline' + (costLike
+      ? ' (normalised cost basis)' : ' (percentage points of solve rate)'),
+    text: Math.abs(d) < 0.005 ? '±0' : txt + arrow,
+  });
+}
+
 async function loadBenchmarks() {
   const host = clear($('#bench-list'));
   loadingState(host, 3);
@@ -4055,8 +4372,15 @@ async function loadBenchmarks() {
     const { runs } = await api('benchmarks');
     clear(host);
     if (!runs || !runs.length) {
+      // The flag is --dashboard-bench-dirs (cmd/context-guru-proxy/main.go:166). This string
+      // said --dash-bench-dirs, which does not exist anywhere in the repo, and an unknown flag
+      // makes the proxy EXIT — so the tab's only instruction killed the process of anyone who
+      // followed it. This empty state is the tab's primary surface: bench_runs is 0 on a
+      // 133k-request production deployment.
       emptyState(host, 'No benchmark runs ingested',
-        'Point --dash-bench-dirs at a harness jobs root (a directory of runs, each with summary.json and rows-*.json) and re-scan.');
+        'Point --dashboard-bench-dirs at a harness jobs root (a directory of runs, each with '
+        + 'summary.json and rows-*.json), restart, and press Re-scan. Re-scan reports what it '
+        + 'found, including the directories it looked in.');
       return;
     }
     // 42 ingested runs rendered flat is 40k pixels of table. Collapse each run and
@@ -4070,34 +4394,92 @@ async function loadBenchmarks() {
         '  ' + [run.dataset, run.model, armNames && 'arms: ' + armNames,
           when(run.ts)].filter(Boolean).join(' · ')));
       const inner = el('div', { style: 'padding:12px 14px' });
+      // BASELINE FIRST, and the delta column exists. The server orders by arm name
+      // (dash/bench.go benchArms), so `off` sorted third of four alphabetically and a reader had
+      // to compute the one number this tab exists to produce — the difference from baseline —
+      // in their head across four rows. docs/RESULTS.md:11-14 puts baseline first with the
+      // deltas in-cell; this matches it.
+      const arms = benchOrder(run.arms || []);
+      const base = arms.find((a) => a.arm === BENCH_BASELINE) || null;
       const tbl = el('table', { class: 'tbl' }, el('thead', {}, el('tr', {},
         el('th', { text: 'Arm' }), el('th', { class: 'num', text: 'Tasks' }),
-        el('th', { class: 'num', text: 'Solved' }), el('th', { class: 'num', text: 'Solve rate' }),
+        // Scored is the DENOMINATOR of Solve rate, and it was in BenchArm without being a
+        // column. Four arms printed rates off four different denominators (60, 59, 57, 57) with
+        // Tasks — which is not the denominator — beside them, and the only clue was Exceptions,
+        // eleven columns right and off-screen below 1100 px. Both now sit next to the rate.
+        el('th', { class: 'num', title: 'tasks that produced a score: tasks − exceptions. This '
+          + 'is the denominator of Solve rate; Tasks is not.', text: 'Scored' }),
+        el('th', { class: 'num', text: 'Exceptions' }),
+        el('th', { class: 'num', text: 'Solved' }),
+        el('th', { class: 'num', text: 'Solve rate' }),
+        el('th', { class: 'num', text: 'vs baseline' }),
         el('th', { class: 'num', text: 'Mean reward' }), el('th', { class: 'num', text: 'Mean steps' }),
-        el('th', { class: 'num', text: 'Total cost' }), el('th', { class: 'num', text: 'Cost / task' }),
+        // Two bases, both named. bench.go computes TotalNormCostUSD and the UI rendered
+        // neither basis by name — `grep -n norm_cost dash/ui/app.js` was zero hits, so the tab
+        // showed the agent-reported basis while the published claim (docs/RESULTS.md) is the
+        // normalised one, unlabelled and differing by over a point.
+        el('th', { class: 'num', title: 'as the agent harness reported it', text: 'Total cost (agent)' }),
+        el('th', { class: 'num', title: 'every arm re-priced from its own token counts at one '
+          + 'rate card — the basis docs/RESULTS.md quotes', text: 'Total cost (normalised)' }),
+        el('th', { class: 'num', text: 'vs baseline' }),
+        el('th', { class: 'num', text: 'Cost / task' }),
         el('th', { class: 'num', text: '$ per solve' }),
-        el('th', { class: 'num', text: 'Cache hit' }), el('th', { class: 'num', text: 'Mean wall' }),
-        el('th', { class: 'num', text: 'Exceptions' }))));
+        el('th', { class: 'num', text: 'Cache hit' }), el('th', { class: 'num', text: 'Mean wall' }))));
       const tb = el('tbody');
-      for (const a of run.arms || []) {
-        const perSolve = a.solved > 0 ? a.total_cost_usd / a.solved : null;
-        tb.appendChild(el('tr', { class: 'click', onclick: () => toggleBenchTasks(inner, run.id, a.arm) },
-          el('td', {}, el('code', { text: a.arm })),
+      for (const a of arms) {
+        const isBase = base && a.arm === base.arm;
+        const known = benchCostKnown(a);
+        const perSolve = a.solved > 0 && known ? a.total_cost_usd / a.solved : null;
+        tb.appendChild(el('tr', { class: 'click' + (isBase ? ' is-current' : ''),
+          onclick: () => toggleBenchTasks(inner, run.id, a.arm) },
+          el('td', {}, el('code', { text: a.arm }),
+            isBase ? el('span', { class: 'pill neutral', text: 'baseline' }) : null),
           el('td', { class: 'num', text: num(a.tasks) }),
+          el('td', { class: 'num', text: num(a.scored) }),
+          el('td', { class: 'num', text: num(a.exceptions) }),
           el('td', { class: 'num', text: num(a.solved) }),
-          el('td', { class: 'num', text: pct(a.solve_rate * 100) }),
+          // The denominator travels with the rate, in the same cell. codesmart 40/60 and rtk
+          // 38/57 both print 66.7% and are not the same measurement.
+          el('td', { class: 'num', title: num(a.solved) + ' of ' + num(a.scored) + ' scored tasks'
+            + (a.exceptions ? ' (' + num(a.exceptions) + ' excluded as infrastructure exceptions)' : '') },
+          a.scored > 0 ? pct(a.solve_rate * 100) + ' of ' + num(a.scored) : 'n/a'),
+          benchDeltaCell(a, base, isBase, 'solve_rate', 'pt'),
           el('td', { class: 'num', text: a.mean_reward.toFixed(3) }),
           el('td', { class: 'num', text: a.mean_steps.toFixed(1) }),
-          el('td', { class: 'num', text: usd(a.total_cost_usd) }),
-          el('td', { class: 'num', text: usd(a.mean_cost_usd) }),
-          el('td', { class: 'num', text: perSolve === null ? '—' : usd(perSolve) }),
-          el('td', { class: 'num', text: pct(a.cache_hit_rate * 100, 2) }),
-          el('td', { class: 'num', text: dur(a.mean_wall_s * 1000) }),
-          el('td', { class: 'num', text: num(a.exceptions) })));
+          el('td', { class: 'num', title: known ? '' : '' },
+            usdOrNA(a.total_cost_usd, known, benchCostNAReason(a))),
+          el('td', { class: 'num' },
+            usdOrNA(a.total_norm_cost_usd, known, benchCostNAReason(a))),
+          benchDeltaCell(a, base, isBase, 'total_norm_cost_usd', '%'),
+          el('td', { class: 'num' }, usdOrNA(a.mean_cost_usd, known, benchCostNAReason(a))),
+          el('td', { class: 'num', text: perSolve === null ? (known ? '—' : 'n/a') : usd(perSolve) }),
+          // Same shape as the cost cells: BenchArm.CacheHitRate is left at 0 when the arm
+          // reported no token counts at all (benchArms guards `total > 0`), and `0.00%` there is
+          // a claim about a cache that was never measured. The token sums are already on the
+          // wire, so the distinction costs nothing.
+          el('td', { class: 'num' }, a.cache_read + a.cache_write + a.fresh_input > 0
+            ? pct(a.cache_hit_rate * 100, 2)
+            : el('span', {
+              class: 'na',
+              title: 'not available: this arm’s rows carry no cache_read / cache_write / '
+                + 'fresh_input counts, so its cache behaviour was not measured',
+              'aria-label': 'not available: this arm reported no token counts, so its cache '
+                + 'hit rate was not measured',
+            }, 'n/a')),
+          el('td', { class: 'num', text: dur(a.mean_wall_s * 1000) })));
       }
       tbl.appendChild(tb);
       inner.appendChild(el('div', { class: 'tblwrap', tabindex: '0' }, tbl));
-      inner.appendChild(el('p', { class: 'note', text: 'Cost per solve is the number that matters: an arm that spends less by solving fewer tasks has not saved anything. Click an arm for its per-task rows.' }));
+      inner.appendChild(el('p', { class: 'note', text: 'Cost per solve is the number that matters: an arm that spends less by solving fewer tasks has not saved anything. Solve rate is over SCORED tasks, so two arms with the same rate off different denominators are not the same measurement — the denominator is in the cell. Click an arm for its per-task rows.' }));
+      if (arms.some((a) => !benchCostKnown(a))) {
+        inner.appendChild(el('p', { class: 'hint' },
+          el('strong', {}, 'One or more arms report no cost on any task. '),
+          'Those cells read ', el('span', { class: 'na' }, 'n/a'),
+          ' rather than $0, because the ingester reads the per-task cost from an ',
+          el('code', {}, 'agent_cost'),
+          ' key and a rows file naming it something else parses to zero silently — which would '
+          + 'render as the cheapest arm in the study. Check the rows file’s cost key.'));
+      }
       // Cost-vs-reward scatter: the visualization the issue asks for.
       inner.appendChild(el('h2', { text: 'Cost vs reward, by arm' }));
       const scatter = el('div', { class: 'chart', 'data-testid': 'bench-scatter' });
@@ -4109,6 +4491,44 @@ async function loadBenchmarks() {
   } catch (err) {
     if (aborted(err)) return;
     errorState(host, 'Could not load benchmarks', err);
+  }
+}
+
+/**
+ * rescanBenchmarks fires the re-scan and SAYS WHAT IT FOUND.
+ *
+ * The click handler used to `await fetch(...)` and discard the response, so a mistyped path and
+ * a correct scan of an empty directory rendered identically — the tab simply stayed empty —
+ * while the server was returning real counts the whole time. It now also reports the
+ * directories, because "scanned nothing because none are configured" is a different problem
+ * from "scanned two and found no runs" and only one of them is fixed by editing a path.
+ */
+async function rescanBenchmarks() {
+  const host = $('#bench-list');
+  try {
+    const r = await fetch('/api/benchmarks?refresh=1');
+    if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + r.statusText);
+    const out = await r.json();
+    const dirs = out.dirs || [];
+    if (out.ingested_runs > 0) {
+      $('#bench-scan').textContent = 'Scanned ' + dirs.length + ' director'
+        + (dirs.length === 1 ? 'y' : 'ies') + ': ingested ' + num(out.ingested_runs)
+        + ' run' + (out.ingested_runs === 1 ? '' : 's') + ', ' + num(out.ingested_tasks)
+        + ' task rows.';
+    } else if (!dirs.length) {
+      $('#bench-scan').textContent = 'Nothing was scanned: no --dashboard-bench-dirs is '
+        + 'configured on this proxy, so Re-scan has no directory to look in. Restart with the '
+        + 'flag pointing at a jobs root.';
+    } else {
+      $('#bench-scan').textContent = 'Scanned ' + dirs.join(', ') + ' and found no run '
+        + 'directory (a run needs summary.json and at least one rows-*.json). 0 runs, 0 tasks '
+        + 'ingested.';
+    }
+    $('#bench-scan').hidden = false;
+    loadBenchmarks();
+  } catch (err) {
+    if (aborted(err)) return;
+    errorState(host, 'Re-scan failed', err);
   }
 }
 
@@ -4202,7 +4622,7 @@ async function toggleBenchTasks(sec, runID, arm) {
             : el('span', { class: 'pill neutral', text: 'unsolved' }))));
     }
     tbl.appendChild(tb);
-    host.appendChild(tbl);
+    host.appendChild(el('div', { class: 'tblwrap', tabindex: '0' }, tbl));
   } catch (err) {
     errorState(host, 'Could not load tasks', err);
   }
@@ -5215,10 +5635,7 @@ function init() {
   });
   $('#sess-prev').addEventListener('click', () => { state.sessOffset = Math.max(0, state.sessOffset - 25); loadSessions(); });
   $('#sess-next').addEventListener('click', () => { state.sessOffset += 25; loadSessions(); });
-  $('#bench-refresh').addEventListener('click', async () => {
-    await fetch('/api/benchmarks?refresh=1');
-    loadBenchmarks();
-  });
+  $('#bench-refresh').addEventListener('click', rescanBenchmarks);
   $('#drawer-close').addEventListener('click', closeDrawer);
   // Forward wrap: reaching the sentinel means the last real stop is behind us.
   $('#drawer-end').addEventListener('focus', () => { $('#drawer-close').focus(); });
@@ -8294,11 +8711,18 @@ function npsBar(host, nps) {
     el('span', {}, el('i', { class: 'sw ' + cls }), `${label}: ${n}`))));
 }
 
-/** starText renders a stored rating as filled and empty stars plus its number. */
+/**
+ * starText renders a stored rating as filled and empty stars plus its number.
+ *
+ * The empty half is U+2606 WHITE STAR (an outline), not a recoloured U+2605. Both halves were
+ * the same filled glyph separated only by colour, which fails WCAG 1.4.1 / DESIGN §2.5 for a
+ * colour-blind reader even after the unfilled colour was fixed — and at the old 1.32:1 it was
+ * invisible outright, so the SCALE of the rating was unreadable.
+ */
 function starText(v) {
   return el('span', { class: 'star-read', title: `${v} of 5` },
     el('span', { class: 'on', text: '★'.repeat(v) }),
-    el('span', { class: 'off', text: '★'.repeat(5 - v) }),
+    el('span', { class: 'off', text: '☆'.repeat(5 - v) }),
     el('span', { class: 'vh', text: ` ${v} of 5` }));
 }
 
@@ -8469,7 +8893,7 @@ Object.assign(loaders, { feedback: loadFeedback });
 // to an entity and never to a rank.
 
 /** kaState holds the tab's loaded payloads, so a control redraw need not refetch. */
-const kaState = { ledger: null, behaviour: null, sessions: [], calc: null, armed: [], live: null,
+const kaState = { ledger: null, recommend: null, behaviour: null, sessions: [], calc: null, armed: [], live: null,
   x: 280, k: 2,
   // canArm is false on a single-tenant deployment, which mounts no control plane at all — so
   // there is nothing to POST an arm to. Drawing the button anyway would put an affordance on the
@@ -8489,6 +8913,10 @@ async function loadKeepAlive() {
   try {
     kaState.ledger = await api('keepalive');
     renderKAVerdict(kaState.ledger);
+    // The decision row paints immediately with the ledger half, and again when the
+    // counterfactual lands. The ledger must not wait on a window function; the row must not
+    // wait on the ledger either, or the two halves flash in a different order every load.
+    renderKADecision(kaState.ledger, kaState.recommend);
     renderKADownside(kaState.ledger);
   } catch (e) {
     if (aborted(e)) return;
@@ -8529,20 +8957,102 @@ function renderKACoverage(o) {
   }
 }
 
+/**
+ * renderKADecision reconciles the THREE verdicts this tab used to give on one window, all of
+ * them reachable without touching a filter, two of them right, none of them labelled as the
+ * decision:
+ *
+ *   - the `ka-net` tile:      +$99.79, green, "Winner"
+ *   - the K ladder, rung 2:   −$83.33, and all four rungs negative
+ *   - "What should I set?":   "this would COST you money … entirely below zero"
+ *
+ * They are not contradictory measurements. They are three different questions and the tab never
+ * said so:
+ *
+ *   the LEDGER is retrospective and SELECTED — what the shipped policy did on the 36 sessions
+ *   it actually fired on, and its saving half is explicitly a CEILING (content-keyed cache);
+ *   the LADDER and the RECOMMENDATION are counterfactual over the WHOLE window — every ping the
+ *   gated policy would have sent across all 173 sessions with an expiry, 3,323 of them at K=2
+ *   against the 544 really sent.
+ *
+ * The decision "should this stay on across my traffic" is the counterfactual one, so that is the
+ * decision number, it is named as such, and the ledger is subordinate to it — still at full
+ * size, because a negative net is never demoted (DESIGN §3.7) and neither is an inconvenient
+ * positive one.
+ *
+ * It renders in the Verdict panel, ADJACENT to the ledger tiles, not 2,900 px below them: cost
+ * belongs beside its benefit. The counterfactual arrives from a slower endpoint, so the row is
+ * built with a placeholder and filled when that lands — the ledger must never wait on it
+ * (see loadKeepAlive).
+ */
+function renderKADecision(o, rec) {
+  const host = clear($('#ka-decision'));
+  const ledgerNet = o && o.keepalive_recorded_from ? o.net_usd : null;
+  // The three-part row: benefit, cost, signed net. A renderer that can emit one without the
+  // other is a bug, so all three come from one call.
+  const rows = [];
+  if (rec && !rec.refused && rec.lo_usd !== undefined) {
+    const mid = (rec.lo_usd + rec.hi_usd) / 2;
+    rows.push(['DECISION — expected across all your traffic',
+      usd(rec.lo_usd) + ' to ' + usd(rec.hi_usd),
+      '90% interval over ' + num(rec.n) + ' expiries in ' + num(rec.sessions) + ' sessions, at '
+      + rec.idle_seconds + 's / ' + rec.max_pings + ' pings',
+      mid < 0 ? 'bad' : 'good']);
+  } else if (rec && rec.refused) {
+    rows.push(['DECISION — expected across all your traffic',
+      rec.service_lo_usd !== undefined && rec.n
+        ? 'below zero'
+        : 'not computable',
+      rec.refused, 'bad']);
+  }
+  if (ledgerNet !== null) {
+    rows.push(['Measured on the sessions it already fired on', usd(ledgerNet),
+      num(o.sessions_touched) + ' of the sessions in this window · the saving half is a CEILING, '
+      + 'so this is an upper bound and it is not the decision',
+      '']);
+  }
+  if (!rows.length) { host.hidden = true; return; }
+  host.hidden = false;
+  host.appendChild(el('div', { class: 'panel', 'data-testid': 'ka-decision-panel' },
+    el('h2', {}, 'Which number is the decision?'),
+    el('p', { class: 'note' },
+      'These two answer different questions and the tab used to show them 2,900 px apart with '
+      + 'nothing saying which to act on. The ', el('strong', {}, 'first'), ' is the one a '
+      + 'decision rests on: it replays the gated policy over ',
+      el('strong', {}, 'every'), ' session in this window. The second is what the policy '
+      + 'actually did on the subset of sessions it fired on, which is a selected population and '
+      + 'a ceiling. The K ladder further down is the same counterfactual, per rung.'),
+    // Inside its own overflow-x wrapper: the third column is a sentence, and at 390 px an
+    // unwrapped 3-column table pushed the BODY sideways (DESIGN §3.1 — the page body never
+    // scrolls horizontally, the table does).
+    el('div', { class: 'tblwrap', tabindex: '0' },
+    el('table', { class: 'grid', 'data-testid': 'ka-decision-table' },
+      el('tbody', {}, ...rows.map(([label, value, note, cls]) => el('tr', {},
+        el('td', {}, el('strong', {}, label)),
+        el('td', { class: 'num ' + (cls === 'bad' ? 'bad-text' : cls === 'good' ? 'good-text' : ''),
+          style: 'font-weight:600' }, value),
+        el('td', { class: 'small' }, note))))))));
+}
+
 /** renderKAVerdict is panel 1: a handful of headline numbers, as tiles. Not a bar chart of four
  *  numbers — four values with different units are four figures, not a comparison. */
 function renderKAVerdict(o) {
   renderKACoverage(o);
   const host = clear($('#ka-tiles'));
   const ran = !!o.keepalive_recorded_from;
-  const position = !ran || !o.pings ? 'No pings yet' : (o.net_usd < 0 ? 'Losing' : 'Winner');
-  const cls = position === 'Winner' ? 'good' : position === 'Losing' ? 'bad' : '';
+  // "Winner" was decided by the LEDGER's sign alone, so this tab called a policy a winner on a
+  // window where its own ladder said every rung loses money and its own recommendation refused
+  // it outright. The position now states which population it describes, and the judgement — the
+  // --good/--bad colour — is deferred to the decision row above, which has the counterfactual.
+  const position = !ran || !o.pings ? 'No pings yet' : (o.net_usd < 0 ? 'Behind' : 'Ahead');
   host.appendChild(tileGroup(null, null, [
     // The words are beside the colour, always: a status must never rest on hue alone.
-    tile('ka-position', 'Your position', position,
-      ran ? num(o.sessions_touched) + ' sessions touched' : 'nothing to judge yet', cls),
-    tile('ka-net', 'Keep-alive net', ran ? usd(o.net_usd) : '—',
-      'avoided − spent', ran ? (o.net_usd < 0 ? 'bad' : 'good') : ''),
+    tile('ka-position', 'Where it stands so far', position,
+      ran ? num(o.sessions_touched) + ' sessions touched — see the decision row above'
+        : 'nothing to judge yet', ran ? 'accent' : ''),
+    tile('ka-net', 'Keep-alive net, measured', ran ? usd(o.net_usd) : '—',
+      'avoided − spent, on the sessions it fired on — an upper bound, not the decision',
+      ran ? (o.net_usd < 0 ? 'bad' : '') : ''),
     tile('ka-pings', 'Pings sent', ran ? num(o.pings) : '—',
       ran ? usd(o.ping_usd) + ' spent on your key' : 'none'),
     tile('ka-saved', 'Re-creations avoided', ran ? usd(o.saved_usd) : '—',
@@ -8928,7 +9438,7 @@ async function loadKAArmed() {
       }, 'Disarm'))));
   }
   tbl.appendChild(tb);
-  host.appendChild(tbl);
+  host.appendChild(el('div', { class: 'tblwrap', tabindex: '0' }, tbl));
 }
 
 /** loadKABehaviour fills panels 3a–3e. */
@@ -9018,7 +9528,7 @@ async function loadKABehaviour() {
         el('td', {}, g.median_hours.toFixed(2) + ' h'), el('td', {}, g.max_hours.toFixed(2) + ' h')));
     }
     tbl.appendChild(tb);
-    gaps.appendChild(tbl);
+    gaps.appendChild(el('div', { class: 'tblwrap', tabindex: '0' }, tbl));
   }
 }
 
@@ -9165,6 +9675,11 @@ async function loadKARecommend() {
     errorState(host, 'Could not work out a recommendation', e);
     return;
   }
+  kaState.recommend = rec;
+  // Same payload, two places: the decision row above (which is what a reader acts on) and the
+  // detail below. Rendering it only here is how the refusal came to sit 2,900 px under a green
+  // "Winner" tile that contradicted it.
+  renderKADecision(kaState.ledger, rec);
   clear(host);
   if (rec.refused) {
     // Two different refusals, and only one of them is about thin history: "your own gaps are
