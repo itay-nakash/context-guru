@@ -26,20 +26,33 @@ context-guru-proxy --preset codesmart      # or PRESET=codesmart, or preset: in 
 
 | Preset | Pipeline |
 |---|---|
-| `codesmart` | `format, toon, dedup, failed_run, cmdfilter, extract_llm, extract, cachesplit` |
-| `codesafe` | `format, dedup, failed_run, cmdfilter, extract, collapse, cachesplit` |
-| `safe` | `format, cachesplit` |
-| `balanced` | `format, dedup, failed_run, cmdfilter, cachesplit` |
-| `aggressive` | `format, dedup, failed_run, cmdfilter, smartcrush, extract, extract_llm, cachesplit` |
-| `coding` | `format, toon, dedup, cmdfilter, extract, cachesplit` |
-| `mcp` | `format, smartcrush, cachesplit` |
-| `agent` | `format, dedup, failed_run, mask, extract, extract_llm, cachesplit` |
-| `general` | `format, toon, dedup, failed_run, cmdfilter, mask, extract, extract_llm, collapse, cachesplit` |
+| `codesmart` | `format, textclean, searchfold, dedup, failed_run, cmdfilter, extract_llm, extract, linecap, cachesplit` |
+| `codesafe` | `format, textclean, searchfold, dedup, failed_run, cmdfilter, extract, collapse, linecap, cachesplit` |
+| `safe` | `format, textclean, searchfold, cachesplit` |
+| `balanced` | `format, textclean, searchfold, dedup, failed_run, cmdfilter, linecap, cachesplit` |
+| `aggressive` | `format, textclean, searchfold, dedup, failed_run, cmdfilter, smartcrush, extract, extract_llm, linecap, cachesplit` |
+| `coding` | `format, textclean, searchfold, dedup, cmdfilter, extract, linecap, cachesplit` |
+| `mcp` | `format, textclean, smartcrush, cachesplit` |
+| `agent` | `format, textclean, searchfold, dedup, failed_run, mask, extract, extract_llm, cachesplit` |
+| `general` | `format, textclean, searchfold, dedup, failed_run, cmdfilter, mask, extract, extract_llm, collapse, linecap, cachesplit` |
 | `summarize` | `summarize` |
 | `off` | *(empty)* |
+| `agentdiet` | `format, agentdiet, cachesplit` |
+| `house` | `format, dedup, toon, cmdfilter, searchfold, textclean, extract, cachesplit, toolfilter` |
+| `housellm` | `format, dedup, toon, cmdfilter, searchfold, textclean, extract_llm, extract_llm_sweep, extract, cachesplit, toolfilter` |
 
 Order is deliberate: lossless repack first, then the cheap structural offloaders, then
-anything that costs a model call, cache directives last.
+anything that costs a model call, cache directives last — except in `house` and `housellm`,
+whose order is the operator's on purpose: `dedup` and `cmdfilter` run ahead of the lossless
+pair and `toolfilter` sits after `cachesplit`. That costs per-component attribution in
+`/stats`, never content; the reasons are recorded in
+[`config/config.go`](../design.md#config-registry) and the exemption is noted in the
+[preset reference](../reference/presets.md).
+
+The last three rows are not options in the chooser above. `house` and `housellm` are the
+**service** configs — what a hosted account runs unless it asks otherwise — and `agentdiet`
+reproduces a published baseline for A/B comparison, not a recommendation. They are in the
+table so it lists every preset that exists; pick from the table above this one.
 
 ## Notes on the ones people pick
 
