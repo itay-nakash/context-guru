@@ -33,8 +33,12 @@
 // extract_llm_sweep, and nowhere else. Every-request matters because `tools` hashes before system and
 // messages, so a tool that appears when the sweep fires and vanishes on the next turn invalidates the
 // prefix from position zero -- the flap expand's `always` mode exists to prevent. But that argument
-// only forbids gating on something that varies PER TURN: pipeline membership is fixed at config load
-// and the provider by the route, so both conditions are byte-stable for a session. Injecting without
+// only forbids gating on something that varies PER TURN: pipeline membership is fixed per config
+// DOCUMENT and the provider by the route, so both conditions are byte-stable for every request under a
+// given config. Not "fixed at config load", which is what this used to claim: proxy/tenancy.go rebuilds
+// a tenant's *Pipeline when the config document changes, mid-session. That rebuild is a
+// prefix-invalidating event in its own right, so the byte-stability argument holds where it matters.
+// Injecting without
 // them cost a measured 946 bytes at the head of the cacheable prefix of every preset including `off`,
 // the control arm of every published comparison here, and including presets with no sweep at all.
 //
@@ -173,20 +177,6 @@ func toolChoiceIsAuto(tc gjson.Result) bool {
 	return false
 }
 
-// AnswerStrayCalls replaces the client's tool_result for any call the AGENT made to this tool with a
-// definite answer, and reports how many it replaced.
-//
-// Same request-path shape as expand.RepairToolResults, and for the same reason: the client executes
-// the real tools itself, finds no tool by this name because the PROXY injected it, and answers
-// something like "Tool 'context_guru_adjudicate' not found". Left alone, the model reads a failure it
-// cannot act on and may retry. Rewriting it on the next request works WITH the client's loop instead
-// of against it, needs nothing implemented client-side, and is deterministic — the same substitution
-// every turn, so the prefix does not flap.
-//
-// Reading the tool_use out of the transcript rather than trusting the tool_result is what makes this
-// safe: a client's tool_result is rewritten only when the assistant turn it answers called OUR tool.
-// A body with no such call comes back byte-identical, because this runs on every request and a
-// gratuitous rewrite would change the prefix and cost a cache write for nothing.
 // ResponseCallIDs returns the ids of calls the AGENT made to this tool in an upstream RESPONSE.
 //
 // The request-path repair (AnswerStrayCalls) is a backstop and cannot be the primary defence: by the
@@ -194,6 +184,12 @@ func toolChoiceIsAuto(tc gjson.Result) bool {
 // declared, and already spent a turn answering "not found". Answering the call in-band on the
 // response path -- before the client is written to -- is what makes the repair a backstop, and these
 // ids are what the response loop needs to build that answer.
+//
+// "Backstop" is not "unreachable", and this comment used to imply it was. The response loop declines
+// the in-band answer, deliberately, when the assistant turn ALSO calls a client tool: it cannot
+// continue a turn whose other tool_use only the client can execute, so it hands the round over and
+// leaves the next request's repair to fix it. On that path the repair is the ONLY defence and the agent
+// does pay one turn.
 func ResponseCallIDs(provider string, resp []byte) (ids []string) {
 	if provider == "anthropic" {
 		gjson.GetBytes(resp, "content").ForEach(func(_, blk gjson.Result) bool {
@@ -217,6 +213,24 @@ func ResponseCallIDs(provider string, resp []byte) (ids []string) {
 	return ids
 }
 
+// AnswerStrayCalls replaces the client's tool_result for any call the AGENT made to this tool with a
+// definite answer, and reports how many it replaced.
+//
+// Same request-path shape as expand.RepairToolResults, and for the same reason: the client executes
+// the real tools itself, finds no tool by this name because the PROXY injected it, and answers
+// something like "Tool 'context_guru_adjudicate' not found". Left alone, the model reads a failure it
+// cannot act on and may retry. Rewriting it on the next request works WITH the client's loop instead
+// of against it, needs nothing implemented client-side, and is deterministic — the same substitution
+// every turn, so the prefix does not flap.
+//
+// Reading the tool_use out of the transcript rather than trusting the tool_result is what makes this
+// safe: a client's tool_result is rewritten only when the assistant turn it answers called OUR tool.
+// A body with no such call comes back byte-identical, because this runs on every request and a
+// gratuitous rewrite would change the prefix and cost a cache write for nothing.
+//
+// The response loop answers most strays before this ever runs, but NOT all of them: an assistant turn
+// that calls this tool alongside a CLIENT tool is handed to the client whole, so for that turn this
+// repair is the only defence rather than a second one. See the co-call note in the response loop.
 func AnswerStrayCalls(provider string, body []byte) (out []byte, answered int) {
 	msgs := gjson.GetBytes(body, "messages")
 	if !msgs.IsArray() {

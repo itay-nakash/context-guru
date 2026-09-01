@@ -108,8 +108,14 @@ func toolsRequestOpenAI(t *testing.T, msgs ...map[string]any) []byte {
 // ADVERTISED ON EVERY TURN, not only on the turn a sweep is about to ask. `tools` hashes ahead of
 // system and messages, so a tool that appears when the sweep fires and disappears on the next turn
 // invalidates the cached prefix from position zero — the flap expand's InjectAuto exists to prevent.
-// And the declaration is the whole mechanism: with the tool present and no tool_choice, the prefix ask
-// measured 6 of 6 verdicts on 4 of 4 trials at cache-read price, against 0 of 6 under tool_choice:none.
+// And the declaration is the whole mechanism, measured over three passes per arm on the same transcript:
+// with the tool declared and no tool_choice, unparseable replies ran 9.1% (7 of 77 replied asks) against
+// 30.0% (6 of 20) on main's tool_choice:none — Fisher two-tailed p = 0.0245 — and 55.8% of replies came
+// back carrying a tool_use where main produced none at all. Dropping tool_choice WITHOUT declaring the
+// tool is worse than main (58.3% unparseable), which is why the DECLARATION and not the tool_choice
+// removal is what earns its place. The "6 of 6 against 0 of 6" this comment used to cite was a six-item
+// hand pass and is retracted: main returns verdicts on 71.5% of the items it asks about, so the defect
+// is that ~30% of its asks come back unusable, not that all of them do.
 func TestAdjudicateToolAdvertisedOnEveryTurn(t *testing.T) {
 	got := forwardedBody(t, toolsRequest(t, map[string]any{"role": "user", "content": "go"}))
 	if len(got) == 0 {
@@ -249,6 +255,107 @@ func TestAdjudicateStrayCallDoesNotReachTheClientOnTheJSONPath(t *testing.T) {
 	}
 	if !strings.Contains(string(got), "done") {
 		t.Errorf("the client did not receive the finished turn: %s", got)
+	}
+}
+
+// THE HOLE IN "answered in band on both paths", pinned rather than papered over. When the model calls
+// our tool AND a client tool in the SAME assistant turn, expand.ResponseCalls reports otherTools, the
+// response loop bail()s, and our tool_use reaches the client raw — the loop DOES see this path and
+// defers it deliberately, because it cannot continue a turn whose other tool_use only the client can
+// execute without either inventing a result for the client's tool or dropping the client's call.
+//
+// This test asserts what actually happens today, not what would be nicer: the leak this turn, the
+// repair on the next request, the client's own tool_result untouched, and the stray counted exactly
+// once. It exists so that the behaviour is a decision on the record rather than something a later
+// change "fixes" by guessing. If the deferral is ever replaced by a real in-band answer for co-called
+// turns, this test SHOULD fail and be rewritten — that is the point of pinning it.
+func TestAdjudicateStrayCoCalledWithClientToolLeaks(t *testing.T) {
+	// The assistant turn both requests share: one call to the CLIENT's tool, one to ours.
+	assistantCoCall := map[string]any{"role": "assistant", "content": []any{
+		map[string]any{"type": "tool_use", "id": "cli1", "name": "read_file",
+			"input": map[string]any{"path": "a.go"}},
+		map[string]any{"type": "tool_use", "id": "stray1", "name": adjudicate.ToolName,
+			"input": map[string]any{"verdicts": []any{}}},
+	}}
+
+	// --- Turn 1: the leak. -------------------------------------------------------------------
+	rounds := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		rounds++
+		w.Header().Set("Content-Type", "application/json")
+		blocks, _ := json.Marshal(assistantCoCall["content"])
+		_, _ = w.Write([]byte(`{"id":"m1","type":"message","role":"assistant","model":"claude",` +
+			`"content":` + string(blocks) + `,"stop_reason":"tool_use",` +
+			`"usage":{"input_tokens":5,"output_tokens":2}}`))
+	}))
+	defer upstream.Close()
+	h, _ := buildHandler(t, sweepPipeline, upstream.URL)
+	srv := httptest.NewServer(h.Mux())
+	defer srv.Close()
+	resp, err := http.Post(srv.URL+"/anthropic/v1/messages", "application/json",
+		bytes.NewReader(toolsRequest(t, map[string]any{"role": "user", "content": "go"})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaked, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	// PRECONDITION: exactly one upstream round. A continuation would mean the loop answered in band
+	// after all, and then the rest of this test is asserting nothing about the co-call path.
+	if rounds != 1 {
+		t.Fatalf("expected the loop to bail on otherTools after ONE round, got %d — the co-call path "+
+			"no longer defers, so this test's premise is gone: %s", rounds, leaked)
+	}
+	// The leak itself. Asserted, not lamented: this is the documented cost of the deferral.
+	if !strings.Contains(string(leaked), adjudicate.ToolName) {
+		t.Errorf("expected the co-called proxy tool_use to reach the client this turn (the known, "+
+			"deliberate deferral); it did not, so the response loop changed: %s", leaked)
+	}
+	if !strings.Contains(string(leaked), "cli1") {
+		t.Errorf("the CLIENT's own tool_use did not survive the round: %s", leaked)
+	}
+
+	// --- Turn 2: the repair. -----------------------------------------------------------------
+	// The client did what a client does: ran its own tool, and answered ours "not found" because the
+	// PROXY injected it and the client never declared it.
+	before := adjudicate.StrayAnswered()
+	got := forwardedBody(t, toolsRequest(t,
+		map[string]any{"role": "user", "content": "go"},
+		assistantCoCall,
+		map[string]any{"role": "user", "content": []any{
+			map[string]any{"type": "tool_result", "tool_use_id": "cli1",
+				"content": "package main"},
+			map[string]any{"type": "tool_result", "tool_use_id": "stray1", "is_error": true,
+				"content": "Error: No such tool available: " + adjudicate.ToolName},
+		}},
+	))
+	if strings.Contains(string(got), "No such tool available") {
+		t.Errorf("the client's dead-end refusal reached the model unchanged: %s", got)
+	}
+	if !strings.Contains(string(got), "runs automatically") {
+		t.Errorf("the stray was leaked AND never repaired on the next request: %s", got)
+	}
+	// The client's own tool_result must come through untouched — the repair keys off the tool_use it
+	// answers, so a bug here would rewrite somebody else's result.
+	blocks := gjson.GetBytes(got, `messages.2.content`).Array()
+	if len(blocks) != 2 {
+		t.Fatalf("the repaired turn does not have both tool_results: %s", got)
+	}
+	if c := blocks[0].Get("content").String(); c != "package main" {
+		t.Errorf("the CLIENT's tool_result was rewritten to %q; the repair must only touch ours", c)
+	}
+	if blocks[0].Get("is_error").Exists() {
+		t.Errorf("is_error was invented on the client's own tool_result: %s", blocks[0].Raw)
+	}
+	// Ours: answered, and no longer an error — leaving is_error set tells the model its call failed
+	// while handing it that call's answer.
+	if blocks[1].Get("is_error").Bool() {
+		t.Errorf("is_error stayed set on the repaired block: %s", blocks[1].Raw)
+	}
+	if n := adjudicate.StrayAnswered() - before; n != 1 {
+		t.Errorf("the leaked stray was counted %d times, want exactly 1 — adjudicate_stray is the "+
+			"only signal that the tool's description stopped working", n)
 	}
 }
 

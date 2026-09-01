@@ -146,14 +146,19 @@ head of the cacheable prefix, so both conditions matter:
 - **Provider.** `prefixAskerFor` returns nil for anything but Anthropic and `cheapmodel/openai.go` has no
   `CompletePrefixed` at all, so on the OpenAI route the definition is unreachable by construction.
 
-Neither condition varies per turn — pipeline membership is fixed at config load, the provider by the
-route — so the prefix stays byte-stable across a session and never flaps. That is the distinction the
-cache argument actually requires: it forbids gating on something that changes turn to turn, not on
-something fixed for the session.
+Neither condition varies per turn — pipeline membership is fixed per **config document**, the provider
+by the route — so the prefix stays byte-stable for every request under a given config and never flaps.
+That is the distinction the cache argument actually requires: it forbids gating on something that
+changes turn to turn, not on something fixed for the config. (Not "fixed at config load": `tenancy.go`
+rebuilds a tenant's `*Pipeline` when the config document changes, mid-session. A config change that adds
+or drops this component has already invalidated the prefix for much bigger reasons than 946 bytes.)
 
 Because the model is told not to call it and sometimes still would, a call the **agent** makes is
-answered on the response path before the client is written to, and `/stats` publishes
-`adjudicate_stray` — measured 0 across all three passes of arm C.
+answered on the response path before the client is written to — **except** when the model calls it
+alongside a *client* tool in the same assistant turn. The response loop cannot continue a turn whose
+other `tool_use` only the client can execute, so it hands that round over whole and
+`adjudicate.AnswerStrayCalls` repairs it on the next request: the agent pays one turn, the session is
+fine. `/stats` publishes `adjudicate_stray` either way — measured 0 across all three passes of arm C.
 
 ## The trigger: pre-expiry, not cold
 

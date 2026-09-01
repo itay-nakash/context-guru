@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"fmt"
 	"os"
 	"reflect"
 	"regexp"
@@ -8,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/rossoctl/context-guru/expand"
+	"github.com/rossoctl/context-guru/internal/adjudicate"
 	"github.com/rossoctl/context-guru/metrics"
 )
 
@@ -175,6 +177,58 @@ func TestExpandUnresolvedSeriesRender(t *testing.T) {
 				"expand's counters (Snapshot.ExpandUnresolved* are filled only by /stats)", still)
 		}
 	}
+}
+
+// TestAdjudicateStraySeriesRender is the guard half of the pattern TestExpandUnresolvedSeriesRender
+// establishes, applied to cg_adjudicate_stray_total: the line RENDERS even at zero, and its value MOVES
+// when the counter behind it does.
+//
+// The second half is the whole point, and this PR shipped without it. `s` in renderMetrics is the bare
+// aggregator snapshot; Snapshot.AdjudicateStray is filled by the /stats handler AFTER that snapshot is
+// taken, so sourcing this series from `float64(s.AdjudicateStray)` exports a hard-wired 0 on every
+// scrape however often the agent calls the tool. TestEverySnapshotFieldIsExportedOrExempt cannot catch
+// that, by its own documented design: it checks that the exporter READS the field, not that the value is
+// real. Nothing else in ./proxy caught it either — the suite stayed green with that revert applied,
+// which is what a reviewer demonstrated. This test is the thing that fails on it.
+//
+// Baseline-relative rather than absolute because strayAnswered is a process-wide counter and the
+// adjudicate tests in package proxy_test share this test binary with it.
+func TestAdjudicateStraySeriesRender(t *testing.T) {
+	h := New(nil, nil, metrics.NewAggregator(), Options{})
+	before := adjudicate.StrayAnswered()
+	want := fmt.Sprintf("cg_adjudicate_stray_total %d", before)
+	if !containsLine(h.renderMetrics(), want) {
+		t.Fatalf("/metrics is missing the line %q — a family that appears only once something breaks "+
+			"renders \"No data\" in Grafana, which reads as healthy", want)
+	}
+	if help := helpLine(h.renderMetrics(), "cg_adjudicate_stray_total"); help == "" {
+		t.Error("cg_adjudicate_stray_total renders with no HELP, so nothing on the panel says what a " +
+			"non-zero value means")
+	}
+
+	// And the value moves. Two strays answered in band; the series must read two higher.
+	adjudicate.NoteAnsweredInBand(2)
+	body := h.renderMetrics()
+	if containsLine(body, want) {
+		t.Errorf("still reads %q after two answered strays — the series is not reading "+
+			"adjudicate.StrayAnswered() (Snapshot.AdjudicateStray is filled only by /stats, so a "+
+			"promLine off `s` exports a permanent 0)", want)
+	}
+	if now := fmt.Sprintf("cg_adjudicate_stray_total %d", before+2); !containsLine(body, now) {
+		t.Errorf("expected the line %q, got:\n%s", now,
+			strings.Join(linesWithPrefix(body, "cg_adjudicate_stray_total"), "\n"))
+	}
+}
+
+// linesWithPrefix is for failure messages: showing the series that DID render is what tells you whether
+// the value was stale or the line vanished altogether.
+func linesWithPrefix(body, prefix string) (out []string) {
+	for _, ln := range strings.Split(body, "\n") {
+		if strings.HasPrefix(ln, prefix) {
+			out = append(out, ln)
+		}
+	}
+	return out
 }
 
 func containsLine(body, line string) bool {

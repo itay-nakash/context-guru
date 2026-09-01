@@ -123,12 +123,15 @@ func TestCompletePrefixedAppendsWithoutDisturbingThePrefix(t *testing.T) {
 	if len(sent.System) != 1 || sent.System[0]["cache_control"] == nil {
 		t.Errorf("the prefix's cache_control was lost, so there is no entry to read: %v", sent.System)
 	}
-	// NO TOOL_CHOICE AT ALL, and this reverses what this test used to assert. Same prefix, only
-	// tool_choice varying: {"type":"none"} returned prose and 0 of 6 verdicts (free cache read, no
-	// answer); {"type":"tool",name} returned 6 of 6 but MISSED the cache and wrote 8,378 tokens against
-	// the 8,268 already there, so naming a tool participates in the key; omitting it read the same
-	// entry for free AND returned 6 of 6 on 4 of 4 trials. Setting `none` to PREVENT a tool_use is what
-	// drove the model into prose, which the caller then scored as an unparseable failure.
+	// NO TOOL_CHOICE AT ALL, and this reverses what this test used to assert. Two separate findings on
+	// the same prefix with only tool_choice varying. On the CACHE: {"type":"tool",name} MISSED the entry
+	// and wrote 8,378 tokens against the 8,268 already there, so naming a tool DOES participate in the
+	// key, while omitting tool_choice read that entry for free. On the ANSWER: with the tool declared
+	// and no tool_choice, unparseable replies ran 9.1% (7 of 77 replied asks) against 30.0% (6 of 20)
+	// under main's {"type":"none"}, Fisher two-tailed p = 0.0245 — setting `none` to PREVENT a tool_use
+	// is what drove the model into prose, which the caller then scored as an unparseable failure.
+	// The "0 of 6 / 6 of 6" verdict counts this comment used to cite came from a six-item hand pass and
+	// are retracted; main returns verdicts on 71.5% of the items it asks about, not none of them.
 	if sent.ToolChoice != nil {
 		t.Errorf("tool_choice was set (%v); `none` drives the model into prose and a named tool costs "+
 			"a fresh cache write", sent.ToolChoice)

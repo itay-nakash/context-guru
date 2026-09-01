@@ -176,7 +176,15 @@ const sseRetainMaxBytes = 16 << 20
 // can be intercepted, and everything is forwarded as it arrives. found still reports whether
 // the response called expand, because the client then receives that call and the caller has
 // to count it.
-func (sp *sseSplicer) pass(body io.Reader, proxyTools ...string) (whole, withheld []byte, found bool) {
+//
+// ONE REQUIRED NAME plus a variadic tail, rather than a bare `proxyTools ...string`. A bare variadic
+// compiles with NO names at all, and an empty withhold set silently disables this entire defence:
+// startsProxyToolCall can never match, found stays false, cut stays -1, and every proxy-injected
+// tool_use streams straight to the client while the call site reads as though it were protected. The
+// two-argument signature this grew out of made that unrepresentable; this keeps that property while
+// still taking a set.
+func (sp *sseSplicer) pass(body io.Reader, proxyTool string, moreProxyTools ...string) (whole, withheld []byte, found bool) {
+	proxyTools := append([]string{proxyTool}, moreProxyTools...)
 	br := bufio.NewReader(body)
 	// One event buffer for the round, not one per event: a 2.25 MB round is ~19,000 events.
 	// Worth doing and not where the money was — recorder-free, per-event churn is 9.60x the
