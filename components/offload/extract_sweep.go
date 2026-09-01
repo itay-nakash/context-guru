@@ -694,6 +694,23 @@ func (e *ExtractSweep) adjudicate(req *bschemas.BifrostChatRequest, c *component
 	} else if !fellBack {
 		r.event("sweep_prefix_cache_read_ok")
 	}
+	// HOW THE ANSWER ARRIVED: the proxy's structured-answer tool, or reply prose. Split because
+	// nothing else in this component can tell the two apart. ParseVerdicts reads a tool_use `input`
+	// and a JSON array in text identically -- by design, so that declaring the tool is additive --
+	// which means a run where the declared tool is never touched produces the same verdicts, the same
+	// savings and the same gate counts as one where it is used every time. A review of PR #137
+	// measured exactly that divergence live (0 of 5 asks used the tool, all 5 answered in prose)
+	// against that PR's claim of 6 of 6, and no published counter could adjudicate between them.
+	//
+	// Only for the PREFIX ask. The fallback calls Complete(), which has no tool to declare, so
+	// counting it as prose would report a shape that was never on offer.
+	if !fellBack {
+		if usage.ViaTool {
+			r.event("sweep_answered_via_tool")
+		} else {
+			r.event("sweep_answered_via_prose")
+		}
+	}
 	for range items {
 		r.event("sweep_adjudicated")
 	}

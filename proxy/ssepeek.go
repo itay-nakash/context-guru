@@ -176,7 +176,7 @@ const sseRetainMaxBytes = 16 << 20
 // can be intercepted, and everything is forwarded as it arrives. found still reports whether
 // the response called expand, because the client then receives that call and the caller has
 // to count it.
-func (sp *sseSplicer) pass(body io.Reader, expandTool string) (whole, withheld []byte, found bool) {
+func (sp *sseSplicer) pass(body io.Reader, proxyTools ...string) (whole, withheld []byte, found bool) {
 	br := bufio.NewReader(body)
 	// One event buffer for the round, not one per event: a 2.25 MB round is ~19,000 events.
 	// Worth doing and not where the money was — recorder-free, per-event churn is 9.60x the
@@ -190,7 +190,7 @@ func (sp *sseSplicer) pass(body io.Reader, expandTool string) (whole, withheld [
 		e, err := readSSEEvent(br, &ev)
 		if len(e) > 0 {
 			sent := false
-			if startsExpandCall(e, expandTool) {
+			if startsProxyToolCall(e, proxyTools) {
 				found = true
 				if !over && cut < 0 {
 					cut = buf.Len()
@@ -333,9 +333,14 @@ func sseEventPayload(ev []byte) string {
 	return ""
 }
 
-// startsExpandCall reports whether this event OPENS a call to the expand tool — the one
-// block a client must never receive, because only this proxy implements the tool.
-func startsExpandCall(ev []byte, expandTool string) bool {
+// startsProxyToolCall reports whether this event OPENS a tool_use block for ANY tool the proxy
+// injected — the one class of block a client must never receive, because only this proxy implements
+// those tools. A set rather than one name because the proxy now advertises two — expand and the
+// adjudication tool — and withholding only the first let the second stream straight to the client,
+// which is the #103 class of defect: a client cannot execute a tool it never declared, so it answers
+// "not found" and the agent loses a turn. Unlike expand, an agent call to the adjudication tool is
+// never useful, so there is nothing on the other side of the trade.
+func startsProxyToolCall(ev []byte, proxyTools []string) bool {
 	if !bytes.Contains(ev, []byte("content_block_start")) {
 		return false // cheap reject: the parse below is the expensive half
 	}
@@ -344,7 +349,16 @@ func startsExpandCall(ev []byte, expandTool string) bool {
 		return false
 	}
 	cb := p.Get("content_block")
-	return cb.Get("type").String() == "tool_use" && cb.Get("name").String() == expandTool
+	if cb.Get("type").String() != "tool_use" {
+		return false
+	}
+	name := cb.Get("name").String()
+	for _, t := range proxyTools {
+		if t != "" && name == t {
+			return true
+		}
+	}
+	return false
 }
 
 // terminate closes the client's turn if nothing has. A continuation round is not obliged to

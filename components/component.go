@@ -126,6 +126,14 @@ type PrefixUsage struct {
 	CacheWrite int
 	Fresh      int
 	Output     int
+	// ViaTool records that the answer arrived as a tool_use for the proxy's own structured-answer
+	// tool rather than as reply TEXT. Reported for the same reason CacheRead is: a caller that
+	// declares a verdict tool in order to get a schema-shaped answer cannot otherwise tell whether it
+	// got one. A sweep whose tool is never used and a sweep that works look IDENTICAL in every other
+	// counter -- both return parsed verdicts and real savings -- because the prose parser accepts
+	// both. Measured: a review of PR #137 found 0 of 5 live asks using the declared tool while every
+	// verdict arrived through the text path, and no counter in this repo could show that.
+	ViaTool bool
 }
 
 // PrefixAsker completes `ask` as a trailing user message appended to the EXACT body this session

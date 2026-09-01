@@ -73,6 +73,7 @@ consumer that reads by key keeps working. The tables below group the `Snapshot` 
 | `adjusted_saved` | `saved − wasted`. May be negative. |
 | `components` | Per-component rollup (see below). |
 | `top_passthrough` | Components that ran but never *changed* a request — dead weight. A component that mutated without saving content tokens (`cachesplit`, `cacheinject`) is **not** listed here. |
+| `adjudicate_stray` | Times the **agent** called `context_guru_adjudicate`, the verdict tool the proxy injects for [`extract_llm_sweep`](../components/extract_llm_sweep.md) and tells the model not to call. Counted whether the call was answered on the response path or repaired on the next request. Each one costs the agent nothing now that it is answered in band, so this is a *description-health* number rather than an error: non-zero means the "do not call this yourself" wording has stopped working. Measured 0 over three benchmark passes. Also exported as `cg_adjudicate_stray_total`. |
 | `top_discarded` | Components whose changes the **writeback layer threw away** at least once. Any entry needs investigating: the component ran, mutated, and had no effect on the wire. |
 
 Per-component (`components.<name>` and `potential_components.<name>`):

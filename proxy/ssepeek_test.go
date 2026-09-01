@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/rossoctl/context-guru/expand"
+	"github.com/rossoctl/context-guru/internal/adjudicate"
 )
 
 const (
@@ -50,9 +51,29 @@ func TestStartsExpandCall(t *testing.T) {
 		{"[DONE]", "data: [DONE]\n\n", false},
 		{"no data line at all", "event: content_block_start\n\n", false},
 	} {
-		if got := startsExpandCall([]byte(tc.ev), expand.ToolName); got != tc.want {
+		if got := startsProxyToolCall([]byte(tc.ev), []string{expand.ToolName}); got != tc.want {
 			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
 		}
+	}
+
+	// THE SET, not one name. The proxy injects two tools now, and this predicate deciding on expand
+	// alone is what streamed an adjudication tool_use to the client event by event: the client never
+	// declared that tool, cannot run it, and answers "not found".
+	adj := "event: content_block_start\n" +
+		`data: {"type":"content_block_start","index":0,"content_block":` +
+		`{"type":"tool_use","id":"a1","name":"` + adjudicate.ToolName + `","input":{}}}` +
+		"\n\n"
+	if startsProxyToolCall([]byte(adj), []string{expand.ToolName}) {
+		t.Error("fixture is wrong: the adjudication call must not match an expand-only set")
+	}
+	if !startsProxyToolCall([]byte(adj), []string{expand.ToolName, adjudicate.ToolName}) {
+		t.Error("a second proxy-injected tool was not withheld, so its tool_use reaches the client")
+	}
+	if !startsProxyToolCall([]byte(pkExpand()), []string{expand.ToolName, adjudicate.ToolName}) {
+		t.Error("adding a name to the set stopped expand itself being withheld")
+	}
+	if startsProxyToolCall([]byte(pkOtherT), []string{expand.ToolName, adjudicate.ToolName}) {
+		t.Error("a CLIENT tool was withheld; only proxy-injected tools may be")
 	}
 }
 

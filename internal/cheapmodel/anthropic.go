@@ -194,6 +194,10 @@ type PrefixUsage struct {
 	CacheWrite int
 	Fresh      int
 	Output     int
+	// ViaTool: the answer came back as a tool_use for adjudicate.ToolName, not as reply text. See
+	// components.PrefixUsage.ViaTool -- the field exists so the caller can COUNT which shape it got,
+	// because the text parser accepts both and therefore hides the difference.
+	ViaTool bool
 }
 
 // CompletePrefixed sends `ask` as a trailing user message appended to prefixBody — an ENTIRE
@@ -213,22 +217,31 @@ type PrefixUsage struct {
 //   - appending a trailing user message to a byte-identical prefix reads the whole prefix from
 //     cache and writes nothing: 19,595 read / 0 created.
 //
-//   - NO `tool_choice` IS SET, and the earlier claim here — that forcing it to "none" is free and
-//     necessary, "because the model will otherwise answer with a tool_use instead of the verdicts" —
-//     was wrong in both halves. Same prefix, only tool_choice varying:
+//   - NO `tool_choice` IS SET, and a structured-answer tool IS declared. Those two halves are ONE
+//     change: the earlier comment here claimed forcing "none" was free and necessary "because the
+//     model will otherwise answer with a tool_use instead of the verdicts", and it was RIGHT about
+//     the mechanism and WRONG about the remedy. Three arms over the same transcript and ask model,
+//     three benchmark passes each, run sequentially:
 //
-//     tool_choice          reply shape             cache               verdicts returned
-//     {"type":"none"}      prose / thinking only   read 8,268 (free)   0 of 6
-//     {"type":"tool",name} tool_use                MISS, wrote 8,378   6 of 6
-//     (omitted)            tool_use                read 8,268 (free)   6 of 6, on 4 of 4 trials
+//     tool_choice       tool declared   asks replied   unusable        answered via tool_use
+//     {"type":"none"}   no              20             6  (30.0%)      0
+//     (omitted)         NO              24             14 (58.3%)      0
+//     (omitted)         yes             77             7  (9.1%)       43 (55.8%)
 //
-//     So `none` is what DROVE the model into prose — a sampled reply reasoned correctly under the
-//     criterion and simply said so in sentences, which the contract calls a valid answer, and the
-//     caller then scored it as an unparseable failure. Forcing a NAMED tool is not free either: it
-//     wrote a second cache entry, so tool_choice does participate in the key when it names a tool even
-//     though "none" does not. Omitting it gets a schema-shaped answer for the whole batch at
-//     cache-read price, provided a structured-answer tool is declared — which is why
-//     internal/adjudicate injects one on EVERY request rather than only here.
+//     Fisher two-tailed: row 1 vs row 3 p = 0.0245, row 2 vs row 3 p = 0.0000.
+//
+//     THE MIDDLE ROW IS THE POINT, and it is the arm that had never been run before: dropping the
+//     suppression WITHOUT declaring an answer tool is worse than leaving it in. Freed to call
+//     something and offered only the agent's tools plus context_guru_expand, the model calls one of
+//     those — observed directly by logging every reply's content blocks, as
+//     `thinking,tool_use:context_guru_expand` with NO text block, which this function's text
+//     extraction reads as "" and the caller files as unusable. That arm also lost 5 asks to the 90 s
+//     llmCallTimeout, against 0 and 1 in the others. So `none` was suppressing a real failure mode;
+//     declaring a tool worth calling is what removes the mode instead of trading it for prose.
+//
+//     Forcing a NAMED tool is separately not free: it wrote a second cache entry (8,378 against the
+//     8,268 already cached), so tool_choice DOES participate in the key when it names a tool even
+//     though "none" does not. Omitting it entirely reads the prefix for free.
 //
 //   - `tools` ARE part of the key. They are therefore left exactly as the prefix had them; dropping
 //     them read a different, smaller entry (19,129) i.e. a separate cache line and a fresh write.
@@ -322,6 +335,7 @@ func (a Anthropic) CompletePrefixed(ctx context.Context, prefixBody []byte, ask 
 	// input would replace a usable prose answer with an argument list that cannot parse.
 	for _, c := range out.Content {
 		if c.Type == "tool_use" && c.Name == adjudicate.ToolName && len(c.Input) > 0 {
+			u.ViaTool = true
 			return string(c.Input), u, nil
 		}
 	}

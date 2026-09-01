@@ -158,9 +158,17 @@ func TestCompletePrefixedPrefersOurToolInputOverText(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 	cli := cheapmodel.Anthropic{BaseURL: srv.URL, Model: "claude-sonnet-5", APIKey: "k"}
-	reply, _, err := cli.CompletePrefixed(context.Background(), []byte(prefixBodyFixture), "ASK")
+	reply, u, err := cli.CompletePrefixed(context.Background(), []byte(prefixBodyFixture), "ASK")
 	if err != nil {
 		t.Fatalf("CompletePrefixed: %v", err)
+	}
+	// REPORTED, not just used. The caller counts which reply shape it got, and it cannot infer this
+	// one: extract.ParseVerdicts reads a tool_use input and a JSON array in text identically, so a
+	// run whose declared tool is never touched looks exactly like one where it always is. That
+	// ambiguity is what left the reviewer's "0 of 5 asks used the tool" and this PR's "6 of 6"
+	// un-adjudicable against each other. See components.PrefixUsage.ViaTool.
+	if !u.ViaTool {
+		t.Error("the answer arrived as a tool_use but was not reported as one")
 	}
 	if strings.Contains(reply, "I think output 1") {
 		t.Errorf("the prose text was returned in preference to the tool input: %q", reply)
@@ -184,7 +192,13 @@ func TestCompletePrefixedPrefersOurToolInputOverText(t *testing.T) {
 func TestCompletePrefixedStillReadsTextWhenNoToolWasCalled(t *testing.T) {
 	srv := newCapturePrefixed(t, 8268)
 	cli := cheapmodel.Anthropic{BaseURL: srv.srv.URL, Model: "m", APIKey: "k"}
-	reply, _, err := cli.CompletePrefixed(context.Background(), []byte(prefixBodyFixture), "ASK")
+	reply, u, err := cli.CompletePrefixed(context.Background(), []byte(prefixBodyFixture), "ASK")
+	// And the shape is reported as PROSE, so the two counters cannot both be inflated by the same
+	// reply. A ViaTool that defaulted to true would make every prose answer look like a tool answer,
+	// which is the exact confusion the field exists to remove.
+	if u.ViaTool {
+		t.Error("a text-only reply was reported as having arrived via the tool")
+	}
 	if err != nil {
 		t.Fatalf("CompletePrefixed: %v", err)
 	}

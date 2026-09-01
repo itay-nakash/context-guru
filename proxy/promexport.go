@@ -13,6 +13,7 @@ import (
 
 	"github.com/rossoctl/context-guru/components/offload"
 	"github.com/rossoctl/context-guru/expand"
+	"github.com/rossoctl/context-guru/internal/adjudicate"
 	"github.com/rossoctl/context-guru/internal/cheapmodel"
 	"github.com/rossoctl/context-guru/metrics"
 	"github.com/rossoctl/context-guru/store"
@@ -428,6 +429,14 @@ func (h *Handler) renderMetrics() string {
 			promLine(&b, "cg_frozen_decisions_total", `outcome="dropped"`, float64(dropped))
 			promLine(&b, "cg_frozen_decisions_total", `outcome="repaired"`, float64(repaired))
 		}
+
+		// Same rule as the two families above, and this counter would have had the same bug:
+		// Snapshot.AdjudicateStray is filled only by the /stats handler (proxy.go), so a promLine
+		// off `s` here would export a hard-wired 0 on every scrape however often the agent called
+		// the tool. Read from adjudicate's own counter instead.
+		promHeaderProc(&b, "cg_adjudicate_stray_total",
+			"Times the AGENT called the proxy-injected context_guru_adjudicate tool, which it is told not to. Each one is a lost agent turn, not a correctness failure; rising means the tool's description has stopped working.", "counter")
+		promLine(&b, "cg_adjudicate_stray_total", "", float64(adjudicate.StrayAnswered()))
 
 		promHeaderProc(&b, "cg_sse_streams_total", "Responses by streaming path.", "counter")
 		promLine(&b, "cg_sse_streams_total", `path="streamed"`, float64(s.SSEStreamed))

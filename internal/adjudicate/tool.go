@@ -1,30 +1,42 @@
 // Package adjudicate declares the context-maintenance tool the cold-sweep adjudication asks with, and
 // the wire helpers that keep it byte-stable in the prompt-cache prefix.
 //
-// WHY A TOOL AT ALL, rather than only asking for a JSON array in the reply text. Measured against the
-// live gateway with the same prefix and only tool_choice varying:
+// WHY A TOOL AT ALL, rather than only asking for a JSON array in the reply text. The ask carries the
+// AGENT's tools, because `tools` are in the cache key and stripping them costs the read — so the only
+// question is what the model does with that freedom. Three arms, same transcript and ask model, three
+// benchmark passes each, run sequentially:
 //
-//	tool_choice          reply shape                 cache            verdict coverage
-//	{"type":"none"}      prose / thinking only       read 8,268 (free)   0 of 6 -- no answer at all
-//	{"type":"tool",name} tool_use                    MISS, wrote 8,378   6 of 6
-//	(omitted)            tool_use                    read 8,268 (free)   6 of 6, on 4 of 4 trials
+//	tool_choice          verdict tool   asks replied   unusable       answered via tool_use
+//	{"type":"none"}      no             20             6  (30.0%)     0
+//	(omitted)            NO             24             14 (58.3%)     0
+//	(omitted)            yes            77             7  (9.1%)      43 (55.8%)
 //
-// Three things follow, and each is the opposite of an assumption this repo carried in
-// cheapmodel.CompletePrefixed:
+// Fisher two-tailed: row 1 vs row 3 p = 0.0245, row 2 vs row 3 p = 0.0000.
 //
-//   - Setting tool_choice:none to STOP the model answering with a tool_use is what forced it into
-//     PROSE. A sampled reply reasoned correctly under the criterion and said so in sentences ("the task
-//     is not yet complete, and no summary of this raw data has been recorded elsewhere") -- which the
-//     contract itself calls a valid answer -- and was then scored as an unparseable failure.
-//   - FORCING the tool is not free: naming one produced a separate cache entry (8,378 written against
-//     the 8,268 already cached), so tool_choice DOES participate in the key when it names a tool, even
-//     though `none` does not.
-//   - Merely DECLARING the tool, with no tool_choice at all, gets a schema-shaped answer covering the
-//     whole batch at cache-read price.
+// The MIDDLE row is why this package exists, and it is the arm nobody had run: removing
+// tool_choice:none on its own is WORSE than leaving it in. Freed to call a tool and offered only the
+// agent's own plus context_guru_expand, the model calls one of those; logging every reply's content
+// blocks caught it as `thinking,tool_use:context_guru_expand` with no text block at all, which the
+// text-only extraction reads as "" and files as unusable. That arm also lost 5 asks to the 90 s
+// llmCallTimeout against 0 and 1 in the others.
 //
-// The tool is therefore injected on EVERY request rather than only when the sweep is about to ask.
-// `tools` hashes before system and messages, so a tool that appears and disappears invalidates the
-// prefix from position zero -- the same flap expand's `always` mode exists to prevent.
+// So the two halves are one change. Suppressing the call trades a lost answer for prose (row 1's
+// failures); allowing it with nothing worth calling loses the answer outright (row 2); allowing it and
+// declaring the right tool gets 55.8% of replies back schema-shaped at cache-read price, with the rest
+// still read by the unchanged prose parser (row 3).
+//
+// FORCING the tool by name is separately not free: it produced a second cache entry (8,378 written
+// against the 8,268 already cached), so tool_choice DOES participate in the key when it names a tool,
+// even though `none` does not.
+//
+// WHERE IT IS INJECTED. On every request of an Anthropic route whose pipeline contains
+// extract_llm_sweep, and nowhere else. Every-request matters because `tools` hashes before system and
+// messages, so a tool that appears when the sweep fires and vanishes on the next turn invalidates the
+// prefix from position zero -- the flap expand's `always` mode exists to prevent. But that argument
+// only forbids gating on something that varies PER TURN: pipeline membership is fixed at config load
+// and the provider by the route, so both conditions are byte-stable for a session. Injecting without
+// them cost a measured 946 bytes at the head of the cacheable prefix of every preset including `off`,
+// the control arm of every published comparison here, and including presets with no sweep at all.
 //
 // This does not replace the text path. extract.ParseVerdicts and extract.BuildFallbackAsk are still
 // the fallback, and a model that answers in prose anyway is still read exactly as before; the tool
@@ -45,8 +57,19 @@ import (
 // cheap insurance policy rather than a hot path.
 var strayAnswered atomic.Int64
 
-// StrayAnswered returns how many stray calls have been answered.
+// StrayAnswered returns how many stray calls have been answered, on either path.
 func StrayAnswered() int64 { return strayAnswered.Load() }
+
+// NoteAnsweredInBand counts stray calls answered on the RESPONSE path, before the client saw them.
+// The same counter as the request-path repair on purpose: /stats publishes "the agent called a tool it
+// was told not to call, n times", and which of the two defences caught it does not change that number
+// — it is the rate that says whether the description is still working. Which path caught it is in the
+// cg.adjudicate_stray log line, where it belongs.
+func NoteAnsweredInBand(n int) {
+	if n > 0 {
+		strayAnswered.Add(int64(n))
+	}
+}
 
 // ToolName is the wire name. Prefixed like the expand tool so an operator reading a transcript can
 // tell at a glance which tools the proxy injected and which the client owns.
@@ -164,6 +187,36 @@ func toolChoiceIsAuto(tc gjson.Result) bool {
 // safe: a client's tool_result is rewritten only when the assistant turn it answers called OUR tool.
 // A body with no such call comes back byte-identical, because this runs on every request and a
 // gratuitous rewrite would change the prefix and cost a cache write for nothing.
+// ResponseCallIDs returns the ids of calls the AGENT made to this tool in an upstream RESPONSE.
+//
+// The request-path repair (AnswerStrayCalls) is a backstop and cannot be the primary defence: by the
+// time it runs, the client has already SEEN the call, already failed to execute a tool it never
+// declared, and already spent a turn answering "not found". Answering the call in-band on the
+// response path -- before the client is written to -- is what makes the repair a backstop, and these
+// ids are what the response loop needs to build that answer.
+func ResponseCallIDs(provider string, resp []byte) (ids []string) {
+	if provider == "anthropic" {
+		gjson.GetBytes(resp, "content").ForEach(func(_, blk gjson.Result) bool {
+			if blk.Get("type").String() == "tool_use" && blk.Get("name").String() == ToolName {
+				if id := blk.Get("id").String(); id != "" {
+					ids = append(ids, id)
+				}
+			}
+			return true
+		})
+		return ids
+	}
+	gjson.GetBytes(resp, "choices.0.message.tool_calls").ForEach(func(_, tc gjson.Result) bool {
+		if tc.Get("function.name").String() == ToolName {
+			if id := tc.Get("id").String(); id != "" {
+				ids = append(ids, id)
+			}
+		}
+		return true
+	})
+	return ids
+}
+
 func AnswerStrayCalls(provider string, body []byte) (out []byte, answered int) {
 	msgs := gjson.GetBytes(body, "messages")
 	if !msgs.IsArray() {

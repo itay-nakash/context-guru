@@ -16,26 +16,43 @@ type Call struct {
 // true if the model also called some OTHER tool — in that case the host cannot
 // safely auto-continue (the client must resolve the other tools), so the loop
 // bails and returns the response as-is.
-func ResponseCalls(provider string, resp []byte) (calls []Call, otherTools bool) {
+// otherProxyTools are additional names the caller owns. otherTools means "a tool the CLIENT
+// implements", which is what makes the response loop hand the turn over untouched — so a second
+// proxy-injected tool counted as "other" caused the loop to bail and stream that proxy tool_use to
+// the client. Variadic so the existing callers, which advertise only expand, are unchanged.
+func ResponseCalls(provider string, resp []byte, otherProxyTools ...string) (calls []Call, otherTools bool) {
+	ours := func(name string) bool {
+		if name == ToolName {
+			return true
+		}
+		for _, t := range otherProxyTools {
+			if t != "" && name == t {
+				return true
+			}
+		}
+		return false
+	}
 	switch provider {
 	case "anthropic":
 		gjson.GetBytes(resp, "content").ForEach(func(_, blk gjson.Result) bool {
 			if blk.Get("type").String() != "tool_use" {
 				return true
 			}
-			if blk.Get("name").String() == ToolName {
+			switch name := blk.Get("name").String(); {
+			case name == ToolName:
 				calls = append(calls, Call{CallID: blk.Get("id").String(), HashID: blk.Get("input.id").String()})
-			} else {
+			case !ours(name):
 				otherTools = true
 			}
 			return true
 		})
 	default: // openai and compatibles
 		gjson.GetBytes(resp, "choices.0.message.tool_calls").ForEach(func(_, tc gjson.Result) bool {
-			if tc.Get("function.name").String() == ToolName {
+			switch name := tc.Get("function.name").String(); {
+			case name == ToolName:
 				hash := gjson.Get(tc.Get("function.arguments").String(), "id").String()
 				calls = append(calls, Call{CallID: tc.Get("id").String(), HashID: hash})
-			} else {
+			case !ours(name):
 				otherTools = true
 			}
 			return true
