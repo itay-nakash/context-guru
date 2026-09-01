@@ -33,6 +33,57 @@ jobs:
       - name: Build
         run: make build
 
+  # The binary needs no C toolchain — asserted, not asserted-in-a-comment.
+  #
+  # Our own docs told every evaluator to install one (`docs/setup.md` even named bifrost's
+  # tokenizer as a cgo dependency, which it never was). The only cgo dependency is tree-sitter,
+  # behind the `cg_skeleton` build tag. Nothing checked that, and the `build-test` job above runs
+  # exclusively with CGO_ENABLED=1 because `go test -race` requires it — so the configuration a
+  # user would actually build was never exercised.
+  #
+  # CGO_ENABLED=0 is what does the work: with cgo off the toolchain never consults CC at all, so a
+  # dependency that needs it fails to BUILD here rather than in a stranger's terminal. CC is pointed
+  # at a nonexistent path anyway, as a tripwire for the day somebody sets CGO_ENABLED=1 in this job
+  # and expects it to still be testing the same thing.
+  purego:
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "0"
+      CC: /nonexistent-c-compiler
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          check-latest: true
+      - name: Build with no C compiler available
+        run: |
+          go build -o /tmp/cg-purego ./cmd/context-guru-proxy
+          file /tmp/cg-purego | tee /dev/stderr | grep -q "statically linked"
+      - name: It has to start, not just link
+        run: |
+          LISTEN_ADDR=127.0.0.1:4471 CONTEXT_GURU_KEEPALIVE=off /tmp/cg-purego &
+          for _ in $(seq 1 40); do
+            sleep 0.25
+            curl -fsS http://127.0.0.1:4471/healthz && break
+          done
+          curl -fsS http://127.0.0.1:4471/healthz | grep -q ok
+      # And the guard that matters most to a CGO-free build: a preset naming a component which is
+      # not registered without cgo starts the proxy and then fails at pipeline build. That is the
+      # `preset: coding` / `unknown component "skeleton"` breakage, and TestEveryPresetBuilds
+      # covers it — but it had never run in this configuration.
+      # -p 1: run one package binary at a time.
+      #
+      # A CI runner has 2 cores, and `go test` otherwise starts up to GOMAXPROCS package binaries
+      # in parallel. Adding this job therefore added a SECOND heavily-parallel run of the proxy
+      # package per PR, and under that contention a timing-sensitive control-plane test
+      # (TestCtlGetCampaignAggregatesPredictedAndRealPerTenant — rossoctl/context-guru#163) failed
+      # twice on unrelated PRs, then passed on re-run and passes 3/3 locally on main and on the
+      # branch. That flake is not this job's business to hunt, but it IS this job's business not to
+      # provoke it: serialising costs about a minute and removes the contention this job added.
+      - name: Test the packages whose behaviour depends on which components compile in
+        run: go test -p 1 ./config/... ./components/... ./apply/... ./proxy/... ./store/...
+
   trivy:
     runs-on: ubuntu-latest
     steps:
