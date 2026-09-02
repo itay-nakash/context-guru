@@ -1,9 +1,12 @@
 package offload
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/rossoctl/context-guru/components"
 	"github.com/rossoctl/context-guru/internal/cheapmodel"
@@ -154,5 +157,144 @@ func TestSweepCountsBothLegsWhenItFallsBackAfterAsking(t *testing.T) {
 	if rec.PromptTokens != 40+31000 || rec.CompletionTokens != 90+420 {
 		t.Errorf("row tokens = prompt %d / completion %d, want %d/%d — the row still shows one "+
 			"leg", rec.PromptTokens, rec.CompletionTokens, 40+31000, 90+420)
+	}
+}
+
+// erroringModel fails the completion, after enough wall time to be measurable in whole
+// milliseconds. That combination is the subject: a fallback that BURNED SECONDS AND THEN FAILED.
+type erroringModel struct{ calls int64 }
+
+var errFallbackBroke = errors.New("fallback upstream refused the completion")
+
+func (m *erroringModel) Complete(_ context.Context, _ string) (string, error) {
+	m.calls++
+	time.Sleep(8 * time.Millisecond)
+	return "", errFallbackBroke
+}
+
+// REVIEW FINDING (#178, round 4). `foldFallback()` was called per site, and all three sites sit
+// AFTER `if reply, err = runFallback(); err != nil { return nil, r }` — so a fallback that failed
+// never reached the fold. `runFallback` has already booked the leg into metrics via `recordLeg`, so
+// /stats counted the call and its seconds while the ledger row kept only the prefix ask's
+// LatencyMs and a Strategy naming a leg that was no longer the only one that ran.
+//
+// Latency rather than dollars, because on an error the sink is empty — `recordUsageCache` is reached
+// only after a successful decode on both backends and neither errors after billing. But the fallback
+// is the SLOW leg by construction, so a failed one puts tens of seconds into avg_latency_ms against
+// a row showing milliseconds.
+//
+// THE NO-ASKER PATH IS THE SEVERE ONE and it is what this test drives: there, `r.rec` does not exist
+// yet when the fallback runs, so on an error the row was never built at all — Component stayed ""
+// and Offload dropped the entire row on its `call.rec.Component != ""` guard. /stats was left
+// reporting a call the ledger had no row for.
+//
+// ASSERTED AS CROSS-SURFACE AGREEMENT, deliberately. There is no marshalled surface for a ModelCall
+// inside /stats — the ledger rows travel to the dash Event, not this payload — so a JSON-tag
+// assertion would be testing dash's converter rather than this fix. The invariant that actually
+// broke is that the two surfaces disagreed, so that is what is pinned: if /stats counts the call,
+// the ledger must carry a row for it. And the assertion is on rep.Calls AFTER Offload, i.e. past
+// the guard that was doing the dropping, not on the pre-guard value.
+func TestAFailedFallbackStillLandsInTheLedger(t *testing.T) {
+	model := &erroringModel{}
+	_, callsBefore, _ := sweepSpend(t)
+
+	e := newSweepSmall(t, "")
+	c := preExpiryCtx("foldonerror", nil, store.NewMemory(store.Options{})) // no prefix asker
+	c.Model = components.ModelSpec{Incoming: model, Static: model}
+
+	rep := &components.Report{Component: "extract_llm_sweep"}
+	if _, err := e.Offload(sweepReqStocked(), rep, c); err != nil {
+		// Fail-open: a broken fallback must not surface an error to the pipeline.
+		t.Fatalf("Offload returned an error; the component must fail open: %v", err)
+	}
+
+	// PRECONDITIONS. Each one is a way this test could otherwise pass on a fixture that simply
+	// declined, which is the shape that makes an assertion vacuous.
+	if rep.Gates["sweep_no_asker"] != 1 {
+		t.Fatalf("the no-asker path was not taken (gates: %v)", rep.Gates)
+	}
+	if model.calls != 1 {
+		t.Fatalf("the fallback model was called %d times, want 1 — nothing errored, so there is "+
+			"no failed leg to account for", model.calls)
+	}
+	if rep.Gates["sweep_fallback_failed"] != 1 {
+		t.Fatalf("the fallback did not FAIL, so this exercises the success path instead of the "+
+			"error path under test (gates: %v)", rep.Gates)
+	}
+	// And /stats booked it, which is the half that was never in doubt and is what makes the
+	// missing row a DISAGREEMENT rather than a symmetric omission.
+	_, callsAfter, _ := sweepSpend(t)
+	if n := callsAfter - callsBefore; n != 1 {
+		t.Fatalf("/stats recorded %d calls for the failed fallback, want 1", n)
+	}
+
+	// THE FIX: the ledger has a row for the call /stats counted.
+	if len(rep.Calls) != 1 {
+		t.Fatalf("/stats counted a call and the ledger carries %d rows: the row is built after "+
+			"the error return, so Component stayed \"\" and Offload dropped it on its "+
+			"Component != \"\" guard. This is the round-4 finding.", len(rep.Calls))
+	}
+	rec := rep.Calls[0]
+	if rec.Component != "extract_llm_sweep" {
+		t.Errorf("row Component = %q, want extract_llm_sweep — without it the caller's guard "+
+			"drops the row however complete the rest of it is", rec.Component)
+	}
+	if rec.LatencyMs <= 0 {
+		t.Errorf("row LatencyMs = %v: the failed fallback's wall time did not reach the ledger, "+
+			"so avg_latency_ms carries seconds the per-call view cannot account for", rec.LatencyMs)
+	}
+	if rec.Strategy != "fallback" {
+		t.Errorf("row Strategy = %q, want \"fallback\": no prefix ask happened on this route",
+			rec.Strategy)
+	}
+	if rec.Rejection == "" {
+		t.Error("row Rejection is empty on a failed fallback, so the row cannot say why it " +
+			"produced nothing — the distinction ModelCall.Rejection exists for")
+	}
+	// Identity fields must be real, not placeholders: a row the dashboard cannot attribute to a
+	// candidate size or a model is barely better than no row.
+	if rec.CandidateTokens <= 0 {
+		t.Errorf("row CandidateTokens = %d, want the inventory's real size", rec.CandidateTokens)
+	}
+}
+
+// The other shape: the prefix ask succeeded, the cache read was zero, and the fallback then FAILED.
+// Here r.rec already exists, so the row was never dropped — it just kept the prefix ask's latency
+// while /stats carried both legs. Latency-only, and the fold has to cover it too.
+func TestAFailedFallbackAfterAskingStillGrowsTheRow(t *testing.T) {
+	model := &erroringModel{}
+	asker := &fakeAsker{reply: `[{"i":0,"needed_by":"none","quote":"","verdict":"keep"}]`, cacheRead: 0}
+	_, callsBefore, _ := sweepSpend(t)
+
+	e := newSweepSmall(t, "")
+	c := preExpiryCtx("foldonerror2", asker, store.NewMemory(store.Options{}))
+	c.Model = components.ModelSpec{Incoming: model, Static: model}
+
+	rep := &components.Report{Component: "extract_llm_sweep"}
+	if _, err := e.Offload(sweepReqStocked(), rep, c); err != nil {
+		t.Fatalf("Offload must fail open: %v", err)
+	}
+	if rep.Gates["sweep_prefix_cache_read_ZERO"] != 1 || rep.Gates["sweep_fallback_failed"] != 1 {
+		t.Fatalf("wanted a successful ask with a zero cache read and then a FAILED fallback "+
+			"(gates: %v)", rep.Gates)
+	}
+	// Two legs went out, so /stats booked two.
+	_, callsAfter, _ := sweepSpend(t)
+	if n := callsAfter - callsBefore; n != 2 {
+		t.Fatalf("/stats recorded %d calls, want 2 (the ask AND the failed fallback)", n)
+	}
+	if len(rep.Calls) != 1 {
+		t.Fatalf("want one ledger row for the adjudication, got %d", len(rep.Calls))
+	}
+	rec := rep.Calls[0]
+	// The row must name both legs and carry both their seconds. The failed leg sleeps 8ms, so a row
+	// still showing only the ask is detectable: the fake asker returns instantly.
+	if rec.Strategy != "prefix_ask+fallback" {
+		t.Errorf("row Strategy = %q, want \"prefix_ask+fallback\" — a failed fallback still ran",
+			rec.Strategy)
+	}
+	if rec.LatencyMs < 8 {
+		t.Errorf("row LatencyMs = %v, want at least the failed fallback's ~8ms: /stats has both "+
+			"legs' seconds and the per-call view must not show only the fast one", rec.LatencyMs)
 	}
 }

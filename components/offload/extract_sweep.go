@@ -544,10 +544,14 @@ func (r *sweepResult) event(name string) { r.events = append(r.events, name) }
 // obligation, a verdict for something we did not offer. A wrong keep costs tokens on one turn; a wrong
 // drop is a silent permanent loss the agent does not notice and cannot ask about. The two errors are
 // not comparable, so this does not treat them symmetrically.
+// The sweepResult is a NAMED result purely so `defer foldFallback()` below can reach it. It has to
+// be: every early return here is `return nil, r` on a LOCAL, and a deferred mutation of a local
+// happens after the return value has already been copied, so the fold would be silently lost on
+// exactly the error paths it exists to cover. The first result stays blank-named — only this one
+// needs the treatment, and saying so beats leaving a reader to wonder what `dropped` is for.
 func (e *ExtractSweep) adjudicate(req *bschemas.BifrostChatRequest, c *components.Ctx,
-	rep *components.Report, cands []sweepCand) ([]int, sweepResult) {
+	rep *components.Report, cands []sweepCand) (_ []int, r sweepResult) {
 
-	var r sweepResult
 	// A SINGLE-CANDIDATE ASK IS THE REFUTED SHAPE WEARING A NEW NAME, so it is counted rather than
 	// silently accepted. Shown one output, a model simply drops it: 6% live-kept on haiku and 14% on
 	// sonnet, both inside the drop-everything null model's error bar. The ask still proceeds — a
@@ -648,12 +652,35 @@ func (e *ExtractSweep) adjudicate(req *bschemas.BifrostChatRequest, c *component
 		return out, err
 	}
 	// foldFallback adds the fallback leg's tokens, dollars and wall time into the ask's ledger row.
-	// Idempotent by construction — at most one fallback runs per adjudication and this reads the
-	// accumulators rather than adding to them — so calling it on every path that can reach a
-	// fallback is safe.
+	//
+	// Idempotent by construction — at most one fallback runs per adjudication and this READS the
+	// accumulators rather than adding to them — which is what lets it be deferred and also called
+	// explicitly on the happy path, where the row is built after the no-asker fallback has already
+	// run and would otherwise overwrite the fold.
+	//
+	// DEFERRED, so it also covers the three fallback ERROR paths. Each of those is
+	// `if reply, err = runFallback(); err != nil { return nil, r }`, and `runFallback` has already
+	// booked the leg into metrics via recordLeg — so /stats counted the call and its seconds while
+	// the ledger row kept only the prefix ask's LatencyMs and a Strategy naming a leg that was no
+	// longer the only one that ran. Latency rather than dollars, because on an error the sink is
+	// empty (recordUsageCache is reached only after a successful decode on both backends, and
+	// neither returns an error after billing) — but the fallback is the SLOW leg by construction, so
+	// a failed one contributes tens of seconds to avg_latency_ms against a row showing milliseconds.
 	foldFallback := func() {
 		if fbMs == 0 && fbCost == 0 && fbUsage == (components.PrefixUsage{}) {
 			return
+		}
+		// IDENTITY FIRST, and this is the half of the fix that is easy to miss. On the no-asker
+		// path the fallback runs BEFORE r.rec exists, so if it errors the row is never built at
+		// all — Component stays "" and the caller drops the whole row on the
+		// `call.rec.Component != ""` guard. /stats then reports a call the ledger has no row for.
+		// That path never built a row before either, so the row is not a regression; the recorded
+		// spend and latency are new, so the DIVERGENCE is.
+		if r.rec.Component == "" {
+			r.rec.Component = rep.Component
+			r.rec.Model = c.ModelName
+			r.rec.CandidateTokens = before
+			r.rec.GateReason = "pre-expiry window: the cache still exists and is nearly worthless"
 		}
 		r.rec.LatencyMs = askMs + fbMs
 		r.rec.PromptTokens = int64(usage.Fresh + fbUsage.Fresh)
@@ -669,6 +696,10 @@ func (e *ExtractSweep) adjudicate(req *bschemas.BifrostChatRequest, c *component
 			r.rec.Strategy = "prefix_ask+fallback"
 		}
 	}
+	// One arming point for all four exits that can carry a fallback — the three error returns and
+	// the happy path. A per-site call was what left the error paths uncovered, and a fifth site
+	// added later would have been missed the same way.
+	defer foldFallback()
 	if c.PrefixAsk == nil {
 		// No asker at all: a non-Anthropic route, or no incoming client. Not a failure of the ask —
 		// there was nothing to ask through — so it takes the same fork as a missed read.
@@ -702,7 +733,11 @@ func (e *ExtractSweep) adjudicate(req *bschemas.BifrostChatRequest, c *component
 		CostUSD:    askCost,
 		GateReason: "pre-expiry window: the cache still exists and is nearly worthless",
 	}
-	foldFallback() // covers the no-asker path, whose fallback ran before this row existed
+	// The no-asker path's fallback ran BEFORE this row existed, and the assignment above just
+	// overwrote the deferred fold's work-in-progress. Re-folded here rather than relying on the
+	// defer alone because the defer's ordering relative to this assignment is what makes that
+	// reliance fragile — and folding twice is free, since foldFallback reads the accumulators.
+	foldFallback()
 	if ctx.Err() != nil {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			atomic.AddInt64(&llmTimeouts, 1)
@@ -728,7 +763,6 @@ func (e *ExtractSweep) adjudicate(req *bschemas.BifrostChatRequest, c *component
 			return nil, r
 		}
 		fellBack = true
-		foldFallback()
 	}
 	// THE CACHE READ IS THE MECHANISM'S WHOLE JUSTIFICATION, so a read that did not happen is always
 	// COUNTED — a silent miss is what hid this class of problem before, and it looks identical to a
@@ -759,10 +793,6 @@ func (e *ExtractSweep) adjudicate(req *bschemas.BifrostChatRequest, c *component
 			return nil, r
 		}
 		fellBack = true
-		// The ledger row must cover EVERY leg. Folded here rather than at construction because two
-		// of the three fallback points fire after r.rec is built, and a row showing only the prefix
-		// ask is what made the dashboard's per-call view agree with the $0 figure.
-		foldFallback()
 	} else if !fellBack {
 		r.event("sweep_prefix_cache_read_ok")
 	}
