@@ -13,9 +13,13 @@ func TestNetValueGoesNegativeWhenUnderwater(t *testing.T) {
 	// rate ($0.30/MTok) against $3.26 of extraction spend.
 	RecordExtractionSaving("extract_llm", 197548)
 	s := ExtractSnapshot(3.26, 0.30/1e6, 0, 0)
-	if s.NetValueUSD >= 0 {
+	net, known := s.Net()
+	if !known {
+		t.Fatalf("the aggregate net must always be known, got null: %+v", s)
+	}
+	if net >= 0 {
 		t.Fatalf("net must be negative when spend exceeds value: net=%v gross=%v cost=%v",
-			s.NetValueUSD, s.GrossValueUSD, s.ExtractionCostUSD)
+			net, s.GrossValueUSD, s.ExtractionCostUSD)
 	}
 	// And the ratio must reproduce the issue's ~8x-underwater claim to the right order.
 	if ratio := s.ExtractionCostUSD / s.GrossValueUSD; ratio < 40 {
@@ -57,8 +61,8 @@ func TestExtractSnapshotExposesAllCounters(t *testing.T) {
 	if d := s.CacheHitRate - want; d > 1e-9 || d < -1e-9 {
 		t.Errorf("CacheHitRate = %v, want %v", s.CacheHitRate, want)
 	}
-	if s.NetValueUSD != 0.476 {
-		t.Errorf("NetValueUSD = %v, want 0.476", s.NetValueUSD)
+	if net, known := s.Net(); !known || net != 0.476 {
+		t.Errorf("NetValueUSD = %v (known=%v), want 0.476", net, known)
 	}
 	// The trigger reason must be recoverable — an operator's first question.
 	if s.TopReason == "" || len(s.Reasons) != 2 {
@@ -158,8 +162,9 @@ func TestNetValueUsesComponentOwnSavingsNotPipelineTotal(t *testing.T) {
 	if d := s.GrossValueUSD - round4(wantGross); d > 1e-9 || d < -1e-9 {
 		t.Fatalf("GrossValueUSD = %v, want %v (1,000 own tokens x rate)", s.GrossValueUSD, round4(wantGross))
 	}
-	if s.NetValueUSD >= 0 {
-		t.Fatalf("net must be negative: spent $0.05 to save $%.6f", wantGross)
+	if net, known := s.Net(); !known || net >= 0 {
+		t.Fatalf("net must be negative (got %v, known=%v): spent $0.05 to save $%.6f",
+			net, known, wantGross)
 	}
 	// The pipeline-wide figure in a real run is orders of magnitude larger. Prove the
 	// snapshot is NOT reading anything like it: had a 2,000,000-token pipeline total leaked

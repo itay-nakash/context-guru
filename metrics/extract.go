@@ -39,6 +39,16 @@ import (
 // ~59-second asks braked extract_llm's exploration on evidence from a different component
 // and a different model. A brake must read the latency of the calls it is braking.
 
+// CostSource values for ExtractStats.CostSource. Constants because they are read off /stats by
+// operators and by promexport; a typo in one of two string literals is a silently wrong label.
+const (
+	costSourceComponent = "component"
+	costSourceHost      = "host_total"
+	costSourcePartial   = "partial"
+	costSourceUnpriced  = "unpriced"
+	costSourceNone      = "none"
+)
+
 // xCounters is one component's extraction accounting.
 type xCounters struct {
 	calls      atomic.Int64 // extraction LLM calls actually made
@@ -250,9 +260,21 @@ func RecordExtractionSpend(component string, usd float64) {
 	}
 }
 
-// ExtractStats is the extraction economics block served inside /stats. It is ADDITIVE:
-// every pre-existing /stats field keeps its name and meaning, because deploy/harbor/*.py
-// parses them.
+// ExtractStats is the extraction economics block served inside /stats. It is ADDITIVE: every
+// pre-existing field keeps its name and meaning.
+//
+// NOT because the benchmark harness parses it — that reason was carried here and in
+// docs/components/extract_llm.md and it is FALSE. `deploy/` reads `runs`, `acted` and
+// `saved_tokens` off the per-COMPONENT objects (measure.py does so by direct index, so removing
+// one is a KeyError), and reads nothing at all out of this block; grepping deploy/ for
+// gross_saved_tokens, calls_avoided, extraction_cost_usd or avg_latency_ms returns nothing.
+//
+// The real reason these names are frozen is /metrics. proxy/promexport.go publishes them as
+// cg_extract_calls_total, cg_extract_cost_usd, cg_extract_net_value_usd and cg_extract_latency_ms,
+// and dash/metrics_export.go documents cg_extract_net_value_usd as the endpoint's only dollar
+// figure. Those are what an operator's alert rule and dashboard query are written against, off-repo
+// and unversioned, so a rename breaks monitoring silently — which is a worse failure than breaking
+// the harness, because the harness would at least crash.
 type ExtractStats struct {
 	Calls            int64 `json:"calls"`            // extraction LLM calls made
 	CallsAvoided     int64 `json:"calls_avoided"`    // global result-cache hits
@@ -277,7 +299,35 @@ type ExtractStats struct {
 	// the honest headline. Negative means the component is underwater and should be off.
 	ExtractionCostUSD float64 `json:"extraction_cost_usd"`
 	GrossValueUSD     float64 `json:"gross_value_usd"`
-	NetValueUSD       float64 `json:"net_value_usd"`
+	// NetValueUSD is nil — rendered as JSON `null` — when the spend behind it is NOT KNOWN.
+	//
+	// A pointer rather than a float because 0 dollars of spend and 0 evidence of spend are the
+	// same number and the opposite claim, and this field is the one an operator acts on. A
+	// component that made calls and priced none of them would otherwise publish
+	// `net_value_usd: +grossValue` — "comfortably profitable" — on no cost information at all,
+	// while the block enclosing it reported the component underwater from the host's figure. Two
+	// figures for one quantity disagreeing by the whole spend is exactly the failure this change
+	// exists to remove, so the unknown is rendered as unknown. Read CostSource for which case a
+	// row is in.
+	//
+	// The AGGREGATE is never nil: it always has a determined spend, from the components, from the
+	// host's figure, or from there being no spend at all.
+	NetValueUSD *float64 `json:"net_value_usd"`
+	// CostSource says where ExtractionCostUSD came from. Named values, because the number alone
+	// cannot distinguish the cases and they call for different responses:
+	//
+	//	component   every call in this row priced itself, at the rates of the model it called.
+	//	            The figure is this component's own arithmetic — trust it.
+	//	host_total  the host's process-global cheap-model spend. A SUPERSET: it also carries
+	//	            `summarize` and `agentdiet`, and prices everything through one rate card.
+	//	            Aggregate only.
+	//	partial     some calls priced themselves and some did not, and the host's figure was no
+	//	            larger. The total is a FLOOR, not the bill. Aggregate only.
+	//	unpriced    this row made calls and none of them priced itself, so nothing is known about
+	//	            what it spent. ExtractionCostUSD is 0 because there is no evidence, NOT
+	//	            because the component was free, and NetValueUSD is null.
+	//	none        no calls and no spend. 0 is the true figure.
+	CostSource string `json:"cost_source"`
 
 	// Reasons counts why extraction ran or was suppressed, most frequent first.
 	Reasons map[string]int64 `json:"reasons,omitempty"`
@@ -285,10 +335,11 @@ type ExtractStats struct {
 	TopReason string `json:"top_reason,omitempty"`
 
 	// ByComponent breaks every field above down by the component that recorded it (#176).
-	// The enclosing block stays the SUM, because deploy/harbor/*.py reads it and a rename or
-	// a change of meaning there invalidates the reproduction path — but the sum is the figure
-	// that misattributed a 59-second latency and a negative net value to a component that
-	// made no calls, so it must never again be the only figure available. Nil inside each
+	//
+	// The enclosing block stays the SUM — see the type comment for why those names are frozen,
+	// and note it is /metrics rather than the harness that freezes them — but the sum is the
+	// figure that misattributed a 59-second latency and a negative net value to a component
+	// that made no calls, so it must never again be the only figure available. Nil inside each
 	// nested entry: the breakdown does not nest.
 	ByComponent map[string]*ExtractStats `json:"by_component,omitempty"`
 }
@@ -319,6 +370,12 @@ func ExtractSnapshot(cost, perSavedTokenUSD float64, cacheWrite, cacheRead int64
 		totLatMs  int64
 		totReason = map[string]int64{}
 		anySpend  bool
+		// unpricedCalls counts calls made by components that priced NOTHING. It is what stops the
+		// aggregate silently under-reporting: `anySpend` alone is one boolean across every
+		// component, so if extract_llm priced its calls (the cheap card is never zero) while
+		// extract_llm_sweep recorded none, the total became extract_llm's spend alone and the
+		// sweep's real dollars vanished — no fallback, no warning, a smaller number than before.
+		unpricedCalls int64
 	)
 	for _, name := range names {
 		x := xFor(name)
@@ -336,19 +393,42 @@ func ExtractSnapshot(cost, perSavedTokenUSD float64, cacheWrite, cacheRead int64
 		grossVal += gv
 		spend += sp
 		anySpend = anySpend || recorded
+		if !recorded && s.Calls > 0 {
+			unpricedCalls += s.Calls
+		}
 		totLatMs += x.latencyMs.Load()
 		for k, v := range reasons {
 			totReason[k] += v
 		}
 	}
-	// The components' own priced spend where any of them recorded some; the host's
-	// process-global figure only as a fallback. See xCounters.spendNano.
-	if !anySpend {
-		spend = cost
+	// WHICH SPEND FIGURE THE TOTAL PUBLISHES, and it must say which one it chose.
+	//
+	// The components' own priced spend is the figure to prefer: each knows the model it called and
+	// its rates. The host's `cost` is cheapmodel's process-global total priced through one card —
+	// a SUPERSET (it carries `summarize` and `agentdiet` too) and mispriced for any component that
+	// does not call the cheap model. So it is a fallback, never an equal.
+	switch {
+	case !anySpend && cost > 0:
+		// Nothing priced itself. A library embedding, /compact, a host that never fills
+		// ModelCall.CostUSD — the host's figure is all the information there is.
+		spend, total.CostSource = cost, costSourceHost
+	case unpricedCalls > 0:
+		// Some calls priced themselves and some did not, so the recorded sum is a FLOOR. Publish
+		// the larger of the floor and the host's superset figure, and name which one it is: a
+		// total that quietly omits real dollars is the defect, not the loud one.
+		total.CostSource = costSourcePartial
+		if cost > spend {
+			spend, total.CostSource = cost, costSourceHost
+		}
+	case anySpend:
+		total.CostSource = costSourceComponent
+	default:
+		total.CostSource = costSourceNone
 	}
 	total.ExtractionCostUSD = round4(spend)
 	total.GrossValueUSD = round4(grossVal)
-	total.NetValueUSD = round4(grossVal - spend)
+	net := round4(grossVal - spend)
+	total.NetValueUSD = &net
 	if total.CacheLookups > 0 {
 		total.CacheHitRate = float64(total.CallsAvoided) / float64(total.CacheLookups)
 	}
@@ -387,7 +467,25 @@ func (x *xCounters) snapshot(perSavedTokenUSD float64) (
 		Calls: calls, CallsAvoided: hits, CallsSuppressed: x.suppressed.Load(),
 		CacheLookups: lookups, GrossSavedTokens: gross,
 		ExtractionCostUSD: round4(spend), GrossValueUSD: round4(grossValue),
-		NetValueUSD: round4(grossValue - spend),
+	}
+	// A ROW NEVER BORROWS THE HOST'S FIGURE. `cost` is one process-global number covering every
+	// cheap-model call including components that are not extraction at all; there is no sound way
+	// to split it across rows, and splitting it by call count would be an invented number
+	// presented at the same precision as a measured one. So a row that priced nothing says so and
+	// leaves the net UNKNOWN, rather than publishing +grossValue on no cost evidence.
+	switch {
+	case spendRecorded:
+		s.CostSource = costSourceComponent
+		net := round4(grossValue - spend)
+		s.NetValueUSD = &net
+	case calls > 0:
+		s.CostSource = costSourceUnpriced // NetValueUSD stays nil -> JSON null
+	default:
+		// No calls, so nothing was spent and 0 is the true figure — a replay-only component's
+		// row, which is genuinely and provably free.
+		s.CostSource = costSourceNone
+		net := round4(grossValue)
+		s.NetValueUSD = &net
 	}
 	if lookups > 0 {
 		s.CacheHitRate = float64(hits) / float64(lookups)
@@ -426,6 +524,16 @@ func sortedReasons(in map[string]int64) (map[string]int64, string) {
 		return keys[i] < keys[j] // stable output for equal counts
 	})
 	return out, keys[0]
+}
+
+// Net returns the net value, and whether it is known. Consumers that must publish a number (a
+// Prometheus gauge cannot say "unknown") use the bool to decide whether to publish at all rather
+// than turning an unknown into a 0 that reads as break-even.
+func (s ExtractStats) Net() (float64, bool) {
+	if s.NetValueUSD == nil {
+		return 0, false
+	}
+	return *s.NetValueUSD, true
 }
 
 func round4(f float64) float64 {

@@ -53,12 +53,14 @@ func TestStatsRendersPerComponentExtractionAttribution(t *testing.T) {
 
 	var got struct {
 		Extract struct {
-			Calls       int64 `json:"calls"`
+			Calls       int64  `json:"calls"`
+			CostSource  string `json:"cost_source"`
 			ByComponent map[string]struct {
-				Calls             int64   `json:"calls"`
-				AvgLatencyMs      float64 `json:"avg_latency_ms"`
-				ExtractionCostUSD float64 `json:"extraction_cost_usd"`
-				NetValueUSD       float64 `json:"net_value_usd"`
+				Calls             int64    `json:"calls"`
+				AvgLatencyMs      float64  `json:"avg_latency_ms"`
+				ExtractionCostUSD float64  `json:"extraction_cost_usd"`
+				NetValueUSD       *float64 `json:"net_value_usd"`
+				CostSource        string   `json:"cost_source"`
 			} `json:"by_component"`
 		} `json:"extract"`
 		Components map[string]struct {
@@ -94,6 +96,23 @@ func TestStatsRendersPerComponentExtractionAttribution(t *testing.T) {
 	if tail.ExtractionCostUSD != baseTailCost {
 		t.Errorf("extract_llm charged $%v (baseline $%v) it did not spend",
 			tail.ExtractionCostUSD, baseTailCost)
+	}
+	// cost_source has to reach the WIRE, on the block and on every row: it is what separates a
+	// provable $0 from an unknown, and the statsHandler builds this block itself so the field can
+	// be computed and dropped. The sweep priced its own call; extract_llm made none, so its 0 is
+	// provable rather than unknown.
+	if got.Extract.CostSource == "" {
+		t.Errorf("/stats serves no extract.cost_source: %s", w.Body.String())
+	}
+	if sweep.CostSource != "component" {
+		t.Errorf("sweep cost_source = %q on the wire, want \"component\"", sweep.CostSource)
+	}
+	if tail.CostSource != "none" {
+		t.Errorf("extract_llm cost_source = %q on the wire, want \"none\" (no calls, so $0 is "+
+			"the true figure and not a missing one)", tail.CostSource)
+	}
+	if sweep.NetValueUSD == nil {
+		t.Error("the sweep priced its own call, so its net_value_usd must not be null on the wire")
 	}
 
 	cs, ok := got.Components["extract_llm"]

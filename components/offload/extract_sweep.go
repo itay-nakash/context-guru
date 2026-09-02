@@ -583,34 +583,6 @@ func (e *ExtractSweep) adjudicate(req *bschemas.BifrostChatRequest, c *component
 	for _, it := range items {
 		before += it.SizeTokens
 	}
-	start := time.Now()
-	var (
-		reply string
-		usage components.PrefixUsage
-		err   error
-		// fellBack records that the expensive path has already run, so the cache-read check below does
-		// not fire a second time for the same call. Without it a failed ask both fell back AND then
-		// reported a zero cache read, double-counting one event as two.
-		fellBack bool
-	)
-	if c.PrefixAsk == nil {
-		// No asker at all: a non-Anthropic route, or no incoming client. Not a failure of the ask —
-		// there was nothing to ask through — so it takes the same fork as a missed read.
-		r.gate("sweep_no_asker")
-		if e.blockFallback {
-			r.gate("sweep_fallback_blocked")
-			r.rec.Rejection = "no prefix asker on this route and block_fallback is set"
-			return nil, r
-		}
-		if reply, err = e.fallbackAsk(ctx, req, c, &r, items, cands); err != nil {
-			return nil, r
-		}
-		fellBack = true
-	} else {
-		reply, usage, err = c.PrefixAsk.Ask(ctx, c.Session, extract.BuildPrefixAsk(items))
-	}
-	latency := float64(time.Since(start).Milliseconds())
-	metrics.RecordExtractionCall(rep.Component, latency)
 	// COST, which this record carried as $0.00 forever. It never set CostUSD at all, so the per-call
 	// ledger the dashboard shows for this component reported zero on every firing — measured live at
 	// $0.00 against real cache reads of 449,304 and 449,376 tokens and real completion tokens, while
@@ -623,24 +595,114 @@ func (e *ExtractSweep) adjudicate(req *bschemas.BifrostChatRequest, c *component
 	// rather than being two independent guesses. c.SelfRates is the model the request came in on;
 	// falling back to the env card keeps a figure when the host supplies no rates, the same
 	// convention extract_llm.pricingFor uses.
+	//
+	// Resolved BEFORE the ask because both legs below price themselves with it. The fallback goes to
+	// the same model the prefix ask addresses (c.Model.For("incoming")), so one rate card is right
+	// for both.
 	pricing := cheapmodel.PricingFromEnv()
 	if !c.SelfRates.Zero() {
 		pricing = ratesPricing(c.SelfRates)
 	}
+	var (
+		reply string
+		usage components.PrefixUsage
+		err   error
+		// fellBack records that the expensive path has already run, so the cache-read check below does
+		// not fire a second time for the same call. Without it a failed ask both fell back AND then
+		// reported a zero cache read, double-counting one event as two.
+		fellBack bool
+		// The ask's own totals, accumulated PER LEG. An adjudication is not one model call: the
+		// prefix ask and the fallback are two, on two prompts, and either can be the only one that
+		// happens. See recordLeg.
+		askMs, askCost float64
+		fbUsage        components.PrefixUsage
+		fbMs, fbCost   float64
+	)
+	// recordLeg books ONE model call this component made — its wall time and its own priced spend.
+	//
+	// PER LEG, not once per adjudication, because `fallbackAsk` is a SECOND model call on a full
+	// sampled transcript and it used to be accounted at $0.00 and 0 ms. The single record was built
+	// from the PREFIX ask's usage and assigned once, while two of the three fallback points fire
+	// after that assignment — so on every route without an Anthropic prefix asker (where the prefix
+	// ask never happens at all), on every session's first turn (ErrNoPrefix) and on every mistimed
+	// window (CacheRead == 0), the component's real frontier-model spend was reported as free.
+	//
+	// That was survivable before this PR only by accident: the fallback's tokens still reached
+	// /stats through cheapmodel's process totals, which the host passed in as the `cost` argument.
+	// Making the components price their own spend removed that accident, so the leg has to book
+	// itself. This is the same defect class as #176, in the component this PR re-scoped.
+	recordLeg := func(ms float64, u components.PrefixUsage) float64 {
+		metrics.RecordExtractionCall(rep.Component, ms)
+		cost := pricing.Cost(int64(u.Fresh), int64(u.Output),
+			int64(u.CacheWrite), int64(u.CacheRead))
+		metrics.RecordExtractionSpend(rep.Component, cost)
+		return cost
+	}
+	// runFallback runs the expensive path and books it as its own leg, at all three call sites, so a
+	// fourth one cannot be added without the accounting coming with it. It records even when the
+	// call ERRORS: a failed completion still burned wall time, and on some failures tokens.
+	runFallback := func() (string, error) {
+		out, u, ms, err := e.fallbackAsk(ctx, req, c, &r, items, cands)
+		fbUsage, fbMs = u, ms
+		fbCost = recordLeg(ms, u)
+		return out, err
+	}
+	// foldFallback adds the fallback leg's tokens, dollars and wall time into the ask's ledger row.
+	// Idempotent by construction — at most one fallback runs per adjudication and this reads the
+	// accumulators rather than adding to them — so calling it on every path that can reach a
+	// fallback is safe.
+	foldFallback := func() {
+		if fbMs == 0 && fbCost == 0 && fbUsage == (components.PrefixUsage{}) {
+			return
+		}
+		r.rec.LatencyMs = askMs + fbMs
+		r.rec.PromptTokens = int64(usage.Fresh + fbUsage.Fresh)
+		r.rec.CompletionTokens = int64(usage.Output + fbUsage.Output)
+		r.rec.CacheRead = int64(usage.CacheRead + fbUsage.CacheRead)
+		r.rec.CacheWrite = int64(usage.CacheWrite + fbUsage.CacheWrite)
+		r.rec.CostUSD = askCost + fbCost
+		// Name what actually ran. On the no-asker route the prefix ask never happens, so calling
+		// the row "prefix_ask+fallback" would report a leg that did not exist.
+		if c.PrefixAsk == nil {
+			r.rec.Strategy = "fallback"
+		} else {
+			r.rec.Strategy = "prefix_ask+fallback"
+		}
+	}
+	if c.PrefixAsk == nil {
+		// No asker at all: a non-Anthropic route, or no incoming client. Not a failure of the ask —
+		// there was nothing to ask through — so it takes the same fork as a missed read.
+		r.gate("sweep_no_asker")
+		if e.blockFallback {
+			r.gate("sweep_fallback_blocked")
+			r.rec.Rejection = "no prefix asker on this route and block_fallback is set"
+			return nil, r
+		}
+		if reply, err = runFallback(); err != nil {
+			return nil, r
+		}
+		fellBack = true
+	} else {
+		askStart := time.Now()
+		reply, usage, err = c.PrefixAsk.Ask(ctx, c.Session, extract.BuildPrefixAsk(items))
+		askMs = float64(time.Since(askStart).Milliseconds())
+		// ErrNoPrefix is refused LOCALLY — there is no stashed body to append to, so no request
+		// leaves the process. Booking it as a call would put a 0 ms, $0 sample into the mean that
+		// the exploration brake reads, and inflate `calls` with work that by definition did not
+		// happen. Every other outcome, transport failure included, went to the provider.
+		if !errors.Is(err, components.ErrNoPrefix) {
+			askCost = recordLeg(askMs, usage)
+		}
+	}
 	r.rec = components.ModelCall{
 		Component: rep.Component, Model: c.ModelName, Strategy: "prefix_ask",
-		CandidateTokens: before, LatencyMs: latency,
+		CandidateTokens: before, LatencyMs: askMs,
 		PromptTokens: int64(usage.Fresh), CompletionTokens: int64(usage.Output),
 		CacheRead: int64(usage.CacheRead), CacheWrite: int64(usage.CacheWrite),
-		CostUSD: pricing.Cost(int64(usage.Fresh), int64(usage.Output),
-			int64(usage.CacheWrite), int64(usage.CacheRead)),
+		CostUSD:    askCost,
 		GateReason: "pre-expiry window: the cache still exists and is nearly worthless",
 	}
-	// This component's own spend, priced at the REQUEST's model — the one it actually calls.
-	// /stats derived extraction cost from cheapmodel's process totals through the cheap-model
-	// rate card, so this component's frontier-model asks were priced at haiku rates and pooled
-	// with extract_llm's, summarize's and agentdiet's. See metrics.RecordExtractionSpend.
-	metrics.RecordExtractionSpend(rep.Component, r.rec.CostUSD)
+	foldFallback() // covers the no-asker path, whose fallback ran before this row existed
 	if ctx.Err() != nil {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			atomic.AddInt64(&llmTimeouts, 1)
@@ -662,10 +724,11 @@ func (e *ExtractSweep) adjudicate(req *bschemas.BifrostChatRequest, c *component
 			r.rec.Rejection = "prefix ask failed and block_fallback is set: " + err.Error()
 			return nil, r
 		}
-		if reply, err = e.fallbackAsk(ctx, req, c, &r, items, cands); err != nil {
+		if reply, err = runFallback(); err != nil {
 			return nil, r
 		}
 		fellBack = true
+		foldFallback()
 	}
 	// THE CACHE READ IS THE MECHANISM'S WHOLE JUSTIFICATION, so a read that did not happen is always
 	// COUNTED — a silent miss is what hid this class of problem before, and it looks identical to a
@@ -692,10 +755,14 @@ func (e *ExtractSweep) adjudicate(req *bschemas.BifrostChatRequest, c *component
 				"declining rather than paying again for a full-price transcript read"
 			return nil, r
 		}
-		if reply, err = e.fallbackAsk(ctx, req, c, &r, items, cands); err != nil {
+		if reply, err = runFallback(); err != nil {
 			return nil, r
 		}
 		fellBack = true
+		// The ledger row must cover EVERY leg. Folded here rather than at construction because two
+		// of the three fallback points fire after r.rec is built, and a row showing only the prefix
+		// ask is what made the dashboard's per-call view agree with the $0 figure.
+		foldFallback()
 	} else if !fellBack {
 		r.event("sweep_prefix_cache_read_ok")
 	}
@@ -856,14 +923,18 @@ func (e *ExtractSweep) adjudicate(req *bschemas.BifrostChatRequest, c *component
 //
 // The reply budget is raised through components.Budgeter where the client supports it, for the same
 // reason the prefix ask raises it: one reply carries a verdict for every candidate.
+// It returns its OWN usage and wall time so the caller can price it. `model.Complete` reports
+// neither, so the usage is read from a per-call cheapmodel sink nested inside whatever scope already
+// wraps ctx — the same construction extract_llm uses to attribute one call. The sink also reaches
+// every ancestor, so the request's own bill does not lose these tokens.
 func (e *ExtractSweep) fallbackAsk(ctx context.Context, req *bschemas.BifrostChatRequest,
 	c *components.Ctx, r *sweepResult, items []extract.AdjudicationItem,
-	cands []sweepCand) (string, error) {
+	cands []sweepCand) (string, components.PrefixUsage, float64, error) {
 	model := c.Model.For("incoming")
 	if model == nil {
 		r.gate("sweep_fallback_no_model")
 		r.rec.Rejection = "the prefix ask could not read the cache and no request model is available"
-		return "", errNoFallbackModel
+		return "", components.PrefixUsage{}, 0, errNoFallbackModel
 	}
 	if b, ok := model.(components.Budgeter); ok {
 		if m := b.WithMaxTokens(cheapmodel.PrefixAskMaxTokens); m != nil {
@@ -878,13 +949,22 @@ func (e *ExtractSweep) fallbackAsk(ctx context.Context, req *bschemas.BifrostCha
 		withSamples[i] = it
 	}
 	r.event("sweep_fallback_used")
+	ctx, sink := cheapmodel.WithCallSink(ctx)
+	start := time.Now()
 	reply, err := model.Complete(ctx, extract.BuildFallbackAsk(sweepIntent(req), withSamples))
+	ms := float64(time.Since(start).Milliseconds())
+	// Read the sink whatever happened: a completion that failed after the provider billed it still
+	// cost money, and returning zeros there is how spend goes missing.
+	_, inTok, outTok := sink.Totals()
+	cw, cr := sink.CacheTotals()
+	u := components.PrefixUsage{Fresh: int(inTok), Output: int(outTok),
+		CacheWrite: int(cw), CacheRead: int(cr)}
 	if err != nil {
 		r.gate("sweep_fallback_failed")
 		r.rec.Rejection = "fallback completion failed: " + err.Error()
-		return "", err
+		return "", u, ms, err
 	}
-	return reply, nil
+	return reply, u, ms, nil
 }
 
 // sweepIntent renders the conversation's intent for a SPENT-NESS judgement, which wants it ordered

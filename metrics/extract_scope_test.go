@@ -60,13 +60,22 @@ func TestExtractStatsAreScopedPerComponent(t *testing.T) {
 	// And the money lands on the component that spent it. extract_llm is net POSITIVE (free
 	// replays), the sweep net NEGATIVE — the pooled block reported one negative figure and
 	// attributed it to the wrong one.
-	if tail.NetValueUSD <= 0 {
-		t.Errorf("extract_llm net = %v; free replays worth $0.004 cannot be underwater",
-			tail.NetValueUSD)
+	if net, known := tail.Net(); !known || net <= 0 {
+		t.Errorf("extract_llm net = %v (known=%v); it made no call, so its free replays worth "+
+			"$0.004 are provably profitable and the figure must be known", net, known)
 	}
-	if sweep.NetValueUSD >= 0 {
-		t.Errorf("extract_llm_sweep net = %v; it spent $1.166 to save 900 tokens",
-			sweep.NetValueUSD)
+	if net, known := sweep.Net(); !known || net >= 0 {
+		t.Errorf("extract_llm_sweep net = %v (known=%v); it spent $1.166 to save 900 tokens",
+			net, known)
+	}
+	// And the rows must say WHERE their cost came from, so "$0" and "no evidence" are not the
+	// same reading. extract_llm made no calls, so its 0 is provable; the sweep priced its own.
+	if tail.CostSource != costSourceNone {
+		t.Errorf("extract_llm cost_source = %q, want %q", tail.CostSource, costSourceNone)
+	}
+	if sweep.CostSource != costSourceComponent {
+		t.Errorf("extract_llm_sweep cost_source = %q, want %q",
+			sweep.CostSource, costSourceComponent)
 	}
 	// The enclosing block stays the SUM — deploy/harbor/*.py parses it — so the fix must be
 	// additive, not a re-scoping of the existing keys.
@@ -114,12 +123,82 @@ func TestRecordedSpendBeatsTheHostsGlobalFigure(t *testing.T) {
 		t.Errorf("extract_llm cost = %v, want 0.02",
 			s.ByComponent["extract_llm"].ExtractionCostUSD)
 	}
-	// A host that records nothing (a library embedding, /compact) still gets a figure.
+	if s.CostSource != costSourceComponent {
+		t.Errorf("cost_source = %q, want %q", s.CostSource, costSourceComponent)
+	}
+}
+
+// REVIEW FINDING (#178). The host's figure is one process-global number covering every cheap-model
+// call in the process — `summarize` and `agentdiet` included — so it cannot be split across rows.
+// Applying it to the AGGREGATE ONLY produced two figures for one quantity that disagreed by the
+// whole spend: the block said $9.99 while its only by_component row said $0, and an operator
+// reading the row saw a comfortably positive net value on no cost evidence at all.
+//
+// The contract now: a row that priced nothing says so (`cost_source: unpriced`) and leaves
+// net_value_usd NULL rather than publishing +grossValue. 0 dollars and 0 evidence are the same
+// number and the opposite claim.
+func TestAnUnpricedRowSaysSoInsteadOfClaimingZero(t *testing.T) {
+	resetExtract()
+	// A library embedding: calls are made, ModelCall.CostUSD is never filled, and the removal is
+	// worth something — the exact shape that read as "profitable" before.
+	RecordExtractionCall("extract_llm", 100)
+	RecordExtractionValue("extract_llm", 0.05)
+	s := ExtractSnapshot(9.99, 0.30/1e6, 0, 0)
+
+	if s.ExtractionCostUSD != 9.99 || s.CostSource != costSourceHost {
+		t.Errorf("aggregate = $%v from %q, want 9.99 from %q: with nothing priced, the host's "+
+			"figure is all the information there is", s.ExtractionCostUSD, s.CostSource,
+			costSourceHost)
+	}
+	row := s.ByComponent["extract_llm"]
+	if row == nil {
+		t.Fatal("extract_llm missing from the breakdown")
+	}
+	if row.CostSource != costSourceUnpriced {
+		t.Errorf("row cost_source = %q, want %q — $0 must not be indistinguishable from "+
+			"'no spend recorded'", row.CostSource, costSourceUnpriced)
+	}
+	if net, known := row.Net(); known {
+		t.Errorf("row net_value_usd = %v, want null: the component made a call and priced none "+
+			"of it, so nothing is known about whether it paid", net)
+	}
+	// The aggregate's net is always known — it always has a determined spend behind it.
+	if _, known := s.Net(); !known {
+		t.Error("the aggregate net must never be null")
+	}
+}
+
+// REVIEW FINDING (#178), the other half. `anySpend` was one boolean across every component, so
+// PARTIAL recording silently under-reported: if extract_llm priced its calls (the cheap card is
+// never zero) while extract_llm_sweep priced none, the total became extract_llm's spend alone and
+// the sweep's real dollars vanished — no fallback, no warning, a SMALLER number than the code
+// published before this PR.
+func TestPartialPricingDoesNotSilentlyUnderReportTheTotal(t *testing.T) {
 	resetExtract()
 	RecordExtractionCall("extract_llm", 100)
-	if s := ExtractSnapshot(9.99, 0.30/1e6, 0, 0); s.ExtractionCostUSD != 9.99 {
-		t.Errorf("with no recorded spend the host's figure must stand, got %v",
-			s.ExtractionCostUSD)
+	RecordExtractionSpend("extract_llm", 0.02) // priced
+	RecordExtractionCall("extract_llm_sweep", 59_000)
+	// ...and the sweep prices nothing. The host saw $4.00 of cheap-model spend in the process.
+	s := ExtractSnapshot(4.00, 0.30/1e6, 0, 0)
+
+	if s.ExtractionCostUSD <= 0.02 {
+		t.Errorf("aggregate = $%v: the recorded sum alone DROPS the unpriced component's "+
+			"dollars, reporting less than the host already knew", s.ExtractionCostUSD)
+	}
+	if s.ExtractionCostUSD != 4.00 || s.CostSource != costSourceHost {
+		t.Errorf("aggregate = $%v from %q, want 4.00 from %q (the larger of the floor and the "+
+			"host's superset figure, named)", s.ExtractionCostUSD, s.CostSource, costSourceHost)
+	}
+	// And when the host's figure is NOT larger, the total is a floor and must say so rather than
+	// pass itself off as the bill.
+	resetExtract()
+	RecordExtractionCall("extract_llm", 100)
+	RecordExtractionSpend("extract_llm", 5.00)
+	RecordExtractionCall("extract_llm_sweep", 59_000)
+	s = ExtractSnapshot(1.00, 0.30/1e6, 0, 0)
+	if s.ExtractionCostUSD != 5.00 || s.CostSource != costSourcePartial {
+		t.Errorf("aggregate = $%v from %q, want 5.00 from %q", s.ExtractionCostUSD,
+			s.CostSource, costSourcePartial)
 	}
 }
 
@@ -146,6 +225,26 @@ func TestByComponentSurvivesJSON(t *testing.T) {
 	}
 	if row["avg_latency_ms"] != 59_000.0 {
 		t.Errorf("avg_latency_ms = %v in the encoded row, want 59000", row["avg_latency_ms"])
+	}
+	// cost_source must survive the ENCODER, on the row and on the block. It is the field that
+	// separates "$0 spent" from "no spend recorded", so a value computed correctly and dropped by
+	// the json tag would put the reader back where #176 found them. Verified non-vacuous: tagging
+	// the field `json:"-"` makes this fail.
+	for _, k := range []string{"cost_source", "net_value_usd", "extraction_cost_usd"} {
+		if _, ok := row[k]; !ok {
+			t.Errorf("the encoded by_component row is missing %q: %s", k, b)
+		}
+		if _, ok := m[k]; !ok {
+			t.Errorf("the encoded extract block is missing %q: %s", k, b)
+		}
+	}
+	// This row made a call and priced none of it, so the rendered net must be JSON null and the
+	// source must name the case. A 0 here reads as break-even on no evidence.
+	if row["cost_source"] != "unpriced" {
+		t.Errorf("rendered cost_source = %v, want \"unpriced\"", row["cost_source"])
+	}
+	if v, present := row["net_value_usd"]; !present || v != nil {
+		t.Errorf("rendered net_value_usd = %v (present=%v), want null", v, present)
 	}
 	// It must not recurse: a nested row carrying its own breakdown would be an infinite
 	// document, and the omitempty is what prevents it.
