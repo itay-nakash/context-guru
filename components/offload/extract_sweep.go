@@ -305,16 +305,16 @@ func (e *ExtractSweep) Offload(req *bschemas.BifrostChatRequest, rep *components
 		// came from a model, but the REPLACEMENT is a pure function of (content, config), so a replay
 		// can never emit different bytes than the turn that decided it.
 		if cached, hit := getResult(c, id); hit {
-			metrics.RecordExtractionCacheLookup(true)
+			metrics.RecordExtractionCacheLookup(rep.Component, true)
 			if saved := schema.TextTokens(content) - schema.TextTokens(cached.Projected); saved > 0 {
-				metrics.RecordExtractionValue(float64(saved) * val.repeatPerToken)
+				metrics.RecordExtractionValue(rep.Component, float64(saved)*val.repeatPerToken)
 			}
 			if k, ok := applySweepDrop(c, rep, e.mode, msg, content); ok {
 				changed++
 				if k != "" {
 					keys = append(keys, k)
 				}
-				rep.Event("reapplied_same_session")
+				rep.Replay("reapplied_same_session")
 			}
 			continue
 		}
@@ -323,7 +323,7 @@ func (e *ExtractSweep) Offload(req *bschemas.BifrostChatRequest, rep *components
 			// all such a turn has to do.
 			continue
 		}
-		metrics.RecordExtractionCacheLookup(false)
+		metrics.RecordExtractionCacheLookup(rep.Component, false)
 		if schema.TextTokens(content) < e.minTokens {
 			rep.Gate("below_output_floor")
 			continue
@@ -610,7 +610,7 @@ func (e *ExtractSweep) adjudicate(req *bschemas.BifrostChatRequest, c *component
 		reply, usage, err = c.PrefixAsk.Ask(ctx, c.Session, extract.BuildPrefixAsk(items))
 	}
 	latency := float64(time.Since(start).Milliseconds())
-	metrics.RecordExtractionCall(latency)
+	metrics.RecordExtractionCall(rep.Component, latency)
 	// COST, which this record carried as $0.00 forever. It never set CostUSD at all, so the per-call
 	// ledger the dashboard shows for this component reported zero on every firing — measured live at
 	// $0.00 against real cache reads of 449,304 and 449,376 tokens and real completion tokens, while
@@ -636,6 +636,11 @@ func (e *ExtractSweep) adjudicate(req *bschemas.BifrostChatRequest, c *component
 			int64(usage.CacheWrite), int64(usage.CacheRead)),
 		GateReason: "pre-expiry window: the cache still exists and is nearly worthless",
 	}
+	// This component's own spend, priced at the REQUEST's model — the one it actually calls.
+	// /stats derived extraction cost from cheapmodel's process totals through the cheap-model
+	// rate card, so this component's frontier-model asks were priced at haiku rates and pooled
+	// with extract_llm's, summarize's and agentdiet's. See metrics.RecordExtractionSpend.
+	metrics.RecordExtractionSpend(rep.Component, r.rec.CostUSD)
 	if ctx.Err() != nil {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			atomic.AddInt64(&llmTimeouts, 1)
@@ -814,8 +819,8 @@ func (e *ExtractSweep) adjudicate(req *bschemas.BifrostChatRequest, c *component
 		r.event("sweep_dropped")
 		drop = append(drop, v.Label)
 		removed += sz - after
-		metrics.RecordExtractionSaving(sz - after)
-		metrics.RecordExtractionValue(float64(sz-after) * savedTokenValue(c).perToken)
+		metrics.RecordExtractionSaving(rep.Component, sz-after)
+		metrics.RecordExtractionValue(rep.Component, float64(sz-after)*savedTokenValue(c).perToken)
 	}
 	// An output named in the inventory that no verdict mentioned is UNJUDGED, and it must not look
 	// like a keep: 4ca1f13 found a live arm where the model silently omitted labels and the missing

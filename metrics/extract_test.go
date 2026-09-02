@@ -11,7 +11,7 @@ func TestNetValueGoesNegativeWhenUnderwater(t *testing.T) {
 	resetExtract()
 	// The measured Terminal-Bench shape: ~197,548 unique tokens saved at the cache-read
 	// rate ($0.30/MTok) against $3.26 of extraction spend.
-	RecordExtractionSaving(197548)
+	RecordExtractionSaving("extract_llm", 197548)
 	s := ExtractSnapshot(3.26, 0.30/1e6, 0, 0)
 	if s.NetValueUSD >= 0 {
 		t.Fatalf("net must be negative when spend exceeds value: net=%v gross=%v cost=%v",
@@ -27,14 +27,14 @@ func TestNetValueGoesNegativeWhenUnderwater(t *testing.T) {
 // calls avoided by cache and calls suppressed by the gate.
 func TestExtractSnapshotExposesAllCounters(t *testing.T) {
 	resetExtract()
-	RecordExtractionCall(450)
-	RecordExtractionCall(550)
-	RecordExtractionCacheLookup(true)
-	RecordExtractionCacheLookup(true)
-	RecordExtractionCacheLookup(false)
-	RecordExtractionSuppressed("suppressed: cache-aware, saving below call cost")
-	RecordExtractionSaving(1200)
-	RecordExtractionReason("high context pressure")
+	RecordExtractionCall("extract_llm", 450)
+	RecordExtractionCall("extract_llm", 550)
+	RecordExtractionCacheLookup("extract_llm", true)
+	RecordExtractionCacheLookup("extract_llm", true)
+	RecordExtractionCacheLookup("extract_llm", false)
+	RecordExtractionSuppressed("extract_llm", "suppressed: cache-aware, saving below call cost")
+	RecordExtractionSaving("extract_llm", 1200)
+	RecordExtractionReason("extract_llm", "high context pressure")
 
 	// 1,200 own saved tokens at a rate chosen to give gross value exactly $0.50.
 	s := ExtractSnapshot(0.024, 0.5/1200, 800, 0)
@@ -71,7 +71,7 @@ func TestExtractSnapshotExposesAllCounters(t *testing.T) {
 func TestPromptCacheReadZeroIsReported(t *testing.T) {
 	resetExtract()
 	for i := 0; i < 5; i++ {
-		RecordExtractionCall(400)
+		RecordExtractionCall("extract_llm", 400)
 	}
 	s := ExtractSnapshot(0.06, 0.30/1e6, 0, 0)
 	if s.Calls != 5 || s.PromptCacheReadTokens != 0 {
@@ -129,17 +129,13 @@ func TestSnapshotJSONKeysAreBackwardCompatible(t *testing.T) {
 	}
 }
 
-// resetExtract clears the process counters so assertions are independent.
+// resetExtract clears the per-component counters so assertions are independent. Dropping the
+// whole registry rather than zeroing each field: a counter added later would otherwise leak
+// across tests silently, which is the failure mode a reset helper exists to prevent.
 func resetExtract() {
-	xCalls.Store(0)
-	xCacheHits.Store(0)
-	xSuppressed.Store(0)
-	xGrossSaved.Store(0)
-	xLatencyMs.Store(0)
-	xLookups.Store(0)
-	xReasonMu.Lock()
-	xReasons = map[string]int64{}
-	xReasonMu.Unlock()
+	xRegMu.Lock()
+	xReg = map[string]*xCounters{}
+	xRegMu.Unlock()
 }
 
 // REGRESSION (H3, reviewer-verified): /stats must value extract_llm's OWN savings, never
@@ -154,7 +150,7 @@ func resetExtract() {
 func TestNetValueUsesComponentOwnSavingsNotPipelineTotal(t *testing.T) {
 	resetExtract()
 	// The component itself saved 1,000 tokens and spent $0.05.
-	RecordExtractionSaving(1000)
+	RecordExtractionSaving("extract_llm", 1000)
 	const rate = 0.30 / 1e6 // cache-read rate per token
 	s := ExtractSnapshot(0.05, rate, 0, 0)
 
@@ -181,12 +177,12 @@ func TestNetValueUsesComponentOwnSavingsNotPipelineTotal(t *testing.T) {
 // count (0 calls => no signal, must not read as "fast").
 func TestExtractionAvgLatencyMs(t *testing.T) {
 	resetExtract()
-	if avg, calls := ExtractionAvgLatencyMs(); avg != 0 || calls != 0 {
+	if avg, calls := ExtractionAvgLatencyMs("extract_llm"); avg != 0 || calls != 0 {
 		t.Fatalf("with no calls expected (0,0), got (%v,%d)", avg, calls)
 	}
-	RecordExtractionCall(4000)
-	RecordExtractionCall(8000)
-	avg, calls := ExtractionAvgLatencyMs()
+	RecordExtractionCall("extract_llm", 4000)
+	RecordExtractionCall("extract_llm", 8000)
+	avg, calls := ExtractionAvgLatencyMs("extract_llm")
 	if calls != 2 || avg != 6000 {
 		t.Fatalf("got (%v,%d), want (6000,2)", avg, calls)
 	}
