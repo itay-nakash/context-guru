@@ -202,6 +202,64 @@ func TestPartialPricingDoesNotSilentlyUnderReportTheTotal(t *testing.T) {
 	}
 }
 
+// REVIEW FOLLOW-UP (#178). `cost_source: partial` said the total was a FLOOR without saying what it
+// was short OF, so a reader had to go and scan every by_component row for `cost_source: unpriced` —
+// re-deriving an answer the snapshot had already computed, since it is the same test that set the
+// aggregate's label. An operator who has to re-derive it will read the label and stop, and then the
+// floor gets quoted as the bill.
+//
+// Asserted on the MARSHALLED PAYLOAD, not the Go field. That is the lesson of this PR's M13: a
+// `cost_source` mutant tagged `json:"-"` survived the first vacuity pass precisely because the
+// assertions read the struct.
+func TestTheAggregateNamesWhichComponentIsUnpriced(t *testing.T) {
+	resetExtract()
+	RecordExtractionCall("extract_llm", 100)
+	RecordExtractionSpend("extract_llm", 5.00) // priced
+	RecordExtractionCall("extract_llm_sweep", 59_000)
+	// ...and the sweep prices nothing, so the total is a floor and the sweep is why.
+	b, err := json.Marshal(ExtractSnapshot(1.00, 0.30/1e6, 0, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["cost_source"] != costSourcePartial {
+		t.Fatalf("precondition: rendered cost_source = %v, want %q — without a floor there is "+
+			"nothing for the list to name: %s", m["cost_source"], costSourcePartial, b)
+	}
+	raw, present := m["unpriced_components"]
+	if !present {
+		t.Fatalf("the rendered block does not name the unpriced component, so `partial` still "+
+			"leaves the reader to scan every row: %s", b)
+	}
+	list, ok := raw.([]any)
+	if !ok || len(list) == 0 {
+		t.Fatalf("unpriced_components = %v, want a non-empty list", raw)
+	}
+	if len(list) != 1 || list[0] != "extract_llm_sweep" {
+		t.Errorf("unpriced_components = %v, want [extract_llm_sweep]: extract_llm priced its "+
+			"call and must not be named, the sweep did not and must be", list)
+	}
+
+	// And it is OMITTED when every call priced itself — an empty list on a complete total would
+	// read as a warning where there is nothing to warn about.
+	resetExtract()
+	RecordExtractionCall("extract_llm", 100)
+	RecordExtractionSpend("extract_llm", 5.00)
+	b2, _ := json.Marshal(ExtractSnapshot(1.00, 0.30/1e6, 0, 0))
+	var m2 map[string]any
+	_ = json.Unmarshal(b2, &m2)
+	if m2["cost_source"] != costSourceComponent {
+		t.Fatalf("precondition: rendered cost_source = %v, want %q", m2["cost_source"],
+			costSourceComponent)
+	}
+	if _, present := m2["unpriced_components"]; present {
+		t.Errorf("unpriced_components must be omitted when nothing is unpriced: %s", b2)
+	}
+}
+
 // The breakdown has to survive JSON, because /stats is the only place anyone reads it and a
 // field can be computed correctly and dropped by the encoder.
 func TestByComponentSurvivesJSON(t *testing.T) {

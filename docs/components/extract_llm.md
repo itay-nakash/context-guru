@@ -707,6 +707,7 @@ questions at a flat rate.
 | `prompt_cache_read_tokens` / `..._write_tokens` | Preamble caching behavior — **0 read means the breakpoint is inert** |
 | `extraction_cost_usd` | What was spent. Read `cost_source` before quoting it |
 | `cost_source` | Where that figure came from: `component` (each call priced itself — trust it), `host_total` (the host's process-global cheap-model spend, a superset that also carries `summarize` and `agentdiet`), `partial` (some calls unpriced, so the total is a **floor**), `unpriced` (this row made calls and priced none — nothing is known), `none` (no calls; `0` is true) |
+| `unpriced_components` | On the aggregate: which components' calls priced nothing, i.e. what a `partial` or `host_total` total is **short of**. Omitted when everything priced itself |
 | `gross_value_usd` | What its saved tokens are worth at the rate they'd have been billed |
 | **`net_value_usd`** | **The honest headline. Negative = underwater.** `null` when the spend is not known |
 | `avg_latency_ms` | Mean wall time per call (latency cost on the hot path) |

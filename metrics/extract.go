@@ -328,6 +328,16 @@ type ExtractStats struct {
 	//	            because the component was free, and NetValueUSD is null.
 	//	none        no calls and no spend. 0 is the true figure.
 	CostSource string `json:"cost_source"`
+	// UnpricedComponents NAMES the components whose calls priced nothing, sorted, so a
+	// `cost_source` of `partial` or `host_total` says WHICH component the total is missing
+	// rather than only that something is missing.
+	//
+	// Aggregate only, and omitted when every call priced itself. Without it the label is a
+	// prompt to go and scan every by_component row for `cost_source: unpriced` — which is work
+	// the snapshot already did, since it is the same test that set the aggregate's label. An
+	// operator who has to re-derive the answer from the rows will read the label and stop, and
+	// then the floor gets quoted as the bill.
+	UnpricedComponents []string `json:"unpriced_components,omitempty"`
 
 	// Reasons counts why extraction ran or was suppressed, most frequent first.
 	Reasons map[string]int64 `json:"reasons,omitempty"`
@@ -376,6 +386,8 @@ func ExtractSnapshot(cost, perSavedTokenUSD float64, cacheWrite, cacheRead int64
 		// extract_llm_sweep recorded none, the total became extract_llm's spend alone and the
 		// sweep's real dollars vanished — no fallback, no warning, a smaller number than before.
 		unpricedCalls int64
+		// unpriced names them. `names` is sorted, so this is too, with no second sort.
+		unpriced []string
 	)
 	for _, name := range names {
 		x := xFor(name)
@@ -395,6 +407,7 @@ func ExtractSnapshot(cost, perSavedTokenUSD float64, cacheWrite, cacheRead int64
 		anySpend = anySpend || recorded
 		if !recorded && s.Calls > 0 {
 			unpricedCalls += s.Calls
+			unpriced = append(unpriced, name)
 		}
 		totLatMs += x.latencyMs.Load()
 		for k, v := range reasons {
@@ -425,6 +438,9 @@ func ExtractSnapshot(cost, perSavedTokenUSD float64, cacheWrite, cacheRead int64
 	default:
 		total.CostSource = costSourceNone
 	}
+	// Published whenever anything is unpriced, whichever branch above ran: under `partial` it
+	// names what the floor is short of, and under `host_total` it names what forced the fallback.
+	total.UnpricedComponents = unpriced
 	total.ExtractionCostUSD = round4(spend)
 	total.GrossValueUSD = round4(grossVal)
 	net := round4(grossVal - spend)

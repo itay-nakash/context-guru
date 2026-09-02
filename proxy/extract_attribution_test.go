@@ -128,3 +128,52 @@ func TestStatsRendersPerComponentExtractionAttribution(t *testing.T) {
 			cs.ActedFresh, cs.ActedReplay)
 	}
 }
+
+// REVIEW FOLLOW-UP (#178), at the surface. metrics computes `unpriced_components`; the statsHandler
+// builds the extract block itself, so the list can be correct and never reach the wire. Same reason
+// the rest of this file asserts on the rendered body.
+//
+// A component name of its own rather than one of the two real ones: these counters are
+// process-global for the whole package run, and TestStatsRendersPerComponentExtractionAttribution
+// asserts ABSOLUTE values on `extract_llm` and `extract_llm_sweep` (zero calls, zero cost). Making
+// either of them unpriced here would break that test through shared state, for a reason unrelated to
+// what either test is about. What is under test is the aggregate's list, not the name in it.
+func TestStatsNamesTheUnpricedComponent(t *testing.T) {
+	const unpriced = "extract_llm_unpriced_fixture"
+	metrics.RecordExtractionCall(unpriced, 1200) // calls, and no RecordExtractionSpend
+
+	h := New(nil, nil, metrics.NewAggregator(), Options{})
+	w := httptest.NewRecorder()
+	h.stats(w, httptest.NewRequest("GET", "/stats", nil))
+
+	var got struct {
+		Extract struct {
+			CostSource         string   `json:"cost_source"`
+			UnpricedComponents []string `json:"unpriced_components"`
+		} `json:"extract"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("/stats is not the expected shape: %v\n%s", err, w.Body.String())
+	}
+	// PRECONDITION: the total is incomplete, so there is something for the list to name. Without
+	// this the assertion below could pass vacuously on a snapshot that had nothing to report.
+	if got.Extract.CostSource != "partial" && got.Extract.CostSource != "host_total" {
+		t.Fatalf("cost_source = %q, want partial or host_total: an unpriced call must make the "+
+			"total incomplete, or this test proves nothing", got.Extract.CostSource)
+	}
+	if len(got.Extract.UnpricedComponents) == 0 {
+		t.Fatalf("/stats serves an incomplete total with no unpriced_components, so an operator "+
+			"cannot tell WHAT it is short of: %s", w.Body.String())
+	}
+	var found bool
+	for _, n := range got.Extract.UnpricedComponents {
+		if n == unpriced {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("unpriced_components = %v on the wire, missing %q — the component that made an "+
+			"unpriced call is the one the reader needs named",
+			got.Extract.UnpricedComponents, unpriced)
+	}
+}
