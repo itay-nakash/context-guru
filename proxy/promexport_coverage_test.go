@@ -71,6 +71,12 @@ func TestEverySnapshotFieldIsExportedOrExempt(t *testing.T) {
 // the honest reason: an entry here is a claim that /metrics loses nothing by it, so "not
 // exported yet" is spelled out as such rather than dressed up as a decision.
 var notExportedWhy = map[string]string{
+	// Not a number. The COUNT is exported as cg_model_info_unresolved_total and is what an alert
+	// fires on; the message is for the human who then goes and reads /stats or the log. A label
+	// carrying an arbitrary error string would be unbounded cardinality, which is the one thing a
+	// Prometheus label must never be.
+	"ModelInfoLastError": "not a metric — free-text; the count is cg_model_info_unresolved_total",
+
 	// Derived: PromQL computes these from series that ARE exported, and a second series
 	// would be a number that can disagree with its own inputs.
 	"AdjustedSaved":  "cg_saved_tokens_total - cg_wasted_tokens_total",
@@ -84,6 +90,7 @@ var notExportedWhy = map[string]string{
 	"ExpandUnresolvedMalformed": `cg_expand_unresolved_total{reason="malformed"}, from expand.Unresolved()`,
 	"ExpandUnresolvedMissing":   `cg_expand_unresolved_total{reason="missing"}, from expand.Unresolved()`,
 	"AdjudicateStray":           "cg_adjudicate_stray_total, from adjudicate.StrayAnswered()",
+	"ModelInfoUnresolved":       "cg_model_info_unresolved_total, from the resolver's Unresolved()",
 	"LLMCalls":                  "cg_llm_calls_total, from cheapmodel.Usage()",
 	"LLMInputTokens":            `cg_llm_tokens_total{direction="input"}, from cheapmodel.Usage()`,
 	"LLMOutputTokens":           `cg_llm_tokens_total{direction="output"}, from cheapmodel.Usage()`,

@@ -1917,6 +1917,19 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
 	// is that it does not call it: measured 0 across ~4,900 requests, and a non-zero figure here says
 	// the description stopped working — which nothing else in this snapshot can reveal.
 	snap.AdjudicateStray = adjudicate.StrayAnswered()
+	// WHETHER THE CONTEXT WINDOW IS THE ONE THE OPERATOR CONFIGURED. Asked through an optional
+	// interface rather than by importing internal/modelinfo, so a host that supplies its own resolver
+	// is not obliged to answer and the proxy keeps one dependency fewer. Silence means "this resolver
+	// cannot say", which is not the same as "all is well" — see metrics.Snapshot.ModelInfoUnresolved
+	// for the run this exists because of.
+	if u, ok := h.opts.Windows.(interface{ Unresolved() (error, int) }); ok {
+		if err, n := u.Unresolved(); n > 0 {
+			snap.ModelInfoUnresolved = int64(n)
+			if err != nil {
+				snap.ModelInfoLastError = err.Error()
+			}
+		}
+	}
 	snap.FrozenHits, snap.FrozenMisses = offload.FrozenStats()
 	// The expand-induced prefix flip, published beside the freeze-replay counters because it is the
 	// same mechanism seen from the other side: a replay that DIDN'T happen because the agent

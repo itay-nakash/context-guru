@@ -79,6 +79,9 @@ type ExtractSweep struct {
 	// output before "still needed" is evidence rather than the only possible answer. See the gate in
 	// Offload and extractSweepConfig.MinLaterTurns.
 	minLaterTurns int
+	// rewardPremium is how much a removed token is believed to be worth relative to the cache read it
+	// saves. 1 = the unadjusted break-even. See extractSweepConfig.RewardPremium.
+	rewardPremium float64
 	// minPressure is the opportunity floor for the REQUEST: the share of the model window it must
 	// occupy before this component will collect candidates at all. See the gate in Offload.
 	minPressure float64
@@ -146,6 +149,29 @@ type extractSweepConfig struct {
 	// has yet been superseded. Measured across 18 probe asks: 0.10 blocks the three uninformative early
 	// asks for 114 removed tokens, 0.20 blocks seven for 11,891. Prefer the low end.
 	MinPressure float64 `yaml:"min_pressure"`
+	// RewardPremium is how much a removed token is worth relative to the cache read it saves, and it
+	// is the only term in the break-even that is a BELIEF rather than a measurement.
+	//
+	// 1 (the unadjusted arithmetic) by default, so no deployment changes behaviour without asking.
+	//
+	// WHY A VALUE ABOVE 1 IS DEFENSIBLE. The break-even prices a removal at the cache reads it saves,
+	// and on the one iteration where this component demonstrably helped, that is not what it was paid
+	// in. Iteration 024 arm B spent $20.26 on the sweep to bank $0.72 of cache savings — 28 dollars
+	// out for every dollar the arithmetic could see — while task accuracy rose from 0.486 to 0.608,
+	// 8 tasks better and 0 worse, clustered p = 0.0078. Sizing a premium to reproduce that run's
+	// firings independently lands in the same place: 0.036 as a divisor on need, i.e. a premium of
+	// about 28. 20 is the rounder, weaker claim and the curve is flat between them (53% of the run's
+	// removal value either way).
+	//
+	// WHY NOTHING SUPPORTS A VALUE BELOW 1, and why one is refused: a premium under 1 asserts that a
+	// removed token is worth LESS than the read it saves, which would silently tighten a gate that
+	// measurement says is already 5x too tight. Values above 100 are refused as typos — at that point
+	// every candidate clears and the term has stopped being a belief about value.
+	//
+	// READ IT BACK, do not assume it: `premium` is on every cg.sweep.econ row precisely so a decline
+	// can be re-priced offline instead of re-run, and so a run that fires on a premium of 20 can be
+	// told apart from one that would have fired anyway.
+	RewardPremium float64 `yaml:"reward_premium"`
 	// BlockFallback refuses the fallback path: when the prefix ask cannot read the cache, decline
 	// instead of asking again with the output content copied into the prompt.
 	//
@@ -172,6 +198,11 @@ const defaultSweepFloor = 1000
 // genuinely-spent candidates. Below that the mechanism is not a timid version of itself, it is
 // answering the question the selection experiment refuted at 6% live-kept.
 const defaultMinInventory = 10
+
+// maxRewardPremium bounds the one configurable BELIEF in the break-even. 100 is not a measured limit —
+// it is a typo guard: iteration 024's own spend-to-savings ratio was 28, so a value four times that is
+// already past any evidence, and beyond it the term stops discriminating at all.
+const maxRewardPremium = 100.0
 
 // maxAskItems bounds how many candidates one ask may carry. Not configurable: it is a property of the
 // reply budget and the model's transport limit, not of a deployment's taste, and an operator raising
@@ -254,6 +285,22 @@ func newExtractSweep(raw []byte) (components.Component, error) {
 	if cfg.MinInventory <= 0 {
 		cfg.MinInventory = defaultMinInventory
 	}
+	// REFUSED, not clamped. Both directions are an operator saying something specific, and the two
+	// mistakes have opposite consequences: below 1 quietly tightens a gate the evidence says is
+	// already far too tight, and a stray extra digit authorises everything while still looking like a
+	// considered number. Neither should be corrected on the operator's behalf.
+	switch {
+	case cfg.RewardPremium == 0:
+		cfg.RewardPremium = 1 // unset
+	case cfg.RewardPremium < 1:
+		return nil, fmt.Errorf("extract_llm_sweep: reward_premium %v is below 1, which asserts a removed "+
+			"token is worth less than the cache read it saves; nothing measured supports that, and the "+
+			"break-even is already the restrictive term (use 1 for the unadjusted arithmetic)", cfg.RewardPremium)
+	case cfg.RewardPremium > maxRewardPremium:
+		return nil, fmt.Errorf("extract_llm_sweep: reward_premium %v exceeds %v; at that size every "+
+			"candidate clears and the term is no longer a claim about value (iteration 024's own "+
+			"spend-to-savings ratio was 28)", cfg.RewardPremium, maxRewardPremium)
+	}
 	pre := defaultPreExpiry
 	if cfg.PreExpirySeconds > 0 {
 		pre = time.Duration(cfg.PreExpirySeconds) * time.Second
@@ -264,6 +311,7 @@ func newExtractSweep(raw []byte) (components.Component, error) {
 		blockFallback: cfg.BlockFallback, econTrigger: cfg.EconTrigger,
 		evidence: cfg.Evidence, ignoreAskCost: cfg.EconIgnoreAskCost,
 		minLaterTurns: cfg.MinLaterTurns, minPressure: cfg.MinPressure,
+		rewardPremium: cfg.RewardPremium,
 		// Per component INSTANCE, which is per configured pipeline. Two pipelines running different
 		// prompts would learn different approval rates, and sharing one ledger between them would
 		// average two workloads into a number describing neither.
@@ -330,6 +378,45 @@ func (e *ExtractSweep) sweeping(c *components.Ctx) bool {
 // two lean opposite ways and neither is calibrated, so read a fired econ trigger as "this batch was
 // worth asking about", not as a realised saving. `prefix_rewrite_not_repaid` vs
 // `prefix_rewrite_repaid` is what makes the split observable.
+// priceBatch runs the break-even for one candidate batch and, on a decline, decides WHICH cost refused.
+// Separate from econPays because econPays needs an inventory and this needs only a mass and an index:
+// the label logic is what has been wrong twice, and a test of it should not have to construct
+// candidates whose token counts happen to land on a chosen side of the threshold — a fixture tuned to
+// the answer is a fixture that tests itself.
+//
+// It fills need/have/ok/askDeclined on d and touches nothing else.
+func (e *ExtractSweep) priceBatch(req *bschemas.BifrostChatRequest, saved, shallowest int,
+	d *econDecision, c *components.Ctx) {
+
+	pricing := rewritePricing{askUSD: d.askUSD, approval: d.approval, premium: e.rewardPremium,
+		creditRemoval: true}
+	d.need, d.have, d.ok = prefixRewritePaysWith(req, saved, shallowest, pricing, c)
+	if d.ok || e.ignoreAskCost {
+		return
+	}
+	// WHICH TERM REFUSED, established by re-running the test with the ask free rather than inferred
+	// from the shape of the numbers. "The rewrite does not repay" and "the question does not repay" are
+	// different findings about different costs, and one counter reporting both would be unreadable in
+	// exactly the way `marker_or_kept_verbatim` was.
+	//
+	// THE COUNTERFACTUAL VARIES THE ASK ALONE, which is what askDeclined is documented to mean: "the
+	// same batch, priced with a free ask, would have been authorised." It is this pricing with askUSD
+	// zeroed, NOT prefixRewritePays, which resets approval, premium and the horizon credit as well and
+	// so answered a broader question — would this clear with a free ask AND no discount AND no belief
+	// AND no credit. Under a premium above 1 that is not merely broader but useless: every decline is
+	// re-priced at a premium of 1, clears nothing, and lands on `prefix_rewrite_not_repaid` whichever
+	// cost actually refused, so the two labels stop distinguishing anything.
+	//
+	// This changes what `econ_ask_not_repaid` counts relative to iteration 025, which ran the resetting
+	// form: there, a batch refused by the APPROVAL DISCOUNT alone could be labelled as refused by the
+	// ask. Recorded in that iteration's results rather than silently re-interpreted.
+	freeAsk := pricing
+	freeAsk.askUSD = 0
+	if _, _, free := prefixRewritePaysWith(req, saved, shallowest, freeAsk, c); free {
+		d.askDeclined = true
+	}
+}
+
 func (e *ExtractSweep) econPays(req *bschemas.BifrostChatRequest, c *components.Ctx,
 	cands []sweepCand) econDecision {
 
@@ -341,17 +428,8 @@ func (e *ExtractSweep) econPays(req *bschemas.BifrostChatRequest, c *components.
 	if !e.ignoreAskCost {
 		d.askUSD, d.approval, d.measured = e.asks.estimate(askCostPrior(req, c))
 	}
-	d.need, d.have, d.ok = prefixRewritePaysCharging(req, saved, shallowest, d.askUSD, d.approval, c)
+	e.priceBatch(req, saved, shallowest, &d, c)
 	d.reqTokens, d.pressure = sweepPressure(req, c)
-	// WHICH TERM REFUSED, established by re-running the test with the ask free rather than inferred
-	// from the shape of the numbers. "The rewrite does not repay" and "the question does not repay" are
-	// different findings about different costs, and one counter reporting both would be unreadable in
-	// exactly the way `marker_or_kept_verbatim` was.
-	if !d.ok && !e.ignoreAskCost {
-		if _, _, free := prefixRewritePays(req, saved, shallowest, c); free {
-			d.askDeclined = true
-		}
-	}
 	// PRESSURE ON EVERY DECISION, fire or decline. `have` already carries the horizon this trigger
 	// reasons about, but it is a projection -- and the open question about this component is whether it
 	// fires TOO EARLY, which is a question about where in the window the request actually sat. That
@@ -367,6 +445,10 @@ func (e *ExtractSweep) econPays(req *bschemas.BifrostChatRequest, c *components.
 	logging.From(c.Ctx).Debug("cg.sweep.econ", "decision", d.ok, "needTurns", d.need, "haveTurns", d.have,
 		"candidates", len(cands), "offeredTokens", saved, "askUSD", d.askUSD,
 		"approval", d.approval, "estFromMeasurement", d.measured, "askDeclined", d.askDeclined,
+		// ON EVERY ROW, fire or decline, so a run's declines can be RE-PRICED offline at another
+		// premium instead of being re-run. Iteration 026 cost $65 to establish a fact that was already
+		// in its logs and unreadable for want of two fields; this is one of them.
+		"premium", e.rewardPremium,
 		"reqTokens", d.reqTokens, "ctxWindow", ctxWindowOf(c), "pressure", d.pressure,
 		// EXPLICITLY. logging.From(c.Ctx) injects route/tenant/provider/mode but NOT the session id —
 		// cg.sweep.ask carries `session` because it passes it by hand, and switching this row to the
@@ -1655,6 +1737,9 @@ func init() {
 			Hint: "Add the ECONOMIC trigger alongside the pre-expiry window: sweep a LIVE cached prefix when the removal's saving, collected over the turns estimated to remain, exceeds the cache-write it forces (S*T > 11.5*W). Unset = FALSE, because it deliberately invalidates a prefix the provider still holds. The two triggers are OR'd and neither contains the other — pre-expiry fires on the clock and cannot reach a session whose cache keeps being refreshed, which is the long run with the most to save; econ fires on mass and cannot know how much time is left. S is the inventory's whole mass and so an upper bound on the batch's real saving; read prefix_rewrite_repaid / prefix_rewrite_not_repaid rather than assuming a fired trigger banked anything. The adjudication's own price and a measured approval rate are now BOTH terms in that test -- see econ_ignore_ask_cost for what happens without them."},
 		{Key: "min_later_turns", Type: components.FieldInt, Min: 0,
 			Hint: "Per-candidate OPPORTUNITY FLOOR: do not offer an output with fewer than this many model turns after it. Unset = 0 = off. Such an output has not yet had the chance to be superseded, so \"still needed\" is the only answer the adjudicator can give and it is not evidence about whether the output is spent. This is not the refuted pre-filter: it carries no verdict, it says the question is premature. 8 mirrors coref's min_later_turns, which exists for the same reason. It matters because the ECONOMIC trigger fires most eagerly exactly where the question is least answerable -- measured, the first ask of a session landed on a 2,621-token transcript with 88% of it candidate output, no cached prefix to rewrite and 70 projected turns to collect over, clearing the break-even by 3.3x at 4% context pressure, and removing nothing. Those are the ask ledger's warm-up samples. Read sweep_candidate_too_new against sweep_offered before trusting a value: on all-recent transcripts it can empty the inventory, which is correct rather than broken."},
+		{Key: "reward_premium", Type: components.FieldFloat, Min: 1,
+			Hint: "How much a REMOVED TOKEN is worth relative to the cache read it saves — the only term in the break-even that is a belief rather than a measurement. Unset = 1 = the unadjusted arithmetic. Raise it when a removal is worth more to you than the reads it avoids, and be able to say why: on iteration 024 this component spent $20.26 to bank $0.72 of cache savings, 28:1 against, while task accuracy rose 0.486 -> 0.608 with 8 tasks better and 0 worse (clustered p = 0.0078). Sizing a premium to reproduce that run's firings lands on the same 28 independently. 20 is the rounder, weaker claim and behaves the same (53% of that run's removal value either way). Values below 1 are REFUSED: they assert a removal is worth less than the read it saves, which nothing measured supports and which tightens a gate already 5x too tight — priced correctly, the shipped break-even authorises 19% of the removal value that produced iteration 024's reward result. Above 100 is refused as a typo. IT CANNOT RESCUE A ZERO HORIZON: with no turns left, ceil(need/premium) >= 1 > 0 refuses at any premium, which is why this pairs with the horizon crediting its own removal (#232). Read `premium` on cg.sweep.econ to re-price a run's declines without re-running it.",
+		},
 		{Key: "min_pressure", Type: components.FieldFloat, Min: 0,
 			Hint: "Request-level OPPORTUNITY FLOOR: the share of the model window a request must occupy before candidates are collected at all. Unset = 0 = off. The economic trigger is most eager exactly where its question is least answerable -- maximum projected turns, nothing cached to rewrite, and candidate mass a large fraction of a small transcript -- so without a floor the ask ledger's warm-up samples are drawn from the moment nothing has been superseded yet, and a low reading there suppresses the asks that would correct it. Measured across 18 probe asks: 0.10 blocks exactly the three uninformative early asks and costs 114 removed tokens; 0.20 blocks seven and costs 11,891; 0.70 blocks seventeen. Prefer the low end, and read sweep_below_min_pressure against sweep_offered on your own workload. Applies to both triggers, because a transcript too young for anything in it to be spent is too young regardless of why the sweep woke up."},
 		{Key: "econ_ignore_ask_cost", Type: components.FieldBool,

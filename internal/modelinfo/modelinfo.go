@@ -8,12 +8,23 @@
 //
 // Every lookup fails OPEN: an unknown model returns ok=false and callers fall back
 // to absolute thresholds. Nothing here ever blocks a request — fetches are cached,
-// single-flighted, and time-bounded, and any error just leaves the window unknown.
+// single-flighted, and time-bounded.
+//
+// READ THE LAST SENTENCE OF THAT PARAGRAPH CAREFULLY, because an earlier version of it
+// claimed more than the package delivers. "Any error just leaves the window unknown" is
+// true of THIS resolver in isolation and false of the chain it is normally used in: a
+// Chain{LiteLLM, DefaultStatic()} answers an unreachable document from the embedded
+// table, so a failed fetch does not produce "unknown", it produces a confident and
+// possibly very wrong number. Callers that have been GIVEN an authoritative document —
+// an explicit MODEL_INFO_URL — must not be silently answered from the fallback table;
+// see modelWindows in cmd/context-guru-proxy, which probes such a URL at startup and
+// refuses to run rather than guess past it.
 package modelinfo
 
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -81,6 +92,48 @@ type LiteLLM struct {
 	priceBy  map[string]Price // normalized key -> per-token USD rates
 	fetched  time.Time        // last fetch ATTEMPT (success or failure)
 	fetching bool             // a background fetch is in flight (single-flight guard)
+	lastErr  error            // why the most recent attempt failed; nil once a map has loaded
+	failures int              // cumulative failed attempts, for the run's own stats artifact
+}
+
+// Load fetches the document SYNCHRONOUSLY and reports whether it produced usable entries.
+//
+// Window() cannot be used for this. It calls refreshIfStale, which starts a BACKGROUND fetch and
+// returns "unknown" immediately, so a caller that wants to verify a configured document at startup
+// would always see failure on the first call and success only some milliseconds later — a race whose
+// two outcomes are "refuse to start" and "start fine". Exposed as its own method so that check is
+// deterministic.
+//
+// It also removes a smaller wart: with a background-only warm-up the FIRST request of a process is
+// always served from the fallback window. On a benchmark that is one request per pass priced against
+// the wrong denominator, which is exactly the kind of small, permanent, invisible error that makes a
+// number untrustworthy without making it look wrong.
+func (l *LiteLLM) Load(ctx context.Context) error {
+	m, pm, err := l.fetch(ctx)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.fetched = time.Now()
+	if err != nil {
+		l.lastErr, l.failures = err, l.failures+1
+		return err
+	}
+	if len(m) == 0 {
+		l.lastErr = fmt.Errorf("modelinfo: %s decoded to no usable model entries", l.URL)
+		l.failures++
+		return l.lastErr
+	}
+	l.byKey, l.priceBy, l.lastErr = m, pm, nil
+	return nil
+}
+
+// Unresolved reports why no model-window document has loaded, and how many attempts have failed.
+// Exposed so a RUN can record it in its stats rather than requiring someone to notice a warning in a
+// debug log: a benchmark that silently priced every threshold against the wrong window is a run whose
+// numbers mean nothing, and the cheapest place to catch that is the artifact already collected per pass.
+func (l *LiteLLM) Unresolved() (err error, failures int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.lastErr, l.failures
 }
 
 // negTTL is how long to wait before retrying after a failed/empty fetch when no map
@@ -130,6 +183,21 @@ func (l *LiteLLM) refreshIfStale(context.Context) {
 		l.fetched = time.Now()
 		if err == nil && len(m) > 0 {
 			l.byKey, l.priceBy = m, pm // on failure keep any prior map (fail open)
+			l.lastErr = nil
+		} else {
+			// REPORTED. This error used to be discarded here, and discarding it is how a proxy ran for
+			// six hours over ten benchmark passes with every context window resolved from the built-in
+			// fallback and not one line of output saying so. Every fraction-based threshold in the
+			// pipeline — summarize's trigger, the sweep's pressure floor, the econ trigger's horizon —
+			// then reads against the wrong denominator, and each of them looks like it is working.
+			if err == nil {
+				err = fmt.Errorf("modelinfo: %s decoded to no usable model entries", l.URL)
+			}
+			l.lastErr = err
+			l.failures++
+			slog.Warn("modelinfo: the model-window document could not be loaded; context windows will "+
+				"fall back to built-in defaults and every fraction-based trigger will be evaluated "+
+				"against the wrong window", "url", l.URL, "err", err, "failures", l.failures)
 		}
 		l.mu.Unlock()
 	}()
@@ -145,6 +213,14 @@ func (l *LiteLLM) fetch(ctx context.Context) (map[string]int, map[string]Price, 
 		return nil, nil, err
 	}
 	defer resp.Body.Close()
+	// CHECKED, because without it a 404 is indistinguishable from a malformed document. The body of an
+	// error response ("404 File not found") flows into the decode below and comes back as a generic
+	// json error, so "the operator's URL is wrong" and "the upstream document changed shape" produced
+	// the same silence. That is not hypothetical: iteration 024 ran ten passes against an unreachable
+	// model-window file, resolved every context window from the built-in fallback, and reported nothing.
+	if resp.StatusCode != http.StatusOK {
+		return nil, nil, fmt.Errorf("modelinfo: %s returned %s", l.URL, resp.Status)
+	}
 	b, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
 		return nil, nil, err
@@ -315,6 +391,21 @@ func (s Static) Window(_ context.Context, model string) (int, bool) {
 
 // Chain tries each resolver in order; the first ok wins.
 type Chain []Resolver
+
+// Unresolved forwards the question to whichever element can answer it, so a caller holding a Chain —
+// which is what the proxy is given — can still find out that the operator's document never loaded. A
+// Chain whose live resolver is failing still ANSWERS every window lookup, from the fallback table
+// behind it, which is exactly why this has to be askable through the Chain and not only on the element.
+func (c Chain) Unresolved() (error, int) {
+	for _, r := range c {
+		if u, ok := r.(interface{ Unresolved() (error, int) }); ok {
+			if err, n := u.Unresolved(); n > 0 {
+				return err, n
+			}
+		}
+	}
+	return nil, 0
+}
 
 func (c Chain) Window(ctx context.Context, model string) (int, bool) {
 	for _, r := range c {

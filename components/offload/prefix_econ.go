@@ -26,17 +26,28 @@ import (
 // turns remain to collect the saving on, which nobody has, so it is estimated from how
 // fast the transcript has been growing.
 //
-// The consequence is counter-intuitive and worth restating wherever this is used: firing
-// at 90% of the window means T is nearly zero — paying a rewrite for a saving collected
-// once. The profitable moment to compact is EARLIER than the moment of maximum pressure.
+// T IS MEASURED ON THE REQUEST AS THE REMOVAL WILL LEAVE IT, not as it arrived — see
+// turnsRemainingAfter. An earlier form measured it on the arriving request, which made the
+// arithmetic self-defeating at exactly the pressure where a sweep is most wanted: at 90% of
+// the window T read as zero, so no benefit could ever repay, even though removing half the
+// transcript restores a long horizon. The restated consequence is narrower than the one
+// this comment used to draw: a rewrite is charity when the removal is SMALL relative to the
+// room it needs to buy back, which is a statement about the removal's size and not about
+// where in the window it happens.
 //
-// A CALLER THAT PAYS A MODEL TO DECIDE has a second one-time cost and a discount on S, and
-// takes prefixRewritePaysCharging instead:
+// A CALLER THAT PAYS A MODEL TO DECIDE has a second one-time cost, a discount on S, and a
+// belief about what a removed token is worth. It takes prefixRewritePaysCharging instead:
 //
-//	cost    = 11.5 x W + ask         benefit = (S x approval) x T
+//	cost    = 11.5 x W + ask         benefit = (S x approval x premium) x T
 //
-// coref does not — its index is deterministic and free — so it keeps prefixRewritePays,
-// which is that same expression with ask 0 and approval 1. See sweep_askcost.go.
+// `premium` is the reward premium: measured on iteration 024, the component paid $20.26 to
+// bank $0.72 of cache savings — 28:1 against — while task reward rose 25% with 8 tasks
+// better and none worse. So a removed token demonstrably delivers value the cache term does
+// not see, and `premium` is where that belief is stated, in config, falsifiably.
+//
+// coref takes none of the three — its index is deterministic and free, and its selection is
+// calibrated against the unadjusted expression — so it keeps prefixRewritePays, which is
+// that same expression with ask 0, approval 1 and premium 1. See sweep_askcost.go.
 
 // cacheWriteX is one cache-write in cache-read-equivalents: ($2.50 - $0.20) / $0.20 on
 // Anthropic's published per-MTok prices. Shared with deploy/harbor/coref.py.
@@ -72,24 +83,47 @@ func prefixRewriteWindow(req *bschemas.BifrostChatRequest, c *components.Ctx) in
 // fraction-based threshold in this package: an unresolvable threshold imposes no
 // constraint rather than silently disabling the pass.
 func prefixRewritePays(req *bschemas.BifrostChatRequest, saved, shallowest int, c *components.Ctx) (need, have int, ok bool) {
-	return prefixRewritePaysCharging(req, saved, shallowest, 0, 1, c)
+	return prefixRewritePaysWith(req, saved, shallowest, rewritePricing{approval: 1, premium: 1}, c)
 }
 
-// prefixRewritePaysCharging is prefixRewritePays plus the two terms extract_llm_sweep's econ trigger
-// needs and coref does not:
-//
-//	askUSD    the price of the model call that decides WHAT to remove, in dollars
-//	approval  the fraction of `saved` that call is expected to actually take
+// rewritePricing carries the terms a caller that PAYS A MODEL to decide has and coref does not. A
+// struct rather than four more positional parameters, because the call sites are the documentation:
+// `rewritePricing{approval: 1, premium: 1}` reads as "no ask, no discount, no belief", which is exactly
+// what coref is, and a reader does not have to count arguments to see it.
+type rewritePricing struct {
+	// askUSD is the price of the model call that decides WHAT to remove, in dollars.
+	askUSD float64
+	// approval is the fraction of `saved` that call is expected to actually take. 1 = no discount.
+	approval float64
+	// premium is how much a removed token is believed to be worth relative to the cache read it saves.
+	// 1 = the unadjusted break-even. See extractSweepConfig.RewardPremium.
+	premium float64
+	// creditRemoval measures the turn horizon on the request AS THE REMOVAL WILL LEAVE IT rather than
+	// as it arrived. See turnsRemainingAfter and #232.
+	//
+	// OPT-IN, and coref does not take it, which is a deliberate choice rather than caution. The credit
+	// is arithmetically right for any caller pricing a removal — but coref's drop SELECTION was
+	// calibrated against the uncredited form (prefixRewriteNet, which is unchanged), and quietly moving
+	// the objective a measured component optimises would invalidate those measurements rather than
+	// improve them. Two components sharing a break-even is the reason this file exists; two components
+	// sharing it while one of them silently changed is how a shared price becomes two prices.
+	creditRemoval bool
+}
+
+// prefixRewritePaysWith is prefixRewritePays plus the terms extract_llm_sweep's econ trigger needs and
+// coref does not — see rewritePricing for each of them:
 //
 // See sweep_askcost.go for why both are measured rather than assumed, and for the pre-flight numbers
 // that made them necessary.
 //
-// coref reaches this through prefixRewritePays with askUSD 0 and approval 1, which reduces it to the
-// original arithmetic TERM FOR TERM: coref decides with a deterministic index, so there is no call to
-// charge and no vote to discount. That equivalence is asserted, not assumed — see
-// TestPrefixRewritePaysUnchangedWithoutAnAsk.
-func prefixRewritePaysCharging(req *bschemas.BifrostChatRequest, saved, shallowest int,
-	askUSD, approval float64, c *components.Ctx) (need, have int, ok bool) {
+// coref reaches this through prefixRewritePays with an empty-but-for-the-ones pricing, which reduces it
+// to the original arithmetic TERM FOR TERM: it decides with a deterministic index, so there is no call
+// to charge, no vote to discount, no belief to apply, and its horizon stays uncredited. That
+// equivalence is asserted, not assumed — see TestPrefixRewritePaysUnchangedWithoutAnAsk.
+func prefixRewritePaysWith(req *bschemas.BifrostChatRequest, saved, shallowest int,
+	pricing rewritePricing, c *components.Ctx) (need, have int, ok bool) {
+
+	askUSD, approval, premium := pricing.askUSD, pricing.approval, pricing.premium
 
 	if c == nil || c.CtxWindow <= 0 {
 		return 0, 0, true
@@ -97,8 +131,24 @@ func prefixRewritePaysCharging(req *bschemas.BifrostChatRequest, saved, shallowe
 	if saved <= 0 {
 		return 0, 0, false
 	}
+	if premium <= 0 {
+		premium = 1
+	}
 	// EXPECTED mass, not offered mass. `saved` is the whole inventory; the model takes a subset.
-	eff := float64(saved) * approval
+	//
+	// `premium` is the REWARD PREMIUM: how much a removed token is believed to be worth relative to
+	// the cache read it saves. It multiplies the BENEFIT rather than dividing `need` at the end, which
+	// is the same arithmetic but says the right thing — the claim is about what a removal delivers,
+	// not about tolerating a cost. Note that it therefore shortens repayment for the ADJUDICATION too,
+	// since need is a ratio: if a removed token is worth 20x, the call that produced it repays 20x
+	// faster. That is intended, and it is asserted rather than left to be rediscovered — see
+	// TestRewardPremiumScalesTheAskTermToo.
+	//
+	// 1 means "worth exactly its cache value", which is the original arithmetic and the default
+	// everywhere except a config that opts in. See extractSweepConfig.RewardPremium for the evidence
+	// behind any value above 1, and for why no evidence supports a value below it.
+	expected := float64(saved) * approval
+	eff := expected * premium
 	if eff <= 0 {
 		return 0, 0, false
 	}
@@ -115,7 +165,33 @@ func prefixRewritePaysCharging(req *bschemas.BifrostChatRequest, saved, shallowe
 		// askUSD 0 the arithmetic below still yields need 0 and ok true, so coref is untouched.
 		rewritten = 0
 	}
-	have = estimateTurnsRemaining(schema.MessagesTokens(req), modelTurns(req), c.CtxWindow)
+	// THE HORIZON IS MEASURED ON THE REQUEST AS IT WILL BE, not as it arrived. Removing `eff` tokens
+	// is the very thing being priced, so pricing it against the pre-removal size asks "how many turns
+	// remain if we do nothing" and then charges the removal against that answer. At high pressure the
+	// two differ by everything: a 90k request against a 64k window has NO turns remaining and returns
+	// 0, which no benefit can ever repay — while the same request with 52k removed sits at 60% of the
+	// window with real turns ahead of it. Measured on iteration 024's own decisions, this is the
+	// difference for 51 of 203 firings (25%), and for those a zero horizon refuses unconditionally: no
+	// reward premium, however large, can clear ceil(m*need) <= 0. See issue #232.
+	//
+	// The growth RATE still comes from the pre-removal request, because the rate is a fact about the
+	// history that has already happened; only the ROOM LEFT is a fact about the future. One number
+	// used to serve both, which is why the credit could not simply be subtracted at the call site.
+	reqNow := schema.MessagesTokens(req)
+	after := reqNow
+	if pricing.creditRemoval {
+		// `expected`, NOT `eff`. The two differ by the premium, and the premium is a belief about what
+		// a removed token is WORTH — it is not a claim that more tokens will be removed. Crediting
+		// eff here silently multiplied the removal by the premium, so a premium of 20 pretended 20x
+		// the mass had left the transcript and manufactured a horizon out of nothing. Caught by
+		// TestRewardPremiumCannotAuthoriseAZeroHorizon, which is the assertion that exists to keep
+		// the premium from reaching anything except the benefit term.
+		after = reqNow - int(expected)
+		if after < 1 {
+			after = 1
+		}
+	}
+	have = turnsRemainingAfter(reqNow, after, modelTurns(req), c.CtxWindow)
 	// The ask converted into cache-read-equivalents, so it can be added to a cache-write term already
 	// expressed that way: dollars / (dollars per cache-read token) = tokens.
 	askEquiv := 0.0
@@ -138,14 +214,32 @@ func prefixRewritePaysCharging(req *bschemas.BifrostChatRequest, saved, shallowe
 // "this rewrite pays for itself" from "this rewrite is charity", and every cheaper proxy
 // (elapsed turns, observed step rate) is the same shape of guess.
 func estimateTurnsRemaining(reqTokens, turns, window int) int {
-	if window <= 0 || turns <= 0 || reqTokens <= 0 || reqTokens >= window {
+	return turnsRemainingAfter(reqTokens, reqTokens, turns, window)
+}
+
+// turnsRemainingAfter is estimateTurnsRemaining with the two roles reqTokens used to play separated:
+//
+//	reqBefore  the request as it stands — the GROWTH RATE is derived from it, because the rate is a
+//	           property of the history that has already been observed
+//	reqAfter   the request as it will be once the mutation under consideration is applied — the ROOM
+//	           LEFT is derived from it
+//
+// Passing the same value for both reproduces the original expression term for term, which is what
+// estimateTurnsRemaining above does and what keeps coref's arithmetic untouched.
+//
+// NOTE the asymmetry with prefixRewriteNet, which still measures its horizon on the pre-removal
+// request: coref's drop selection was calibrated against that form, and silently changing the
+// objective a measured component optimises would invalidate those measurements rather than improve
+// them. Deliberate, and tracked with #232 rather than left as an inconsistency to be tidied.
+func turnsRemainingAfter(reqBefore, reqAfter, turns, window int) int {
+	if window <= 0 || turns <= 0 || reqBefore <= 0 || reqAfter >= window {
 		return 0
 	}
-	perTurn := reqTokens / turns
+	perTurn := reqBefore / turns
 	if perTurn <= 0 {
 		return 0
 	}
-	return (window - reqTokens) / perTurn
+	return (window - reqAfter) / perTurn
 }
 
 // modelTurns counts assistant messages — the closest thing in a request to "steps taken",

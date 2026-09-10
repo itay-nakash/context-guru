@@ -226,6 +226,7 @@ money, so a test decides whether to ask at all. Its vocabulary:
 | **the ledger** | a running record of what this component's own asks have cost and how much they removed — how approval gets *measured* rather than assumed |
 | **warm-up** | the first three asks, before the ledger can average. Assumed values are used instead: approval 1.0, and a cost estimated from the request's shape |
 | **floor** | the lowest approval the ledger will report, 0.05. A guard so a measured zero cannot drive the expected saving to zero and disable the component outright |
+| **premium** | how much a removed token is believed to be worth relative to the cache read it saves (`reward_premium`, default 1). The only term in the test that is a *belief* rather than a measurement — see [What the break-even cannot price](#what-the-break-even-cannot-price) |
 
 The ledger holds four running totals — asks, dollars spent, tokens offered, tokens actually removed — and
 derives two predictions for the next ask: cost as `dollars / asks`, and approval as `removed / offered`.
@@ -326,18 +327,80 @@ them — are the *first* and the *last*, both under 30%.
 
 Two reasons this is structural rather than a quirk of one run:
 
-- **`T` is the whole benefit.** The saving is collected once per remaining turn, so waiting for pressure
-  waits for the moment `T` is smallest. Firing at 90% of the window means paying a rewrite to collect a
-  saving roughly once. The profitable moment to compact is **earlier** than the moment of maximum
-  pressure, which is the same finding stated at the top of this section.
+- **A pressure floor is also a HORIZON CAP.** The horizon is `turns x (1/p - 1)`, so a floor at pressure
+  `p` puts a ceiling on the very term that authorises firing: 9x`turns` at 10%, 1x at 50%, **0.43x at
+  70%**, 0.11x at 90%. At a 70% floor a transcript needs twelve assistant turns just to show a horizon
+  of five. And the floor does not merely cap the multiplier, it *selects* for low turn counts — the
+  requests that reach 70% fastest are the ones with few enormous tool outputs, which is precisely the
+  shape this component exists to act on. Both factors fall together.
 - **A pressure gate on a component that relieves pressure cannot fire once the component works.** The
   request stays at 20% *because* outputs are being removed. Requiring high pressure first is requiring
   the fever before the medicine that prevents it.
 
-The early-conversation economy people are reaching for already exists, and it is **free**:
-`min_inventory` declines before any model call, and it raised `sweep_inventory_below_min` **38 times**
-against 20 econ decisions in the same run. That is the filter doing the work a pressure floor was meant
-to do, without a rate card, a window fraction, or a paid call.
+**Measured on iteration 024, whose firings are the only large sample that exists.** Counting only the
+firings that still repay once priced against a correct window (74 of its 203):
+
+| floor | firings kept | removal value lost |
+|---|---|---|
+| 10% | 57 of 74 | 8% |
+| 20% | 51 of 74 | 12% |
+| 30% | 48 of 74 | 21% |
+| 50% | 39 of 74 | 37% |
+| **70%** | **4 of 74** | **67%** |
+
+So a floor is defensible at **10–20%** and destructive above about 30%. `min_pressure` exists for the
+narrower job its own entry describes — keeping the ask ledger's warm-up samples off transcripts where
+nothing has been superseded yet — and 0.70, tried in iteration 026, blocked 127 of iteration 024's 203
+firings on its own and left the component firing zero times in a $65 run.
+
+A free part of the same economy is `min_inventory`, which declines before any model call and raised
+`sweep_inventory_below_min` **38 times** against 20 econ decisions in one run. It is not a substitute:
+iteration 024's firings commonly carried **three** candidates, so a floor of 7 blocks a further quarter
+of them.
+
+### What the break-even cannot price
+
+`S x T > 11.5 x W` values a removal at **the cache reads it saves**. On the one iteration where this
+component demonstrably helped, that is not what it was paid in.
+
+| iteration 024, arm B | |
+|---|---|
+| sweep spend | **$20.26** |
+| cache savings it banked | **$0.72** |
+| ratio | **28:1 against** |
+| task accuracy | 0.486 → **0.608**, 8 tasks better, 0 worse, clustered p = 0.0078 |
+| cost per task | $2.808 → $3.419 (**+21.8%**) |
+| steps per task | 24.3 → **29.0** (+19.4%) |
+| cost per **step** | $0.1156 → $0.1179 (**+2%**) |
+
+Read the last two rows together: the sweep's own overhead was 2%; the entire cost increase was **more
+steps**. And the accuracy gains land exactly where the steps do — the 8 tasks that improved took +10.2
+steps on average, the 7 that did not took −1.2. **The mechanism is trajectory headroom, not token
+savings**, and headroom appears nowhere in the break-even.
+
+`reward_premium` is where that gap is stated, in config, falsifiably: it multiplies the benefit, so a
+premium of 20 says a removed token delivers twenty times the read it avoids. Priced at face value the
+break-even authorises **19%** of the removal value that produced iteration 024's result; at a premium of
+20 it reaches about **53%**. Two independent routes — sizing the premium to reproduce those firings, and
+dividing that run's spend by its banked savings — both land near **28**.
+
+**It cannot rescue a zero horizon.** `ceil(need/premium) >= 1 > 0`, so a request with no turns left
+refuses at any premium. That is what the next section is about, and the two changes only work together.
+
+### The horizon is measured on the request the removal will leave behind
+
+`T` used to be computed from the request **as it arrived** — which asks "how many turns remain if we do
+nothing" and then charges the removal against that answer. At high pressure the two differ by everything:
+a 90k request against a 64k window has no turns remaining and returns 0, so no benefit can ever repay it,
+while the same request with 52k removed sits at 60% of the window with real turns ahead.
+
+On iteration 024's own decisions the horizon was **exactly zero on 51 of 203 firings (25%)**, and a zero
+refuses unconditionally. The growth *rate* still comes from the pre-removal request, because the rate is a
+fact about history that already happened; only the *room left* is a fact about the future.
+
+Note the asymmetry with `coref`, which shares this file's break-even but keeps the uncredited form: its
+drop selection was calibrated against that expression, and moving the objective a measured component
+optimises would invalidate those measurements rather than improve them.
 
 ## When the cache read does not happen
 
@@ -399,6 +462,7 @@ net; the model does not get to hear about it.
 | key | default | what it does |
 |---|---|---|
 | `min_tokens` | 1000 | Per-output floor for naming a candidate in the inventory. Every line is paid fresh, and a small output's removal cannot repay the marker it leaves behind. At 3000 this produced **zero** extractions across 3,437 production requests. |
+| `reward_premium` | 1 | How much a removed token is worth relative to the cache read it saves — the only term in the break-even that is a belief rather than a measurement. 1 is the unadjusted arithmetic. Values below 1 are refused (they assert a removal is worth less than the read it saves, tightening a gate that is already the restrictive term); above 100 is refused as a typo. See [What the break-even cannot price](#what-the-break-even-cannot-price) for the 28:1 measurement behind any value above 1, and read `premium` on `cg.sweep.econ` to re-price a run's declines without re-running it. |
 | `min_inventory` | 10 | Fewest candidates worth asking about; below it the sweep declines without asking. The model's judgement is a function of how many candidates it **compares**: shown one output it scored 6% live-kept, ~15 together reached 58% at the lowest cost per output. Below the floor a removal is a guess, and a wrong removal costs content the agent still needs while a wrong keep costs one turn's tokens. |
 | `pre_expiry_seconds` | 60 | Width of the pre-expiry window. The component's one unmeasured number. |
 | `evidence` | `false` | Add the co-reference index's record to each inventory line. It is **evidence the model weighs, never a filter** over the candidates — a pre-filter left about one candidate per request, collapsing a bulk arm into the per-output shape refuted at 6% live-kept. Also adds a paragraph teaching how to read the counters; counters with no explanation invite an invented reading. |

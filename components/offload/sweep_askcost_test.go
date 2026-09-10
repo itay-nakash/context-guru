@@ -89,7 +89,7 @@ func TestFreeRewriteStillHasToRepayTheAsk(t *testing.T) {
 		t.Fatal("fixture is wrong: this must be the free-rewrite branch, which authorises with no ask")
 	}
 	// The same batch, with an ask that costs real money, must not be waved through.
-	need, have, ok := prefixRewritePaysCharging(req, saved, last, 5.00, 1, c)
+	need, have, ok := prefixRewritePaysWith(req, saved, last, rewritePricing{askUSD: 5.00, approval: 1, premium: 1, creditRemoval: true}, c)
 	if ok {
 		t.Errorf("a $5.00 adjudication was authorised because the REWRITE was free "+
 			"(need=%d have=%d) — the ask was never a term in the decision", need, have)
@@ -104,8 +104,8 @@ func TestFreeRewriteStillHasToRepayTheAsk(t *testing.T) {
 func TestApprovalDiscountScalesTheRequirement(t *testing.T) {
 	req := bigReq(40, 400)
 	c := econCtx(200_000)
-	full, _, _ := prefixRewritePaysCharging(req, 4_000, 2, 0.10, 1, c)
-	third, _, _ := prefixRewritePaysCharging(req, 4_000, 2, 0.10, 1.0/3.0, c)
+	full, _, _ := prefixRewritePaysWith(req, 4_000, 2, rewritePricing{askUSD: 0.10, approval: 1, premium: 1, creditRemoval: true}, c)
+	third, _, _ := prefixRewritePaysWith(req, 4_000, 2, rewritePricing{askUSD: 0.10, approval: 1.0 / 3.0, premium: 1, creditRemoval: true}, c)
 	if full == 0 {
 		t.Fatal("fixture is wrong: need is 0 even undiscounted, so the discount cannot show")
 	}

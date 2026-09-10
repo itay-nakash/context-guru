@@ -432,6 +432,58 @@ median request was 63,687, i.e. the threshold sat exactly on the median, which i
 choice. Whatever is chosen, report the share of decisions that actually fell inside the band before
 treating the band as the independent variable.
 
+### A window that failed to resolve became a confident 1,000,000, and nothing said so
+
+**The trap that voided iteration 024 outright, and it is a different one from the `clear_tool_uses`
+failure above — that broke the *agent's* compaction, this broke the *proxy's* view of the window.**
+
+The rig serves the band as a model-window document over HTTP and points the proxy at it with
+`MODEL_INFO_URL`. Iteration 024's file was present, correct, and 64,000. The proxy resolved
+**1,000,000 on all 2,207 requests, across ten passes and six hours.**
+
+Three independent silences composed into it:
+
+| where | what it did |
+|---|---|
+| `fetch()` | never checked `resp.StatusCode`, so a 404 body flowed into the JSON decode and returned a generic decode error — a wrong URL was indistinguishable from a changed document |
+| `refreshIfStale()` | assigned the error and **discarded it**. No log line, no counter, no field. A permanently unreachable URL produced zero output for the life of the process |
+| `Chain{LiteLLM, DefaultStatic()}` | answered the resulting emptiness from the embedded table, whose entry for a claude model is 1,000,000. "Unknown" became a confident wrong number |
+
+The rig contributed the fourth: `pgrep -f "http.server 6980" || start one` adopts **any** listener on
+that port regardless of which directory it serves, so a stale server from another session serves 404s
+for a file that exists.
+
+**What it cost, and why nothing caught it.** Every fraction-based threshold in the pipeline was evaluated
+against a window nobody configured:
+
+- `summarize`'s trigger, 0.78, became **780,000**. The largest request either arm produced was 345,996,
+  so summarize **never fired once** — 4,015 invocations, all declined, in both arms. Iteration 024 had no
+  compaction of any kind.
+- the econ trigger's horizon is linear in the window, so it came out ~16x too long: `haveTurns` never
+  dropped below 32 and ran to 11,611. It authorised **626 asks**. Repriced at 64,000, 74 of its 203
+  real-horizon firings still repay — **the gate was never in a position to decline.**
+- the run completed with `cost_source: component`, healthy counters, and a full results table. **Nothing
+  in the artifact said the configuration was not in effect.**
+
+The lesson is not "check your URLs". It is that **a fallback which converts "I cannot resolve this" into a
+plausible number is worse than one that fails**, because the failure mode has no symptom. Four fixes, in
+descending order of value:
+
+1. **`model_info_unresolved` in `/stats`** — the run's own artifact now says whether its thresholds meant
+   anything. This is the cheapest possible detection: one field in a file already collected per pass.
+2. **`cg_model_info_unresolved_total`**, alertable, for a deployment rather than a benchmark.
+3. **An explicitly-configured `MODEL_INFO_URL` is probed synchronously at startup and the proxy refuses
+   to run** if it does not load, matching the treatment `MODEL_PRICES` already had. Iteration 024 would
+   not have started.
+4. **The rig asserts the RESOLVED window**, off the proxy's own log after traffic, not just the file's
+   reachability — a document that fetches fine but does not name the run's model id falls through to the
+   fallback just as silently.
+
+The general form, worth stating separately because it recurs: **any threshold expressed as a fraction has
+a denominator that can be silently wrong, and a wrong denominator produces a component that looks
+configured, runs, and measures nothing.** Prefer an assertion on the *resolved* value over one on the
+input that was supposed to produce it.
+
 ### Untracked scratch tooling is the least-reviewed code in the measurement path
 
 `repair_shim.py` — an ~80-line HTTP hop between LOCA and the gateway, living only in `/tmp` on the

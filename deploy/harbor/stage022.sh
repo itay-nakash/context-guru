@@ -28,8 +28,25 @@ CAPPID=""; PXPID=""; SHPID=""
 cleanup() { for p in $SHPID $PXPID $CAPPID; do [ -n "$p" ] && kill "$p" 2>/dev/null; done; }
 trap cleanup EXIT
 
+# REUSES ANY LISTENER ON THIS PORT, whatever directory it serves — which is the specific hazard below.
 pgrep -f "http.server 6980" >/dev/null || (cd "$H" && nohup python3 -m http.server 6980 --bind 127.0.0.1 >/dev/null 2>&1 &)
 sleep 1
+# THE BAND HAS TO BE REACHABLE, not merely configured. The line above adopts an already-running
+# http.server on :6980 no matter which working directory it was started from, so a stale server from
+# another session serves 404s for a file that exists and is correct. Nothing downstream notices: the
+# proxy's resolver discards the fetch error and answers from its built-in table, which for a claude
+# model is 1,000,000.
+#
+# THIS IS THE CHECK THAT WOULD HAVE STOPPED ITERATION 024. It ran ten passes with a correct
+# model-window-64k.json on disk and an unreachable URL, resolved 1,000,000 on all 2,207 requests,
+# and produced a full set of healthy counters describing a configuration that was never in effect.
+MODEL_INFO_URL="http://localhost:6980/model-window-${BAND}k.json"
+curl -sf "$MODEL_INFO_URL" | grep -q max_input_tokens || {
+  echo "MODEL_INFO_UNREACHABLE: $MODEL_INFO_URL"
+  echo "  the file may exist and still be unreachable: :6980 is whichever http.server got there first."
+  echo "  \`pgrep -af 'http.server 6980'\` then \`readlink /proc/<pid>/cwd\` — it must be $H."
+  exit 1
+}
 rm -f "$H/i022flap-$NAME.jsonl" "$H/i022capfail-$NAME.jsonl" "$H/i022log-$NAME.jsonl"
 
 CAPTURE_UPSTREAM="$ANTHROPIC_BENCHMARK_BASE_URL" CAPTURE_PORT="$CAP_PORT" \
@@ -40,7 +57,7 @@ for i in $(seq 1 30); do curl -sf "http://localhost:$CAP_PORT/capture-stats" >/d
 curl -sf "http://localhost:$CAP_PORT/capture-stats" >/dev/null || { echo CAPTURE_FAILED; exit 1; }
 echo "  capture hop pid=$CAPPID on :$CAP_PORT"
 
-MODEL_INFO_URL="http://localhost:6980/model-window-${BAND}k.json" \
+MODEL_INFO_URL="$MODEL_INFO_URL" \
 ANTHROPIC_UPSTREAM="http://localhost:$CAP_PORT" ANTHROPIC_API_KEY="$ANTHROPIC_AUTH_TOKEN" \
 CHEAP_MODEL=aws/claude-haiku-4-5 CHEAP_MODEL_PROVIDER=anthropic \
 CHEAP_MODEL_BASE="$ANTHROPIC_BENCHMARK_BASE_URL" CHEAP_MODEL_KEY="$ANTHROPIC_AUTH_TOKEN" \
@@ -52,6 +69,16 @@ for i in $(seq 1 40); do curl -sf "http://localhost:$PORT/healthz" >/dev/null &&
 curl -sf "http://localhost:$PORT/healthz" >/dev/null || { echo PROXY_FAILED; tail -5 "$H/i022proxy-$NAME.log"; exit 1; }
 grep -qE "\"?pipeline\"?[=:]" "$H/i022proxy-$NAME.log" || { echo "PROXY_FAILED: did not bind :$PORT"; exit 1; }
 echo "  proxy pid=$PXPID bound :$PORT $(grep -oE "\"?pipeline\"?[=:] ?\"[^\"]+\"" "$H/i022proxy-$NAME.log" | head -1)"
+
+# DID THE DOCUMENT LOAD, asked of the proxy rather than of the file. `model_info_unresolved` is non-zero
+# whenever a fetch failed, and it needs no traffic to read — the resolved WINDOW cannot be checked yet,
+# because ctx_window is only logged once requests flow. That assertion is at the end of this script.
+UNRES=$(curl -s "http://localhost:$PORT/stats" | grep -o '"model_info_unresolved":[0-9]*' | grep -o '[0-9]*$')
+if [ -n "$UNRES" ] && [ "$UNRES" != "0" ]; then
+  echo "MODEL_INFO_UNRESOLVED=$UNRES: the proxy could not load $MODEL_INFO_URL"
+  curl -s "http://localhost:$PORT/stats" | grep -o '"model_info_last_error":"[^"]*"'
+  exit 1
+fi
 
 SHIM_UPSTREAM="http://localhost:$PORT/anthropic" SHIM_PORT="$SHIM_PORT" SHIM_DIGEST= \
   .venv/bin/python repair_shim_sab.py > "$H/i022shim-$NAME.log" 2>&1 &
@@ -70,4 +97,23 @@ echo "loca exit=$?"; date -u
 grep -E "Overall Success|Avg Accuracy|Avg Cost" "$H/i022loca-$NAME.log" | tail -4
 curl -s "http://localhost:$PORT/stats" -o "$H/st-i022-$NAME.json"
 curl -s "http://localhost:$CAP_PORT/capture-stats" -o "$H/cap-i022-$NAME.json"
+
+# THE WINDOW THE PROXY ACTUALLY USED, read off its own log now that traffic has been through it. This is
+# a DIFFERENT assertion from the reachability check at the top and it is the one that matters: a document
+# that fetches fine but does not name this run's model id falls through to the built-in table just as
+# silently as a 404 does, and the built-in answer for a claude model is 1,000,000.
+#
+# Reported rather than exit 1, because by here the money is already spent — the point is that the pass's
+# own output says whether its thresholds meant anything, instead of that fact living only in a log nobody
+# reads. Iteration 024 is why: ten passes, $207 an arm, resolved 1,000,000 against a configured 64,000,
+# summarize's trigger consequently at 780,000 and never fired once in either arm, every counter healthy.
+RESOLVED=$(grep -o '"ctx_window":[0-9]*' "$H/i022log-$NAME.jsonl" 2>/dev/null |
+  sort | uniq -c | sort -rn | head -1 | grep -o '[0-9]*$')
+if [ "$RESOLVED" != "$CLEAR_AT" ]; then
+  echo "!!!!! WINDOW_MISMATCH $NAME: proxy resolved ctx_window=$RESOLVED, band is $CLEAR_AT"
+  echo "!!!!! every fraction-based threshold in this pass used the wrong denominator."
+  echo "!!!!! DO NOT COMPARE THIS PASS to one that resolved correctly."
+else
+  echo "  window verified: ctx_window=$RESOLVED throughout (band ${BAND}k)"
+fi
 echo "ARM_DONE $NAME"

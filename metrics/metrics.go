@@ -650,8 +650,22 @@ type Snapshot struct {
 	// adjudication tool. The proxy advertises that tool on every request and tells the model not to
 	// call it; this is the number that says whether the telling works (measured 0 across ~4,900
 	// requests). Non-zero is a lost agent turn per count, not a correctness failure.
-	AdjudicateStray int64               `json:"adjudicate_stray"`
-	Components      map[string]compStat `json:"components"`
+	AdjudicateStray int64 `json:"adjudicate_stray"`
+	// ModelInfoUnresolved counts failed attempts to load the operator's model-window document, and
+	// ModelInfoLastError says why the most recent one failed. Empty/zero is the healthy case.
+	//
+	// PUBLISHED HERE BECAUSE THIS IS THE ARTIFACT A RUN KEEPS. When the window cannot be resolved,
+	// every fraction-based threshold in the pipeline is silently evaluated against a built-in default
+	// instead: iteration 024 ran ten benchmark passes that way, resolved 1,000,000 on all 2,207
+	// requests against a configured 64,000, and produced a complete set of healthy counters describing
+	// a configuration that was never in effect — summarize's 0.78 trigger became 780,000 and never
+	// fired once, and the econ trigger's turn horizon came out 16x too long. Nothing else in this
+	// snapshot can go non-zero for that. A warning in a debug log was not enough, because nobody reads
+	// a debug log for a run that looks fine.
+	ModelInfoUnresolved int64  `json:"model_info_unresolved"`
+	ModelInfoLastError  string `json:"model_info_last_error,omitempty"`
+
+	Components map[string]compStat `json:"components"`
 	// TopPassthrough names components that ran but never saved a token — dead
 	// weight in the pipeline, candidates to drop from the config.
 	TopPassthrough []string `json:"top_passthrough"`

@@ -104,6 +104,18 @@ was present and effectively inert.
 fires only when the decline holds *with a free ask and no discount* — i.e. decisions iteration 024's
 arithmetic would also have refused. There are **751** of those, and iteration 024 recorded 25.
 
+!!! note "The counterfactual behind these two labels changed after this run"
+
+    In this run the free-ask re-pricing was `prefixRewritePays`, which also reset the approval discount
+    (and, once it existed, the reward premium and the horizon credit). So it answered a broader question
+    than the label claims — *would this clear with a free ask **and** no discount* — and a batch refused
+    by the approval discount alone could be counted here as refused by the **ask**. From iteration 027
+    the counterfactual varies the ask and holds every other term, which is what `askDeclined` is
+    documented to mean. The 368 / 751 split above is therefore not directly comparable with a later
+    run's, and the reason it had to change is that under a premium above 1 the resetting form re-prices
+    every decline at premium 1, clears nothing, and sends all of them to `prefix_rewrite_not_repaid`
+    whichever cost actually refused.
+
 The pressure distribution says where they are. **571 of the 1,119 declines were taken at or beyond 100%
 of the declared window**, where `estimateTurnsRemaining` returns 0 by construction and nothing can repay
 anything. (An earlier draft said 568; that was the count beyond 101%, the bucket table's boundary.)

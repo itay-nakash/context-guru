@@ -276,6 +276,19 @@ func TestSweepEconTriggerDeclinesWhenTheAskCannotRepayItself(t *testing.T) {
 	asker.cacheRead = 19595
 	e := newSweep(t, "econ_trigger: true\n")
 	req := sweepReqStocked()
+	// THE INVENTORY IS A MINORITY OF THE TRANSCRIPT, and it has to be for this fixture to be about the
+	// ask at all. sweepReqStocked's candidates are 86,700 of its 87,127 tokens — 99.5% — and once the
+	// horizon credits the removal it is pricing (#232), removing 99.5% of a transcript genuinely does
+	// buy a turn: have went 10 -> 11 against a need of 11 and the same batch cleared, correctly, by one
+	// turn. That is the arithmetic working, not the ask charge failing, but it left this test asserting
+	// a margin instead of a mechanism.
+	//
+	// A large NON-candidate message fixes that without touching the shared fixture: candidates become a
+	// minority, the credit moves the horizon by a fraction of a turn instead of doubling it, and the
+	// decline is once again about the ask's own price. Verified by reverting the charge — with askUSD
+	// forced to 0 this test fires, which is the defect it exists to catch.
+	req.Input = append(req.Input, assistantMsg(strings.Repeat(
+		"a long stretch of model reasoning that is not a tool output and so is not a candidate\n", 2200)))
 	c := preExpiryCtx("s", asker, store.NewMemory(store.Options{}))
 	c.IdleMs = 30 * 1000 // trigger one is OFF, so this is the econ decision and nothing else
 
