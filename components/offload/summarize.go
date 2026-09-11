@@ -154,7 +154,23 @@ func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 	headCount, start, end := summarizeSpan(msgs, s.keepLast)
 	// Request-level trigger: don't summarize (an LLM call) until the transcript
 	// is genuinely large / deep. Zero thresholds fire always (back-compat).
-	if !s.trigger.Fires(req, c.CtxWindow) || end <= start {
+	// SPLIT, because one silent skip was reporting two unrelated facts: "this transcript is not big
+	// enough to compact yet", which is the healthy steady state, and "there is nothing between the head
+	// and the kept tail to compact", which is a transcript SHAPE the component can never act on however
+	// large it grows. Both left rep.Skipped with no gate, so a run where summarize never fired could not
+	// be told apart from a run where it was never asked to.
+	if !s.trigger.Fires(req, c.CtxWindow) {
+		rep.Gate("summary_below_trigger")
+		rep.Skipped = true
+		return nil, nil
+	}
+	if end <= start {
+		// Nothing lies between msg0 and the kept tail. On a transcript of a few enormous messages this
+		// is permanent: keep_last protects the mass, and the span that remains is empty regardless of
+		// how far past the trigger the request goes. Measured on the iteration 027 probe, requests of
+		// 81,580 tokens sat above the trigger for six consecutive turns and summarize acted on none of
+		// them, with nothing recorded to say which of the paths in this function refused.
+		rep.Gate("summary_span_empty")
 		rep.Skipped = true
 		return nil, nil
 	}
@@ -173,6 +189,11 @@ func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 		if end <= start {
 			// Nothing summarizable is left once expanded content is protected. Declining is the
 			// outcome summarize already has for an empty span, and the safe direction.
+			//
+			// SEPARATE from summary_span_empty above: that one is the transcript's own shape, this one
+			// is the agent having expanded content we then must not re-summarize. Same outcome, opposite
+			// remedies — one is a keep_last question, the other is about expand traffic.
+			rep.Gate("summary_span_empty_after_expand_trim")
 			rep.Skipped = true
 			return nil, nil
 		}
@@ -182,7 +203,11 @@ func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 		model = c.Model.For(s.modelSource)
 	}
 	if model == nil {
-		rep.Skipped = true // NeedsModel but none available → degrade gracefully
+		// A CONFIGURATION FAULT THAT LOOKS LIKE INERTNESS. summarize is NeedsModel; with no client it
+		// can never act, and without a label that reads in the counters exactly like a transcript that
+		// never needed compacting.
+		rep.Gate("summary_no_model")
+		rep.Skipped = true // degrade gracefully
 		return nil, nil
 	}
 
@@ -201,6 +226,11 @@ func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 
 	span := msgs[start:end]
 	if schema.MessagesTokens(&bschemas.BifrostChatRequest{Input: span}) < s.minTokens {
+		// The span cleared the request-level trigger and is still too small to be worth an LLM call.
+		// Labelled because it is the decline that says "the request is large but its COMPACTABLE part is
+		// not" — the signature of mass concentrated in the protected tail, and unrecoverable from the
+		// request size alone.
+		rep.Gate("summary_span_below_min_tokens")
 		rep.Skipped = true
 		return nil, nil
 	}
@@ -248,6 +278,9 @@ func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 		return nil, err // fail-open: the pipeline reverts this component
 	}
 	if strings.TrimSpace(summary) == "" {
+		// PAID FOR AND WASTED, which is the one decline here that costs money. Unlabelled it was
+		// indistinguishable from never having called.
+		rep.Gate("summary_empty_reply")
 		rep.Skipped = true
 		return nil, nil
 	}

@@ -20,6 +20,21 @@ export ANTHROPIC_CUSTOM_HEADERS=          # benchmark traffic must NOT go throug
 export UV_CONSTRAINT="$H/uv-constraints.txt"   # mcp<2 : 2.1.1 removed Server.list_tools
 export PATH="$H/bin:$H/.venv/bin:/home/vpcuser/.nvm/versions/node/v22.23.2/bin:$PATH"
 command -v npx >/dev/null || { echo "NPX_MISSING -- filesystem MCP tools would silently vanish"; exit 1; }
+# CHEAP MODEL RATES, in dollars per MILLION tokens. Restored after being lost in a rig sync: without
+# these, PricingConfigured() is false, and extract_llm's economic gate then falls back to built-in LIST
+# rates unless the operator's price table happens to answer — measured 333/389/413 times per arm in
+# iteration 023, i.e. once per request in all three arms, which means every allow/suppress decision it
+# made was taken against list rates and extraction_cost_usd could not be attributed at all.
+#
+# BELT AND BRACES with the model-window document. That document carries per-token prices, so RatesFor
+# answers from it and `cheap_model_price_unconfigured` stays quiet (verified 0 occurrences on the
+# iteration 027 probe) — but the gate needs EITHER the card or these vars, and a document that stops
+# carrying prices would silently move every gate decision onto list rates. haiku-4.5 list.
+export CHEAP_MODEL_PRICE_IN=1.00
+export CHEAP_MODEL_PRICE_OUT=5.00
+export CHEAP_MODEL_PRICE_CACHE_READ=0.10
+export CHEAP_MODEL_PRICE_CACHE_WRITE=1.25
+
 SHIM_PORT=$((PORT+50)); CAP_PORT=$((PORT+70))
 echo "ports: proxy=$PORT shim=$SHIM_PORT capture=$CAP_PORT  (6980 = model-info, must not collide)"
 if [ "$SHIM_PORT" = 6980 ] || [ "$CAP_PORT" = 6980 ] || [ "$PORT" = 6980 ]; then echo PORT_COLLISION_6980; exit 1; fi
@@ -51,6 +66,7 @@ rm -f "$H/i022flap-$NAME.jsonl" "$H/i022capfail-$NAME.jsonl" "$H/i022log-$NAME.j
 
 CAPTURE_UPSTREAM="$ANTHROPIC_BENCHMARK_BASE_URL" CAPTURE_PORT="$CAP_PORT" \
 CAPTURE_FLAPLOG="$H/i022flap-$NAME.jsonl" CAPTURE_FAILLOG="$H/i022capfail-$NAME.jsonl" \
+CAPTURE_BODYDUMP="$H/i022body-$NAME.json" \
   nohup .venv/bin/python capture_hop_sab.py > "$H/i022cap-$NAME.log" 2>&1 &
 CAPPID=$!
 for i in $(seq 1 30); do curl -sf "http://localhost:$CAP_PORT/capture-stats" >/dev/null && break; sleep 0.5; done

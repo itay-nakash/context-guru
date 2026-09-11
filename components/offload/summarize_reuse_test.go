@@ -2,6 +2,8 @@ package offload
 
 import (
 	"context"
+	"os"
+	"strings"
 	"testing"
 
 	bschemas "github.com/maximhq/bifrost/core/schemas"
@@ -145,5 +147,60 @@ func TestSummarizeRecordsWhenTheCoveredSpanChangedUnderIt(t *testing.T) {
 	}
 	if rep2.Events["summary_checkpoint_reused"] != 0 {
 		t.Errorf("claimed a reuse on a span that had changed: %v", rep2.Events)
+	}
+}
+
+// EVERY DECLINE ON THE FRESH PATH IS NAMED. Seven `rep.Skipped = true` returns in Offload used to carry no
+// gate between them, and the cost of that was measured rather than imagined: on the iteration 027 probe a
+// session sat at 81,580 tokens — above its own 0.90 trigger — for six consecutive turns while summarize
+// acted on none of them, and the recorded gates named a span trim and a missing checkpoint, neither of
+// which was the reason. "summarize is inert" and "summarize was never asked" read identically.
+//
+// Asserted as a SET rather than one test per path, because the property that matters is that no route to
+// Skipped is anonymous — a new unlabelled early return is the regression, and enumerating the labels one
+// at a time would not catch one being added.
+func TestEveryFreshPathDeclineIsLabelled(t *testing.T) {
+	src, err := os.ReadFile("summarize.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(string(src), "\n")
+	// The window of source that is Offload's fresh path: from its signature to the emitCheckpoint
+	// helpers below it. refuse() has its own gate (stash_reserve_exhausted) covering its returns.
+	start, end := -1, -1
+	for i, l := range lines {
+		if strings.HasPrefix(l, "func (s *Summarize) Offload(") {
+			start = i
+		}
+		if start >= 0 && strings.HasPrefix(l, "func ") && i > start {
+			end = i
+			break
+		}
+	}
+	if start < 0 || end < 0 {
+		t.Fatal("could not locate Offload in summarize.go")
+	}
+	var anonymous []int
+	for i := start; i < end; i++ {
+		if !strings.Contains(lines[i], "rep.Skipped = true") {
+			continue
+		}
+		// A gate must be raised within the same block — look back a few lines for rep.Gate.
+		labelled := false
+		for j := i; j >= i-6 && j > start; j-- {
+			if strings.Contains(lines[j], "rep.Gate(") {
+				labelled = true
+				break
+			}
+		}
+		if !labelled {
+			anonymous = append(anonymous, i+1)
+		}
+	}
+	if len(anonymous) > 0 {
+		t.Fatalf("summarize.go: %d decline path(s) in Offload set rep.Skipped with no rep.Gate above them, "+
+			"at line(s) %v. An unlabelled decline is why a session above the trigger could go six turns "+
+			"without acting and leave nothing in the counters to say which check refused.",
+			len(anonymous), anonymous)
 	}
 }

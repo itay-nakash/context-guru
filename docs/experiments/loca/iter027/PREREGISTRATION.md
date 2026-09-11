@@ -4,9 +4,10 @@
 
 | | |
 |---|---|
-| binary | `cg-i027-proxy-v01`, SHA-256 (first 32) `a3c0e725248e6fab19356d61aec0f57e` |
+| binary | `cg-i027-proxy-v02`, SHA-256 (first 32) `827876e9e0893db05f6b4abebe073de6` — v01 ran the mechanism probe only; v02 adds the summarize decline labels |
 | arms | `cfg-iter027-{A-baseline,B-merged}.yaml` |
 | B differs by | **five lines** — `evidence`, `econ_trigger`, `reward_premium: 20`, `min_pressure: 0.20`, `min_inventory: 3` |
+| pipeline | **`housellm` + `summarize`** — `collapse` removed from both arms, see [The pipeline is now the one being claimed](#the-pipeline-is-now-the-one-being-claimed) |
 | band | 64k |
 | design | 2 arms × 15 tasks × 5 seeds = 150 runs, interleaved A then B within each seed |
 | funded | **step 0 and step 1 only** — see [Staging and budget](#staging-and-budget) |
@@ -85,6 +86,50 @@ started.** `/stats` gained `model_info_unresolved` and Prometheus `cg_model_info
 Together, iteration 026's config would have permitted **1 of iteration 024's 203 firings** — 127 blocked
 by the pressure floor, 50 by the inventory floor, 25 by the econ gate.
 
+### The pipeline is now the one being claimed
+
+**Amended after the mechanism probe, on the probe's own data, before any endpoint was read.** Every
+iteration from 023 to 026 ran `housellm` plus `collapse` plus `summarize`. `housellm` is the shipped
+baseline this work is measured against and already contains `extract_llm_sweep`; **no shipped preset
+contains `collapse` and `summarize` together**, and nothing documented adding it.
+
+Removing it, for four reasons the probe measured:
+
+| | |
+|---|---|
+| its documented job | prevent upstream 400s on bodies of **2.6–14.8 MB** |
+| largest request that reached it | **93,791** tokens, against sonnet-5's 1,000,000 |
+| upstream failures | **0** in the probe, **0** in both arms of iteration 026 |
+| its default threshold | **`max_tokens: 2000`** |
+| what it removed | **544,336** tokens, against the sweep's **35,318** — 15× |
+
+At `max_tokens: 2000` it capped every tool output above 2,000 tokens to 20 head + 20 tail lines with **no
+judgement about whether the output was spent** — which is the question `extract_llm_sweep` is paid to
+answer two positions earlier. Whatever the sweep declined to remove, collapse truncated anyway, so the
+sweep's marginal value has been measured throughout this series against a baseline that had already
+truncated every large output.
+
+It also ran **before** `summarize`, and therefore before summarize's window fraction was evaluated. The
+probe's two sessions separate cleanly:
+
+| | collapse removed | summarize saw | its 0.90 trigger | summarize acted |
+|---|---|---|---|---|
+| 6 turns, session 1 | **54,589** per turn | 28,613–39,202 | no | 0 |
+| 6 turns, session 2 | **0** | 81,385–81,580 | **fires** | 0 |
+
+So where collapse acted it pre-empted summarize, and where it did not, summarize's trigger fired and
+summarize declined anyway with **no gate recorded**. Both are fixed here: collapse is gone, and the five
+silent decline paths in `summarize.go` now raise `summary_below_trigger`, `summary_span_empty`,
+`summary_span_empty_after_expand_trim`, `summary_no_model`, `summary_span_below_min_tokens` and
+`summary_empty_reply`.
+
+**Consequence for the deferral row:** it becomes meaningful for the first time. With collapse present,
+"summarize acted" largely answered "did collapse act". It stays *reported, not vetoing*.
+
+**The risk, stated plainly:** an uncapped oversized output causing an upstream 400. Measured as absent on
+this band and this task set — and that is **not** a claim about a 128k band or a different task set. If
+step 2 moves off this configuration, check `capfail` before assuming it still holds.
+
 ### In the rig
 
 `stage022.sh` refuses to start when the model-window document is unreachable (`:6980` is whichever
@@ -119,11 +164,17 @@ no runtime gate can see coming.
 
 ### Reported, not vetoing
 
-**Deferral.** `summarize` acted, arm B against arm A. This is the thesis iteration 026 was built for, and
-it has **never been observed**: iteration 024's summarize never fired, so nothing was ever deferred. Note
-in advance that iteration 026 seed 1 showed arm A 71 acted against arm B 15 — a 79% reduction that looks
-exactly like deferral and cannot be, because arm B's sweep fired zero times. **At one seed this figure is
-trajectory divergence.** It is reported, and it vetoes nothing.
+**Deferral.** `summarize` acted, arm B against arm A. This is the thesis iteration 026 was built for and
+it has **never been observed**: iteration 024's summarize never fired at all, and iterations 023–026 ran
+`collapse` ahead of it, which removed 15× more and disarmed its trigger before it was evaluated. This is
+the first configuration in which the number can mean what it says — see [The pipeline is now the one being
+claimed](#the-pipeline-is-now-the-one-being-claimed).
+
+Two warnings that stand regardless. Iteration 026 seed 1 showed arm A 71 acted against arm B 15 — a 79%
+reduction that looks exactly like deferral and cannot be, because arm B's sweep fired zero times; **at one
+seed this figure is trajectory divergence.** And a decline is now labelled, so read *which* label:
+`summary_span_below_min_tokens` and `summary_span_empty` mean the transcript's mass sits in the protected
+tail, which no amount of sweeping will change. Reported, vetoes nothing.
 
 ## Staging and budget
 

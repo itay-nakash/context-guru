@@ -31,7 +31,39 @@
 #   3. sweep_offered / cg.sweep.ask count -- did it fire AT ALL. Iteration 026's answer was zero.
 #   4. premium and haveTurns on cg.sweep.econ -- which term is refusing now
 #   5. accuracy, cost per task, steps per task against arm A -- the endpoints, in that order of priority
-pipeline: [format, dedup, toon, cmdfilter, searchfold, textclean, extract_llm, extract_llm_sweep, extract, collapse, cachesplit, toolfilter, summarize]
+#   6. summarize acted, B against A -- and this is the FIRST run in which that number means deferral.
+#      While `collapse` sat in the pipeline it removed 15x what the sweep did and pulled requests under
+#      summarize's trigger before that trigger was evaluated, so "summarize acted" largely answered "did
+#      collapse act". With collapse gone, summarize is the only lossy compactor left and the sweep is the
+#      only thing that can hold a request below its threshold. Still REPORTED, not vetoing: deferral is a
+#      by-product, and the thesis is only worth anything if reward, cost or latency moved.
+# EXACTLY `housellm` PLUS `summarize`, and `collapse` is gone. housellm is the shipped baseline this
+# work is measured against -- format, dedup, toon, cmdfilter, searchfold, textclean, extract_llm,
+# extract_llm_sweep, extract, cachesplit, toolfilter -- and every iteration from 023 to 026 quietly added
+# `collapse` to it. Nothing documented why.
+#
+# WHY IT IS REMOVED, and it is not a judgement about the component:
+#
+#  - it is not in housellm, nor in ANY shipped preset that also contains summarize (none do)
+#  - its documented job is preventing upstream 400s on bodies of 2.6-14.8 MB. On this workload that
+#    condition is an order of magnitude away: the largest request reaching it in the iteration 027 probe
+#    was 93,791 tokens against sonnet-5's 1,000,000, and capfail was 0 in the probe and in BOTH arms of
+#    iteration 026. It was protecting against nothing here.
+#  - its default threshold is `max_tokens: 2000`, so it capped EVERY tool output above 2,000 tokens to 20
+#    head + 20 tail lines, with no judgement about whether the output was spent -- which is precisely the
+#    question extract_llm_sweep is paid to answer, two positions earlier. Whatever the sweep declined to
+#    remove, collapse truncated anyway. Measured on the probe: collapse removed 544,336 tokens against
+#    the sweep's 35,318, a factor of 15.
+#  - and it ran BEFORE summarize, so it took requests from 93,791 to 39,202 -- under summarize's 0.90
+#    trigger -- before that trigger was ever evaluated. Six probe turns where collapse acted: summarize
+#    could not fire. Six where it did not: summarize's trigger fired and summarize declined anyway.
+#
+# Present in both arms it did not break internal validity, but it measured the sweep's value in the
+# presence of a component doing the same job lossily and without judgement, which is not a pipeline
+# anyone ships. THE RISK OF REMOVING IT is an uncapped oversized output causing an upstream 400; that is
+# measured as absent on this band and these tasks, and is NOT a claim about a 128k band or another task
+# set. If step 2 ever moves off this configuration, re-check capfail before assuming this still holds.
+pipeline: [format, dedup, toon, cmdfilter, searchfold, textclean, extract_llm, extract_llm_sweep, extract, cachesplit, toolfilter, summarize]
 components:
   extract: {min_tokens: 400}
   extract_llm:
