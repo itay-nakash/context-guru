@@ -484,6 +484,33 @@ a denominator that can be silently wrong, and a wrong denominator produces a com
 configured, runs, and measures nothing.** Prefer an assertion on the *resolved* value over one on the
 input that was supposed to produce it.
 
+### A long transcript is not a large request, and picking a fixture on the wrong axis manufactures a null
+
+Caught before it cost anything, on iteration 027's mechanism probe, and recorded because the mistake is
+natural and the failure is a **false negative** — the most expensive kind, because a null result ends an
+investigation.
+
+The probe had to show whether a size-gated component (`min_pressure: 0.20`, i.e. 12,800 tokens of a 64k
+band) fires at all. The two tasks first chosen were "the cheapest long transcripts": 51 and 27 steps. Their
+**mean request** sizes are 8,865 and 7,827 tokens. Neither reaches the floor. The probe would have fired
+nothing, and the pre-registered stop rule for "fires nothing" is *stop*.
+
+**Step count and request size are nearly uncorrelated on LOCA.** Measured across iteration 024's five seeds:
+
+| task | steps | mean request |
+|---|---|---|
+| `UpdateMaterialInventoryS2LEnv` | 14 | **40,381** |
+| `AcademicWarningS2LEnv` | **51** | 8,865 |
+| `PayableInvoiceCheckerS2LEnv` | 19 | 4,477 |
+
+A task can run fifty steps against small requests (many short tool results) or twelve against enormous ones
+(a few large ones). Both are "long conversations"; only the second exercises a fraction-of-window gate.
+
+The general rule: **select the fixture on the axis the mechanism is gated on, not on a proxy that feels
+related.** Where a gate reads a request's token mass, rank candidate tasks by measured mean request size
+before anything else — and where no such measurement exists yet, that measurement is the first thing the
+probe should produce, before any decision is read from it.
+
 ### Untracked scratch tooling is the least-reviewed code in the measurement path
 
 `repair_shim.py` — an ~80-line HTTP hop between LOCA and the gateway, living only in `/tmp` on the

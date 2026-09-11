@@ -129,17 +129,43 @@ trajectory divergence.** It is reported, and it vetoes nothing.
 
 | step | what | cost | answers |
 |---|---|---|---|
-| **0** | mechanism probe, arm B, 2 tasks | ~$8 | Did the window resolve? Did anything fire? |
+| **0** | mechanism probe, arm B, 2 tasks | ~$10 | Did the window resolve? Did anything fire? |
 | **1** | seed 1, arm A then B | ~$100 | Direction on the three endpoints. **Not significant.** |
 | **2** | seeds 2–5 | ~$400 | The registered design. **Needs new budget and an explicit go-ahead.** |
 
 Per-pass cost is estimated from iteration 024 ($41.57 arm A, $52.66 arm B) and is **uncertain in a known
 direction**: arm A's `summarize` will now actually fire, which no prior iteration measured.
 
-The probe's two tasks are named in advance: **`AcademicWarningS2LEnv`** (51 steps, $3.60 in iteration 024
-— the cheapest long transcript in the set, so the sweep is certain to reach the 0.20 floor) and
-**`MachineOperatingS2LEnv`** (27 steps, $1.67). `deploy/harbor/task-configs/i027-probe.json` on the eval
-box holds exactly those two, filtered from `i024-64k-s1.json` so every other parameter is identical.
+### The probe's tasks, and the selection error that nearly wasted it
+
+**Amended before the probe ran, on no data from it.** The first choice was `AcademicWarningS2LEnv` and
+`MachineOperatingS2LEnv`, picked as "the cheapest long transcripts" — 51 and 27 steps at $3.60 and $1.67.
+Both are wrong, and wrong in the direction that would have produced a **false negative**:
+
+`min_pressure: 0.20` gates on the request's size as a fraction of the window, i.e. **12,800 tokens of the
+64k band**. Those two tasks average **8,865** and **7,827** tokens per request across iteration 024's five
+seeds. Neither reaches the floor, so the probe would have fired nothing for a reason that has nothing to
+do with the gate under test — and the pre-registered stop rule for "step 0 fires nothing" is *stop*.
+
+**A long transcript is not a large request.** Step count and request size are nearly uncorrelated on this
+benchmark: `AcademicWarningS2LEnv` runs 51 steps at 8.9k per request, `UpdateMaterialInventoryS2LEnv` runs
+14 steps at 40.4k. Selecting a fixture for a size-gated mechanism on step count is selecting on the wrong
+axis.
+
+The corrected pair, chosen on **mean request size first**, then on whether iteration 024 showed a gain on
+that task, then on cost:
+
+| task | mean request | steps | iteration 024 cost | iteration 024 accuracy A → B |
+|---|---|---|---|---|
+| `SetConfCrDdlS2LEnv` | **28,252** (2.2× the floor) | 12 | $1.33 | 0.40 → 0.60 |
+| `FilterLowSellingProductsS2LEnv` | **18,370** (1.4×) | 47 | $6.58 | 0.20 → 0.60, +31 steps |
+
+Both cleared the floor comfortably in iteration 024 and both **gained** accuracy there, so a null result
+is about the gate rather than about the task. Two rather than one because a single transcript shape can be
+idiosyncratic; the second is the strongest step-delta gainer in the set, which is the shape the mechanism
+is claimed to help. Seed 1, so every other parameter matches the three runs already on record.
+`deploy/harbor/task-configs/i027-probe.json` on the eval box holds exactly those two, filtered from
+`i024-64k-s1.json`.
 
 **The remaining budget is about $100, so steps 0 and 1 exhaust it.** Step 2 is registered so that the
 design is fixed in advance, not because it is funded.
