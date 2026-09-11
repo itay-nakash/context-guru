@@ -16,8 +16,8 @@
 # is why the hash is checked BEFORE EVERY PASS and not once at launch — a rebuild landing on this path at
 # hour three leaves some passes on code X and others on code Y with every counter still healthy.
 set -uo pipefail
-H="$HOME/cg-loca"; BIN="$HOME/cg-bin/cg-i027-proxy-v02"; PORT=6870
-EXPECT=827876e9e0893db05f6b4abebe073de6
+H="$HOME/cg-loca"; BIN="$HOME/cg-bin/cg-i027-proxy-v03"; PORT=6870
+EXPECT=607ef085d0151c4048f6460345429070
 STEP="${1:-probe}"
 
 check_binary() {

@@ -82,6 +82,18 @@ type ExtractSweep struct {
 	// rewardPremium is how much a removed token is believed to be worth relative to the cache read it
 	// saves. 1 = the unadjusted break-even. See extractSweepConfig.RewardPremium.
 	rewardPremium float64
+	// lastEcon carries the most recent econ decision to the ask dump, which is written one call deeper
+	// and has no other way to see it. Written ONLY when dumping is configured, so an unconfigured
+	// deployment retains nothing; atomic because one component instance serves concurrent sessions, and
+	// a torn read here would put one session's economics beside another's verdicts.
+	//
+	// It is a DIAGNOSTIC path and deliberately not load-bearing: under concurrency the dump may show a
+	// neighbouring request's terms. Anything that must be exact reads cg.sweep.econ, which carries the
+	// session id. Said plainly here because a number in a dump invites being trusted.
+	lastEcon atomic.Pointer[econDecision]
+	// keepRecheckTurns is how many model turns must pass before re-offering a candidate the adjudicator
+	// already judged still needed. 0 = off. See extractSweepConfig.KeepRecheckTurns.
+	keepRecheckTurns int
 	// minPressure is the opportunity floor for the REQUEST: the share of the model window it must
 	// occupy before this component will collect candidates at all. See the gate in Offload.
 	minPressure float64
@@ -149,6 +161,23 @@ type extractSweepConfig struct {
 	// has yet been superseded. Measured across 18 probe asks: 0.10 blocks the three uninformative early
 	// asks for 114 removed tokens, 0.20 blocks seven for 11,891. Prefer the low end.
 	MinPressure float64 `yaml:"min_pressure"`
+	// KeepRecheckTurns is how many model turns must pass before a candidate the adjudicator already
+	// judged STILL NEEDED is offered again. 0 (off) by default, which is the behaviour every iteration
+	// up to 027 had: every candidate is re-offered, and re-paid for, every turn.
+	//
+	// WHY IT IS WORTH A KNOB. Measured on one probe pass, SEVEN of ten adjudications were the same five
+	// candidates at the same 41,453 tokens, kept every time — 70% of the pass's adjudication spend
+	// buying a verdict already given. Drops are frozen and replayed; keeps were forgotten.
+	//
+	// WHY IT MUST NOT BE LARGE, and why "cache the keep forever" is the wrong instinct: "still needed"
+	// is a judgement about the conversation's CURRENT obligations, not a property of the bytes. Suppress
+	// re-asking for too long and a candidate judged needed once becomes unreachable, which disables the
+	// component for precisely the outputs it most wants and reads in the counters as an inventory that
+	// quietly shrank. Read `sweep_keep_still_held` against `sweep_offered`.
+	//
+	// Counted in TURNS rather than seconds deliberately: what changes whether an output is spent is the
+	// agent doing more work, and wall-clock says nothing about that.
+	KeepRecheckTurns int `yaml:"keep_recheck_turns"`
 	// RewardPremium is how much a removed token is worth relative to the cache read it saves, and it
 	// is the only term in the break-even that is a BELIEF rather than a measurement.
 	//
@@ -311,7 +340,7 @@ func newExtractSweep(raw []byte) (components.Component, error) {
 		blockFallback: cfg.BlockFallback, econTrigger: cfg.EconTrigger,
 		evidence: cfg.Evidence, ignoreAskCost: cfg.EconIgnoreAskCost,
 		minLaterTurns: cfg.MinLaterTurns, minPressure: cfg.MinPressure,
-		rewardPremium: cfg.RewardPremium,
+		rewardPremium: cfg.RewardPremium, keepRecheckTurns: cfg.KeepRecheckTurns,
 		// Per component INSTANCE, which is per configured pipeline. Two pipelines running different
 		// prompts would learn different approval rates, and sharing one ledger between them would
 		// average two workloads into a number describing neither.
@@ -429,6 +458,11 @@ func (e *ExtractSweep) econPays(req *bschemas.BifrostChatRequest, c *components.
 		d.askUSD, d.approval, d.measured = e.asks.estimate(askCostPrior(req, c))
 	}
 	e.priceBatch(req, saved, shallowest, &d, c)
+	// Stashed for the ask dump, which is written inside adjudicate and cannot see this decision.
+	// Guarded so nothing is retained when dumping is off.
+	if sweepAskDumpDir() != "" {
+		e.lastEcon.Store(&d)
+	}
 	d.reqTokens, d.pressure = sweepPressure(req, c)
 	// PRESSURE ON EVERY DECISION, fire or decline. `have` already carries the horizon this trigger
 	// reasons about, but it is a projection -- and the open question about this component is whether it
@@ -818,8 +852,23 @@ func (e *ExtractSweep) Offload(req *bschemas.BifrostChatRequest, rep *components
 		// there is nothing worth asking about and declining is right. That is the opposite of
 		// `4ca1f13`, where the removed candidates were judgeable and the batch was starved of them.
 		// Counted either way, and `sweep_inventory_thinned` below still trips if this thins silently.
-		if e.minLaterTurns > 0 && laterModelTurns(req, i) < e.minLaterTurns {
+		later := laterModelTurns(req, i)
+		if e.minLaterTurns > 0 && later < e.minLaterTurns {
 			rep.Gate("sweep_candidate_too_new")
+			continue
+		}
+		// ALREADY ANSWERED. A candidate the adjudicator judged still needed is not re-offered until the
+		// conversation has moved on by keepRecheckTurns model turns — see sweep_keepcache.go for why the
+		// interval is in turns and why it must exist rather than caching the keep outright.
+		//
+		// SUPPRESSING AN OFFER IS NOT THE REFUTED PRE-FILTER, and the distinction is worth stating here
+		// because it sits at the exact line 4ca1f13's defect occupied. That filter substituted the
+		// INDEX's opinion for the model's, so the model only ever saw what the index had already judged
+		// spent. This substitutes the MODEL'S OWN PRIOR ANSWER, unchanged, and only until the state it
+		// was answering about has changed. It removes a repeated question, not a veto.
+		if held, since := sweepKeepStillHolds(c, id, later, e.keepRecheckTurns); held {
+			rep.Gate("sweep_keep_still_held")
+			_ = since
 			continue
 		}
 		eligible++
@@ -1116,6 +1165,15 @@ func (e *ExtractSweep) adjudicate(req *bschemas.BifrostChatRequest, c *component
 			byIdx[recs[i].Idx] = &recs[i]
 		}
 	}
+	// ONE FLUSH POINT FOR EVERY EXIT, on the same reasoning as foldFallback below: this function
+	// returns from a dozen places, and a per-site write would miss the ones added later. A dump of a
+	// FAILED ask — prompt present, reply empty — is as diagnostic as a successful one, so the deferred
+	// write is not conditional on getting an answer.
+	dumpDir := sweepAskDumpDir()
+	var dump *sweepAskDump
+	if dumpDir != "" {
+		defer func() { writeSweepAskDump(dumpDir, dump) }()
+	}
 	items := make([]extract.AdjudicationItem, 0, len(cands))
 	for k := range cands {
 		it := extract.AdjudicationItem{
@@ -1282,7 +1340,23 @@ func (e *ExtractSweep) adjudicate(req *bschemas.BifrostChatRequest, c *component
 		fellBack = true
 	} else {
 		askStart := time.Now()
-		reply, usage, err = c.PrefixAsk.Ask(ctx, c.Session, extract.BuildPrefixAsk(items))
+		// NAMED rather than inlined, so the dump records the prompt AS SENT. A dump that rebuilt the
+		// prompt from `items` would be a reconstruction, and the whole point of capturing it is to be
+		// able to review the text the model actually received.
+		askPrompt := extract.BuildPrefixAsk(items)
+		if dumpDir != "" {
+			dump = newSweepAskDump(req, c.Session, c.ModelName, items, cands, askPrompt)
+			dump.Trigger = "pre_expiry"
+			if d := e.lastEcon.Load(); d != nil && d.ok {
+				dump.Trigger = "econ"
+				dump.Econ = &sweepAskDumpEcon{
+					NeedTurns: d.need, HaveTurns: d.have, Premium: e.rewardPremium,
+					Approval: d.approval, AskUSD: d.askUSD, ReqTokens: d.reqTokens,
+					Pressure: d.pressure, Offered: d.offered,
+				}
+			}
+		}
+		reply, usage, err = c.PrefixAsk.Ask(ctx, c.Session, askPrompt)
 		askMs = float64(time.Since(askStart).Milliseconds())
 		// ErrNoPrefix is refused LOCALLY — there is no stashed body to append to, so no request
 		// leaves the process. Booking it as a call would put a 0 ms, $0 sample into the mean that
@@ -1385,6 +1459,9 @@ func (e *ExtractSweep) adjudicate(req *bschemas.BifrostChatRequest, c *component
 	}
 
 	verdicts, parsed := extract.ParseVerdicts(reply)
+	if dump != nil {
+		dump.Reply, dump.ViaTool, dump.Parsed = reply, usage.ViaTool, parsed
+	}
 	if !parsed {
 		// TRUNCATION IS NOT JUNK, and the two need opposite fixes -- raise the budget versus fix the
 		// prompt -- so one name for both hid a 70%-of-calls failure behind a label that reads as "the
@@ -1435,6 +1512,21 @@ func (e *ExtractSweep) adjudicate(req *bschemas.BifrostChatRequest, c *component
 	// increment for why the ledger's reason is derived from this rather than from the skip gates.
 	var spentJudged int
 	var judgedTokens int
+	// RECORDED AT EACH BRANCH, never derived afterwards. Deriving the outcome from the verdict a second
+	// time would mean the dump agrees with a re-implementation of this loop rather than with the loop —
+	// and the divergence between what the model SAID and what the component DID is precisely the row
+	// worth reading (a self-contradictory drop leaves the output in place).
+	noteVerdict := func(v extract.Verdict, a extract.Adjudication, outcome string) {
+		if dump == nil {
+			return
+		}
+		dump.Verdicts = append(dump.Verdicts, sweepAskDumpVerdict{
+			Label: v.Label, Drop: a.Drop, NeededBy: v.NeededBy, Quote: v.Quote,
+			QuoteFabricated: a.QuoteFabricated, CriterionMissing: a.CriterionMissing,
+			VerdictUnusable: a.VerdictUnusable, RefusedObligation: a.RefusedObligation,
+			Outcome: outcome,
+		})
+	}
 	for _, v := range verdicts {
 		if v.Label < 0 || v.Label >= len(cands) {
 			// A verdict for something we did not offer. NEVER acted on: the label is how a decision is
@@ -1448,10 +1540,12 @@ func (e *ExtractSweep) adjudicate(req *bschemas.BifrostChatRequest, c *component
 			// the content makes mis-keying less likely in the first place, which is the only defence
 			// available against a plausible-but-wrong label.
 			r.gate("sweep_verdict_unknown_label")
+			noteVerdict(v, extract.Adjudication{}, "unknown_label")
 			continue
 		}
 		if seen[v.Label] {
 			r.gate("sweep_verdict_duplicate_label")
+			noteVerdict(v, extract.Adjudication{}, "duplicate_label")
 			continue
 		}
 		seen[v.Label] = true
@@ -1484,10 +1578,16 @@ func (e *ExtractSweep) adjudicate(req *bschemas.BifrostChatRequest, c *component
 		}
 		if a.RefusedObligation {
 			r.gate("sweep_drop_refused_obligation")
+			noteVerdict(v, a, "refused_obligation")
 			continue
 		}
 		if !a.Drop {
 			r.gate("sweep_kept")
+			noteVerdict(v, a, "kept")
+			// RECORDED AT THE BRANCH that took the decision, beside the counter, so a keep cannot be
+			// counted without being remembered. Keyed by CONTENT, so the same output recurring in a
+			// later turn's transcript resolves to the same record.
+			recordSweepKeep(c, cands[v.Label].id, laterModelTurns(req, cands[v.Label].i))
 			continue
 		}
 		sz := schema.TextTokens(content)
@@ -1496,9 +1596,11 @@ func (e *ExtractSweep) adjudicate(req *bschemas.BifrostChatRequest, c *component
 			// The never-worse check also lives in applySweepDrop, marker included. This one is here
 			// so a decision phase 3 will refuse is not counted as a removal.
 			r.gate("sweep_drop_would_not_shrink")
+			noteVerdict(v, a, "would_not_shrink")
 			continue
 		}
 		r.event("sweep_dropped")
+		noteVerdict(v, a, "dropped")
 		drop = append(drop, v.Label)
 		judgedTokens += sz - after
 		// NOT BOOKED HERE. A verdict is a decision, not a removal: phase 3 still has to apply it,
@@ -1739,6 +1841,9 @@ func init() {
 			Hint: "Per-candidate OPPORTUNITY FLOOR: do not offer an output with fewer than this many model turns after it. Unset = 0 = off. Such an output has not yet had the chance to be superseded, so \"still needed\" is the only answer the adjudicator can give and it is not evidence about whether the output is spent. This is not the refuted pre-filter: it carries no verdict, it says the question is premature. 8 mirrors coref's min_later_turns, which exists for the same reason. It matters because the ECONOMIC trigger fires most eagerly exactly where the question is least answerable -- measured, the first ask of a session landed on a 2,621-token transcript with 88% of it candidate output, no cached prefix to rewrite and 70 projected turns to collect over, clearing the break-even by 3.3x at 4% context pressure, and removing nothing. Those are the ask ledger's warm-up samples. Read sweep_candidate_too_new against sweep_offered before trusting a value: on all-recent transcripts it can empty the inventory, which is correct rather than broken."},
 		{Key: "reward_premium", Type: components.FieldFloat, Min: 1,
 			Hint: "How much a REMOVED TOKEN is worth relative to the cache read it saves — the only term in the break-even that is a belief rather than a measurement. Unset = 1 = the unadjusted arithmetic. Raise it when a removal is worth more to you than the reads it avoids, and be able to say why: on iteration 024 this component spent $20.26 to bank $0.72 of cache savings, 28:1 against, while task accuracy rose 0.486 -> 0.608 with 8 tasks better and 0 worse (clustered p = 0.0078). Sizing a premium to reproduce that run's firings lands on the same 28 independently. 20 is the rounder, weaker claim and behaves the same (53% of that run's removal value either way). Values below 1 are REFUSED: they assert a removal is worth less than the read it saves, which nothing measured supports and which tightens a gate already 5x too tight — priced correctly, the shipped break-even authorises 19% of the removal value that produced iteration 024's reward result. Above 100 is refused as a typo. IT CANNOT RESCUE A ZERO HORIZON: with no turns left, ceil(need/premium) >= 1 > 0 refuses at any premium, which is why this pairs with the horizon crediting its own removal (#232). Read `premium` on cg.sweep.econ to re-price a run's declines without re-running it.",
+		},
+		{Key: "keep_recheck_turns", Type: components.FieldInt, Min: 0,
+			Hint: "How many model turns must pass before re-offering a candidate the adjudicator already judged STILL NEEDED. Unset = 0 = off, which re-offers and re-pays for every candidate every turn. Measured on one probe pass: SEVEN of ten adjudications were the same five candidates at the same 41,453 tokens, kept every time — 70% of that pass's adjudication spend buying a verdict already given, because drops are frozen and replayed through cg:res: while keeps were forgotten. DO NOT SET IT LARGE, and do not reach for \"cache the keep forever\": \"still needed\" is a judgement about the conversation's current obligations, not a property of the bytes, so suppressing the question for too long makes a candidate judged needed once unreachable for the rest of the session — which disables the component for precisely the outputs it most wants and reads in the counters as an inventory that quietly shrank rather than as a component that stopped asking. Counted in TURNS, not seconds, because what changes whether an output is spent is the agent doing more work. A transcript that got SHORTER behind an output (agent-side compaction, a rewind) invalidates the record rather than extending it. Read sweep_keep_still_held against sweep_offered.",
 		},
 		{Key: "min_pressure", Type: components.FieldFloat, Min: 0,
 			Hint: "Request-level OPPORTUNITY FLOOR: the share of the model window a request must occupy before candidates are collected at all. Unset = 0 = off. The economic trigger is most eager exactly where its question is least answerable -- maximum projected turns, nothing cached to rewrite, and candidate mass a large fraction of a small transcript -- so without a floor the ask ledger's warm-up samples are drawn from the moment nothing has been superseded yet, and a low reading there suppresses the asks that would correct it. Measured across 18 probe asks: 0.10 blocks exactly the three uninformative early asks and costs 114 removed tokens; 0.20 blocks seven and costs 11,891; 0.70 blocks seventeen. Prefer the low end, and read sweep_below_min_pressure against sweep_offered on your own workload. Applies to both triggers, because a transcript too young for anything in it to be spent is too young regardless of why the sweep woke up."},

@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| binary | `cg-i027-proxy-v02`, SHA-256 (first 32) `827876e9e0893db05f6b4abebe073de6` — v01 ran the mechanism probe only; v02 adds the summarize decline labels |
+| binary | `cg-i027-proxy-v03`, SHA-256 (first 32) `607ef085d0151c4048f6460345429070` — v01 ran the first mechanism probe, v02 added the summarize decline labels, v03 adds the adjudication dump (`CG_SWEEP_ASK_DUMP`, off unless a directory is named) |
 | arms | `cfg-iter027-{A-baseline,B-merged}.yaml` |
 | B differs by | **five lines** — `evidence`, `econ_trigger`, `reward_premium: 20`, `min_pressure: 0.20`, `min_inventory: 3` |
 | pipeline | **`housellm` + `summarize`** — `collapse` removed from both arms, see [The pipeline is now the one being claimed](#the-pipeline-is-now-the-one-being-claimed) |

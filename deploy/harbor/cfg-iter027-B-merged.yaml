@@ -111,6 +111,26 @@ components:
     # a floor is not how to get large batches, it is how to decline. Read sweep_inventory_below_min
     # against sweep_offered.
     min_inventory: 3
+    # THE PER-CANDIDATE OPPORTUNITY FLOOR, which iteration 027's first three probes left OFF. It is the
+    # one this failure needed and I set the request-level floor instead: measured on the probe, 3 of 46
+    # offered candidates had later_turns == 0 -- the model had taken no turn since receiving them -- and
+    # they carried 22% of all offered token mass, including the 56,399-token output kept under a quote
+    # that is not in the transcript. "Still needed" is the only honest answer about an output the model
+    # has not yet had the chance to act on, so the verdict carries no information and we pay for it.
+    #
+    # 3 rather than coref's 8: at 8 the probe would have lost 12 of 46 candidates, and the drop it did
+    # get came from the 1-4 bucket. Read sweep_candidate_too_new against sweep_offered.
+    min_later_turns: 3
+    # STOP RE-BUYING AN ANSWER WE ALREADY HAVE. Seven of the probe's ten adjudications were the same five
+    # candidates at the same 41,453 tokens, kept every time -- 70% of the pass's adjudication spend on a
+    # verdict already given, because drops are frozen and replayed while keeps were forgotten.
+    #
+    # 4 turns, not "forever": "still needed" is a judgement about the conversation's current obligations,
+    # not a property of the bytes, so a permanent keep would make a candidate judged needed once
+    # unreachable for the rest of the session. On the probe's trace (the same output re-asked at
+    # later_turns 5,6,7,8,9,10,11) a recheck of 4 gives two asks instead of seven and keeps every chance
+    # to change the verdict. Read sweep_keep_still_held against sweep_offered.
+    keep_recheck_turns: 4
   summarize:
     trigger: {min_request_frac: 0.90}
     resummarize_tokens: 20000

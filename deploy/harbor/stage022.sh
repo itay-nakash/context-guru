@@ -16,6 +16,12 @@ NAME="$1"; BIN="$2"; CFG="$3"; PORT="$4"; TASKCFG="$5"; BAND="${6:-32}"
 # a proxy told 64k while LOCA clears at 32k measures a pressure curve nothing else shares.
 CLEAR_AT=$((BAND*1000)); CLEAR_LEAST=$((BAND*1000/4))
 set -a; . "$HOME/.cg-bench/env"; set +a
+# THE ADJUDICATION DUMP is passed through when the CALLER sets it, and is otherwise absent. Off by
+# default because it writes the full prompt and transcript of every ask to disk in the clear — which is
+# what makes it the only way to ask "was that judgement right, or is the prompt wrong", and exactly why
+# it must be a deliberate act on a controlled box. Set it per pass:
+#
+#   CG_SWEEP_ASK_DUMP=$HOME/cg-loca/askdump-$NAME bash run027.sh probe
 export ANTHROPIC_CUSTOM_HEADERS=          # benchmark traffic must NOT go through Context Guru
 export UV_CONSTRAINT="$H/uv-constraints.txt"   # mcp<2 : 2.1.1 removed Server.list_tools
 export PATH="$H/bin:$H/.venv/bin:/home/vpcuser/.nvm/versions/node/v22.23.2/bin:$PATH"
@@ -79,6 +85,7 @@ CHEAP_MODEL=aws/claude-haiku-4-5 CHEAP_MODEL_PROVIDER=anthropic \
 CHEAP_MODEL_BASE="$ANTHROPIC_BENCHMARK_BASE_URL" CHEAP_MODEL_KEY="$ANTHROPIC_AUTH_TOKEN" \
 CHEAP_MODEL_AUTH=bearer LISTEN_ADDR=":$PORT" CACHE_MODE=on INJECT_EXPAND=always CONTEXT_GURU_PREFIX_ASK=1 \
 CG_LOG_LEVEL=debug CG_LOG_FILE="$H/i022log-$NAME.jsonl" \
+CG_SWEEP_ASK_DUMP="${CG_SWEEP_ASK_DUMP:-}" \
 "$BIN" --config "$CFG" > "$H/i022proxy-$NAME.log" 2>&1 &
 PXPID=$!
 for i in $(seq 1 40); do curl -sf "http://localhost:$PORT/healthz" >/dev/null && break; sleep 0.5; done
