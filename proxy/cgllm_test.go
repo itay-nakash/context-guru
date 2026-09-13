@@ -417,41 +417,57 @@ func TestTheCallersAuthSchemeSurvivesIntoOurOwnCalls(t *testing.T) {
 // row carries the work until the session's next turn — so these counters are not decoration, they
 // are the only signal that exists.
 //
-// This pins the ROUTE rather than the values: that each field is wired to its source at all. A
-// counter maintained and served to nobody is the failure being prevented.
+// IT CALLS THE REAL HANDLER AND READS THE WIRE. An earlier version of this test re-executed the
+// handler's own assignment expression against a local Snapshot, which pinned a COPY of the route:
+// swapping two fields in proxy.go alone would have passed it, because the test performed the same
+// swap. That is the same shape as the defect it was written to prevent — a check that cannot fail
+// for the thing it names — so it decodes /stats instead.
+//
+// The concurrency bound is what makes the field-to-source pairing assertable: it is a distinctive
+// constant, so reading it back off the wire proves the field carries ITS source rather than merely
+// existing. The counts themselves are zero in a fresh process, so key existence (which
+// stats_golden_test pins over the real handler) is all they can be held to here.
 func TestAsyncSummaryCountersReachStats(t *testing.T) {
-	started, committed, waitedMs, waitTimeouts, refused, unresolved := offload.AsyncSummaryStats()
-	bound := offload.MaxConcurrentSummaries()
-	if bound <= 0 {
-		t.Fatalf("MaxConcurrentSummaries = %d; a refusal count is meaningless without the ceiling "+
-			"it was measured against", bound)
+	if offload.MaxConcurrentSummaries() <= 0 {
+		t.Fatal("MaxConcurrentSummaries is not positive; a refusal count is meaningless without " +
+			"the ceiling it was measured against")
 	}
 
-	var snap metrics.Snapshot
-	snap.SummarizeAsyncStarted, snap.SummarizeAsyncCommitted,
-		snap.SummarizeAwaitedMs, snap.SummarizeAwaitTimeouts,
-		snap.SummarizeAsyncRefused, snap.SummarizeAsyncUnresolved = offload.AsyncSummaryStats()
-	snap.SummarizeAsyncConcurrency = offload.MaxConcurrentSummaries()
+	h := New(nil, nil, metrics.NewAggregator(), Options{})
+	w := httptest.NewRecorder()
+	h.stats(w, httptest.NewRequest("GET", "/stats", nil))
+	if w.Code != 200 {
+		t.Fatalf("/stats -> %d", w.Code)
+	}
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("/stats is not a JSON object: %v", err)
+	}
 
-	// Every field must be reachable and must carry its source's value. Written as a table so a
-	// SEVENTH counter added without a snapshot field fails here rather than silently going nowhere.
-	for _, c := range []struct {
-		name string
-		got  int64
-		want int64
-	}{
-		{"summarize_async_started", snap.SummarizeAsyncStarted, started},
-		{"summarize_async_committed", snap.SummarizeAsyncCommitted, committed},
-		{"summarize_awaited_ms", snap.SummarizeAwaitedMs, waitedMs},
-		{"summarize_await_timeouts", snap.SummarizeAwaitTimeouts, waitTimeouts},
-		{"summarize_async_refused", snap.SummarizeAsyncRefused, refused},
-		{"summarize_async_unresolved", snap.SummarizeAsyncUnresolved, unresolved},
-		{"summarize_async_concurrency", snap.SummarizeAsyncConcurrency, bound},
+	// Every async field must be present ON THE WIRE, not merely in the struct.
+	for _, k := range []string{
+		"summarize_async_started", "summarize_async_committed", "summarize_async_refused",
+		"summarize_async_unresolved", "summarize_awaited_ms", "summarize_await_timeouts",
+		"summarize_async_concurrency",
 	} {
-		if c.got != c.want {
-			t.Errorf("%s = %d, want %d: the snapshot field is not wired to its source",
-				c.name, c.got, c.want)
+		if _, ok := got[k]; !ok {
+			t.Errorf("%s is absent from /stats: the counter is maintained and served to nobody, "+
+				"which off the hot path means its path has no signal at all", k)
 		}
+	}
+
+	// The pairing, via the one field with a distinctive value: this proves the wire field is fed
+	// from its source rather than from some other counter that happens to be zero too.
+	var concurrency int64
+	if raw, ok := got["summarize_async_concurrency"]; ok {
+		if err := json.Unmarshal(raw, &concurrency); err != nil {
+			t.Fatalf("summarize_async_concurrency is not a number: %v", err)
+		}
+	}
+	if concurrency != offload.MaxConcurrentSummaries() {
+		t.Errorf("summarize_async_concurrency on the wire = %d, want %d from "+
+			"offload.MaxConcurrentSummaries(): the field is not wired to its source",
+			concurrency, offload.MaxConcurrentSummaries())
 	}
 }
 
