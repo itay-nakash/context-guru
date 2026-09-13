@@ -267,6 +267,17 @@ finished inside the time range being viewed; voided means the client compacted i
 part-way through, which is the very thing this trigger tries to get ahead of, so the remainder is
 not comparable.
 
+!!! note "Expect the settled total to be empty on a young session, by design"
+    The span is 10% of the window's worth of **new** content, and a summarized session adds new
+    content slowly — a few hundred to a few thousand tokens a turn. So a session that has only just
+    been summarized shows an **open** episode with its credits populated and a **settled total of
+    $0**, which is correct rather than broken: the per-episode row is where the money is visible
+    until the span closes. Verified on a live run, where five turns after the summary had accrued
+    3,486 of a 20,000 target.
+
+    If you want to see the closing behaviour on a session that has not run long enough, narrow the
+    span with `?span=` on the API — the axis is the same, only the threshold moves.
+
 The measurement introduces no new pricing. Every dollar comes from the same per-request figures the
 rest of the dashboard uses, priced when the request was recorded at the rates then in force — the
 panel scopes them into spans and splits them by the cache state of the turn that earned them.
