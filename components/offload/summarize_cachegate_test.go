@@ -475,3 +475,53 @@ func commissionThenSplice(t *testing.T, s *Summarize, msgs []bschemas.ChatMessag
 	}
 	return second, &rep2
 }
+
+// The GLOBAL bound refuses rather than queues, and says which refusal it was.
+//
+// Single-flight is per session and is about correctness — two summaries over one transcript race to
+// write the same checkpoint. This is a different property: a burst of sessions returning from idle
+// can each commission a ~57k-token call at once, and the detached path has none of the inline
+// path's accidental self-limiting (a call used to occupy a request, so it was bounded by server
+// concurrency and visible in that request's latency and row).
+//
+// Saturation must be a REFUSAL, not a wait: a summary is a cost-saving measure, so a proxy under
+// enough load to saturate the bound should decline to compact rather than queue work nobody is
+// waiting for. And the two refusals get different gate names because they have different remedies —
+// a busy session is self-correcting, a full bound means the deployment is shedding compaction.
+func TestTheGlobalBoundRefusesWithItsOwnGateName(t *testing.T) {
+	// Fill every slot, and release them however this test exits.
+	for i := 0; i < maxConcurrentSummaries; i++ {
+		summarySlots <- struct{}{}
+	}
+	defer func() {
+		for i := 0; i < maxConcurrentSummaries; i++ {
+			<-summarySlots
+		}
+	}()
+
+	s := newCacheGatedSummarize(t, "")
+	s.modelClient = &countingModel{out: "SUMMARY: saturated."}
+	st := store.NewMemory(store.Options{MaxEntries: 400})
+	msgs := sumTranscript(3)
+	req := &bschemas.BifrostChatRequest{Input: append([]bschemas.ChatMessage(nil), msgs...)}
+	ctx := sumCtx(st, "pre_expiry", 0, false, 0)
+	ctx.Session = "saturated-session"
+	var rep components.Report
+	if _, err := s.Offload(req, &rep, ctx); err != nil {
+		t.Fatalf("Offload must fail open: %v", err)
+	}
+	if rep.Gates["summary_concurrency_full"] == 0 {
+		t.Errorf("want the summary_concurrency_full gate, got %v — a saturated bound must be "+
+			"distinguishable from a busy session, which is an ordinary self-correcting state",
+			rep.Gates)
+	}
+	if rep.Gates["summary_already_in_flight"] != 0 {
+		t.Error("a full global bound was reported as a busy session; the two have different remedies")
+	}
+	// The per-session flight must have been RELEASED, or the session is wedged: a refusal that
+	// left it marked busy would make its next turn report the wrong reason forever.
+	if _, running := inFlight.peek(ctx.Session); running {
+		t.Error("the refused session is still marked in-flight, so its next turn would report " +
+			"summary_already_in_flight for a call that never started")
+	}
+}

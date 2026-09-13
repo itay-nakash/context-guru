@@ -652,6 +652,18 @@ func (e *ExtractLLM) Offload(req *bschemas.BifrostChatRequest, rep *components.R
 	// Resolved once: the candidate loop below tests it per tool output, and it is a
 	// handler call rather than a field read.
 	dbg := debugExtractLLM(c)
+	// THE FRACTION IS BEST-EFFORT HERE, and deliberately not held to summarize's standard.
+	//
+	// Trigger.Fires compares min_request_frac against Ctx.PrevBilledInput (the provider's own count
+	// for the session's previous turn) and SKIPS the conjunct when that is 0 — a session's first
+	// turn, or a host that does not record it. summarize refuses such a turn outright via
+	// FracResolvable, because it is deciding "is this context nearly full" and a wrong answer there
+	// compacts at the wrong size.
+	//
+	// This component is deciding whether a turn is big enough to be worth looking at, and its real
+	// gate is the per-candidate economics below. Adopting FracResolvable would make it fire LESS on
+	// exactly the deployments that cannot report a billed figure, for no gain in correctness — so
+	// the asymmetry is a choice, not an oversight. docs/components/extract_llm.md says so.
 	fires := e.trigger.Fires(req, c)
 	goal := e.extractionContext(req)
 	query := keywords(goal)

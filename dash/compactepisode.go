@@ -73,8 +73,12 @@ type compactRow struct {
 	// unknown. It is what splits the credit.
 	MissReason string
 	// CacheWrite / CacheWrite1h are this turn's cache-creation tokens, and the 1h-tier subset.
-	// Read only on t0, to price the invalidation this component itself caused.
+	// Read to price the invalidation this component caused, and to classify a write as NEW content
+	// or as re-creation of an expired prefix (see newContentBilled).
 	CacheWrite, CacheWrite1h int64
+	// CacheRead is what the provider served from its cache. Never new content, and its presence is
+	// what distinguishes a newly-written TAIL from the re-creation of a whole expired prefix.
+	CacheRead int64
 	// CGLLMCostUSD is context-guru's own model spend on this request — the summarizer's call.
 	CGLLMCostUSD float64
 	// SavedUSD is summarize's share of this request's baseline delta, priced at write time.
@@ -127,12 +131,13 @@ type CompactionEpisode struct {
 	Window      int   `json:"window"`
 	StartBilled int64 `json:"start_billed"`
 	EndBilled   int64 `json:"end_billed"`
-	// SpentBilled is the provider-billed input CONSUMED since t0, summed over the span's turns.
-	// It is the axis the span closes on, because it is the only one that grows monotonically: a
-	// per-turn size falls as soon as a summary lands (measured: 154,584 -> 31,682), so a span
-	// defined against it never closes.
-	SpentBilled int64 `json:"spent_billed"`
-	Turns       int64 `json:"turns"`
+	// NewContentBilled is the provider-billed NEW content since t0 — fresh input plus the
+	// newly-written tail on turns whose cache hit. It is the axis the span closes on: monotone by
+	// construction, in the window's own units, and excluding both the re-sent prefix and the
+	// re-creation of an expired one. See the derivation in conversationEpisodes for why the two
+	// obvious axes (per-turn size, cumulative spend) each fail.
+	NewContentBilled int64 `json:"new_content_billed"`
+	Turns            int64 `json:"turns"`
 	// The credit, split by the cache state of the turn that earned it. ColdCreditUSD is the
 	// headline: turns whose entry had lapsed, where an uncompacted prefix would have been
 	// re-written in full. ReadCreditUSD is every warm turn's re-sent remainder at 0.1x, which is
@@ -251,8 +256,17 @@ type CompactionEpisodes struct {
 // Defaults for the two fractions. Both are parameters rather than constants of nature, and both
 // are reported in Assumptions.
 const (
-	// defaultSpanFrac is the 10%-more-of-the-window span: long enough to contain several cold
-	// misses on real traffic, short enough that a session's later behaviour does not dominate.
+	// defaultSpanFrac is the span: 10% of the window's worth of NEW content after t0.
+	//
+	// The word "new" is what makes the number mean something. On the live haiku run the turns
+	// after a summary added 3,323 / 158 / 275 billed tokens of new tail against a 20,000 target,
+	// so the span covers on the order of tens of turns and minutes-to-hours of wall clock — long
+	// enough for the idle gaps a cold miss needs. Measured against cumulative SPEND instead, the
+	// same 20,000 was exceeded by the single turn after t0.
+	//
+	// It is not a tuned optimum, and the honest test of it is whether ColdCreditUSD is ever
+	// non-empty on real traffic — which the validation run has not yet shown, because every
+	// post-summary turn there was warm.
 	defaultSpanFrac = 0.10
 	// defaultFillFrac matches summarize's own shipped min_request_frac, so the coverage
 	// population is the one the trigger is actually deciding about.
@@ -438,19 +452,32 @@ func conversationEpisodes(conv []compactRow, w int, p kvcache.Pricing, spanFrac 
 				// arrival while the expiry happened inside the pipeline.
 				cur.InvalidationDebitUSD += writeUSD(r.CacheWrite, r.CacheWrite1h, p)
 			}
-			// CUMULATIVE billed input, not the difference between two request sizes. Compaction
-			// REDUCES what a turn sends, so `r.Billed` falls the moment a summary lands — on the
-			// live validation run it went 154,584 -> 31,682 — and a span defined as
-			// `Billed >= StartBilled + span` could then never close: it would be waiting for the
-			// transcript to regrow past a size the compaction had just removed. The episode stayed
-			// `open` forever and contributed to no total, which is the same blindness as having no
-			// episode at all.
+			// CUMULATIVE NEW CONTENT, which is neither of the two obvious axes.
 			//
-			// Cumulative spend is monotone by construction, is in the provider's units (so it is
-			// comparable to the window), and is what "10% more of the context has been SPENT"
-			// actually means.
-			cur.SpentBilled += r.Billed
-			if cur.SpentBilled >= span {
+			// Per-turn SIZE does not work: compaction reduces what a turn sends, so `r.Billed`
+			// falls the moment a summary lands — on the live run 154,584 -> 31,682 — and a span
+			// waiting for it to exceed t0's size never closes at all.
+			//
+			// Cumulative SPEND does not work either, and that was the first correction's mistake:
+			// billed input re-counts the whole prefix every turn, so one turn of a qualifying
+			// conversation already exceeds 10% of the window. On the live run the span was 20,000
+			// against a next-turn 31,682, so it closed on the turn immediately after t0 — a span
+			// of seconds, in which no cold miss can occur, making the headline ColdCreditUSD
+			// bucket structurally empty. The threshold kept its growth-shaped 0.10 while the axis
+			// became a spend, which is the same units error one level up.
+			//
+			// So the axis is what NEW CONTENT entered the conversation, in the provider's own
+			// units, which is comparable to the window and monotone by construction:
+			//
+			//   - fresh_input is new by definition.
+			//   - cache_write on a turn that HIT is the newly-written tail — content that was not
+			//     in the entry the turn read from, i.e. new.
+			//   - cache_write on a turn that MISSED is re-creation of a prefix that already
+			//     existed. Counting it would call the whole transcript "new" every time an entry
+			//     expired, which is exactly the over-count that made a cold t0 close its own span.
+			//   - cache_read is the re-sent prefix and is never new.
+			cur.NewContentBilled += newContentBilled(r)
+			if cur.NewContentBilled >= span {
 				cur.State = EpisodeClosed
 				finishEpisode(cur, p)
 				out = append(out, *cur)
@@ -577,6 +604,31 @@ func isFreshSummary(r compactRow) string {
 	return ""
 }
 
+// newContentBilled is how much of a turn's billed input was CONTENT THE CONVERSATION HAD NOT SEEN,
+// in the provider's own units.
+//
+// It is the episode span's axis. See conversationEpisodes for why the alternatives fail; the rule
+// here is just the classification:
+//
+//   - fresh_input: new by definition.
+//   - cache_write on a turn that HIT: the newly-written tail, which was not in the entry the turn
+//     read from.
+//   - cache_write on a turn that MISSED: re-creation of a prefix that already existed, so not new.
+//     Counting it would call a whole transcript "new" every time an entry expired.
+//   - cache_read: the re-sent prefix. Never new.
+func newContentBilled(r compactRow) int64 {
+	// Billed = fresh + read + write, and the row carries read and write, so fresh is the remainder.
+	fresh := r.Billed - r.CacheRead - r.CacheWrite
+	if fresh < 0 {
+		fresh = 0
+	}
+	n := fresh
+	if r.CacheRead > 0 {
+		n += r.CacheWrite
+	}
+	return n
+}
+
 // causedWriteUSD prices only the cache creation WE are responsible for on a summarizing turn.
 //
 // THE DISTINCTION DECIDES WHETHER THIS PANEL REPORTS A GAIN OR A LOSS, and getting it wrong was
@@ -675,13 +727,13 @@ func compactAssumptions(spanFrac, fillFrac float64) CompactionAssumptions {
 	return CompactionAssumptions{
 		SpanFrac:    spanFrac,
 		FillFrac:    fillFrac,
-		SpanMeasure: "provider-billed input (fresh + cache read + cache write), the units the context window is stated in",
+		SpanMeasure: "provider-billed NEW content (fresh input, plus the newly-written tail on turns whose cache hit), in the units the context window is stated in",
 		CreditSource: "request_components.saved_usd for the summarize component, priced at write time " +
 			"(Event.baselineDeltaUSD: unique removals at the cache-creation rate, re-sent " +
 			"removals at the rate that turn's cache actually paid)",
 		ColdLabel:       "turns whose cache_miss_reason is ttl_expiry — the entry had lapsed, so an uncompacted prefix would have been re-written in full",
 		ReadLabel:       "turns whose cache_miss_reason is hit — the re-sent remainder, billed at the cache-read rate",
-		SpanMeasureNote: "the span closes on CUMULATIVE billed input since t0, which is the only monotone axis: a per-turn size falls as soon as a summary lands",
+		SpanMeasureNote: "the span closes on cumulative NEW content since t0 — fresh input plus the newly-written tail on turns whose cache hit. It excludes the re-sent prefix (a cache read) and the re-creation of an expired one (a cache write on a miss), because counting either makes one turn exceed the whole span",
 		DebitBound:      "cache-creation tokens on a summarizing turn, charged ONLY where the entry was still live: on a turn whose cache had already expired the write was due whatever we did, so none of it is our cost. Where it is charged it is an upper bound, since some of that write was transcript growth that would have been paid anyway",
 		VoidRule:        "an episode whose span contains a drop in our own message-token count is voided — the client compacted, so the remainder is not comparable",
 		WindowRule:      "a conversation whose model window is not exactly published contributes nothing and is counted as window_unknown",
@@ -702,7 +754,7 @@ func compactAssumptions(spanFrac, fillFrac float64) CompactionAssumptions {
 // consumed some. An INNER join would silently shorten every span to the turns summarize touched.
 const compactEpisodeSelect = `SELECT r.tenant_id, r.session_id, r.model, r.ts, r.tokens_before,
 		r.fresh_input + r.cache_read + r.cache_write AS billed,
-		r.cache_miss_reason, r.cache_write, r.cache_write_1h, r.cg_llm_cost_usd,
+		r.cache_miss_reason, r.cache_write, r.cache_write_1h, r.cache_read, r.cg_llm_cost_usd,
 		COALESCE(c.saved_usd, 0), COALESCE(c.events, ''), COALESCE(c.acted, 0)
 	FROM requests r
 	LEFT JOIN request_components c ON c.request_id = r.id AND c.component = 'summarize'
@@ -723,8 +775,8 @@ func (d *DB) compactEpisodeDataset(f Filter) ([]compactRow, error) {
 		var r compactRow
 		var acted int
 		if err := rows.Scan(&r.Tenant, &r.Session, &r.Model, &r.TS, &r.TokensBefore,
-			&r.Billed, &r.MissReason, &r.CacheWrite, &r.CacheWrite1h, &r.CGLLMCostUSD,
-			&r.SavedUSD, &r.Events, &acted); err != nil {
+			&r.Billed, &r.MissReason, &r.CacheWrite, &r.CacheWrite1h, &r.CacheRead,
+			&r.CGLLMCostUSD, &r.SavedUSD, &r.Events, &acted); err != nil {
 			return nil, err
 		}
 		r.Acted = acted != 0
@@ -806,7 +858,12 @@ func queryFrac(r *http.Request, key string, def float64) float64 {
 		return def
 	}
 	f, err := strconv.ParseFloat(v, 64)
-	if err != nil || f <= 0 || f >= 1 {
+	// The upper bound is 8, not 1: `span` is a multiple of the window's worth of NEW content, and
+	// an operator investigating whether a span is long enough to contain cold misses has a
+	// legitimate reason to ask for several windows' worth. The `fill` fraction is a fraction of one
+	// window and could not exceed 1, but one guard serves both and the looser bound cannot hurt
+	// fill (a fill above 1 simply qualifies nothing, which is visible rather than silent).
+	if err != nil || f <= 0 || f > 8 {
 		return def
 	}
 	return f

@@ -44,6 +44,11 @@ func row(ts, billed int64, opts ...func(*compactRow)) compactRow {
 		// detects a CLIENT-side compaction, so every fixture silently voided its own episode. The
 		// real relationship is the opposite: our outgoing shrinks while the client's transcript
 		// keeps growing.
+		// CacheRead and CacheWrite are left at zero, so `billed` here is entirely FRESH input and
+		// therefore entirely new content. That keeps every fixture's span arithmetic readable —
+		// "billed" in a fixture means "new content" — while the cache-shaped cases that actually
+		// matter (a warm turn's written tail, a cold turn's re-creation) set the split explicitly.
+		// TestAtProductionScaleTheSpanSurvivesMoreThanOneTurn is the one that uses real shapes.
 		Billed: billed, TokensBefore: 100_000 + ts*100, MissReason: CacheHit,
 	}
 	for _, o := range opts {
@@ -139,8 +144,8 @@ func TestAnEpisodeClosesWhenTheSessionHasBeenBilledTenPercentMoreOfTheWindow(t *
 	if e.Turns != 3 {
 		t.Errorf("closed episode covered %d turns, want 3", e.Turns)
 	}
-	if e.SpentBilled != testSpan {
-		t.Errorf("spent_billed = %d, want exactly the span %d", e.SpentBilled, testSpan)
+	if e.NewContentBilled != testSpan {
+		t.Errorf("new content = %d, want exactly the span %d", e.NewContentBilled, testSpan)
 	}
 	if e.StartBilled != 1_000 {
 		t.Errorf("start_billed = %d, want t0's own size 1000", e.StartBilled)
@@ -445,7 +450,9 @@ func TestARollForwardInsideTheSpanChargesTheSameEpisode(t *testing.T) {
 func TestTheTurnThatClosesOneSpanAndOpensAnotherIsCreditedOnce(t *testing.T) {
 	out := walkCompactEpisodes([]compactRow{
 		row(1, 1_000, fresh),
-		row(2, testSpan, fresh, saved(5), miss(CacheTTLExpiry), wrote(8_000), cgCost(0.03)),
+		// billed = span + the write, because on a MISS the written tokens are re-creation rather
+		// than new content, so only the fresh remainder counts toward the span.
+		row(2, testSpan+8_000, fresh, saved(5), miss(CacheTTLExpiry), wrote(8_000), cgCost(0.03)),
 	}, exactWindow, testPrice, 0.10, 0.90)
 
 	if len(out.Episodes) != 2 {
@@ -796,8 +803,8 @@ func TestTheSpanClosesOnCumulativeSpendEvenWhenEachTurnGetsSmaller(t *testing.T)
 			"span that waits for a per-turn SIZE to exceed t0's would never close here",
 			e.State)
 	}
-	if e.SpentBilled < testSpan {
-		t.Errorf("spent_billed = %d, want at least the span %d", e.SpentBilled, testSpan)
+	if e.NewContentBilled < testSpan {
+		t.Errorf("new content = %d, want at least the span %d", e.NewContentBilled, testSpan)
 	}
 }
 
@@ -838,5 +845,61 @@ func TestAColdT0IsNotChargedForAWriteThatWasDueAnyway(t *testing.T) {
 	if offUSD(e2.InvalidationDebitUSD, 100_000*1.25e-6) {
 		t.Errorf("invalidation debit = %v, want %v — a live entry that we rewrote IS our cost",
 			e2.InvalidationDebitUSD, 100_000*1.25e-6)
+	}
+}
+
+// AT PRODUCTION SCALE, with the live run's own numbers. Every other span test here keeps t0 tiny
+// and the window at 1,000,000, and that is what hid a real defect: with the axis on cumulative
+// SPEND, the live run's 200,000 window gave a 20,000 span against a next-turn 31,682, so the span
+// closed on the turn immediately after t0 — seconds of wall clock, in which no cold miss can occur,
+// leaving the headline ColdCreditUSD bucket structurally empty.
+//
+// The fixtures could not show it because a 1M window makes the span 100,000, which the small
+// fixture turns never reach. So this test uses the real window and the real per-turn figures, and
+// asserts the span is long enough to still be open after several turns.
+func TestAtProductionScaleTheSpanSurvivesMoreThanOneTurn(t *testing.T) {
+	const haikuWindow = 200_000
+	window := func(string) (int, bool) { return haikuWindow, true }
+
+	// The live run, verbatim: t0 is a cold turn that re-created its whole prefix, and the turns
+	// after it are compacted and warm. read/write are what the provider reported.
+	rows := []compactRow{
+		{Tenant: "t", Session: "s", Model: "m", TS: 1, Billed: 167_266, CacheRead: 0,
+			CacheWrite: 167_263, MissReason: CacheTTLExpiry, TokensBefore: 122_043,
+			Events: `{"` + offload.EventSummaryStarted + `":1}`},
+		{Tenant: "t", Session: "s", Model: "m", TS: 2, Billed: 32_056, CacheRead: 28_730,
+			CacheWrite: 3_323, MissReason: CacheHit, TokensBefore: 122_190, SavedUSD: 0.14},
+		{Tenant: "t", Session: "s", Model: "m", TS: 3, Billed: 32_214, CacheRead: 32_053,
+			CacheWrite: 158, MissReason: CacheHit, TokensBefore: 122_324, SavedUSD: 0.01},
+		{Tenant: "t", Session: "s", Model: "m", TS: 4, Billed: 32_489, CacheRead: 32_211,
+			CacheWrite: 275, MissReason: CacheHit, TokensBefore: 122_562, SavedUSD: 0.01},
+	}
+	out := walkCompactEpisodes(rows, window, testPrice, 0.10, 0.50)
+	e := only(t, out)
+
+	// t0's 167,263-token write is a re-creation of an expired prefix, not new content, so it must
+	// not count toward the span. If it did, t0 would close its own span.
+	if e.NewContentBilled >= 0.10*haikuWindow {
+		t.Errorf("new content = %d after four turns, which already meets the %.0f span: the axis "+
+			"is counting re-sent or re-created tokens as new, and the span will close before any "+
+			"cold miss can happen", e.NewContentBilled, 0.10*haikuWindow)
+	}
+	// The real new content on those three warm turns: the written tails (3,323 + 158 + 275) PLUS
+	// the few fresh tokens each turn carries, which are the new user message itself and are new by
+	// definition. billed - read - write is 3 on each of them.
+	const wantNew = 3_323 + 158 + 275 + 3 + 3 + 3
+	if e.NewContentBilled != wantNew {
+		t.Errorf("new content = %d, want %d (the warm turns' written tails plus their fresh input)",
+			e.NewContentBilled, wantNew)
+	}
+	if e.State != EpisodeOpen {
+		t.Errorf("state = %q, want %q: four turns of a real session add ~3.7k of new content "+
+			"against a 20,000 span, so the episode must still be accruing", e.State, EpisodeOpen)
+	}
+	// And it is still reported, with its net, rather than dropped for being unfinished.
+	g := out.ByProvenance[0]
+	if g.OpenTurns == 0 || g.OpenNetUSD == 0 {
+		t.Errorf("an open episode must report its exposure: turns=%d net=%v",
+			g.OpenTurns, g.OpenNetUSD)
 	}
 }

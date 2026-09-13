@@ -464,6 +464,8 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 
 	chat := &bschemas.BifrostChatRequest{Provider: provider, Input: norm}
 	sys, firstUser := schema.SessionHead(norm)
+	// Via the same helper the response path uses (SessionIDFor), so observe mode's billed-input
+	// record and this pipeline's checkpoints can never key on different ids.
 	sessionID := session.Scoped(o.Tenant, explicitSession(o.Session, body), sys, firstUser)
 	cacheAware := resolveCacheAware(o.CacheMode, provider, body)
 	nowMs := o.nowMs()
@@ -1098,6 +1100,34 @@ func prevLen(st store.Store, session string) int {
 
 func putLen(st store.Store, session string, n int) {
 	st.Put("cg:len:"+session, []byte(strconv.Itoa(n)))
+}
+
+// SessionIDFor derives the session id apply WOULD use for a request, without running a pipeline.
+//
+// It exists for the response path in OBSERVE mode. There, the enforced path never calls BodyOpts at
+// all — that is what makes observe's byte-identity guarantee structural — so it has no Trace and no
+// session id, and RecordBilledInput had nothing to key on. The consequence was that
+// Ctx.PrevBilledInput stayed 0 forever on an observe tenant, FracResolvable read false, and
+// summarize's shipped 0.9 default projected `window_not_exact` on every turn: a permanent zero in
+// the one mode whose entire purpose is showing an operator what enforcing WOULD have saved.
+//
+// The derivation is not duplicated — BodyOpts calls this same function — because two copies of a
+// session id are two ids the moment either changes, and every checkpoint, cold decision and billed
+// figure is keyed by it.
+//
+// It re-parses the body, so it is for callers that have no Trace. A caller holding one should use
+// Trace.Session.
+func SessionIDFor(tenant, explicitSess string, provider bschemas.ModelProvider, body []byte) string {
+	msgsRaw := gjson.GetBytes(body, "messages")
+	if !msgsRaw.Exists() {
+		msgsRaw = gjson.GetBytes(body, "input")
+	}
+	norm, _ := normalize(provider, msgsRaw.Array())
+	if len(norm) == 0 {
+		return ""
+	}
+	sys, firstUser := schema.SessionHead(norm)
+	return session.Scoped(tenant, explicitSession(explicitSess, body), sys, firstUser)
 }
 
 // RecordBilledInput stores the provider's own input-token count for a finished turn, so the NEXT

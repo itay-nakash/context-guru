@@ -98,6 +98,34 @@ type summaryFlight struct {
 
 var inFlight = &summaryFlight{jobs: map[string]*summaryJob{}}
 
+// maxConcurrentSummaries bounds detached summarizer calls ACROSS sessions.
+//
+// Single-flight is per session, which is the right unit for correctness — two summaries over one
+// transcript race to write the same checkpoint — but it is not a ceiling. The inline path was
+// self-limiting in a way that is easy to miss: a call occupied a request, so it was bounded by the
+// server's own concurrency, and it showed up in that request's latency and row. Detached, a burst
+// of sessions returning from idle can each commission a ~57k-token call at the same moment, with no
+// bound, no visible latency, and no row anywhere until each session's next turn.
+//
+// 8 is chosen to be small. This is not a throughput knob: a summary is a cost-saving measure, so a
+// proxy under enough load to saturate it should decline to compact rather than queue work nobody is
+// waiting for. Saturation is therefore a REFUSAL (counted as a gate), never a wait.
+const maxConcurrentSummaries = 8
+
+// summarySlots is the global bound. Buffered channel rather than a semaphore type because the
+// non-blocking acquire is the whole point — see startAsyncSummary.
+var summarySlots = make(chan struct{}, maxConcurrentSummaries)
+
+// summarizeUnresolved counts calls that were commissioned and never resolved: the process exited
+// while they were in flight.
+//
+// It exists because nothing drains on shutdown, and a commissioned call that dies with the process
+// is money spent with no checkpoint and no record. asyncStarted/asyncCommitted is a per-process
+// pair, so the gap it would show dies with the process too. This counter is written at the moment
+// of commissioning and cleared on resolution, so /stats reports a non-zero value only while calls
+// are genuinely outstanding — an operator watching it across a restart sees what was lost.
+var summarizeUnresolved int64
+
 // begin claims the flight for a session. ok=false means one is already running, and the caller must
 // NOT start a second.
 func (f *summaryFlight) begin(session string) (*summaryJob, bool) {
@@ -144,15 +172,15 @@ func (f *summaryFlight) peek(session string) (*summaryJob, bool) {
 //
 // The request context is in the select on purpose: a client that has already given up must not be
 // held here, and a wait that outlived its request would be holding a goroutine for nobody.
-func (f *summaryFlight) waitFor(ctx context.Context, session string, cap time.Duration) (waited time.Duration, landed bool) {
+func (f *summaryFlight) waitFor(ctx context.Context, session string, limit time.Duration) (waited time.Duration, landed bool) {
 	j, ok := f.peek(session)
 	if !ok {
 		return 0, false
 	}
-	if cap <= 0 {
-		cap = defaultSummaryWait
+	if limit <= 0 {
+		limit = defaultSummaryWait
 	}
-	t := time.NewTimer(cap)
+	t := time.NewTimer(limit)
 	defer t.Stop()
 	start := time.Now()
 	select {
@@ -184,13 +212,28 @@ func (s *Summarize) summaryWait() time.Duration {
 // The context is DETACHED from the request. c.Ctx is cancelled the moment the response is written,
 // so a background call inheriting it would be cancelled essentially always — the failure mode being
 // a component that appears to work, files its event, and never produces anything.
+// It returns the REASON it declined, or "" when the call was started. Two refusals, two remedies: a
+// session already summarizing is ordinary and self-correcting, while the global bound being full
+// means the proxy is shedding compaction under load. One gate name for both would report a busy
+// deployment as a busy session.
 func (s *Summarize) startAsyncSummary(c *components.Ctx, model components.Model,
-	span []bschemas.ChatMessage, goal string, coveredCount int) bool {
+	span []bschemas.ChatMessage, goal string, coveredCount int) string {
 	j, ok := inFlight.begin(c.Session)
 	if !ok {
-		return false
+		return "summary_already_in_flight"
+	}
+	// The global bound, acquired WITHOUT blocking: a saturated proxy declines to compact rather
+	// than queueing a call nobody is waiting for. Releasing the per-session flight first, so a
+	// refusal here does not leave the session marked busy.
+	select {
+	case summarySlots <- struct{}{}:
+	default:
+		inFlight.finish(c.Session, j)
+		atomic.AddInt64(&summarizeAsyncRefused, 1)
+		return "summary_concurrency_full"
 	}
 	atomic.AddInt64(&summarizeAsyncStarted, 1)
+	atomic.AddInt64(&summarizeUnresolved, 1)
 	spanCopy := make([]bschemas.ChatMessage, len(span))
 	copy(spanCopy, span)
 	// Everything the goroutine needs, read HERE while we are still on the request's goroutine.
@@ -201,6 +244,10 @@ func (s *Summarize) startAsyncSummary(c *components.Ctx, model components.Model,
 	session, st := c.Session, c.Store
 	go func() {
 		defer inFlight.finish(session, j)
+		defer func() {
+			atomic.AddInt64(&summarizeUnresolved, -1)
+			<-summarySlots
+		}()
 		// Fail open, always: a panic in a detached goroutine takes the process down, which is a
 		// far worse outcome than a missing summary. The pipeline's own recover cannot reach here.
 		defer func() { _ = recover() }()
@@ -232,7 +279,7 @@ func (s *Summarize) startAsyncSummary(c *components.Ctx, model components.Model,
 		}
 		s.commitAsyncSummary(c, session, st, spanCopy, summary, coveredCount)
 	}()
-	return true
+	return ""
 }
 
 // commitAsyncSummary stashes the span and writes the checkpoint, from the background goroutine.
@@ -286,14 +333,21 @@ var (
 	summarizeAsyncCommitted int64
 	summarizeWaitedMs       int64
 	summarizeWaitTimeouts   int64
+	// summarizeAsyncRefused counts commissions the GLOBAL bound turned away — distinct from the
+	// per-session single-flight refusal, which is ordinary and expected on a busy session. A
+	// climbing value here means the proxy is shedding compaction under load, which is the designed
+	// behaviour but worth seeing.
+	summarizeAsyncRefused int64
 )
 
 // AsyncSummaryStats reports the async path's counters for /stats.
-func AsyncSummaryStats() (started, committed, waitedMs, waitTimeouts int64) {
+func AsyncSummaryStats() (started, committed, waitedMs, waitTimeouts, refused, unresolved int64) {
 	return atomic.LoadInt64(&summarizeAsyncStarted),
 		atomic.LoadInt64(&summarizeAsyncCommitted),
 		atomic.LoadInt64(&summarizeWaitedMs),
-		atomic.LoadInt64(&summarizeWaitTimeouts)
+		atomic.LoadInt64(&summarizeWaitTimeouts),
+		atomic.LoadInt64(&summarizeAsyncRefused),
+		atomic.LoadInt64(&summarizeUnresolved)
 }
 
 // deferredUsage is what a detached summarizer call used, waiting for a turn to attribute it to.
@@ -310,10 +364,21 @@ type deferredUsage struct {
 // Additive rather than replacing: two calls can complete between one turn and the next (a
 // commission and a roll-forward), and the second must not erase the first's cost. The whole point
 // of this record is that a cost we incurred is a cost we report.
+// deferredUsageMu serializes the read-modify-write on a session's deferred-usage record.
+//
+// deferUsage does Get -> add -> Put on a background goroutine while takeDeferredUsage does
+// Get -> clear -> replay on a request. Without a lock, a call finishing between the take's Get and
+// its clear has its record erased UNREAD: the cost silently vanishes, which is the one direction the
+// episode panel must not lean, and it is the same hazard deferUsage's additive read guards against
+// from the other side. store.Store offers no atomic read-and-clear, so the mutex is the mechanism.
+var deferredUsageMu sync.Mutex
+
 func deferUsage(st store.Store, session string, sink *cheapmodel.Sink) {
 	if st == nil || session == "" || sink == nil {
 		return
 	}
+	deferredUsageMu.Lock()
+	defer deferredUsageMu.Unlock()
 	calls, in, out := sink.Totals()
 	cw, cr := sink.CacheTotals()
 	if calls == 0 || (in == 0 && out == 0 && cw == 0 && cr == 0) {
@@ -346,9 +411,11 @@ func takeDeferredUsage(c *components.Ctx) {
 	if c == nil || c.Store == nil || c.Session == "" {
 		return
 	}
+	deferredUsageMu.Lock()
 	key := store.UsagePrefix + c.Session
 	b, ok := c.Store.Get(key)
 	if !ok || len(b) == 0 {
+		deferredUsageMu.Unlock()
 		return
 	}
 	// CLEARED BEFORE REPLAYING, not after: replaying without clearing charges the same call to
@@ -356,6 +423,9 @@ func takeDeferredUsage(c *components.Ctx) {
 	// Overwritten rather than deleted because store.Store has no Delete — an empty record reads
 	// back as all-zero and is refused by the guard below.
 	c.Store.Put(key, []byte("{}"))
+	// Unlocked as soon as the record is CLEARED: the replay below touches only this request's sink,
+	// so holding the lock across it would serialize unrelated requests for nothing.
+	deferredUsageMu.Unlock()
 	var u deferredUsage
 	if json.Unmarshal(b, &u) != nil {
 		return

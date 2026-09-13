@@ -477,12 +477,16 @@ func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 	if c.Session == "" {
 		return s.summarizeInline(c, rep, req, msgs, model, span, headCount, start, end, stale)
 	}
-	if !s.startAsyncSummary(c, model, span, conversationGoal(req), end-start) {
+	if why := s.startAsyncSummary(c, model, span, conversationGoal(req), end-start); why != "" {
 		// Another summary is already in flight for this session. This turn must not start a
 		// second: a session that keeps firing would otherwise queue one full-transcript model
 		// call per turn, each paying for a ~48k-token prompt, with the last writer's checkpoint
 		// winning arbitrarily.
-		rep.Gate("summary_already_in_flight")
+		// The reason is named rather than assumed: this session is already summarizing (ordinary —
+		// a session that keeps firing must not queue one full-transcript call per turn), or the
+		// global bound is full, which means the proxy is shedding compaction under load. Those have
+		// different remedies, so they get different gate names.
+		rep.Gate(why)
 	} else {
 		// An Event, not a Replay: money is being spent, just not on this turn's clock. The
 		// FRESH-summary event is filed by the goroutine's commit, so /stats never reports a

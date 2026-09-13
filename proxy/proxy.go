@@ -1404,8 +1404,28 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request, provider bschema
 		// non-provider path) must leave the previous turn's figure in place rather than
 		// overwrite it with a zero that would read as "unknown" and shut the gate.
 		if usageOK {
-			apply.RecordBilledInput(tn.Store, session,
-				usage.FreshInput+usage.CacheRead+usage.CacheWrite)
+			billed := usage.FreshInput + usage.CacheRead + usage.CacheWrite
+			apply.RecordBilledInput(tn.Store, session, billed)
+			// OBSERVE MODE NEEDS ITS OWN RECORD, or the projection it exists to produce is a
+			// permanent zero.
+			//
+			// In observe mode the enforced path never runs a pipeline — that is what makes the
+			// byte-identity guarantee structural — so there is no Trace, `session` above is "",
+			// and the write no-ops. The off-path run also reads a DIFFERENT store, tn.Shadow,
+			// which nothing would ever write cg:bin: into. So Ctx.PrevBilledInput stayed 0,
+			// FracResolvable read false, and summarize's shipped 0.9 default reported
+			// window_not_exact on every turn: an operator deciding whether to enable this would
+			// see it save nothing, forever. That is the same defect resolveWindow fixes for
+			// /compact, arriving through the other door.
+			//
+			// The session id is derived HERE rather than on the request path, so observe keeps
+			// paying only the enqueue for its measurement — the property modes.go documents.
+			if tn.Mode == components.ModeObserve && tn.Shadow != nil {
+				if sid := apply.SessionIDFor(tn.ID, r.Header.Get("x-context-guru-session"),
+					provider, body); sid != "" {
+					apply.RecordBilledInput(tn.Shadow, sid, billed)
+				}
+			}
 		}
 		cp.finish(usage, usageOK, h.captureContentFor(tn), h.contentCap(), h.contentMax())
 		// THE one line per request. In a defer so every terminal path emits it exactly
