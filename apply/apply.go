@@ -412,8 +412,8 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 	}
 	tr.HeadTTL1h, tr.HeadTTLTokens = headTTL1h, headTTLTokens
 
-	msgsRaw := gjson.GetBytes(body, "messages")
-	if !msgsRaw.Exists() || !msgsRaw.IsArray() {
+	msgsRaw := messagesArray(body)
+	if !msgsRaw.Exists() {
 		// Assign rather than return a fresh Result: res already carries the trace fields
 		// set above, and a bypassed request that also lacks a messages array must still
 		// report itself as bypassed rather than as "no messages".
@@ -463,10 +463,9 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 	}
 
 	chat := &bschemas.BifrostChatRequest{Provider: provider, Input: norm}
-	sys, firstUser := schema.SessionHead(norm)
-	// Via the same helper the response path uses (SessionIDFor), so observe mode's billed-input
-	// record and this pipeline's checkpoints can never key on different ids.
-	sessionID := session.Scoped(o.Tenant, explicitSession(o.Session, body), sys, firstUser)
+	// Via the same function the response path reaches through SessionIDFor, so observe mode's
+	// billed-input record and this pipeline's checkpoints cannot key on different ids.
+	sessionID := sessionIDFrom(o.Tenant, o.Session, body, norm)
 	cacheAware := resolveCacheAware(o.CacheMode, provider, body)
 	nowMs := o.nowMs()
 	coldCache := false
@@ -523,6 +522,7 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 			//
 			// Reading a key we also write is safe: aliasSeen reads BEFORE it writes and runs
 			// once per request, so the value is the previous turn's, never this one's.
+			sys, firstUser := schema.SessionHead(norm)
 			alias := session.Scoped(o.Tenant, "", sys, firstUser)
 			if aliasAt := aliasSeen(st, alias, nowMs); aliasAt > prevAt {
 				prevAt = aliasAt
@@ -1102,32 +1102,57 @@ func putLen(st store.Store, session string, n int) {
 	st.Put("cg:len:"+session, []byte(strconv.Itoa(n)))
 }
 
+// messagesArray is the ONE gate on a body's message array: it must exist and be an array. An
+// invalid Result means "no messages", which every caller must treat as a request with nothing to
+// derive from.
+//
+// Shared because two copies of this condition diverged immediately. SessionIDFor originally fell
+// back to `input` where BodyOpts required array `messages`, so a body carrying `input` produced a
+// session id from one and nothing from the other — and the billed-input record then landed under an
+// id no pipeline would ever read. The bug was invisible: both functions were individually
+// reasonable.
+func messagesArray(body []byte) gjson.Result {
+	msgsRaw := gjson.GetBytes(body, "messages")
+	if !msgsRaw.Exists() || !msgsRaw.IsArray() {
+		return gjson.Result{}
+	}
+	return msgsRaw
+}
+
+// sessionIDFrom is the ONE derivation of a request's session id, given its normalized messages.
+//
+// Every checkpoint, cold-cache decision and billed-input figure is keyed by this string, so two
+// implementations of it are two different sessions the moment either changes.
+func sessionIDFrom(tenant, explicitSess string, body []byte, norm []bschemas.ChatMessage) string {
+	sys, firstUser := schema.SessionHead(norm)
+	return session.Scoped(tenant, explicitSession(explicitSess, body), sys, firstUser)
+}
+
 // SessionIDFor derives the session id apply WOULD use for a request, without running a pipeline.
 //
-// It exists for the response path in OBSERVE mode. There, the enforced path never calls BodyOpts at
+// It exists for the response path in OBSERVE mode. There the enforced path never calls BodyOpts at
 // all — that is what makes observe's byte-identity guarantee structural — so it has no Trace and no
 // session id, and RecordBilledInput had nothing to key on. The consequence was that
 // Ctx.PrevBilledInput stayed 0 forever on an observe tenant, FracResolvable read false, and
-// summarize's shipped 0.9 default projected `window_not_exact` on every turn: a permanent zero in
-// the one mode whose entire purpose is showing an operator what enforcing WOULD have saved.
+// summarize's shipped 0.9 default reported window_not_exact on every turn: a permanent zero in the
+// one mode whose entire purpose is showing an operator what enforcing WOULD have saved.
 //
-// The derivation is not duplicated — BodyOpts calls this same function — because two copies of a
-// session id are two ids the moment either changes, and every checkpoint, cold decision and billed
-// figure is keyed by it.
+// It shares BOTH halves with BodyOpts — messagesArray for the gate and sessionIDFrom for the
+// derivation — rather than reproducing them. An earlier version claimed that agreement in a comment
+// while actually holding a second copy, and the two had already drifted apart on which body shape
+// they accepted.
 //
-// It re-parses the body, so it is for callers that have no Trace. A caller holding one should use
-// Trace.Session.
+// It re-parses the body, so it is for callers with no Trace. A caller holding one uses Trace.Session.
 func SessionIDFor(tenant, explicitSess string, provider bschemas.ModelProvider, body []byte) string {
-	msgsRaw := gjson.GetBytes(body, "messages")
+	msgsRaw := messagesArray(body)
 	if !msgsRaw.Exists() {
-		msgsRaw = gjson.GetBytes(body, "input")
+		return ""
 	}
 	norm, _ := normalize(provider, msgsRaw.Array())
 	if len(norm) == 0 {
 		return ""
 	}
-	sys, firstUser := schema.SessionHead(norm)
-	return session.Scoped(tenant, explicitSession(explicitSess, body), sys, firstUser)
+	return sessionIDFrom(tenant, explicitSess, body, norm)
 }
 
 // RecordBilledInput stores the provider's own input-token count for a finished turn, so the NEXT

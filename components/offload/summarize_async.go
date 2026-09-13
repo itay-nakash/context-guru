@@ -12,6 +12,7 @@ import (
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/components"
 	"github.com/rossoctl/context-guru/internal/cheapmodel"
+	"github.com/rossoctl/context-guru/internal/logging"
 	"github.com/rossoctl/context-guru/store"
 )
 
@@ -116,14 +117,17 @@ const maxConcurrentSummaries = 8
 // non-blocking acquire is the whole point — see startAsyncSummary.
 var summarySlots = make(chan struct{}, maxConcurrentSummaries)
 
-// summarizeUnresolved counts calls that were commissioned and never resolved: the process exited
-// while they were in flight.
+// summarizeUnresolved is how many detached calls are outstanding RIGHT NOW.
 //
-// It exists because nothing drains on shutdown, and a commissioned call that dies with the process
-// is money spent with no checkpoint and no record. asyncStarted/asyncCommitted is a per-process
-// pair, so the gap it would show dies with the process too. This counter is written at the moment
-// of commissioning and cleared on resolution, so /stats reports a non-zero value only while calls
-// are genuinely outstanding — an operator watching it across a restart sees what was lost.
+// It says nothing about a restart, and an earlier version of this comment claimed it did — which it
+// cannot: it lives in process memory and dies with the process, exactly like the
+// started/committed pair whose gap it was supposed to explain. What survives a restart is the LOG,
+// which is why commissioning and resolution each emit a line (see logCommission). An unmatched pair
+// in the log is a call that was paid for and lost, and it is queryable after the fact.
+//
+// Nothing drains on shutdown, and that is deliberate rather than unfinished: a shutdown hook that
+// waits on in-flight summaries adds a path that can hang the process for a cost-saving measure
+// nobody is awaiting. The log makes the loss visible without that risk.
 var summarizeUnresolved int64
 
 // begin claims the flight for a session. ok=false means one is already running, and the caller must
@@ -234,6 +238,10 @@ func (s *Summarize) startAsyncSummary(c *components.Ctx, model components.Model,
 	}
 	atomic.AddInt64(&summarizeAsyncStarted, 1)
 	atomic.AddInt64(&summarizeUnresolved, 1)
+	// Logged, because the counters cannot survive a restart and this is the only record that can.
+	// A commission with no matching resolution line is a call that was paid for and lost.
+	logging.From(c.Ctx).Info("summarize: commissioned a detached summary",
+		"session", c.Session, "covered_messages", coveredCount)
 	spanCopy := make([]bschemas.ChatMessage, len(span))
 	copy(spanCopy, span)
 	// Everything the goroutine needs, read HERE while we are still on the request's goroutine.
@@ -242,16 +250,23 @@ func (s *Summarize) startAsyncSummary(c *components.Ctx, model components.Model,
 	// calls into (store.PutStash, store.SumPrefix). It compiled, which is what makes it worth
 	// renaming rather than leaving.
 	session, st := c.Session, c.Store
+	// Detached from the request's cancellation but keeping its logger, so the resolution line
+	// carries the same request-scoped fields the commission line did.
+	baseCtx := context.WithoutCancel(c.Ctx)
 	go func() {
 		defer inFlight.finish(session, j)
 		defer func() {
 			atomic.AddInt64(&summarizeUnresolved, -1)
 			<-summarySlots
+			// The matching half of the commission line. Emitted from a defer so it fires on every
+			// exit — success, model error, timeout, or a recovered panic — because an unmatched
+			// commission is exactly the signal being preserved and a missed line would fake one.
+			logging.From(baseCtx).Info("summarize: detached summary resolved", "session", session)
 		}()
 		// Fail open, always: a panic in a detached goroutine takes the process down, which is a
 		// far worse outcome than a missing summary. The pipeline's own recover cannot reach here.
 		defer func() { _ = recover() }()
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Ctx), asyncSummaryBudget())
+		ctx, cancel := context.WithTimeout(baseCtx, asyncSummaryBudget())
 		defer cancel()
 		// A DETACHED sink, not a nested one. This goroutine inherits the commissioning request's
 		// context, so a chained sink would also reach THAT request's row — and when the call
@@ -339,6 +354,11 @@ var (
 	// behaviour but worth seeing.
 	summarizeAsyncRefused int64
 )
+
+// MaxConcurrentSummaries is the global bound, reported beside the counts for the reason
+// llm_call_timeout_ms travels with its timeout total: a refusal count is meaningless without the
+// ceiling it was measured against.
+func MaxConcurrentSummaries() int64 { return maxConcurrentSummaries }
 
 // AsyncSummaryStats reports the async path's counters for /stats.
 func AsyncSummaryStats() (started, committed, waitedMs, waitTimeouts, refused, unresolved int64) {

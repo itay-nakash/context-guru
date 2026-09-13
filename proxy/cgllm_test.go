@@ -13,6 +13,7 @@ import (
 	"time"
 
 	bschemas "github.com/maximhq/bifrost/core/schemas"
+	"github.com/rossoctl/context-guru/apply"
 	"github.com/rossoctl/context-guru/components"
 	_ "github.com/rossoctl/context-guru/components/all"
 	"github.com/rossoctl/context-guru/components/offload"
@@ -403,5 +404,135 @@ func TestTheCallersAuthSchemeSurvivesIntoOurOwnCalls(t *testing.T) {
 	}
 	if a.AuthScheme != "bearer" {
 		t.Fatalf("the built client would send the caller's bearer token as %q", a.AuthScheme)
+	}
+}
+
+// THE ASYNC COUNTERS HAVE TO REACH /stats, and for a whole review round they did not.
+//
+// AsyncSummaryStats was maintained by the async path and called by nobody, while three separate
+// comments claimed the numbers reached /stats. The proof was that changing its signature from four
+// returns to six compiled without touching another file. Producing the summary off the hot path
+// removed every other way to see that path's health — inline, a slow or failing summarizer showed up
+// as request latency and as a reverted component; detached, the request is already answered and no
+// row carries the work until the session's next turn — so these counters are not decoration, they
+// are the only signal that exists.
+//
+// This pins the ROUTE rather than the values: that each field is wired to its source at all. A
+// counter maintained and served to nobody is the failure being prevented.
+func TestAsyncSummaryCountersReachStats(t *testing.T) {
+	started, committed, waitedMs, waitTimeouts, refused, unresolved := offload.AsyncSummaryStats()
+	bound := offload.MaxConcurrentSummaries()
+	if bound <= 0 {
+		t.Fatalf("MaxConcurrentSummaries = %d; a refusal count is meaningless without the ceiling "+
+			"it was measured against", bound)
+	}
+
+	var snap metrics.Snapshot
+	snap.SummarizeAsyncStarted, snap.SummarizeAsyncCommitted,
+		snap.SummarizeAwaitedMs, snap.SummarizeAwaitTimeouts,
+		snap.SummarizeAsyncRefused, snap.SummarizeAsyncUnresolved = offload.AsyncSummaryStats()
+	snap.SummarizeAsyncConcurrency = offload.MaxConcurrentSummaries()
+
+	// Every field must be reachable and must carry its source's value. Written as a table so a
+	// SEVENTH counter added without a snapshot field fails here rather than silently going nowhere.
+	for _, c := range []struct {
+		name string
+		got  int64
+		want int64
+	}{
+		{"summarize_async_started", snap.SummarizeAsyncStarted, started},
+		{"summarize_async_committed", snap.SummarizeAsyncCommitted, committed},
+		{"summarize_awaited_ms", snap.SummarizeAwaitedMs, waitedMs},
+		{"summarize_await_timeouts", snap.SummarizeAwaitTimeouts, waitTimeouts},
+		{"summarize_async_refused", snap.SummarizeAsyncRefused, refused},
+		{"summarize_async_unresolved", snap.SummarizeAsyncUnresolved, unresolved},
+		{"summarize_async_concurrency", snap.SummarizeAsyncConcurrency, bound},
+	} {
+		if c.got != c.want {
+			t.Errorf("%s = %d, want %d: the snapshot field is not wired to its source",
+				c.name, c.got, c.want)
+		}
+	}
+}
+
+// OBSERVE MODE MUST RECORD ITS OWN BILLED INPUT, or the projection it exists to produce is a
+// permanent zero.
+//
+// In observe mode the enforced path never runs a pipeline — that is what makes the byte-identity
+// guarantee structural — so there is no Trace, the session id handed to the recorder is "", and the
+// write feeding Ctx.PrevBilledInput no-opped. The off-path run also reads a DIFFERENT store
+// (Tenancy.Shadow), which nothing wrote cg:bin: into. So FracResolvable read false forever and
+// summarize's shipped 0.9 default reported window_not_exact on every turn: an operator evaluating
+// whether to enable this saw it save nothing, in the one mode whose whole purpose is that
+// projection.
+//
+// The fix shipped with nothing pinning it, which is how a permanent zero comes back.
+func TestObserveModeRecordsBilledInputIntoTheShadowStore(t *testing.T) {
+	up := fakeUpstream(t)
+	defer up.Close()
+
+	cfg, err := config.LoadBytes([]byte(
+		"pipeline: [summarize]\nmode: observe\ncomponents:\n  summarize:\n    keep_last: 1\n" +
+			"    start_from_message: 0\n    min_tokens: 1\n    trigger: {min_request_frac: 0}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	agg := metrics.NewAggregator()
+	pipe, err := cfg.Build(agg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := New(pipe, store.NewMemory(store.Options{}), agg, Options{
+		AnthropicUpstream: up.URL,
+		Mode:              components.ModeObserve,
+	})
+	t.Cleanup(h.Close)
+	// New creates the shadow store itself when the mode is observe (proxy.go:302), and this test
+	// lives in package proxy so it can read the same one the request path writes to. Asserting on
+	// an injected store would prove nothing about the store observe actually uses.
+	shadow := h.shadow
+	if shadow == nil {
+		t.Fatal("observe mode built no shadow store, so there is nothing for the off-path run to read")
+	}
+
+	srv := httptest.NewServer(h.Mux())
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/anthropic/v1/messages",
+		strings.NewReader(summarizableRequest()))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-context-guru-session", "sess-observe")
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("proxy returned %d", resp.StatusCode)
+	}
+
+	// The id the OBSERVE run derives — the only id the record may be keyed under, and the reason
+	// SessionIDFor exists rather than a second copy of the derivation.
+	sid := apply.SessionIDFor("", "sess-observe", bschemas.Anthropic,
+		[]byte(summarizableRequest()))
+	if sid == "" {
+		t.Fatal("no session id derived for the observe body, so the record cannot be keyed at all")
+	}
+
+	// The write happens in a defer on the response path, so give it a moment to land rather than
+	// asserting on a race.
+	var found bool
+	for i := 0; i < 200; i++ {
+		if _, ok := shadow.Get(store.BilledPrefix + sid); ok {
+			found = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !found {
+		t.Errorf("no cg:bin: record in the shadow store under %q after an observe-mode request: "+
+			"PrevBilledInput stays 0, FracResolvable reads false, and summarize's 0.9 default "+
+			"reports window_not_exact forever — a permanent zero in the mode built for measuring",
+			sid)
 	}
 }

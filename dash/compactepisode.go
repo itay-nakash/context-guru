@@ -616,6 +616,13 @@ func isFreshSummary(r compactRow) string {
 //   - cache_write on a turn that MISSED: re-creation of a prefix that already existed, so not new.
 //     Counting it would call a whole transcript "new" every time an entry expired.
 //   - cache_read: the re-sent prefix. Never new.
+//
+// IT ASSUMES A BREAKPOINT KEEPS UP WITH THE TAIL, which the live run does show — every warm turn
+// there wrote its new tail on arrival. Where a client's breakpoints lag, the same tokens are billed
+// FRESH on the turn they arrive and written on a later one, so they count twice and the span closes
+// in roughly half the new content it claims. That errs toward a shorter span, which under-reports
+// this component rather than over-reporting it; a client that never writes at all degenerates to
+// counting fresh input only, which is correct.
 func newContentBilled(r compactRow) int64 {
 	// Billed = fresh + read + write, and the row carries read and write, so fresh is the remainder.
 	fresh := r.Billed - r.CacheRead - r.CacheWrite

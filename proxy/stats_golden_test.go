@@ -115,6 +115,17 @@ var statsGoldenTopLevel = []string{
 	"summarize_call_timeout_ms",
 	"summarize_errors",
 	"summarize_timeouts",
+	// The detached summarizer path's health. Seven fields, because the path they describe removed
+	// every other way to see it: inline, a slow or failing summarizer was visible as request
+	// latency and as a reverted component; detached, the request is already answered and no row
+	// carries the work until the session's next turn.
+	"summarize_async_started",
+	"summarize_async_committed",
+	"summarize_async_refused",
+	"summarize_async_unresolved",
+	"summarize_awaited_ms",
+	"summarize_await_timeouts",
+	"summarize_async_concurrency",
 	"sync_enforced",
 	"tokens_after",
 	"tokens_before",
