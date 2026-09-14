@@ -178,24 +178,63 @@ Which is the real division of labour: **the model is there for the conversation,
 mechanism.** Every step that does not need a human sentence should be a fixed string, and the two that
 do should be the only reason a model is in the path at all.
 
-### Open questions, to settle by testing before building
+### Measured, 2026-09-14: three of four answered, and one of them inverts the design
 
-Three, and the first one decides how much of "A" survives:
+Probed in a sandboxed `claude -p` run (throwaway plugin via `--plugin-dir`, isolated
+`CLAUDE_CONFIG_DIR`, `--permission-mode auto`, routed off Context Guru so the synthetic traffic
+neither contaminated Guru nor touched the live session).
 
-1. **Does `allowed-tools:` (or `!` pre-execution) clear the auto-mode classifier, or only the
-   permission prompt?** They are different layers. If `allowed-tools` satisfies the classifier too,
-   the step-0 permission-rule advice becomes unnecessary and A is fixed by construction. If it only
-   satisfies permission rules, the `[Traffic Redirection]` gate remains and the rule advice stays.
-   **Assume it does not until measured** — the classifier denied a command that a permission rule
-   would have allowed, which is evidence they are independent.
-2. **Does a `` !`` `` block that gets denied fail the whole skill invocation, or render as an error the
-   model can read?** If the former, step 4 must stay a normal tool call so a denial is recoverable and
-   the user gets the paste-ready command.
-3. **Does `${CLAUDE_PLUGIN_ROOT}` expand inside `` !`` ``?** It expands in hook commands and in
-   `allowed-tools` patterns; unverified in this position, and the whole shape depends on it.
-4. **Is `~/.local/bin` on the PATH of the shell `!` uses?** `install.sh` already reports
-   `on_path=false` for exactly this case, and if it is false then `! cg-install` does not resolve and
-   the shim has to be printed as an absolute path — which costs it most of its point.
+**1. `` !`` `` pre-execution works.** The skill body's block ran during rendering and the model
+received the *output*: it replied `RENDERED: PROBE_MARKER_9F3A ok`. A sentinel file written by the
+script confirms execution independently of anything the model said.
+
+**2. `${CLAUDE_PLUGIN_ROOT}` is substituted into the command STRING but is NOT exported to the
+child process.** Both halves of that sentence matter, and they look contradictory until you separate
+them: the script was found and ran (so the path expanded), yet the script's own read of
+`$CLAUDE_PLUGIN_ROOT` reported `EMPTY_OR_UNSET`.
+
+> **Consequence, and a live trap.** Any script invoked from a `` !`` `` block must locate itself from
+> `$0`, never from `$CLAUDE_PLUGIN_ROOT`. `check-proxy.sh:54` reads that variable internally today —
+> correct for a hook, where plugin variables *are* present, but it would silently no-op if it were
+> ever moved to the `` !`` `` path: `-x "/scripts/start-proxy.sh"` is false, and the branch is skipped
+> without an error.
+
+**3. The auto-mode classifier does NOT inspect a `` !`` `` block.** Measured with a control, which is
+the only way this claim means anything — the same command string, the same permission mode, two code
+paths:
+
+| path | outcome |
+|---|---|
+| `` !`start-proxy.sh --unrouted --upstream https://…` `` in a skill body | **ran** |
+| the identical command as a model Bash tool call | **denied** — *"`--unrouted` read as a routing/egress bypass … aimed at an internal-looking upstream host"* |
+
+The denial reason is almost the wording the 2026-09-14 install hit.
+
+**4. Unanswered:** whether `~/.local/bin` is on the PATH of the shell `!` uses. It is on the author's
+machine; that is one data point, not a fact about users.
+
+#### What finding 3 means, and what it must not be used for
+
+It would be technically sufficient to put the whole install in a `` !`` `` block and never be gated
+again. **The design must not do that.** This repo's own position on the denial is that it is *correct*:
+installing a plugin by name is not the same as consenting to have your model traffic intercepted, and
+an agent should not make that call for its user. A mechanism that happens to skip the question does
+not answer it.
+
+So finding 3 **inverts** the earlier plan rather than vindicating it:
+
+- `` !`` `` carries only `--plan`, which is read-only. Determinism where determinism is free.
+- the traffic-redirecting `--confirm` step stays an **ordinary tool call, deliberately, so that it is
+  classified.** The gate on that one step is a feature, and the decision file is what makes the
+  gated command a constant with no arguments to get wrong.
+
+That also fixes a straightforward error in an earlier revision, which had `--confirm` in a `` !`` ``
+block: **every `` !`` `` block in a skill fires at render, before the model sees anything** — so it
+would have installed before the user was asked the question. The timing constraint and the consent
+argument happen to point the same way.
+
+A last implication for `--plan`: because it runs on *every* invocation, it needs an `already_routed`
+state so a re-run does not narrate a fresh install.
 
 ## The design: `install.sh --route`
 
@@ -457,20 +496,13 @@ Go is not installed on this laptop, so these run on the eval box per that sectio
 
 ## Recommendation
 
-**Settle the three open questions above first — by testing, in one throwaway session.** All of them
-are about mechanism, none needs this repo changed to answer, and the first decides whether A is a
-prose fix or nothing at all. Building the orchestrator before knowing whether `` !`` `` clears the
-classifier risks shipping a determinism story that still stops at a gate.
-
-Then build the orchestrator, and land A and C on top of it rather than into prose that is about to be
-replaced. Sequence:
-
-0. **Measure**: does `allowed-tools` / `` !`` `` clear the auto-mode classifier; does a denied
-   `` !`` `` block break the invocation; does `${CLAUDE_PLUGIN_ROOT}` expand there.
-1. `install.sh --route` with `--plan`, `--decide` and `--confirm`, the contract above, and the install
-   skill restructured around a `` !`` `` block and cut to ~120 lines. Carries A for free if question 1
-   says the classifier is satisfied; otherwise keeps `permission_rule=` as an output key and the
-   step-0 advice as prose.
+The mechanism questions are answered (see *Measured*), so the sequence starts at code. Land A and C
+on top of the orchestrator rather than into prose that is about to be replaced.
+1. `install.sh --route` with `--plan`, `--decide` and `--confirm`; self-locating from `$0` rather than
+   `$CLAUDE_PLUGIN_ROOT` (finding 2); the install skill restructured around one `` !`` `` block
+   carrying `--plan` only, and cut to ~120 lines. A stays a prose fix: the confirm step is
+   deliberately left classifiable, so the pre-grant rule remains the way to avoid the one prompt, and
+   `permission_rule=` stays an output key.
 2. `--cache-strategy` and `/context-guru:cache-strategy-picker`, with the `plugin.json` copy change
    that default-on keep-alive requires.
 3. `valid_base_url()` in `settings.py`, gating `add`. **Not optional and not last if `attach` is in
@@ -480,3 +512,46 @@ replaced. Sequence:
 
 [d178]: ../../how-to/install-plugin.md
 [d190]: ../../how-to/install-plugin.md
+
+## Appendix A: the PATH-shim option, and why it is not the recommendation
+
+Considered and set aside. Recorded because the reasoning is the interesting part, and because the
+question ("why does a model need to be in this path at all?") will be asked again.
+
+The fully model-free form is a command the user types themselves:
+
+```
+/plugin marketplace add rossoctl/context-guru
+/plugin install context-guru@context-guru
+/reload-plugins
+!~/.claude/plugins/marketplaces/context-guru/context-guru-plugin/scripts/install.sh --route
+```
+
+That fourth line has no model and no classifier in it, and the path is **stable across plugin
+updates** — verified against a real cache layout: the *install* cache is versioned
+(`…/pyright-lsp/1.0.0`) or content-hashed (`…/context7/022b3c274938`), but
+`~/.claude/plugins/marketplaces/<name>/` is a plain source checkout with no version segment. That
+checkout also exists after `marketplace add` alone, so this route does not strictly need the plugin
+installed — though the plugin is what supplies the `SessionStart` / `UserPromptSubmit` hooks that
+restart a dead proxy, which is most of the safety net.
+
+A shim would shorten everything after it by dropping a `context-guru` executable in `~/.local/bin`,
+giving `!context-guru install`, `!context-guru status`, `!context-guru cache-strategy 5-min-ping`.
+
+**Why it is an appendix and not the plan** — the owner's objection, and it is the right one: it
+**writes into `~/.local/bin`, and unwinding that is harder than unwinding one settings key.** The
+whole reversibility story of this plugin is "one key in one file, plus a backup, plus a hatch that
+restores from a copy taken before the first edit". A shim on the PATH is a second class of artifact in
+a second location, outside every mechanism that already exists to remove things: `uninstall` does not
+know about it, the reset hatch does not record it, and a stale shim pointing into a plugin cache
+directory that a later update has moved is a broken command with no obvious owner. `install.sh` already
+reports `on_path=false` for `~/.local/bin` on some machines, so it is not even reliably reachable.
+
+Two narrower forms keep most of the value without that cost, if this is ever revisited:
+
+- **No shim, just the long line.** It is stable and it works; it is only unpleasant to type. A pod
+  image or a team runbook types it once and never again, which is exactly the population that wants a
+  model-free install.
+- **A shim owned by the same machinery as everything else**: written only by an explicit
+  `install.sh --shim`, recorded in the reset manifest, and removed by `uninstall`. The objection is to
+  an unowned artifact, not to the idea of a short command.
