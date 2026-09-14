@@ -3,6 +3,7 @@ package components
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/maximhq/bifrost/core/schemas"
 )
@@ -130,5 +131,98 @@ func TestTriggerFractions(t *testing.T) {
 	}
 	if (Trigger{}).IsHuge(999999, W) {
 		t.Error("huge must be false when HugeOutputFrac unset")
+	}
+}
+
+// EVERY CONSTRUCTOR THAT EMBEDS A TRIGGER VALIDATES IT, which CacheAllows' docstring has always
+// promised and exactly one of the three actually did.
+func TestTriggerValidateRejectsWhatTheFormWouldAccept(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		tr      Trigger
+		wantErr bool
+	}{
+		{"the zero trigger is valid", Trigger{}, false},
+		{"an empty cache_state means no constraint", Trigger{CacheState: ""}, false},
+		{"every declared cache state is accepted", Trigger{CacheState: CacheStatePreExpiryOrCold}, false},
+		{"a typo in cache_state is refused, not read as `any`",
+			Trigger{CacheState: "pre_expiryy"}, true},
+		// A WINDOW AT OR ABOVE THE TTL SWALLOWS THE WHOLE LIFETIME: `remaining <= preExpiry` is then
+		// true for every request that has an entry at all, so CachePhase returns PreExpiry always and
+		// Warm never, and a component gated on pre_expiry rewrites a live prefix on EVERY turn. The
+		// settings form accepted 600 silently.
+		{"a pre-expiry window wider than the shortest cache lifetime is refused",
+			Trigger{PreExpirySeconds: 600}, true},
+		{"a pre-expiry window exactly at the shortest cache lifetime is refused",
+			Trigger{PreExpirySeconds: 300}, true},
+		{"one second inside it is accepted", Trigger{PreExpirySeconds: 299}, false},
+		{"a negative window is refused", Trigger{PreExpirySeconds: -1}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.tr.Validate("c")
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Validate() error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if err != nil && !strings.Contains(err.Error(), "c:") {
+				t.Errorf("error must name the component whose config block is wrong: %v", err)
+			}
+		})
+	}
+}
+
+// A 600-second window really does make every warm request pre-expiry, which is the behaviour
+// Validate exists to prevent. Asserted directly so the constant's justification is not merely a
+// comment.
+func TestAWindowWiderThanTheTTLWouldSwallowEveryWarmTurn(t *testing.T) {
+	// A maximally warm turn: the entry was written one second ago on a 5-minute TTL.
+	warm := &Ctx{CacheTTLMs: 5 * 60 * 1000, IdleMs: 1_000}
+	if got := warm.CachePhase(DefaultPreExpiry); got != CachePhaseWarm {
+		t.Fatalf("precondition: phase = %s, want %s", got, CachePhaseWarm)
+	}
+	if got := warm.CachePhase(600 * time.Second); got != CachePhasePreExpiry {
+		t.Fatalf("with a 600s window a one-second-old entry classified %s; the point of the "+
+			"validation is that it classifies %s, so the component would rewrite a live prefix "+
+			"every turn", got, CachePhasePreExpiry)
+	}
+	if err := (Trigger{PreExpirySeconds: 600}).Validate("c"); err == nil {
+		t.Error("...and that configuration must therefore be refused at config time")
+	}
+}
+
+// THE TWO SIZE THRESHOLDS ARE ANDed, NOT max()ed, and until now nothing asserted it. No shipped
+// config sets both, so the change was invisible — which is exactly the kind of semantic change that
+// wants a test before someone relies on the old behaviour.
+//
+// Under max() a request passing EITHER threshold fired. Under AND it must pass BOTH, each measured
+// on its own ruler: min_request_tokens against our own message-text count, min_request_frac against
+// the provider's billed input. max() could not be salvaged, because taking the larger of two numbers
+// on two different rulers is meaningless.
+func TestTheTwoSizeThresholdsAreAndedNotMaxed(t *testing.T) {
+	// frac 0.9 of a 200k window = 180,000 billed tokens.
+	tr := Trigger{MinRequestTokens: 1_000, MinRequestFrac: 0.9}
+	req := &schemas.BifrostChatRequest{Input: []schemas.ChatMessage{mkMsg(strings.Repeat("word ", 4000))}}
+
+	full := &Ctx{CtxWindow: 200_000, CtxWindowExact: true, PrevBilledInput: 190_000}
+	if !tr.Fires(req, full) {
+		t.Error("both thresholds met, so it must fire")
+	}
+	// Passing the token threshold but NOT the fraction: under max() this fired, because 5,000
+	// exceeded... nothing comparable. Under AND it must not.
+	notFull := &Ctx{CtxWindow: 200_000, CtxWindowExact: true, PrevBilledInput: 50_000}
+	if tr.Fires(req, notFull) {
+		t.Error("the request is over min_request_tokens but the context is only a quarter full; " +
+			"ANDed thresholds must both hold")
+	}
+	// And the other way: a full context but a tiny request.
+	tiny := &schemas.BifrostChatRequest{Input: []schemas.ChatMessage{mkMsg("a")}}
+	if tr.Fires(tiny, full) {
+		t.Error("the context is full but the request is below min_request_tokens; ANDed thresholds " +
+			"must both hold")
+	}
+	// A trigger carrying only ONE threshold — every shipped default — is unaffected, which is why
+	// no operator is affected today.
+	only := Trigger{MinRequestTokens: 1_000}
+	if !only.Fires(req, notFull) {
+		t.Error("a trigger with no fraction configured must not be constrained by one")
 	}
 }

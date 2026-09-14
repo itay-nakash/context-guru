@@ -39,6 +39,12 @@ func newExtract(raw []byte) (components.Component, error) {
 	if err := components.Decode(raw, &cfg); err != nil {
 		return nil, err
 	}
+	// Validated here too, though this component does not consult the cache phase: an operator who
+	// sets a bad pre_expiry_seconds deserves the error at config time whichever block it is in, and
+	// CacheAllows' docstring promises every constructor makes this check.
+	if err := cfg.Trigger.Validate("extract"); err != nil {
+		return nil, err
+	}
 	return &Extract{minTokens: cfg.MinTokens, trigger: cfg.Trigger, mode: parseMarkerMode(cfg.MarkerMode)}, nil
 }
 
@@ -100,5 +106,7 @@ func init() {
 			Hint: "Per-output floor: only extract from a tool output above this many tokens."},
 		markerModeField(),
 	}
-	components.RegisterFields("extract", extractConfig{}, append(f, components.TriggerFields("trigger")...))
+	// TriggerFieldsNoCache: this component never reads the cache phase, so it must not offer a
+	// control that claims to restrict firing by it. See Trigger.TriggerFieldsNoCache.
+	components.RegisterFields("extract", extractConfig{}, append(f, components.TriggerFieldsNoCache("trigger")...))
 }

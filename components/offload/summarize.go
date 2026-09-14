@@ -245,12 +245,10 @@ func applySummarizeTriggerDefaults(raw []byte, t *components.Trigger) error {
 	if t.CacheState == "" {
 		t.CacheState = summarizeDefaultCacheState
 	}
-	// Refused rather than silently read as "any": a typo in the one key that decides WHEN this
-	// component fires would otherwise turn the cache gate off and look like it was on.
-	if !slices.Contains(components.CacheStates, t.CacheState) {
-		return fmt.Errorf("summarize: trigger.cache_state %q is not one of %v", t.CacheState, components.CacheStates)
-	}
-	return nil
+	// Shared with every other component that embeds a Trigger, because this check drifted: it used
+	// to live here and only here, while CacheAllows' docstring promised that all constructors made
+	// it. See Trigger.Validate.
+	return t.Validate("summarize")
 }
 
 func (Summarize) Name() string                 { return "summarize" }

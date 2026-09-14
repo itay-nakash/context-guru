@@ -1,7 +1,9 @@
 package components
 
 import (
+	"fmt"
 	"math"
+	"slices"
 	"time"
 
 	"github.com/maximhq/bifrost/core/schemas"
@@ -279,18 +281,80 @@ func (t Trigger) IsHuge(outputTokens, window int) bool {
 // "trigger"). It lives beside the struct so a new threshold cannot be added without the
 // form learning about it — the fields parity test compares these keys against the struct's
 // yaml tags.
-func TriggerFields(prefix string) []Field {
+func TriggerFields(prefix string) []Field { return triggerFields(prefix, true) }
+
+// TriggerFieldsNoCache is TriggerFields without `cache_state` and `pre_expiry_seconds`, for a
+// component that does not consult the cache phase.
+//
+// ADVERTISING A KEY A COMPONENT IGNORES IS WORSE THAN NOT OFFERING IT. `extract` and `extract_llm`
+// both embed Trigger and neither one calls CacheAllows or CachePhase anywhere, so the settings form
+// offered them a `cache_state` control — hinted "Restrict firing by the prompt cache's state" — that
+// did nothing at all. An operator setting `cache_state: cold` there would reasonably believe the
+// component had been told to wait for a cold cache, and it would go on firing on maximally warm
+// turns. A review found it; the form is the only place these keys were reachable.
+//
+// A component that later starts consulting the phase switches to TriggerFields and gets them back.
+func TriggerFieldsNoCache(prefix string) []Field { return triggerFields(prefix, false) }
+
+func triggerFields(prefix string, cacheAware bool) []Field {
 	p := prefix + "."
-	return []Field{
+	f := []Field{
 		{Key: p + "min_request_tokens", Type: FieldInt, Hint: "Fire only when the whole request carries at least this many tokens (0 = no constraint)."},
 		{Key: p + "min_messages", Type: FieldInt, Hint: "…and at least this many messages, which is roughly agent steps (0 = no constraint)."},
 		{Key: p + "min_output_tokens", Type: FieldInt, Hint: "Per-item floor: only act on a tool output at least this big (0 = use the component's own min_tokens)."},
 		{Key: p + "min_request_frac", Type: FieldFloat, Hint: "The request threshold as a fraction of the model's context window, e.g. 0.6. Raises the absolute floor, never lowers it; ignored when the window is unknown."},
 		{Key: p + "min_output_frac", Type: FieldFloat, Hint: "The per-item floor as a fraction of the window. Also only ever raises the absolute one."},
 		{Key: p + "huge_output_frac", Type: FieldFloat, Hint: "Hard per-item trigger: a single output at least this fraction of the window is acted on regardless of the request-level gate."},
-		{Key: p + "cache_state", Type: FieldEnum, Default: CacheStateAny, Options: CacheStates,
-			Hint: "Restrict firing by the prompt cache's state: any (no constraint), pre_expiry (the entry still exists but is about to expire — acting then invalidates almost nothing), cold (the entry is gone), or either. A component whose default is not `any` documents its own."},
-		{Key: p + "pre_expiry_seconds", Type: FieldInt, Default: int(DefaultPreExpiry / time.Second),
-			Hint: "How wide the pre-expiry window is, in seconds. Wider fires more often and invalidates more remaining cache lifetime; narrower fires rarely. Unmeasured either way."},
 	}
+	if !cacheAware {
+		return f
+	}
+	return append(f,
+		Field{Key: p + "cache_state", Type: FieldEnum, Default: CacheStateAny, Options: CacheStates,
+			Hint: "Restrict firing by the prompt cache's state: any (no constraint), pre_expiry (the entry still exists but is about to expire — acting then invalidates almost nothing), cold (the entry is gone), or either. A component whose default is not `any` documents its own."},
+		Field{Key: p + "pre_expiry_seconds", Type: FieldInt, Default: int(DefaultPreExpiry / time.Second),
+			Min:  0,
+			Hint: "How wide the pre-expiry window is, in seconds. Wider fires more often and invalidates more remaining cache lifetime; narrower fires rarely. Must stay below the shortest prompt-cache lifetime (300s), or every warm request counts as pre-expiry. Unmeasured either way."},
+	)
+}
+
+// maxPreExpirySeconds is one past the widest pre-expiry window that can mean anything: the SHORTEST
+// prompt-cache lifetime this repo derives, which is the 5 minutes a bare `ephemeral` mark buys and
+// the tier every captured Claude Code breakpoint uses.
+//
+// A WINDOW AT OR ABOVE THE TTL SWALLOWS THE WHOLE LIFETIME. `remaining <= preExpiry` is then true for
+// every request that has a cache entry at all, so CachePhase returns PreExpiry always, Warm never,
+// and a component gated on pre_expiry compacts on EVERY turn — rewriting a live prefix each time,
+// which is the most expensive thing this pipeline can do. The form accepted 600 silently. A review
+// found it.
+const maxPreExpirySeconds = 300
+
+// Validate checks the Trigger's own keys and is called by every component constructor that embeds
+// one, so a bad value is refused at config time rather than becoming a silent behaviour change.
+//
+// IT IS SHARED BECAUSE IT DRIFTED. CacheAllows' docstring promised that "constructors validate the
+// string and refuse a bad one at config time", and exactly one of the three constructors that accept
+// the key did. `extract` and `extract_llm` took `cache_state: pre_expiryy` without complaint — which
+// mattered less than it sounds, because neither consults the key either, but the promise in the
+// docstring was load-bearing for the component that DOES.
+//
+// `component` names the caller so the error says which config block is wrong.
+func (t Trigger) Validate(component string) error {
+	// Refused rather than silently read as "any": a typo in the one key that decides WHEN a
+	// component fires would otherwise turn the cache gate off and look like it was on.
+	if t.CacheState != "" && !slices.Contains(CacheStates, t.CacheState) {
+		return fmt.Errorf("%s: trigger.cache_state %q is not one of %v",
+			component, t.CacheState, CacheStates)
+	}
+	if t.PreExpirySeconds >= maxPreExpirySeconds {
+		return fmt.Errorf("%s: trigger.pre_expiry_seconds is %d, which is at or above the shortest "+
+			"prompt-cache lifetime (%ds); every warm request would then count as pre-expiry and the "+
+			"component would act on every turn",
+			component, t.PreExpirySeconds, maxPreExpirySeconds)
+	}
+	if t.PreExpirySeconds < 0 {
+		return fmt.Errorf("%s: trigger.pre_expiry_seconds is %d, which cannot be negative",
+			component, t.PreExpirySeconds)
+	}
+	return nil
 }

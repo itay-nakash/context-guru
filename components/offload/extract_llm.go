@@ -1650,5 +1650,8 @@ func init() {
 		markerModeField(),
 	}
 	f = append(f, modelFields("model")...)
-	components.RegisterFields("extract_llm", extractLLMConfig{}, append(f, components.TriggerFields("trigger")...))
+	// TriggerFieldsNoCache: this component consults neither CacheAllows nor CachePhase anywhere, so
+	// offering a `cache_state` control would advertise a restriction it does not apply. The cache
+	// phase belongs to extract_llm_sweep, which declares its own fields.
+	components.RegisterFields("extract_llm", extractLLMConfig{}, append(f, components.TriggerFieldsNoCache("trigger")...))
 }
