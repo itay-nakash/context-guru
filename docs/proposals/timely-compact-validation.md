@@ -498,6 +498,36 @@ Three ways this can come out, and the arm prints which:
 | `max_tokens` differs and it does not | the rule is refuted |
 | `max_tokens` is the same on both models | no variation was available; **the arm proves nothing** and says so |
 
+**The third is what happened, and it is structural for this model pair.** Claude Code sent
+`max_tokens = 32,000` on `claude-sonnet-4-5` — identical to haiku. So **no pair of 200,000-window
+models can test the rule here**, because the predictor does not vary. Varying it needs a model where
+the client picks a different output cap, or control of `max_tokens` itself, and neither is available
+cheaply.
+
+That is acceptable rather than a gap, because the rule is a speculation that has already been
+retracted and the primary source for `C` — direct observation in billed tokens — does not depend on it.
+Keep the arm for the day a model with a different output cap is on hand; do not spend money on it
+before then.
+
+**And the run failed for a second, unrelated reason worth recording:** the unprefixed
+`claude-sonnet-4-5` returns `403 team not allowed to access model` on the gateway this was written
+against, while the same model under `aws/` is routable. Every request 403s, the session never grows,
+and the arm reports *"the client did not compact"* — **which looks like a result and is a routing
+error.** The default is now the prefixed form. A live arm that can report a plausible-looking finding
+from a total failure is the trap this whole suite keeps running into.
+
+### An incidental finding from arm B worth keeping
+
+On its last run a turn arriving **383 s** after the previous one — past the nominal 300 s TTL and past
+the 60 s clock-skew allowance — came back as a **partial hit** (`read=22,441 write=10,829`) rather than
+a full miss. Two later turns at the same 383 s gap did miss completely.
+
+So the provider's entry can outlive its nominal lifetime, and by more than the margin. That is direct
+support for `CertainlyColdByClock` requiring `ColdMargin` past expiry before claiming an entry is gone:
+a gate that trusted `remaining <= 0` would have called that turn cold and rewritten a prefix that was
+still partly live. It also means a scenario arm cannot *guarantee* a cold turn by waiting — it can only
+make one likely, which is why arm B checks the verdict it actually got rather than assuming.
+
 ### Reading a run
 
 Each arm prints every request row as the provider billed it — `billed`, `read`, `write`, the cache

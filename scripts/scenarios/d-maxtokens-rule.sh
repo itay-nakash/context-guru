@@ -33,13 +33,29 @@
 #     haiku match was a coincidence. Worth knowing before anyone builds on it.
 #   - max_tokens is the SAME on both models -> no variation was available, the arm proves nothing, and
 #     it says so rather than reporting a pass.
+#
+# THE THIRD OUTCOME IS WHAT HAPPENED, AND IT IS STRUCTURAL FOR THIS MODEL PAIR. Claude Code sent
+# max_tokens = 32,000 on `claude-sonnet-4-5` — identical to haiku. So no pair of 200,000-window models
+# can test the rule here: the predictor does not vary. Varying it needs a model where the client picks
+# a different output cap, or control of max_tokens itself, and neither is available cheaply.
+#
+# Which is fine, because the rule is a SPECULATION that has already been retracted (see
+# internal/compactionpoint: one data point, and evidence against the mechanism that would make it
+# non-arbitrary). The primary source for C is direct observation in billed tokens and does not depend
+# on it. Keep this arm for the day a model with a different output cap is on hand; do not spend money
+# on it before then.
 set -u
 . "$(dirname "$0")/lib.sh"
 
 N=maxtokrule
 PORT=4214
 # A second 200,000-window model, so the cost is comparable to arm A rather than a 1M session.
-MODEL2="${CG_SCEN_MODEL2:-claude-sonnet-4-5}"
+#
+# PREFIXED, because a gateway routes by its own names: the unprefixed `claude-sonnet-4-5` 403s with
+# "team not allowed to access model" on the gateway this was written against, while the same model
+# under `aws/` is routable. Every request then returns 403, the session never grows, and the arm
+# reports "the client did not compact" — which looks like a result and is a routing error.
+MODEL2="${CG_SCEN_MODEL2:-aws/claude-sonnet-4-5}"
 # Override the library's model for this whole arm, rather than prefixing every call.
 MODEL="$MODEL2"
 
