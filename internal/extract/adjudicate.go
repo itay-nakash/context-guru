@@ -384,7 +384,58 @@ func ParseVerdicts(reply string) ([]Verdict, bool) {
 			return out, true
 		}
 	}
-	return nil, false
+	// NEWLINE-DELIMITED FALLBACK, and it is a parser fix rather than a prompt one because the reply it
+	// recovers is CORRECT. The contract says "Reply with ONLY a JSON array"; sonnet-5 sometimes answers
+	// with one verdict object per line and no brackets at all — measured on a prefix ask whose four
+	// verdicts were individually well-formed, correctly reasoned, and complete for the batch. The array
+	// scan above finds no `[`, so the whole ask was discarded and its cost wasted.
+	//
+	// ACCEPTING MORE VALID ANSWERS IS NOT LOOSENING THE GUARDS. Every check the array path applies is
+	// applied here: each line must decode into a Verdict and must satisfy looksLikeVerdict, so `{}` and
+	// `{"note":"x"}` are still rejected rather than becoming phantom verdicts for label 0.
+	//
+	// EVERY LINE MUST PARSE, which is what keeps truncation distinguishable from malformation. A reply
+	// cut off mid-line leaves a final fragment that does not decode; returning false there sends the
+	// caller to ReplyWasTruncated, which handles the bracket-less case below. Accepting the good lines
+	// and ignoring the fragment would report a partial batch as a complete judgement — the quiet
+	// failure this package already guards against on the array path.
+	return parseVerdictLines(s)
+}
+
+// parseVerdictLines reads a reply of one verdict object per line. Reports false unless EVERY non-empty
+// line is a plausible verdict — see the fallback note in ParseVerdicts for why partial acceptance is
+// worse than rejection here.
+func parseVerdictLines(s string) ([]Verdict, bool) {
+	var out []Verdict
+	for _, ln := range strings.Split(s, "\n") {
+		ln = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(ln), ","))
+		if ln == "" {
+			continue
+		}
+		if !strings.HasPrefix(ln, "{") {
+			return nil, false
+		}
+		var v Verdict
+		if json.Unmarshal([]byte(ln), &v) != nil {
+			return nil, false
+		}
+		if !looksLikeVerdict(v) {
+			return nil, false
+		}
+		out = append(out, v)
+	}
+	// AT LEAST TWO LINES, and this is a deliberate conservatism rather than an arithmetic need.
+	// `TestAnUnparseableReplyYieldsNoVerdicts` refuses a BARE OBJECT as "not an array", and that guard is
+	// older than this fallback: a lone object is indistinguishable from the first line of an answer that
+	// stopped, whereas two or more lines are evidence of a chosen format. Every single-verdict reply that
+	// follows the contract is `[{...}]` and already parses on the array path, so the only thing refused
+	// here is a lone bare object — and inventories of one are gated out by min_inventory long before the
+	// ask. Revisit only if one-candidate asks ever become worth recovering, and change that test
+	// deliberately if so rather than as a side effect.
+	if len(out) < 2 {
+		return nil, false
+	}
+	return out, true
 }
 
 // looksLikeVerdict reports whether a decoded element is plausibly a verdict object rather than an
@@ -408,7 +459,30 @@ func looksLikeVerdict(v Verdict) bool {
 // -- so folding them under one name hid a 70%-of-calls failure behind a label that reads as "the
 // prompt is wrong" (`659e7a6`). Only meaningful when ParseVerdicts returned false.
 func ReplyWasTruncated(reply string) bool {
-	return strings.Contains(reply, "[") && !strings.Contains(reply, "]")
+	if strings.Contains(reply, "[") {
+		return !strings.Contains(reply, "]")
+	}
+	// THE BRACKET-LESS CASE, which exists because ParseVerdicts now also reads one verdict per line. A
+	// newline-delimited reply cut off mid-object has no bracket to be missing, so the test above calls
+	// it a format failure and points the operator at the prompt when the remedy is the token budget.
+	// Read as truncation only when EARLIER lines did parse: a reply whose every line is malformed is a
+	// format failure, and one that got several verdicts out before stopping ran out of room.
+	lines := strings.Split(strings.TrimSpace(reply), "\n")
+	if len(lines) < 2 {
+		return false
+	}
+	last := strings.TrimSpace(lines[len(lines)-1])
+	if last == "" || !strings.HasPrefix(last, "{") {
+		return false
+	}
+	var v Verdict
+	if json.Unmarshal([]byte(last), &v) == nil {
+		return false // the final line is whole; nothing was cut off
+	}
+	if _, ok := parseVerdictLines(strings.Join(lines[:len(lines)-1], "\n")); ok {
+		return true
+	}
+	return false
 }
 
 // Adjudication is what OUR code concluded, which is not the same thing as what the model said. Every
