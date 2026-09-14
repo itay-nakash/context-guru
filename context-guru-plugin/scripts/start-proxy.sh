@@ -298,8 +298,21 @@ KEEPALIVE_CFG="${STATE}/keepalive-${PORT}.yaml"
 # was not in effect, and the two diverge the moment somebody changes the option after enabling
 # keep-alive — a confident report of something untrue, which is the failure this plugin exists to avoid.
 PRESET_NOTE="$PRESET"
+# STRATEGY_NOTE is the NAME of the cache strategy in effect. Reported because a name is the only
+# thing a user can say back to us: "put it back on 5-min-ping" has to be a sentence, not an
+# archaeology exercise over four tuning numbers. `split` is the absence of a config, so it is the
+# correct thing to report when there is no file - not "unknown", and not silence.
+STRATEGY_NOTE="split"
 if [ -f "$KEEPALIVE_CFG" ]; then
   CONFIG_ARGS=(--config "$KEEPALIVE_CFG")
+  # Same fail-open discipline as the preset read below: an unreadable or marker-less file must
+  # still start the proxy, and must report what is KNOWN rather than something confident and wrong.
+  cfg_strategy=$(sed -n '1s/.*strategy=\([A-Za-z0-9._-]*\).*/\1/p' "$KEEPALIVE_CFG" 2>/dev/null)
+  if [ -n "$cfg_strategy" ]; then
+    STRATEGY_NOTE="$cfg_strategy"
+  else
+    STRATEGY_NOTE="unnamed (config predates named strategies, or is not ours)"
+  fi
   # Fails OPEN, and reports nothing rather than something wrong. This runs on the SessionStart path, so
   # an unreadable, empty, comment-only or preset-less file must still start the proxy.
   #
@@ -366,11 +379,11 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   # and overwrites the pidfile with a pid that immediately exits), not on this one.
   if curl -fsS --max-time 1 "$HEALTH" >/dev/null 2>&1; then
       if [ -n "$UPSTREAM" ]; then
-      note "proxy up on 127.0.0.1:${PORT} (preset ${PRESET_NOTE}, idle-exit ${IDLE_EXIT}), chained behind ${UPSTREAM}."
+      note "proxy up on 127.0.0.1:${PORT} (preset ${PRESET_NOTE}, cache strategy ${STRATEGY_NOTE}, idle-exit ${IDLE_EXIT}), chained behind ${UPSTREAM}."
       note "dashboard: http://127.0.0.1:${PORT}/dashboard/"
       exit 0
     fi
-    note "proxy up on 127.0.0.1:${PORT} (preset ${PRESET_NOTE}, idle-exit ${IDLE_EXIT})."
+    note "proxy up on 127.0.0.1:${PORT} (preset ${PRESET_NOTE}, cache strategy ${STRATEGY_NOTE}, idle-exit ${IDLE_EXIT})."
     note "dashboard: http://127.0.0.1:${PORT}/dashboard/"
     exit 0
   fi

@@ -2582,205 +2582,381 @@ func TestStatuslineCachesStatsAcrossQuickRenders(t *testing.T) {
 
 // --- the keep-alive opt-in toggle -----------------------------------------------------------
 
-// keepalivePort is deliberately not 8787. These blocks name the config file after the port, so a
-// regression to `${CLAUDE_PLUGIN_OPTION_PORT:-8787}` writes a filename nothing reads — and at a
-// fixture port of 8787 that regression passes by coincidence, which is exactly how it shipped.
+// keepalivePort is deliberately not 8787. `settings.py strategy` names the config file after the
+// port, so a regression to a defaulted port writes a filename nothing reads — and at a fixture port
+// of 8787 that regression passes by coincidence, which is exactly how it shipped once.
 const keepalivePort = "4041"
 
-// emptyPreset asks runKeepaliveBlock to substitute an EMPTY preset value, which is not the same as
-// passing "" — that means "this block has no <preset> line at all". Only the first models a model that
-// looked for `option_preset=` and found nothing to use.
-const emptyPreset = "\x00"
-
-// unfilledPlaceholder matches a `<lowercase>` placeholder left in an extracted block. Lower-case only
-// on purpose, so a heredoc delimiter (`<<EOF`) is not mistaken for one.
-var unfilledPlaceholder = regexp.MustCompile(`<[a-z][a-z_]*>`)
-
-// fillSkillPlaceholder substitutes one placeholder in an extracted skill block, failing loudly when
-// it is absent: an unsubstituted `PORT="<port>"` makes every path below look inert for the wrong
-// reason, which is what happened when the placeholder was introduced in the uninstall skill.
-func fillSkillPlaceholder(t *testing.T, skill, block, placeholder, value string) string {
-	t.Helper()
-	if !strings.Contains(block, placeholder) {
-		t.Fatalf("the %s block no longer carries %s; if that value is obtained differently now, this "+
-			"test needs to follow suit rather than execute a stale template:\n%s", skill, placeholder, block)
-	}
-	return strings.Replace(block, placeholder, value, 1)
-}
-
-// runKeepaliveBlock executes one bash block from skills/keepalive/SKILL.md with a controlled
-// environment, the same way runCheck/skillBlock drive the other skills' destructive snippets.
+// The keep-alive toggle used to be a heredoc embedded in skills/keepalive/SKILL.md, and the tests
+// below used to EXTRACT and execute that heredoc. They no longer do, because the heredoc is gone:
+// `settings.py strategy` is now the one place that decides what a strategy name means, and the skill
+// carries a name rather than four tuning numbers. These tests therefore assert behaviour instead of
+// prose, which is a strict improvement — a skill can be reworded without breaking them, and the
+// invariants they defend (ownership, the stated preset, no file for `split`) hold for every caller
+// rather than for one code path in one markdown file.
 //
-// The blocks are TEMPLATES: the skill tells the model to discover the port and preset with
-// `settings.py config` and substitute them, because CLAUDE_PLUGIN_OPTION_* never reaches a Bash tool
-// call. So fill the placeholders the way the model is instructed to, and run with those variables
-// EMPTY — that is the environment the blocks actually execute in.
-func runKeepaliveBlock(t *testing.T, needle, preset string, env map[string]string) (out string, code int) {
-	t.Helper()
-	requireTool(t, "bash")
-	block := skillBlock(t, "keepalive", needle)
-	block = fillSkillPlaceholder(t, "keepalive", block, `PORT="<port>"`, `PORT="`+keepalivePort+`"`)
-	if preset != "" {
-		v := preset
-		if v == emptyPreset {
-			v = ""
-		}
-		block = fillSkillPlaceholder(t, "keepalive", block, `PRESET="<preset>"`, `PRESET="`+v+`"`)
-	}
-	// Nothing below may execute a template. The per-call substitutions above are opt-in, so this is
-	// the check that does not have to be remembered: the day a block gains a placeholder no call site
-	// fills, it fails here instead of running literally and asserting on nothing.
-	if m := unfilledPlaceholder.FindString(block); m != "" {
-		t.Fatalf("the keepalive %q block still carries the placeholder %s after substitution; it would "+
-			"execute as a literal template and every assertion below would pass on nothing:\n%s",
-			needle, m, block)
-	}
-	cmd := exec.Command("bash", "-c", block)
-	cmd.Env = append(sandboxEnv(t), "CLAUDE_PLUGIN_OPTION_PORT=", "CLAUDE_PLUGIN_OPTION_PRESET=")
-	for k, v := range env {
-		cmd.Env = append(cmd.Env, k+"="+v)
-	}
-	b, err := cmd.CombinedOutput()
-	if ee, ok := err.(*exec.ExitError); ok {
-		code = ee.ExitCode()
-	} else if err != nil {
-		t.Fatalf("running keepalive block: %v (%s)", err, b)
-	}
-	t.Logf("keepalive block (needle %q) env=%v -> exit %d, output:\n%s", needle, env, code, b)
-	return string(b), code
+// Kept from the old suite, deliberately, one property at a time:
+//   - a config that omits its own `preset:` line silently turns compaction off, because --config
+//     REPLACES --preset rather than layering over it;
+//   - an unresolved preset must be REFUSED rather than written empty, which is the same defect
+//     arriving by a different route;
+//   - a file we did not write is never modified or removed;
+//   - the port is never defaulted, because the file is NAMED after it.
+
+// strategyCfg is where `settings.py strategy` writes, for the fixture port.
+func strategyCfg(state string) string {
+	return filepath.Join(state, "keepalive-"+keepalivePort+".yaml")
 }
 
-// TestKeepaliveEnableWritesAPresetPreservingConfig is the fix for the defect the config toggle
-// would otherwise reintroduce: --config REPLACES --preset entirely (loadConfig in
-// cmd/context-guru-proxy/main.go only reads --preset when --config is ABSENT), so a keep-alive
-// config that omitted its own `preset:` line would silently turn compaction off the moment
-// keep-alive turned on — the opposite of what enabling it is supposed to do.
-func TestKeepaliveEnableWritesAPresetPreservingConfig(t *testing.T) {
-	state := t.TempDir()
-	out, code := runKeepaliveBlock(t, `cat > "$CFG" <<EOF`, "codesmart", map[string]string{
-		"XDG_STATE_HOME": state,
-	})
+// TestStrategyListIsTheAuthoritativeSetAndNamesItsDefault. The names exist so that switching back is
+// one word; a list that omitted one, or disagreed about the default, would send a model to invent a
+// name and get `unknown_strategy`.
+func TestStrategyListIsTheAuthoritativeSetAndNamesItsDefault(t *testing.T) {
+	state, home := t.TempDir(), t.TempDir()
+	facts, code := settingsIn(t, state, home, "strategy", "list")
 	if code != 0 {
-		t.Fatalf("exit %d: %s", code, out)
+		t.Fatalf("exit %d: %v", code, facts)
 	}
-	cfg := filepath.Join(state, "context-guru", "keepalive-"+keepalivePort+".yaml")
-	b, err := os.ReadFile(cfg)
+	if facts["default"] != "5-min-ping" {
+		t.Errorf("default strategy is %q, want 5-min-ping: this is the value the install writes, and "+
+			"plugin.json's cache_strategy default has to agree with it", facts["default"])
+	}
+	for _, k := range []string{"strategy_split", "strategy_5_min_ping", "strategy_1_hour_head"} {
+		if facts[k] == "" {
+			t.Errorf("`strategy list` does not describe %s; a name the picker offers but list omits "+
+				"cannot be discovered", k)
+		}
+	}
+	// The honesty that matters most: exactly one strategy spends the caller's money, and it must be
+	// the one that says so. A `spends=false` on 5-min-ping would make the install's one-line
+	// disclosure wrong.
+	if facts["spends_5_min_ping"] != "true" {
+		t.Errorf("5-min-ping reports spends=%q; it pings on idle turns with the caller's own "+
+			"credential, and the install's disclosure is generated from this",
+			facts["spends_5_min_ping"])
+	}
+	for _, k := range []string{"spends_split", "spends_1_hour_head"} {
+		if facts[k] != "false" {
+			t.Errorf("%s reports spends=%q, want false: neither sends a ping, and claiming they "+
+				"spend would push users off the free strategies for no reason", k, facts[k])
+		}
+	}
+}
+
+// TestStrategySetWritesTheStatedPresetAndRecordsTheName is the old
+// TestKeepaliveEnableWritesAPresetPreservingConfig, moved to the script. --config REPLACES --preset
+// entirely (loadConfig in cmd/context-guru-proxy/main.go reads --preset only when --config is
+// ABSENT), so a strategy file that omitted its own `preset:` line would silently turn compaction off
+// at the moment a cache strategy was armed — the opposite of the intent.
+func TestStrategySetWritesTheStatedPresetAndRecordsTheName(t *testing.T) {
+	state, home := t.TempDir(), t.TempDir()
+	facts, code := settingsIn(t, state, home, "strategy", "set",
+		"--name", "5-min-ping", "--port", keepalivePort, "--preset", "codesmart")
+	if code != 0 {
+		t.Fatalf("exit %d: %v", code, facts)
+	}
+	if facts["strategy"] != "5-min-ping" || facts["spends"] != "true" {
+		t.Errorf("set reported strategy=%q spends=%q; the caller reports both to the user",
+			facts["strategy"], facts["spends"])
+	}
+	b, err := os.ReadFile(strategyCfg(state))
 	if err != nil {
-		t.Fatalf("config was not written at %s: %v", cfg, err)
+		t.Fatalf("no config written at %s: %v", strategyCfg(state), err)
 	}
-	if !strings.Contains(string(b), "preset: codesmart") {
-		t.Errorf("the configured PRESET did not survive into the config file, which would "+
-			"silently drop compaction the moment --config is passed:\n%s", b)
+	body := string(b)
+	if !strings.Contains(body, "preset: codesmart") {
+		t.Errorf("the CONFIGURED preset did not survive into the file, which silently drops "+
+			"compaction the moment --config is passed:\n%s", body)
 	}
-	if !strings.Contains(string(b), "keepalive: true") {
-		t.Errorf("cache.keepalive: true is missing from the written config:\n%s", b)
+	if !strings.Contains(body, "keepalive: true") {
+		t.Errorf("cache.keepalive: true is missing, so the strategy would not actually ping:\n%s", body)
+	}
+	// The name has to be IN the file, not merely in the command that wrote it: `strategy show` and
+	// start-proxy.sh both read it back, and the whole point of a name is that it survives.
+	if !strings.Contains(body, "strategy=5-min-ping") {
+		t.Errorf("the strategy name was not recorded in the file, so nothing can report it back and "+
+			"the user cannot be told what to switch back to:\n%s", body)
+	}
+	// Written 0600 like every other file this script owns: it is not secret, but it is ours, and a
+	// world-writable config that decides whether money is spent is a bad shape.
+	if fi, serr := os.Stat(strategyCfg(state)); serr == nil && fi.Mode().Perm() != 0o600 {
+		t.Errorf("config mode is %v, want 0600", fi.Mode().Perm())
 	}
 }
 
-// TestKeepaliveEnableRefusesToClobberAForeignFile: a file at the same path that this skill did
-// not write (no marker) might be something else entirely — refuse rather than overwrite it.
-func TestKeepaliveEnableRefusesToClobberAForeignFile(t *testing.T) {
-	state := t.TempDir()
-	stateDir := filepath.Join(state, "context-guru")
-	if err := os.MkdirAll(stateDir, 0o755); err != nil {
-		t.Fatal(err)
+// TestStrategySplitIsTheAbsenceOfAConfig pins the one non-obvious choice in the table: `split` is
+// expressed by REMOVING the file, never by writing `keepalive: false`. Because --config replaces the
+// preset, a file that said "off" would still hijack preset resolution — so the only faithful way to
+// say "just the preset" is to leave no config at all.
+func TestStrategySplitIsTheAbsenceOfAConfig(t *testing.T) {
+	state, home := t.TempDir(), t.TempDir()
+	if _, code := settingsIn(t, state, home, "strategy", "set",
+		"--name", "5-min-ping", "--port", keepalivePort, "--preset", "cache"); code != 0 {
+		t.Fatal("could not arm the strategy this test then switches away from")
 	}
-	cfg := filepath.Join(stateDir, "keepalive-"+keepalivePort+".yaml")
-	foreign := "# hand-written, not ours\npreset: cache\n"
-	if err := os.WriteFile(cfg, []byte(foreign), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	out, code := runKeepaliveBlock(t, `cat > "$CFG" <<EOF`, "cache", map[string]string{
-		"XDG_STATE_HOME": state,
-	})
+	facts, code := settingsIn(t, state, home, "strategy", "set",
+		"--name", "split", "--port", keepalivePort, "--preset", "cache")
 	if code != 0 {
-		t.Fatalf("must not fail outright, just refuse: exit %d: %s", code, out)
+		t.Fatalf("exit %d: %v", code, facts)
 	}
-	if !strings.Contains(out, "REFUSING") {
-		t.Errorf("no refusal reported for a foreign file: %s", out)
+	if _, err := os.Stat(strategyCfg(state)); err == nil {
+		b, _ := os.ReadFile(strategyCfg(state))
+		t.Errorf("switching to `split` left a config behind, so --config is still passed and the "+
+			"preset is still overridden:\n%s", b)
 	}
-	got, err := os.ReadFile(cfg)
-	if err != nil || string(got) != foreign {
-		t.Errorf("the foreign file was modified: %v, %q", err, got)
+	if facts["strategy"] != "split" {
+		t.Errorf("reported strategy=%q after switching to split", facts["strategy"])
+	}
+	// And `show` must call that state `split` rather than "unknown" or "none": it is a real,
+	// selectable strategy, and the install leaves exactly this behind for --cache-strategy split.
+	shown, _ := settingsIn(t, state, home, "strategy", "show", "--port", keepalivePort)
+	if shown["strategy"] != "split" {
+		t.Errorf("with no config, show reports strategy=%q; want split", shown["strategy"])
 	}
 }
 
-// TestKeepaliveDisableOnlyRemovesOurOwnFile mirrors the same ownership discipline
-// settings.py enforces for everything else this plugin writes.
-func TestKeepaliveDisableOnlyRemovesOurOwnFile(t *testing.T) {
-	t.Run("removes what we wrote", func(t *testing.T) {
-		state := t.TempDir()
-		stateDir := filepath.Join(state, "context-guru")
-		if err := os.MkdirAll(stateDir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		cfg := filepath.Join(stateDir, "keepalive-"+keepalivePort+".yaml")
-		ours := "# context-guru: written by /context-guru:keepalive\npreset: cache\ncache:\n  keepalive: true\n"
-		if err := os.WriteFile(cfg, []byte(ours), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		out, code := runKeepaliveBlock(t, `rm -f "$CFG"`, "", map[string]string{
-			"XDG_STATE_HOME": state,
+// TestStrategyNeverTouchesAFileItDidNotWrite is the old
+// TestKeepaliveEnableRefusesToClobberAForeignFile and TestKeepaliveDisableOnlyRemovesOurOwnFile,
+// merged: the same ownership discipline settings.py enforces for everything else it writes, applied
+// to both directions. A config at our path may be somebody's hand-tuned file.
+func TestStrategyNeverTouchesAFileItDidNotWrite(t *testing.T) {
+	const foreign = "# hand-written, not ours\npreset: house\ncache:\n  keepalive: true\n"
+	for _, op := range []string{"set", "clear"} {
+		t.Run(op, func(t *testing.T) {
+			state, home := t.TempDir(), t.TempDir()
+			if err := os.MkdirAll(state, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(strategyCfg(state), []byte(foreign), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			args := []string{"strategy", op, "--port", keepalivePort}
+			if op == "set" {
+				args = append(args, "--name", "5-min-ping", "--preset", "cache")
+			}
+			facts, code := settingsIn(t, state, home, args...)
+			if code != 2 {
+				t.Errorf("exit %d, want 2 (a refusal the caller can distinguish from a failure): %v",
+					code, facts)
+			}
+			if facts["reason"] != "not_ours" {
+				t.Errorf("reason=%q, want not_ours", facts["reason"])
+			}
+			got, err := os.ReadFile(strategyCfg(state))
+			if err != nil || string(got) != foreign {
+				t.Errorf("a config this plugin never wrote was modified or removed: %v, %q", err, got)
+			}
 		})
-		if code != 0 {
-			t.Fatalf("exit %d: %s", code, out)
-		}
-		if _, err := os.Stat(cfg); err == nil {
-			t.Error("our own config survived the disable block")
-		}
-	})
-
-	t.Run("leaves a foreign file alone", func(t *testing.T) {
-		state := t.TempDir()
-		stateDir := filepath.Join(state, "context-guru")
-		if err := os.MkdirAll(stateDir, 0o755); err != nil {
+	}
+	t.Run("show reports it as foreign rather than guessing", func(t *testing.T) {
+		state, home := t.TempDir(), t.TempDir()
+		if err := os.MkdirAll(state, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		cfg := filepath.Join(stateDir, "keepalive-"+keepalivePort+".yaml")
-		foreign := "# hand-written\npreset: cache\n"
-		if err := os.WriteFile(cfg, []byte(foreign), 0o644); err != nil {
+		if err := os.WriteFile(strategyCfg(state), []byte(foreign), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		out, code := runKeepaliveBlock(t, `rm -f "$CFG"`, "", map[string]string{
-			"XDG_STATE_HOME": state,
-		})
-		if code != 0 {
-			t.Fatalf("exit %d: %s", code, out)
-		}
-		got, err := os.ReadFile(cfg)
-		if err != nil || string(got) != foreign {
-			t.Errorf("a config this skill never wrote was removed: %v, %q, output: %s", err, got, out)
+		facts, code := settingsIn(t, state, home, "strategy", "show", "--port", keepalivePort)
+		if code != 0 || facts["strategy"] != "(foreign)" {
+			t.Errorf("show on a foreign config: exit %d strategy=%q, want 0 and (foreign) — naming a "+
+				"strategy here would attribute somebody else's tuning to us", code, facts["strategy"])
 		}
 	})
 }
 
-// TestKeepaliveEnableRefusesAnEmptyPreset closes the hole the placeholder flow itself opens.
+// TestStrategySetRefusesAnEmptyPreset is the old TestKeepaliveEnableRefusesAnEmptyPreset, and the
+// hole it closes is unchanged: `settings.py config` prints `option_preset=` only when that key is
+// actually configured, so a user who set the port and never touched the preset leaves the caller with
+// nothing to substitute. Writing `preset:` empty is not an error anywhere downstream — applyPreset
+// returns early on `Preset == ""`, so Load reports success, no pipeline is filled, and compaction is
+// entirely OFF while the strategy keeps spending the caller's credential on idle pings.
 //
-// `settings.py config` prints `option_preset=` only when that key is actually configured, so a user who
-// set the port and never touched the preset leaves the model with nothing to substitute. Writing the
-// resulting `preset:` line empty is not an error anywhere downstream: applyPreset returns early on
-// `Preset == ""` (config/config.go), so Load reports success, no pipeline is filled, and compaction is
-// entirely OFF while the keep-alive keeps spending the caller's credential on idle pings.
-//
-// That is strictly worse than the defaulted-`cache` bug this branch fixes, since `cache` at least ran
-// the split. The block already refuses to write over a file that is not its own; an unresolved preset
-// earns the same conservatism, and must leave no file behind.
-func TestKeepaliveEnableRefusesAnEmptyPreset(t *testing.T) {
-	state := t.TempDir()
-	out, code := runKeepaliveBlock(t, `cat > "$CFG" <<EOF`, emptyPreset, map[string]string{
-		"XDG_STATE_HOME": state,
-	})
+// That is strictly worse than a defaulted `cache` would be, since `cache` at least ran the split. So
+// the refusal must leave no file behind at all.
+func TestStrategySetRefusesAnEmptyPreset(t *testing.T) {
+	state, home := t.TempDir(), t.TempDir()
+	facts, code := settingsIn(t, state, home, "strategy", "set",
+		"--name", "5-min-ping", "--port", keepalivePort, "--preset", "")
 	if code == 0 {
 		t.Errorf("an unresolved preset was accepted; that writes `preset:` empty, which turns "+
-			"compaction off while keep-alive keeps paying for pings:\n%s", out)
+			"compaction off while the strategy keeps paying for pings: %v", facts)
 	}
-	if !strings.Contains(out, "REFUSING") {
-		t.Errorf("the refusal was not reported as such:\n%s", out)
+	if facts["reason"] != "empty_preset" {
+		t.Errorf("reason=%q, want empty_preset", facts["reason"])
 	}
-	cfg := filepath.Join(state, "context-guru", "keepalive-"+keepalivePort+".yaml")
-	if _, err := os.Stat(cfg); err == nil {
-		t.Errorf("a config was written anyway at %s, so the proxy would start with compaction off", cfg)
+	if _, err := os.Stat(strategyCfg(state)); err == nil {
+		t.Errorf("a config was written anyway at %s, so the proxy would start with compaction off",
+			strategyCfg(state))
 	}
+}
+
+// TestStrategySetRefusesAnUnknownName. A name is the interface, so an invented one must fail loudly
+// rather than write a file whose contents nobody chose.
+func TestStrategySetRefusesAnUnknownName(t *testing.T) {
+	state, home := t.TempDir(), t.TempDir()
+	facts, code := settingsIn(t, state, home, "strategy", "set",
+		"--name", "turbo", "--port", keepalivePort, "--preset", "cache")
+	if code != 2 || facts["reason"] != "unknown_strategy" {
+		t.Errorf("exit %d reason=%q, want 2 / unknown_strategy: %v", code, facts["reason"], facts)
+	}
+	if facts["known"] == "" {
+		t.Error("the refusal does not list the names that WOULD work, so the caller has to guess again")
+	}
+	if _, err := os.Stat(strategyCfg(state)); err == nil {
+		t.Error("a config was written for a name that does not exist")
+	}
+}
+
+// TestStrategyRequiresThePortRatherThanDefaultingIt is the defect that shipped once already, in the
+// form `${CLAUDE_PLUGIN_OPTION_PORT:-8787}`: the config file is NAMED after the port, so a defaulted
+// 8787 writes a file nothing ever reads and then reports success. The fixture port is deliberately
+// not 8787, because at 8787 that regression passes by coincidence.
+func TestStrategyRequiresThePortRatherThanDefaultingIt(t *testing.T) {
+	state, home := t.TempDir(), t.TempDir()
+	for _, op := range [][]string{
+		{"strategy", "set", "--name", "5-min-ping", "--preset", "cache"},
+		{"strategy", "show"},
+		{"strategy", "clear"},
+	} {
+		facts, code := settingsIn(t, state, home, op...)
+		if code == 0 {
+			t.Errorf("%v was accepted without --port; a defaulted port writes or reads a file for the "+
+				"wrong proxy: %v", op, facts)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(state, "keepalive-8787.yaml")); err == nil {
+		t.Error("a config was written at the DEFAULT port, which is exactly the shipped defect")
+	}
+}
+
+// TestStrategyStillRecognisesTheOldKeepaliveMarker. Files written by the previous
+// /context-guru:keepalive skill exist on real machines. Treating them as foreign would strand anyone
+// who armed keep-alive before the rename: they could neither re-point nor clear their own config.
+func TestStrategyStillRecognisesTheOldKeepaliveMarker(t *testing.T) {
+	const old = "# context-guru: written by /context-guru:keepalive\npreset: cache\ncache:\n  keepalive: true\n"
+	state, home := t.TempDir(), t.TempDir()
+	if err := os.MkdirAll(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(strategyCfg(state), []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	shown, _ := settingsIn(t, state, home, "strategy", "show", "--port", keepalivePort)
+	if shown["strategy"] != "(unnamed)" {
+		t.Errorf("show on a pre-rename config reports strategy=%q; want (unnamed) — it is ours, but "+
+			"it carries no name, and inventing one would misreport what is armed", shown["strategy"])
+	}
+	facts, code := settingsIn(t, state, home, "strategy", "set",
+		"--name", "5-min-ping", "--port", keepalivePort, "--preset", "cache")
+	if code != 0 {
+		t.Fatalf("a pre-rename config could not be re-set, which strands its owner: exit %d %v",
+			code, facts)
+	}
+	b, _ := os.ReadFile(strategyCfg(state))
+	if !strings.Contains(string(b), "strategy=5-min-ping") {
+		t.Errorf("re-setting a pre-rename config did not give it a name:\n%s", b)
+	}
+}
+
+// TestPluginJSONCacheStrategyAgreesWithTheScript. Two sources of truth for the default would drift,
+// and the drift is invisible: plugin.json is what the user's settings UI shows, and the script is
+// what actually gets written.
+func TestPluginJSONCacheStrategyAgreesWithTheScript(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join(".claude-plugin", "plugin.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest struct {
+		UserConfig map[string]struct {
+			Default     any    `json:"default"`
+			Description string `json:"description"`
+		} `json:"userConfig"`
+	}
+	if err := json.Unmarshal(b, &manifest); err != nil {
+		t.Fatalf("plugin.json does not parse: %v", err)
+	}
+	cs, ok := manifest.UserConfig["cache_strategy"]
+	if !ok {
+		t.Fatal("plugin.json declares no cache_strategy option, so the strategy cannot be set at " +
+			"install time and the picker is the only way in")
+	}
+	state, home := t.TempDir(), t.TempDir()
+	facts, _ := settingsIn(t, state, home, "strategy", "list")
+	if got, want := cs.Default, facts["default"]; got != want {
+		t.Errorf("plugin.json cache_strategy default is %v but the script's default is %q; the UI "+
+			"would advertise one strategy while the install wrote another", got, want)
+	}
+	// The default spends money, so the option that selects it has to say so where the user reads it.
+	if !strings.Contains(strings.ToUpper(cs.Description), "SPENDS") {
+		t.Errorf("the cache_strategy description never says the default SPENDS the user's own "+
+			"credential; that disclosure cannot live only in a skill the user never reads:\n%s",
+			cs.Description)
+	}
+
+	// And the preset option must no longer make the claim that default-on keep-alive falsifies.
+	// "no model calls" was true when `cache` meant cachesplit alone; an idle ping is a model call.
+	preset, ok := manifest.UserConfig["preset"]
+	if !ok {
+		t.Fatal("plugin.json declares no preset option")
+	}
+	if strings.Contains(preset.Description, "no model calls") &&
+		!strings.Contains(preset.Description, "cache_strategy") {
+		t.Errorf("the preset description still promises \"no model calls\" without pointing at "+
+			"cache_strategy, whose default pings. A trust claim that has quietly become false is "+
+			"worse than no claim:\n%s", preset.Description)
+	}
+}
+
+// TestPickerSkillOffersOnlyRealStrategies is a docdrift guard: the picker's table is what a model
+// reads before choosing a --name, so a name that exists only in prose becomes an
+// `unknown_strategy` at the worst moment, and a strategy missing from the table is undiscoverable.
+func TestPickerSkillOffersOnlyRealStrategies(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("skills", "cache-strategy-picker", "SKILL.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(b)
+	state, home := t.TempDir(), t.TempDir()
+	facts, _ := settingsIn(t, state, home, "strategy", "list")
+	real := map[string]bool{}
+	for k := range facts {
+		if name, ok := strings.CutPrefix(k, "strategy_"); ok {
+			real[name] = true
+		}
+	}
+	if len(real) == 0 {
+		t.Fatal("no strategies were discovered, so this guard proved nothing")
+	}
+	for name := range real {
+		// The skill spells names with hyphens; `strategy list` keys use underscores.
+		spelled := strings.ReplaceAll(name, "_", "-")
+		if !strings.Contains(body, "`"+spelled+"`") {
+			t.Errorf("the picker skill never mentions the strategy %q, so a user cannot discover it",
+				spelled)
+		}
+	}
+	// Every backticked hyphenated token that LOOKS like a strategy must be one.
+	for _, m := range regexp.MustCompile("`([a-z0-9]+(?:-[a-z0-9]+){1,3})`").FindAllStringSubmatch(body, -1) {
+		tok := m[1]
+		if strings.Contains(tok, ".") || strings.HasSuffix(tok, ".py") {
+			continue
+		}
+		if !real[strings.ReplaceAll(tok, "-", "_")] && isStrategyShaped(tok) {
+			t.Errorf("the picker skill offers %q, which `strategy list` does not know: a model that "+
+				"passes it gets reason=unknown_strategy", tok)
+		}
+	}
+}
+
+// isStrategyShaped keeps the guard above from flagging ordinary hyphenated prose. Only tokens that
+// look like a strategy NAME are candidates: they end in a word this vocabulary actually uses.
+func isStrategyShaped(tok string) bool {
+	for _, suffix := range []string{"-ping", "-head", "-split"} {
+		if strings.HasSuffix(tok, suffix) {
+			return true
+		}
+	}
+	return tok == "split"
 }
 
 // TestStartProxyPicksUpAKeepaliveConfig proves the wiring between the opt-in toggle above and the
@@ -2920,7 +3096,8 @@ func TestEverySkillStatesThePerOptionFallback(t *testing.T) {
 	}
 	if checked < 4 {
 		t.Fatalf("only %d skills were found to read `settings.py config`; expected at least the four "+
-			"(install, status, uninstall, keepalive), so this guard proved less than it claims", checked)
+			"(install, status, uninstall, cache-strategy-picker), so this guard proved less than it "+
+			"claims", checked)
 	}
 	t.Logf("checked %d skills that read the configured options", checked)
 }
@@ -3369,8 +3546,28 @@ func TestStartProxyReportsThePresetActuallyInEffect(t *testing.T) {
 			// preset at all.
 			name:      "no keepalive config: the plugin option is the truth and is reported",
 			writeCfg:  false,
-			wantIn:    []string{"preset " + optionPreset},
+			wantIn:    []string{"preset " + optionPreset, "cache strategy split"},
 			wantNotIn: []string{"unstated"},
+		},
+		{
+			// The NAME is the whole reason strategies are named: it is the only thing a user can say
+			// back to us. It has to survive from the file into the note, or "switch it back to
+			// 5-min-ping" is not a sentence anybody can act on.
+			name:     "the strategy name in the marker is reported",
+			writeCfg: true,
+			cfg: "# context-guru: strategy=1-hour-head written by /context-guru:cache-strategy-picker\n" +
+				"preset: house\ncache:\n  head_ttl_1h: true\n",
+			wantIn:    []string{"cache strategy 1-hour-head", "preset house"},
+			wantNotIn: []string{"cache strategy split", "preset " + optionPreset},
+		},
+		{
+			// A config we own but that predates named strategies, or one we do not own at all: report
+			// it as unnamed rather than guessing. Naming the DEFAULT here would be the worst answer —
+			// it would tell the user 5-min-ping is armed when the file might say anything.
+			name:     "a config with no strategy marker is unnamed, never guessed",
+			writeCfg: true, cfg: "preset: house\ncache:\n  keepalive: true\n",
+			wantIn:    []string{"cache strategy unnamed"},
+			wantNotIn: []string{"cache strategy 5-min-ping", "cache strategy split"},
 		},
 	} {
 		t.Run(c.name, func(t *testing.T) {

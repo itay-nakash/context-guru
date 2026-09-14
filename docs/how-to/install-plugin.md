@@ -363,9 +363,12 @@ restart needed beyond a new session:
 anything, a display hook would double as an unbounded traffic generator billed to you. Sending a
 keep-alive ping is a separate, explicit action, whether or not its counter is shown here:
 
-`/context-guru:keepalive` reports whether the mechanism is on, and turns it on or off. Turning it
-on means the proxy will spend your own credential on idle turns, between sessions, to keep the
-cache warm — worth knowing before you enable it, which is why this asks rather than infers.
+`/context-guru:cache-strategy-picker` reports which named cache strategy is in effect and switches
+between them. Idle keep-alive is the strategy named `5-min-ping`, and **it is now the install
+default** — so the proxy will spend your own credential on idle turns, between sessions, to keep the
+cache warm. That is what holds the cache across a gap, and it is bounded (at most 2 pings per idle
+span, only on prefixes over 20k tokens, capped at $0.25 a ping) but it is not free. `split` is the
+strategy that sends no pings at all, and switching to it is one word.
 
 One nuance worth having straight: once keep-alive is on, `cache cold` in the status line (once
 you have turned that segment on) no longer means the provider's own cached entry is actually

@@ -29,8 +29,14 @@
     "preset": {
       "type": "string",
       "title": "Preset",
-      "description": "Compaction pipeline. `cache` (the default) runs the prompt-cache split and NOTHING else: no content dropped, no markers, no extra tool, no model calls. `codesmart` adds the offloaders once you want them.",
+      "description": "Compaction PIPELINE - what happens to the request body. `cache` (the default) runs the prompt-cache split and NOTHING else: no content dropped, no markers, no extra tool. `codesmart` adds the offloaders once you want them. This option does not decide whether idle keep-alive pings are sent: that is `cache_strategy`, and the default one DOES make model calls. Read both before assuming nothing is spent.",
       "default": "cache"
+    },
+    "cache_strategy": {
+      "type": "string",
+      "title": "Cache strategy",
+      "description": "Which cache mechanism runs, by NAME, so switching back is one word rather than four tuning numbers. `5-min-ping` (the default) is the split PLUS an idle ping just under the provider's 5-minute TTL - at most 2 per idle span, only on prefixes over 20k tokens, capped at $0.25 a ping - and it SPENDS YOUR OWN CREDENTIAL while nobody is at the keyboard, which is the whole point: it is what keeps the cache warm across a gap. `split` is the split alone: no pings, no spend. `1-hour-head` asks for the 1-hour tier on the tools/system breakpoints instead; measured GRANTED on Haiku 4.5 and silently DOWNGRADED on Sonnet 5, so on Opus/Sonnet expect $0 until Usage.CacheWrite1h says otherwise. Change it any time with /context-guru:cache-strategy-picker; it takes effect at the proxy's next start.",
+      "default": "5-min-ping"
     },
     "idle_exit": {
       "type": "string",

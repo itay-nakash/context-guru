@@ -24,7 +24,7 @@ cold`) and the keep-alive ping counter (`ka 2p`) are extras, each behind its own
 installed command — see "Turn an extra on" below. Neither is shown until you ask for it.
 
 **It never sends a keep-alive ping, and never will.** It only reads. Turning the keep-alive
-mechanism on is a separate, explicit action — see `/context-guru:keepalive`.
+mechanism on is a separate, explicit action — see `/context-guru:cache-strategy-picker`.
 
 ## Where to install it
 
