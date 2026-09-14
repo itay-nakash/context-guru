@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -249,7 +250,15 @@ func (s *Summarize) startAsyncSummary(c *components.Ctx, model components.Model,
 	// `st`, not `store`: the obvious name shadows the store PACKAGE, which this goroutine also
 	// calls into (store.PutStash, store.SumPrefix). It compiled, which is what makes it worth
 	// renaming rather than leaving.
-	session, st := c.Session, c.Store
+	// `mode` is read HERE too, and that is the point of this line existing separately.
+	//
+	// commitAsyncSummary used to take the live `*Ctx` and call effectiveMode(c, s.mode) from inside
+	// the goroutine, which reads c.Store — contradicting the discipline stated two lines above and
+	// putting a concurrent read on a struct the request owns. No production write to a Ctx field
+	// exists today (a Ctx is per-request and never pooled), so it was latent rather than a live
+	// race; the race detector trips on it, and it is exactly the shape where the NEXT field write
+	// becomes a silent production race. A review found it.
+	session, st, mode := c.Session, c.Store, effectiveMode(c, s.mode)
 	// Detached from the request's cancellation but keeping its logger, so the resolution line
 	// carries the same request-scoped fields the commission line did.
 	baseCtx := context.WithoutCancel(c.Ctx)
@@ -265,7 +274,20 @@ func (s *Summarize) startAsyncSummary(c *components.Ctx, model components.Model,
 		}()
 		// Fail open, always: a panic in a detached goroutine takes the process down, which is a
 		// far worse outcome than a missing summary. The pipeline's own recover cannot reach here.
-		defer func() { _ = recover() }()
+		//
+		// AND IT IS NOT SILENT. `_ = recover()` swallowed the only evidence that anything had gone
+		// wrong: nothing on the hot path waits for this call, so a panicking summarizer produced a
+		// growing asyncStarted/asyncCommitted gap and no other trace at all — a component failing
+		// invisibly, which is the shape this repo has been bitten by before. A counter so it shows
+		// up in /stats beside the other async figures, and a log line with the value so the cause
+		// is diagnosable rather than merely countable.
+		defer func() {
+			if r := recover(); r != nil {
+				atomic.AddInt64(&summarizeAsyncPanics, 1)
+				logging.From(baseCtx).Error("summarize: detached summary panicked; no summary was "+
+					"committed for this turn", "session", session, "panic", fmt.Sprint(r))
+			}
+		}()
 		ctx, cancel := context.WithTimeout(baseCtx, asyncSummaryBudget())
 		defer cancel()
 		// A DETACHED sink, not a nested one. This goroutine inherits the commissioning request's
@@ -292,7 +314,7 @@ func (s *Summarize) startAsyncSummary(c *components.Ctx, model components.Model,
 		if strings.TrimSpace(summary) == "" {
 			return
 		}
-		s.commitAsyncSummary(c, session, st, spanCopy, summary, coveredCount)
+		s.commitAsyncSummary(mode, session, st, spanCopy, summary, coveredCount)
 	}()
 	return ""
 }
@@ -308,9 +330,8 @@ func (s *Summarize) startAsyncSummary(c *components.Ctx, model components.Model,
 // and no Report to file against — both belong to a turn that has already been answered. Everything
 // it produces reaches the wire through the next turn's replay, which is the one place that splice
 // happens.
-func (s *Summarize) commitAsyncSummary(c *components.Ctx, session string, st store.Store,
+func (s *Summarize) commitAsyncSummary(mode markerMode, session string, st store.Store,
 	span []bschemas.ChatMessage, summary string, coveredCount int) {
-	mode := effectiveMode(c, s.mode)
 	var key string
 	if mode == markerFull {
 		spanJSON, err := json.Marshal(span)
@@ -353,6 +374,11 @@ var (
 	// climbing value here means the proxy is shedding compaction under load, which is the designed
 	// behaviour but worth seeing.
 	summarizeAsyncRefused int64
+	// summarizeAsyncPanics counts recovered panics in the detached goroutine. It exists because the
+	// recover() was silent: nothing on the hot path waits for this call, so a panicking summarizer
+	// showed up ONLY as a growing started/committed gap and no other trace anywhere. Fail-open is
+	// right; failing open without a countable trace is not.
+	summarizeAsyncPanics int64
 )
 
 // MaxConcurrentSummaries is the global bound, reported beside the counts for the reason
@@ -361,13 +387,14 @@ var (
 func MaxConcurrentSummaries() int64 { return maxConcurrentSummaries }
 
 // AsyncSummaryStats reports the async path's counters for /stats.
-func AsyncSummaryStats() (started, committed, waitedMs, waitTimeouts, refused, unresolved int64) {
+func AsyncSummaryStats() (started, committed, waitedMs, waitTimeouts, refused, unresolved, panics int64) {
 	return atomic.LoadInt64(&summarizeAsyncStarted),
 		atomic.LoadInt64(&summarizeAsyncCommitted),
 		atomic.LoadInt64(&summarizeWaitedMs),
 		atomic.LoadInt64(&summarizeWaitTimeouts),
 		atomic.LoadInt64(&summarizeAsyncRefused),
-		atomic.LoadInt64(&summarizeUnresolved)
+		atomic.LoadInt64(&summarizeUnresolved),
+		atomic.LoadInt64(&summarizeAsyncPanics)
 }
 
 // deferredUsage is what a detached summarizer call used, waiting for a turn to attribute it to.

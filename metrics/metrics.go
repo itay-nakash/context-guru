@@ -713,10 +713,15 @@ type Snapshot struct {
 	// WaitedMs and WaitTimeouts are the other half: whether the wait cap is set anywhere near
 	// right. A climbing timeout count means turns are paying the full cap and getting nothing,
 	// which is the case for lowering it or for looking at the summarizer.
-	SummarizeAsyncStarted     int64 `json:"summarize_async_started"`
-	SummarizeAsyncCommitted   int64 `json:"summarize_async_committed"`
-	SummarizeAsyncRefused     int64 `json:"summarize_async_refused"`
-	SummarizeAsyncUnresolved  int64 `json:"summarize_async_unresolved"`
+	SummarizeAsyncStarted    int64 `json:"summarize_async_started"`
+	SummarizeAsyncCommitted  int64 `json:"summarize_async_committed"`
+	SummarizeAsyncRefused    int64 `json:"summarize_async_refused"`
+	SummarizeAsyncUnresolved int64 `json:"summarize_async_unresolved"`
+	// SummarizeAsyncPanics counts recovered panics in the detached goroutine. Fail-open is right
+	// there — a panic in a detached goroutine would otherwise take the process down — but the
+	// recover() was silent, so a panicking summarizer showed up only as a growing started/committed
+	// gap and nothing named the cause.
+	SummarizeAsyncPanics      int64 `json:"summarize_async_panics"`
 	SummarizeAwaitedMs        int64 `json:"summarize_awaited_ms"`
 	SummarizeAwaitTimeouts    int64 `json:"summarize_await_timeouts"`
 	SummarizeAsyncConcurrency int64 `json:"summarize_async_concurrency"`

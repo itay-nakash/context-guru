@@ -281,22 +281,20 @@ func (t Trigger) IsHuge(outputTokens, window int) bool {
 // "trigger"). It lives beside the struct so a new threshold cannot be added without the
 // form learning about it — the fields parity test compares these keys against the struct's
 // yaml tags.
-func TriggerFields(prefix string) []Field { return triggerFields(prefix, true) }
-
-// TriggerFieldsNoCache is TriggerFields without `cache_state` and `pre_expiry_seconds`, for a
-// component that does not consult the cache phase.
+// TriggerFields declares every key a Trigger accepts, for every component that embeds one.
 //
-// ADVERTISING A KEY A COMPONENT IGNORES IS WORSE THAN NOT OFFERING IT. `extract` and `extract_llm`
-// both embed Trigger and neither one calls CacheAllows or CachePhase anywhere, so the settings form
-// offered them a `cache_state` control — hinted "Restrict firing by the prompt cache's state" — that
-// did nothing at all. An operator setting `cache_state: cold` there would reasonably believe the
-// component had been told to wait for a cold cache, and it would go on firing on maximally warm
-// turns. A review found it; the form is the only place these keys were reachable.
+// It is deliberately NOT split per component, and an attempt to split it is what established that.
+// `extract` and `extract_llm` consult neither CacheAllows nor CachePhase, so their `cache_state`
+// control did nothing — and the obvious fix, hiding the key from their form, breaks this repo's own
+// contract: TestEveryComponentDeclaresExactlyItsConfigurableKeys requires that a key the config
+// STRUCT accepts is declared, because a key that is accepted but undeclarable is settable in YAML and
+// invisible in the UI. Hiding the control would have made the inert key harder to see, not gone.
 //
-// A component that later starts consulting the phase switches to TriggerFields and gets them back.
-func TriggerFieldsNoCache(prefix string) []Field { return triggerFields(prefix, false) }
-
-func triggerFields(prefix string, cacheAware bool) []Field {
+// So the inert key is refused instead — see Trigger.Validate's consultsCache argument — which means
+// it can never be silently ignored, and an operator who sets it is told which component does honour
+// it. The form still offers the control; its default (`any`) is the no-op, so only a deliberate
+// restriction reaches the error.
+func TriggerFields(prefix string) []Field {
 	p := prefix + "."
 	f := []Field{
 		{Key: p + "min_request_tokens", Type: FieldInt, Hint: "Fire only when the whole request carries at least this many tokens (0 = no constraint)."},
@@ -305,9 +303,6 @@ func triggerFields(prefix string, cacheAware bool) []Field {
 		{Key: p + "min_request_frac", Type: FieldFloat, Hint: "The request threshold as a fraction of the model's context window, e.g. 0.6. Raises the absolute floor, never lowers it; ignored when the window is unknown."},
 		{Key: p + "min_output_frac", Type: FieldFloat, Hint: "The per-item floor as a fraction of the window. Also only ever raises the absolute one."},
 		{Key: p + "huge_output_frac", Type: FieldFloat, Hint: "Hard per-item trigger: a single output at least this fraction of the window is acted on regardless of the request-level gate."},
-	}
-	if !cacheAware {
-		return f
 	}
 	return append(f,
 		Field{Key: p + "cache_state", Type: FieldEnum, Default: CacheStateAny, Options: CacheStates,
@@ -339,6 +334,29 @@ const maxPreExpirySeconds = 300
 // docstring was load-bearing for the component that DOES.
 //
 // `component` names the caller so the error says which config block is wrong.
+//
+// WHAT THIS DELIBERATELY DOES NOT DO: refuse a cache_state on a component that ignores it.
+// `extract` and `extract_llm` embed a Trigger and call neither CacheAllows nor CachePhase anywhere,
+// so `cache_state: cold` on either of them is silently inert while the settings form describes it as
+// "Restrict firing by the prompt cache's state". A review found that, and both obvious fixes were
+// tried here and both break a contract this repo already keeps:
+//
+//   - Hiding the keys from those components' form fields fails
+//     TestEveryComponentDeclaresExactlyItsConfigurableKeys — a key the config struct accepts must be
+//     declared, or it is settable in YAML and invisible in the UI.
+//   - Refusing the value in the constructor fails
+//     TestEveryDeclaredFieldReachesTheDocumentAndNothingElseMoves — a declared field must accept every
+//     value it declares.
+//
+// Both contracts are right, and together they say the real defect is upstream of validation: the key
+// should not be in those components' config at all. That wants Trigger split into a size-only
+// embedded struct plus the cache keys, which is a config-shape change with its own compatibility
+// surface — its own issue, not a rider here. Honouring the key on those components is NOT the answer
+// either: they only ever rewrite the uncached tail (Ctx.TailOnly), so they never invalidate the
+// cached prefix, which is exactly why they have no economic reason to wait for a cache state.
+//
+// So this validates what is true for every component that embeds a Trigger: that the enum value
+// exists, and that the window is in range.
 func (t Trigger) Validate(component string) error {
 	// Refused rather than silently read as "any": a typo in the one key that decides WHEN a
 	// component fires would otherwise turn the cache gate off and look like it was on.

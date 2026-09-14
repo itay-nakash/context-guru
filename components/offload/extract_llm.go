@@ -466,6 +466,12 @@ func newExtractLLM(raw []byte) (components.Component, error) {
 	if cfg.AllowOnCachingBackend != nil {
 		allowCached = *cfg.AllowOnCachingBackend
 	}
+	// CacheAllows' docstring promises every constructor validates the trigger; before this, exactly
+	// one of the three did. This component ignores the cache keys — see Trigger.Validate for why that
+	// is a config-shape issue rather than a validation one.
+	if err := cfg.Trigger.Validate("extract_llm"); err != nil {
+		return nil, err
+	}
 	return &ExtractLLM{
 		minTokens: cfg.MinTokens, strategy: cfg.Strategy,
 		modelSource: cfg.Model.Source, modelClient: cfg.Model.Client(),
@@ -1650,8 +1656,9 @@ func init() {
 		markerModeField(),
 	}
 	f = append(f, modelFields("model")...)
-	// TriggerFieldsNoCache: this component consults neither CacheAllows nor CachePhase anywhere, so
-	// offering a `cache_state` control would advertise a restriction it does not apply. The cache
-	// phase belongs to extract_llm_sweep, which declares its own fields.
-	components.RegisterFields("extract_llm", extractLLMConfig{}, append(f, components.TriggerFieldsNoCache("trigger")...))
+	// The cache keys are declared here because the config struct accepts them, and this repo's field
+	// contract requires a declared key for anything the struct reads. This component consults neither
+	// CacheAllows nor CachePhase, so those two keys are INERT on it — see Trigger.Validate for why
+	// that is a config-shape defect with its own issue rather than something validation can fix.
+	components.RegisterFields("extract_llm", extractLLMConfig{}, append(f, components.TriggerFields("trigger")...))
 }

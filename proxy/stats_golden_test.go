@@ -123,6 +123,7 @@ var statsGoldenTopLevel = []string{
 	"summarize_async_committed",
 	"summarize_async_refused",
 	"summarize_async_unresolved",
+	"summarize_async_panics",
 	"summarize_awaited_ms",
 	"summarize_await_timeouts",
 	"summarize_async_concurrency",

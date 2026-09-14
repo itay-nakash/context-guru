@@ -167,6 +167,7 @@ var notExportedWhy = map[string]string{
 	"SummarizeAsyncCommitted":  "NOT EXPORTED YET — as above; the pair is the signal, not either half",
 	"SummarizeAsyncRefused":    "NOT EXPORTED YET — the global bound shedding compaction under load",
 	"SummarizeAsyncUnresolved": "NOT EXPORTED YET — calls outstanding right now; process-local by nature, so the log is the durable record",
+	"SummarizeAsyncPanics":     "NOT EXPORTED YET — recovered panics in the detached goroutine; the ERROR log line beside it carries the panic value, which is the part a diagnosis needs",
 	"SummarizeAwaitedMs":       "NOT EXPORTED YET — latency a turn paid waiting for a summary another turn started",
 	"SummarizeAwaitTimeouts":   "NOT EXPORTED YET — with AwaitedMs, whether the wait cap is set anywhere near right",
 	"AgentDietTimeouts":        "NOT EXPORTED YET — agentdiet's fail-open path, same gap",

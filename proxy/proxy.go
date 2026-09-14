@@ -1970,7 +1970,8 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
 	// TestAsyncSummaryCountersReachStats pins the route so that cannot recur.
 	snap.SummarizeAsyncStarted, snap.SummarizeAsyncCommitted,
 		snap.SummarizeAwaitedMs, snap.SummarizeAwaitTimeouts,
-		snap.SummarizeAsyncRefused, snap.SummarizeAsyncUnresolved = offload.AsyncSummaryStats()
+		snap.SummarizeAsyncRefused, snap.SummarizeAsyncUnresolved,
+		snap.SummarizeAsyncPanics = offload.AsyncSummaryStats()
 	snap.SummarizeAsyncConcurrency = offload.MaxConcurrentSummaries()
 	// agentdiet owns a third budget (a window of steps, between one tool output and a
 	// whole span), and runs in its own arm — so it reports its own counters too.
