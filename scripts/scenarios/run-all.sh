@@ -17,7 +17,7 @@ mkdir -p "$(dirname "$L")"
 : > "$L"
 echo "=== SCENARIO RUN START $(date -u) ===" >> "$L"
 echo "=== source: ${CG_SCEN_SRC:-$PWD} ===" >> "$L"
-for s in a-firing-rate b-cold-events c-warm-only d-early-compacting-client; do
+for s in a-firing-rate b-cold-events c-warm-only d-maxtokens-rule; do
   echo >> "$L"
   "$here/$s.sh" >> "$L" 2>&1
   echo "--- arm $s exited $? at $(date -u +%H:%M:%S)" >> "$L"
