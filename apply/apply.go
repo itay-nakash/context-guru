@@ -1019,6 +1019,76 @@ func aliasSeen(st store.Store, alias string, nowMs int64) int64 {
 	return prev
 }
 
+// RecordCacheTouch records that something refreshed this prefix's provider cache entry at nowMs,
+// against the SAME content-derived alias the request path reads. It is the seam a keep-alive ping
+// uses.
+//
+// # Why a ping has to count
+//
+// A ping's whole job is to READ the cached prefix, and a read refreshes the entry's TTL. So after a
+// successful ping the entry is warm again — and until this existed, nothing told the cache-liveness
+// clock. `prevAt` came only from real requests, so on a kept-alive session the idle time grew without
+// bound while the provider held the entry alive, and every reader of Ctx.IdleMs concluded the cache
+// was long dead.
+//
+// For summarize's gate that conclusion is expensive in the one direction that matters:
+// CertainlyColdByClock returned true, `cache_state: cold` and the shipped `pre_expiry_or_cold`
+// permitted a rewrite, and the component compacted a LIVE prefix — on exactly the sessions someone is
+// paying pings to protect. coldByArithmetic's own docstring exists to avoid that outcome via
+// Ctx.ColdCache and then reproduced it through the timestamp underneath. Issue #243.
+//
+// # And why this is NOT the dashboard's session-recency map
+//
+// keepalive.go deliberately does not touch that map, and its reason is right: re-dating the session
+// would make the next real request's gap read as four minutes instead of the twenty it actually was,
+// hiding the very thing the mechanism exists to demonstrate.
+//
+// Those are two different questions and they want two different clocks:
+//
+//	"is the provider still holding this prefix?"   -> counts pings   -> THIS clock
+//	"how long was the USER away?"                  -> ignores pings  -> the recency map, untouched
+//
+// Sharing one clock forces a wrong answer to one of them. This writes only the first, so the
+// dashboard's idle-gap statistics and any firing-rate measurement over them are unaffected.
+//
+// # Why the alias and not the session id
+//
+// Because the provider's entry is keyed on CONTENT, and this must land on the key apply's own
+// aliasSeen will read. Computing it here, from the same schema.SessionHead + session.Scoped pair,
+// is what makes the two impossible to drift apart — a second derivation of a cache key is how the
+// cold decision and the dashboard came to disagree once already.
+//
+// nowMs must be the time the ping's request STARTED, not its completion: the provider's lifetime runs
+// from request start, which is the same reasoning kaEntry.startedAt is anchored on.
+func RecordCacheTouch(st store.Store, tenant string, body []byte, provider bschemas.ModelProvider, nowMs int64) {
+	if st == nil || nowMs <= 0 || len(body) == 0 {
+		return
+	}
+	msgsRaw := messagesArray(body)
+	if !msgsRaw.Exists() {
+		return
+	}
+	norm, _ := normalize(provider, msgsRaw.Array())
+	if len(norm) == 0 {
+		return
+	}
+	sys, firstUser := schema.SessionHead(norm)
+	alias := session.Scoped(tenant, "", sys, firstUser)
+	if alias == "" {
+		return
+	}
+	// Monotone: never move the clock BACKWARDS. A ping racing a real request must not make the
+	// entry look older than the request already proved it to be, and the whole point of this
+	// record is that later is warmer.
+	k := store.SeenPrefix + alias
+	if b, got := st.Get(k); got {
+		if prev, err := strconv.ParseInt(string(b), 10, 64); err == nil && prev >= nowMs {
+			return
+		}
+	}
+	st.Put(k, []byte(strconv.FormatInt(nowMs, 10)))
+}
+
 // sessionTTL is cacheTTL widened to the LONGEST lifetime this PREFIX has ever asked for.
 //
 // cacheTTL reads the TTL out of THIS request, so a client that marks `ttl: "1h"` on one turn

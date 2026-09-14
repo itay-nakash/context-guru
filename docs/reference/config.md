@@ -105,10 +105,20 @@ needs roughly 240s of idle on a 5-minute entry, and the largest gap in that sess
 That is a measurement of a *continuously active* session, which is the one population where a cache
 entry cannot lapse. It is not evidence that the component does little: skipping costs nothing at all,
 and a turn that does fire prevents a full-prefix rewrite worth roughly **$0.15 per event** at haiku
-rates on a 175k prefix. What the default is really gated on is a session going idle past its TTL with
-a nearly-full context — someone stepping away, a job pausing — and how often that happens in
-production is a question about the traffic, not about the gate. See
-`docs/proposals/timely-compact-validation.md` for the arms that measure both and how to re-run them.
+rates on a 175k prefix.
+
+**This is a deliberate shipped position, not an unresolved question.** `summarize`'s cache gate is
+**insurance**, and it is priced like insurance: no premium on the turns it skips, a large payout on the
+rare turn it fires. What it insures against is a session going idle past its TTL with a nearly-full
+context — someone stepping away, a job pausing, a task switching — which is also the moment a
+full-prefix rewrite costs the most. It is **not** a general per-turn saving and should not be described
+as one anywhere.
+
+The alternative was considered and rejected: making it fire on warm caches too would fire often and
+throw away a live prefix to do it, which is the exact waste the design exists to avoid. Lowering
+`min_request_frac` does not help either — the fill was never the obstacle, the cache timing was.
+
+See `docs/proposals/timely-compact-validation.md` for the arms that measure this and how to re-run them.
 
 (The agent's own compaction is a second route to the same skip — it shrinks the incoming request and
 can drop it back under `min_request_tokens` for several consecutive turns.)

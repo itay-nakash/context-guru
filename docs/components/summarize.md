@@ -71,6 +71,23 @@ messages, and Anthropic accepts it — an alternation rule would reject correct 
 legality on the wire (`role:"tool"` never reaching Anthropic) is a property of the *bytes*, not
 of the normalized list, so it is asserted on the raw body instead (`apply/toolrole_wire_test.go`).
 
+> **This gate is insurance, not a per-turn saving.** It fires only when the transcript is nearly full
+> **and** the prompt cache is about to expire or already has. On a continuously active session the
+> second condition is never true — measured at 0 fires in 53 turns, with the cache warm on 51 of them —
+> because an agent sending a message every few seconds keeps refreshing its own entry. What it insures
+> against is a session going idle past its TTL with a nearly-full context, which is also when a
+> full-prefix rewrite costs the most (~$0.15 per event at haiku rates on a 175k prefix). Skipping costs
+> nothing, so a low firing rate is the mechanism working, not failing.
+
+> **Keep-alive and this gate now agree.** A keep-alive ping READS the cached prefix, which resets the
+> entry's TTL — so after a ping the cache is warm again. The gate is told: a successful cache-reading
+> ping records the refresh against the same content-derived clock the request path reads
+> (`apply.RecordCacheTouch`). Before that, a kept-alive session's idle time grew without bound while the
+> provider held the entry alive, and this gate compacted a **live** prefix on exactly the sessions the
+> pings were paying to protect. The dashboard's idle-gap statistics deliberately do **not** count pings,
+> because "is the provider holding this prefix?" and "how long was the user away?" are different
+> questions — two clocks, one for each.
+
 > **Testing this component.** The gate is timing-dependent and three of its defects were only
 > reachable on live traffic, so the scenarios that matter are written down rather than rediscovered:
 > `docs/proposals/timely-compact-validation.md` (in the repo, not on this site) carries
