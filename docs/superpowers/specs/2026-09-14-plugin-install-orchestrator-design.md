@@ -113,25 +113,45 @@ The difference is not cosmetic:
 - **it is faster.** Seven steps of *decide → emit → read result* collapse into one pre-rendered block.
   Every removed round trip is also a removed opportunity to improvise.
 
-### The principle this generalizes to: gated commands take no model-composed arguments
+### The principle this generalizes to: the one gated command must SAY what it does
 
-`--plan` is read-only, so pre-executing it is free. The *real* run needs the two decisions, and if the
-model supplies them as argv then the dangerous command is model-composed again — exactly what we just
-removed.
+`--plan` is read-only, so pre-executing it is free. The *real* run needs the two decisions.
 
-So decisions travel through a state file, not through `argv`:
+An earlier revision concluded that those decisions must travel in a state file, so the gated command
+would be a constant with no model-composed arguments. **That was wrong, and the reason is worth
+keeping.** A constant gated command reads:
 
 ```
-1. !`install.sh --route --plan`        fixed string, no arguments        (skill renders)
-2. model asks its one question in prose, gets an answer
-3. install.sh --decide --scope project --on-conflict chain               (writes a decision file;
-                                                                         touches no settings, starts
-                                                                         nothing, so not gated)
-4. !`install.sh --route --confirm`    fixed string, reads the decision  (the one gated command)
+install.sh --route --confirm
 ```
 
-Step 4 is the only command that redirects traffic, and it is a **constant**. That is as deterministic
-as this can get while still asking a human the two things only a human knows.
+…which names neither the scope, nor the file, nor the upstream. It optimised away model-composed
+arguments and paid for it with the one screen on which the user could have verified anything — leaving
+an approval that is both redundant with the model's question *and* uninformative. Two consents, neither
+load-bearing.
+
+So the decisions **do** go in `argv`, precisely so the single gate is legible:
+
+```
+1. !`install.sh --route --plan`                        read-only, no arguments (runs at render)
+2. model states in one line what it is about to do
+3. install.sh --route --confirm --scope project --on-conflict chain
+                                                       the one gated command - and it SAYS what it
+                                                       will do, so approving it IS the consent
+                                                       rather than a second copy of it
+```
+
+The malformed-argument worry does not apply to what remains: in `local` mode the URL is **derived from
+the resolved port and never passed**, so `argv` carries only a closed vocabulary
+(`--scope project|team|user`, `--on-conflict chain|replace|abort`) which the script validates, exiting
+2 on anything it does not recognise. A model cannot malform `project`.
+
+`attach` mode is the exception and keeps a decision file: there the URL genuinely is an input, so it is
+guarded by `valid_base_url()` rather than trusted to argv review.
+
+**One yes, not two.** The pre-grant permission rule then becomes what it should always have been - a
+convenience for people who would rather not be asked again - instead of the difference between a
+working install and two pasted commands.
 
 ### The fully deterministic form: `! cg-install`, and the precedent already in the repo
 
@@ -178,7 +198,7 @@ Which is the real division of labour: **the model is there for the conversation,
 mechanism.** Every step that does not need a human sentence should be a fixed string, and the two that
 do should be the only reason a model is in the path at all.
 
-### Measured, 2026-09-14: three of four answered, and one of them inverts the design
+### Measured, 2026-09-14: two mechanism facts, and one claim that did not survive its control
 
 Probed in a sandboxed `claude -p` run (throwaway plugin via `--plugin-dir`, isolated
 `CLAUDE_CONFIG_DIR`, `--permission-mode auto`, routed off Context Guru so the synthetic traffic
