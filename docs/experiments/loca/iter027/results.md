@@ -1,6 +1,7 @@
 # LOCA — iteration 027
 
-**One sentence.** The economic gate was found to refuse hardest exactly where compaction matters,
+**One sentence.** Iteration 024's result was confirmed to belong to the sweep after all, the economic
+gate was found to refuse hardest exactly where compaction matters,
 its approval term was found to shut the component down after three asks, both were fixed and the
 fixes were confirmed to work — and then the adjudicator, finally asked in the regime its own
 measurements call sound, was measured to be **worse than dropping everything** on the candidates a
@@ -13,27 +14,57 @@ proxy can score, while 46% of the mass turned out to be unscoreable in principle
 | spend | **$43.29**: $10.14 probes and shape verification, $8.11 a paired selection slice, $9.89 the rich-inventory arm, $15.15 earlier probes. The two load-bearing simulations cost **$0**. |
 | corpus | 384 decision points over 3,046 candidates from iterations 022/024/026/027 traffic (67% iteration 024) |
 
-## 1. Iteration 024's result cannot be attributed to the sweep
+## 1. Iteration 024's result IS attributable to the sweep, and its ledger understates it ~17x
 
-Every gate change since iteration 024 has been justified by reproducing its reward. Its own pooled
-counters say arm B differed from arm A by **two** components, not one:
+**This section replaced an earlier version of itself that concluded the opposite.** That version read
+`extract_llm`'s `saved_tokens` of 0 in arm A as the component being absent from the arm, inferred that
+arm B added two components, and concluded the sweep was 6% of the intervention. Both configs are in
+this repo and say otherwise.
 
-| component | A saved | B saved | B − A |
-|---|---|---|---|
-| `extract_llm` | **0** | 38,280,211 | **+38,280,211** |
-| `format` | 20,603,867 | 38,695,372 | +18,091,505 |
-| `extract_llm_sweep` | **0** | 2,353,227 | **+2,353,227** |
-| `collapse` | 21,722,964 | 8,482,547 | −13,240,417 |
-| `summarize` | 0 | 0 | 0 |
+`cfg-iter023-A-baseline.yaml` and `cfg-iter023-B-merged.yaml` carry **byte-identical** pipelines and an
+**byte-identical** `extract_llm` block. The only difference in either file is two keys on the sweep:
 
-`extract_llm` was **absent from arm A entirely**. Of the incremental removal, the sweep is **6%**.
+```yaml
+  extract_llm_sweep:
+    min_tokens: 100
+    evidence: true        # B only
+    econ_trigger: true    # B only
+    min_inventory: 3
+```
+
+And the counters say `extract_llm` ran in arm A and simply never fired:
+
+| arm | `extract_llm` | `extract_llm_sweep` |
+|---|---|---|
+| A | runs=1,808 **acted=0** saved=0 | runs=1,808 **acted=0** saved=0 |
+| B | runs=2,207 acted=1,492 saved=38,280,211 | runs=2,207 acted=373 saved=2,353,227 |
+
+**Why `extract_llm` fires only in arm B, and why that is not a second cause.** It is configured
+`fire_on: pressure` with `economic_gate: true`, and iteration 024's window silently resolved to
+1,000,000 instead of the configured 64,000, so pressure never rose and its own trigger never fired —
+`acted=0` in BOTH arms is the expected reading of its trigger. What differs is the shared result cache:
+the sweep's drop path writes verdicts into `cg:res:` through helpers both components call, so once
+`econ_trigger` lets the sweep act, `extract_llm` replays those frozen removals on every later request.
+This iteration's page for it records the mechanism directly — `extract_llm` books **$11.58 at $0.00**
+from **0 fresh calls and 364 replays, in arm B only**. Zero fresh calls is the point: it made no
+judgement of its own, so its 38,280,211 tokens are the SWEEP's removals persisting, counted once per
+request that carries them.
+
+So the intervention is two keys on one component, and the endpoint difference belongs to it.
+
+**The corollary is about accounting, not attribution.** The sweep's own `saved_tokens` of 2,353,227 is
+FRESH removal — content leaving the request for the first time. The effect on what the agent actually
+carries is that plus every later request in which the removal stays applied, which is where the
+38,280,211 comes from. iteration 024's page already stated this ("the sweep's own accounting understates
+it by construction", because a removal banks at cache-read rates); the ratio here puts a number on it,
+roughly **17x**, and reading the two ledgers as separate components is what produced the error above.
+
 Arm B also issued 2,207 requests against arm A's 1,808 (+22%, consistent with the recorded +19.4%
-steps), so trajectory headroom remains the plausible mechanism — but the experiment cannot say which
-component bought it, and the smaller of the two has been carrying the credit.
+steps), so trajectory headroom remains the plausible mechanism — and it is now attributable.
 
-`format` removing 18M more in arm B is not a component difference: it is first in both pipelines, and
-the arms' trajectories diverge. Cross-arm per-component comparisons are confounded for that reason;
-the structural fact — `extract_llm` ran only in B — is not.
+**What is still not established** is *why* headroom raises reward, and the caveats on the endpoint are
+that iteration's own: n = 15 tasks x 5 seeds, +10 solves, and `expand_unresolved_missing` at 175 in arm
+B against 0 in arm A — content the agent asked for and did not get back.
 
 ## 2. The economic gate refuses hardest where compaction matters
 
@@ -233,8 +264,10 @@ Both mattered: the first arms run reported `failures=0` while 17 of 30 batches p
 
 **Settled.**
 
-- Iteration 024's reward is **not attributable to the sweep**; the experiment confounded it with
-  `extract_llm`, which removed 94% of the incremental mass.
+- Iteration 024's arms differ in **two keys on the sweep and nothing else**, so its endpoint difference
+  IS attributable to the sweep. `extract_llm` ran in both arms and fired in neither on its own trigger;
+  its 38M in arm B is 0 fresh calls and pure replay of the sweep's frozen removals, which also means
+  the sweep's own ledger understates its effect by roughly 17x.
 - The gate's pro-cyclicality and the three-ask shutdown are real, mechanical, and now fixed.
 - The horizon credit and the approval fix are **not separable**.
 - `min_inventory: 3` measured a regime the component's own evidence calls a guess.
