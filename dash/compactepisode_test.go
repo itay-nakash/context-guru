@@ -327,7 +327,10 @@ func TestTheInvalidationDebitComesFromTheWriteNotTheLabel(t *testing.T) {
 // apart, so no total picks these up as real figures — the lie kvcache.Pricing.Known exists to stop.
 func TestAnUnpricedModelLeavesTheMoneyAbsentRatherThanZero(t *testing.T) {
 	out := walk([]compactRow{
-		row(1, 1_000, fresh, wrote(40_000)),
+		// cgCost is REQUIRED for this fixture to exercise anything: summarizer_cost_usd is the one
+		// dollar field that does not depend on the model's rates, so without a cg cost here the
+		// "no dollars published" assertion below passes vacuously.
+		row(1, 1_000, fresh, wrote(40_000), cgCost(0.05)),
 		row(2, testSpan, saved(600_000), miss(CacheTTLExpiry)),
 	}, exactWindow, unpricedModel)
 
@@ -337,6 +340,15 @@ func TestAnUnpricedModelLeavesTheMoneyAbsentRatherThanZero(t *testing.T) {
 	}
 	if e.NetUSD != 0 {
 		t.Errorf("net = %v, want 0 — an unpriced episode reports no dollars", e.NetUSD)
+	}
+	// EVERY dollar field, not just the net: summarizer_cost_usd is a stored per-request figure that
+	// does not depend on this model's rates, so it was the one field that survived into an unpriced
+	// episode's JSON. The rendered panel masked it; a JSON consumer of this public route did not.
+	if e.ColdCreditUSD != 0 || e.ReadCreditUSD != 0 || e.OtherCreditUSD != 0 ||
+		e.InvalidationDebitUSD != 0 || e.SummarizerCostUSD != 0 {
+		t.Errorf("an unpriced episode published dollars: cold=%v read=%v other=%v debit=%v cg=%v",
+			e.ColdCreditUSD, e.ReadCreditUSD, e.OtherCreditUSD,
+			e.InvalidationDebitUSD, e.SummarizerCostUSD)
 	}
 	g := out.ByProvenance[0]
 	if g.UnpricedEpisodes != 1 {

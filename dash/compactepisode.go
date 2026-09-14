@@ -658,8 +658,18 @@ func scaledWrite1h(r compactRow) int64 {
 // finishEpisode computes the net once the credits and debits are all in.
 func finishEpisode(e *CompactionEpisode, p kvcache.Pricing) {
 	if !p.Known {
-		// Leave every dollar at zero AND say the episode is unpriced, so no total can pick
-		// these up as real figures.
+		// EVERY dollar field is CLEARED, not just NetUSD left at zero. The comment here used to say
+		// "leave every dollar at zero", and that was true of the credits and the invalidation debit —
+		// both are priced through guards that return 0 on an unknown rate — but NOT of
+		// SummarizerCostUSD, which is a stored per-request figure that does not depend on this
+		// model's rates at all. So an unpriced episode published a real summarizer cost beside four
+		// zeros and a zero net.
+		//
+		// The rendered panel was safe: every cell goes through usdOrNA with the group's priced flag.
+		// A JSON consumer was not, and this is a public API route. A review flagged the general form
+		// ("an unpriced episode still publishes dollars"); this is the one field where it was true.
+		e.ColdCreditUSD, e.ReadCreditUSD, e.OtherCreditUSD = 0, 0, 0
+		e.InvalidationDebitUSD, e.SummarizerCostUSD, e.NetUSD = 0, 0, 0
 		e.Priced = false
 		return
 	}
