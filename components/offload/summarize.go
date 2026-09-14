@@ -3,8 +3,6 @@ package offload
 import (
 	"context"
 	"encoding/json"
-	"fmt"
-	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
