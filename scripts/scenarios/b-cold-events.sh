@@ -117,23 +117,42 @@ if colds:
 rate = list(c.execute("SELECT DISTINCT model FROM requests LIMIT 1"))
 print()
 print("PANEL vs HAND")
+# READ THE EPISODE, NOT THE GROUP. A provenance group's credit fields accumulate over CLOSED episodes
+# only — open ones are reported apart in open_net_usd, by design. Reading the group printed
+# 0.00000000 for every bucket on a run whose episode was open, which reads exactly like "the credit
+# is broken" when the credit is fine and sitting in the other field.
 pan = json.load(open(os.environ["SCEN_PANEL"]))
 for g in pan.get("by_provenance", []):
-    print("  provenance=%s closed=%s open=%s" % (g.get("provenance"), g.get("closed"), g.get("open")))
-    print("    cold_credit_usd   %.8f" % g.get("cold_credit_usd", 0))
-    print("    read_credit_usd   %.8f" % g.get("read_credit_usd", 0))
-    print("    invalidation      %.8f" % g.get("invalidation_debit_usd", 0))
-    print("    summarizer_cost   %.8f" % g.get("summarizer_cost_usd", 0))
-    print("    net_usd           %.8f" % g.get("net_usd", 0))
-    print("    open_net_usd      %.8f" % g.get("open_net_usd", 0))
-for e in pan.get("episodes", [])[:3]:
-    print("  episode state=%s turns=%s new_content=%s cold=%.8f read=%.8f net=%.8f" % (
-        e.get("state"), e.get("turns"), e.get("new_content_billed"),
-        e.get("cold_credit_usd", 0), e.get("read_credit_usd", 0), e.get("net_usd", 0)))
+    print("  GROUP provenance=%s closed=%s open=%s settled_net=%.8f open_net=%.8f open_turns=%s" % (
+        g.get("provenance"), g.get("closed"), g.get("open"), g.get("net_usd", 0),
+        g.get("open_net_usd", 0), g.get("open_turns")))
+eps = pan.get("episodes", [])
+for e in eps[:3]:
+    print("  EPISODE state=%s turns=%s new_content=%s" % (
+        e.get("state"), e.get("turns"), e.get("new_content_billed")))
+    print("    cold_credit_usd   %.8f" % e.get("cold_credit_usd", 0))
+    print("    read_credit_usd   %.8f" % e.get("read_credit_usd", 0))
+    print("    invalidation      %.8f" % e.get("invalidation_debit_usd", 0))
+    print("    summarizer_cost   %.8f" % e.get("summarizer_cost_usd", 0))
+    print("    net_usd           %.8f" % e.get("net_usd", 0))
+
+# SCOPE THE HAND CHECK TO THE TURNS THE PANEL COUNTED, which is t0 plus (turns-1) rows. Summing over
+# everything after t0 compares two different populations, and on this run it disagreed by three whole
+# cold events — the span had closed before any of them.
+turns = int((eps[0].get("turns") if eps else 0) or 0)
+span = rows[t0:t0 + turns] if turns else []
+sc = [r for r in span[1:] if r[5] == 'ttl_expiry']
+sh = [r for r in span[1:] if r[5] == 'hit']
 print()
-print("  hand: sum(saved_gross) on ttl_expiry turns after t0 = %d" % sum(r[6] for r in colds))
-print("  hand: sum(saved_gross) on hit turns after t0        = %d" % sum(r[6] for r in hits))
-print("  (multiply the first by the 5m cache-WRITE rate and the second by the cache-READ rate;")
-print("   the panel's two buckets must equal those two products)")
+print("  HAND, over exactly the %d turns the panel counted:" % len(span))
+print("    sum(saved_gross) on ttl_expiry turns IN SPAN = %d   x the cache-WRITE rate" % sum(r[6] for r in sc))
+print("    sum(saved_gross) on hit turns        IN SPAN = %d   x the cache-READ rate" % sum(r[6] for r in sh))
+print("    (the panel's cold and read buckets must equal those two products)")
+if turns and not sc:
+    print()
+    print("  NOTE: the span contains NO cold event, so cold_credit_usd is legitimately 0. That is a")
+    print("  finding about the SPAN, not about the credit: at 10%% of the window the episode closes")
+    print("  after two or three warm turns — tens of seconds — while a cache expiry needs minutes.")
+    print("  Re-query with ?span= wide enough to contain the cold turns to see the credit accumulate.")
 PY
 echo "=== SCENARIO B done $(date -u +%H:%M:%S) ==="

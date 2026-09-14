@@ -79,15 +79,40 @@ print("turns after t0   %d  (hit=%d, ttl_expiry=%d)" % (len(after), len(hits), l
 print("sum(saved_gross) on hit turns   %d" % sum(r[2] for r in hits))
 print("sum(saved_usd)   on hit turns   %.8f   <-- what the panel USED to report" % sum(r[3] for r in hits))
 print()
+# READ THE EPISODE, NOT THE GROUP: group credit fields accumulate over CLOSED episodes only, so on an
+# open run every bucket reads 0.00000000 and looks broken when the figures are in the episode.
 pan = json.load(open(os.environ["SCEN_PANEL"]))
-for g in pan.get("by_provenance", []):
-    print("panel read_credit_usd  %.8f" % g.get("read_credit_usd", 0))
-    print("panel cold_credit_usd  %.8f   (must be 0.0: no turn after t0 went cold)" % g.get("cold_credit_usd", 0))
-    print("panel open_net_usd     %.8f" % g.get("open_net_usd", 0))
-    print("panel summarizer_cost  %.8f   (must be > 0: the async call's cost lands one turn late)"
-          % g.get("summarizer_cost_usd", 0))
+eps = pan.get("episodes", [])
+e = eps[0] if eps else {}
+print("EPISODE state=%s turns=%s new_content=%s" % (
+    e.get("state"), e.get("turns"), e.get("new_content_billed")))
+print("  read_credit_usd  %.8f" % e.get("read_credit_usd", 0))
+print("  cold_credit_usd  %.8f" % e.get("cold_credit_usd", 0))
+print("  summarizer_cost  %.8f" % e.get("summarizer_cost_usd", 0))
+print("  invalidation     %.8f" % e.get("invalidation_debit_usd", 0))
+print("  net_usd          %.8f" % e.get("net_usd", 0))
+
+# Scoped to the turns the panel counted, and stated as pass/fail rather than as prose a reader has to
+# adjudicate — an arm whose verdict needs interpreting is an arm that will be read as passing.
+turns = int((e.get("turns") or 0))
+span = rows[t0:t0 + turns] if turns else []
+sh = [r for r in span[1:] if r[1] == 'hit']
+gross, usdsum = sum(r[2] for r in sh), sum(r[3] for r in sh)
+cg = sum(r[5] for r in span)
+READ = float(os.environ.get("CG_SCEN_READ_RATE", "1e-7"))
 print()
-print("THE CHECK: panel read_credit_usd must equal sum(saved_gross) x the 5m cache-READ rate,")
-print("and must NOT equal sum(saved_usd) above. If it equals the latter, the write-rate defect is back.")
+print("HAND, over exactly the %d turns the panel counted:" % len(span))
+print("  sum(saved_gross) on hit turns in span   %d" % gross)
+print("  x the cache-READ rate                   %.8f   <-- read_credit must equal this" % (gross * READ))
+print("  sum(saved_usd)   on hit turns in span   %.8f   <-- and must NOT equal this" % usdsum)
+print("  sum(cg_llm_cost) over the span          %.8f" % cg)
+print()
+rc = e.get("read_credit_usd", 0)
+def verdict(ok):
+    return "PASS" if ok else "FAIL"
+print("  read credit at the READ rate      %s" % verdict(abs(rc - gross * READ) < 1e-9))
+print("  read credit != stored saved_usd   %s" % verdict(abs(rc - usdsum) >= 1e-9))
+print("  cold credit is zero               %s" % verdict(e.get("cold_credit_usd", 0) == 0))
+print("  summarizer cost is charged        %s" % verdict(e.get("summarizer_cost_usd", 0) > 0))
 PY
 echo "=== SCENARIO C done $(date -u +%H:%M:%S) ==="
