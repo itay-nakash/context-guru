@@ -232,6 +232,9 @@ func main() {
 	outRate := flag.Float64("out-rate", 15.0, "USD per million output tokens")
 	replyOut := flag.String("replies", "", "write every raw model reply here as JSONL (strongly recommended: "+
 		"an unparseable reply is the only evidence of WHY a batch produced no judgement)")
+	minCands := flag.Int("min-candidates", 0, "skip decision points carrying fewer than N candidates. "+
+		"10 selects the regime the component's own measurements call sound (batch 10 cleared 100% of "+
+		"genuinely-spent candidates; batch 3-6 dropped one 2 times in 4) and matches min_inventory")
 	flag.Parse()
 
 	raw, err := os.ReadFile(*corpus)
@@ -251,6 +254,25 @@ func main() {
 		}
 		all = append(all, b)
 	}
+	// INVENTORY FILTER BEFORE THE SHUFFLE, so a seeded slice of the rich population is a strict prefix
+	// of a larger slice of the SAME population. Filtering after the shuffle would make -n 60 and -n 169
+	// different samples and the two runs incomparable.
+	if *minCands > 0 {
+		kept := all[:0]
+		for _, b := range all {
+			if len(b.Candidates) >= *minCands {
+				kept = append(kept, b)
+			}
+		}
+		fmt.Printf("inventory filter: %d of %d decision points carry >= %d candidates\n",
+			len(kept), len(all), *minCands)
+		all = kept
+		if len(all) == 0 {
+			fmt.Fprintln(os.Stderr, "no decision point meets -min-candidates; nothing to measure")
+			os.Exit(3)
+		}
+	}
+
 	// SEEDED SAMPLE, so -n 30 is a strict prefix of -n 120 and the slice can be compared with the rest.
 	r := rand.New(rand.NewSource(*seed))
 	r.Shuffle(len(all), func(i, j int) { all[i], all[j] = all[j], all[i] })
