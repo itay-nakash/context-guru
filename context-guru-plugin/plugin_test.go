@@ -76,7 +76,7 @@ func settingsIn(t *testing.T, state, home string, args ...string) (map[string]st
 	t.Helper()
 	py := requireTool(t, "python3")
 	cmd := exec.Command(py, append([]string{filepath.Join(scriptsDir(t), "settings.py")}, args...)...)
-	cmd.Env = append(os.Environ(), "CONTEXT_GURU_STATE="+state, "HOME="+home)
+	cmd.Env = append(sandboxEnv(t), "CONTEXT_GURU_STATE="+state, "HOME="+home)
 	out, err := cmd.CombinedOutput()
 	code := 0
 	if ee, ok := err.(*exec.ExitError); ok {
@@ -92,6 +92,52 @@ func settingsIn(t *testing.T, state, home string, args ...string) (map[string]st
 	}
 	t.Logf("settings.py %v -> exit %d, %v", args, code, facts)
 	return facts, code
+}
+
+// sandboxEnv is the base environment for EVERY subprocess this suite starts.
+//
+// S5 in review, reproduced live on a reviewer's machine: `go test ./context-guru-plugin/...` spawned
+// start-proxy.sh, which resolved the developer's REAL ~/.local/state/context-guru and left four
+// pidfiles in it. The PR's notes claimed this was fixed; it was fixed for the settings() helper only,
+// while ~28 other call sites still did `append(sandboxEnv(t), …)` and inherited the real HOME.
+//
+// A test suite for a recovery tool must not be able to disturb the developer's recovery tool, so the
+// isolation belongs in one place that every site goes through rather than in a habit each new test has
+// to remember. Everything that could redirect a write into real dotfiles — or make the suite's result
+// depend on the machine it runs on — is dropped and re-pinned to per-test temp directories.
+//
+// The ANTHROPIC_* variables are dropped for the second reason: the reviewer's box has CLAUDE_CONFIG_DIR
+// set and the suite FAILED there, and a developer machine running this plugin has ANTHROPIC_BASE_URL and
+// ANTHROPIC_CUSTOM_HEADERS exported, which would leak into assertions about an unrouted project.
+//
+// `extra` is appended last, so a test that deliberately sets one of these still wins.
+func sandboxEnv(t *testing.T, extra ...string) []string {
+	t.Helper()
+	sandboxed := map[string]bool{
+		"HOME": true, "XDG_STATE_HOME": true, "CONTEXT_GURU_STATE": true, "CLAUDE_CONFIG_DIR": true,
+		"CONTEXT_GURU_BIN": true, "ANTHROPIC_BASE_URL": true, "ANTHROPIC_UPSTREAM": true,
+		"ANTHROPIC_API_KEY": true, "ANTHROPIC_AUTH_TOKEN": true, "ANTHROPIC_CUSTOM_HEADERS": true,
+	}
+	var env []string
+	for _, kv := range os.Environ() {
+		if k, _, ok := strings.Cut(kv, "="); !ok || !sandboxed[k] {
+			env = append(env, kv)
+		}
+	}
+	// HOME and XDG_STATE_HOME are PINNED; CONTEXT_GURU_STATE is only DROPPED, not set.
+	//
+	// Setting it broke four pre-existing tests, and the reason is worth keeping: since S10,
+	// start-proxy.sh resolves CONTEXT_GURU_STATE ahead of XDG_STATE_HOME — so pinning it here outranked
+	// the XDG_STATE_HOME those tests deliberately pass, and the pidfile and keep-alive config landed
+	// somewhere they were not looking. Dropping it from the inherited environment is all the isolation
+	// needs: every state path then resolves through XDG_STATE_HOME or HOME, both of which are pinned
+	// below. A test that wants to pin CONTEXT_GURU_STATE itself passes it in `extra`, which wins.
+	root := t.TempDir()
+	env = append(env,
+		"HOME="+root,
+		"XDG_STATE_HOME="+filepath.Join(root, "xdg-state"),
+	)
+	return append(env, extra...)
 }
 
 func writeJSON(t *testing.T, path string, v any) {
@@ -282,7 +328,7 @@ func runStart(t *testing.T, env map[string]string) (out string, code int, starte
 	}
 
 	cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "start-proxy.sh"))
-	cmd.Env = append(os.Environ(), "CONTEXT_GURU_BIN="+fake, "TMPDIR="+dir)
+	cmd.Env = append(sandboxEnv(t), "CONTEXT_GURU_BIN="+fake, "TMPDIR="+dir)
 	for k, v := range env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
@@ -407,7 +453,7 @@ func TestHookNeverFailsTheSessionWhenTheBinaryIsMissing(t *testing.T) {
 	dir := t.TempDir()
 	cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "start-proxy.sh"))
 	// An unused high port: nothing answers /healthz, and the binary does not exist.
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(sandboxEnv(t),
 		"CLAUDE_PLUGIN_OPTION_PORT=8799",
 		"ANTHROPIC_BASE_URL=http://127.0.0.1:8799/anthropic",
 		"CONTEXT_GURU_BIN="+filepath.Join(dir, "does-not-exist"),
@@ -462,7 +508,7 @@ func TestHookStartsTheProxyAndWaitsForHealthz(t *testing.T) {
 	}
 
 	cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "start-proxy.sh"))
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(sandboxEnv(t),
 		"CLAUDE_PLUGIN_OPTION_PORT="+port,
 		"ANTHROPIC_BASE_URL=http://127.0.0.1:"+port+"/anthropic",
 		"CONTEXT_GURU_BIN="+fake,
@@ -701,7 +747,7 @@ func TestInstallRefusesAnUnverifiedDownload(t *testing.T) {
 
 	dest := filepath.Join(dir, "dest")
 	cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "install.sh"))
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(sandboxEnv(t),
 		"PATH="+bin+":"+os.Getenv("PATH"),
 		"CONTEXT_GURU_DEST="+dest,
 		"HOME="+dir,
@@ -756,7 +802,7 @@ func TestHookMakesTheProxyIdentifiable(t *testing.T) {
 
 	state := filepath.Join(dir, "state")
 	cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "start-proxy.sh"))
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(sandboxEnv(t),
 		"CLAUDE_PLUGIN_OPTION_PORT="+port,
 		"ANTHROPIC_BASE_URL=http://127.0.0.1:"+port+"/anthropic",
 		"CONTEXT_GURU_BIN="+fake,
@@ -904,7 +950,7 @@ func runCheck(t *testing.T, port, binBody string) (out string, code int, elapsed
 		t.Fatal(err)
 	}
 	cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "check-proxy.sh"))
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(sandboxEnv(t),
 		"CLAUDE_PLUGIN_ROOT="+root,
 		"CLAUDE_PLUGIN_OPTION_PORT="+port,
 		"ANTHROPIC_BASE_URL=http://127.0.0.1:"+port+"/anthropic",
@@ -1015,7 +1061,7 @@ func TestCheckHookIsSilentWhereRoutingIsNotConfigured(t *testing.T) {
 				baseURL = "http://127.0.0.1:" + port + "/anthropic"
 			}
 			cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "check-proxy.sh"))
-			cmd.Env = append(os.Environ(),
+			cmd.Env = append(sandboxEnv(t),
 				"CLAUDE_PLUGIN_OPTION_PORT="+port,
 				"ANTHROPIC_BASE_URL="+baseURL,
 				// No recovery attempt: the binary is absent, so this exercises the gate and the
@@ -1102,7 +1148,7 @@ func TestStartHookBudgetsOnWallClockNotIterations(t *testing.T) {
 	}
 	limit := hookTimeout(t, "SessionStart")
 	cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "start-proxy.sh"))
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(sandboxEnv(t),
 		"CLAUDE_PLUGIN_OPTION_PORT="+port,
 		"ANTHROPIC_BASE_URL=http://127.0.0.1:"+port+"/anthropic",
 		"CONTEXT_GURU_BIN="+fake,
@@ -1220,7 +1266,7 @@ func TestInstallReportsPATHFromTheSourceFallbackToo(t *testing.T) {
 			path = dest + ":" + path
 		}
 		cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "install.sh"))
-		cmd.Env = append(os.Environ(), "PATH="+path, "CONTEXT_GURU_DEST="+dest, "HOME="+dir)
+		cmd.Env = append(sandboxEnv(t), "PATH="+path, "CONTEXT_GURU_DEST="+dest, "HOME="+dir)
 		out, err := cmd.CombinedOutput()
 		t.Logf("install.sh (dest on PATH=%v) -> %v, output:\n%s", pathHasDest, err, out)
 		if err != nil {
@@ -1407,7 +1453,7 @@ func TestUninstallDoesNotSignalAProcessThatIsNotOurs(t *testing.T) {
 				"  printf '%s\\n' \"$*\" >> " + strconv.Quote(killLog) + "\n" +
 				"}\n"
 			cmd := exec.Command("bash", "-c", preamble+block)
-			cmd.Env = append(os.Environ(),
+			cmd.Env = append(sandboxEnv(t),
 				"PATH="+stubs+":"+os.Getenv("PATH"),
 				"CLAUDE_PLUGIN_OPTION_PORT=8787",
 				"XDG_STATE_HOME="+filepath.Join(dir, "state"))
@@ -1696,7 +1742,7 @@ func TestStartProxyReportsArgumentsItCannotUse(t *testing.T) {
 			cmd := exec.Command("bash", append([]string{
 				filepath.Join(scriptsDir(t), "start-proxy.sh"), "--unrouted", "--bin", fake,
 			}, c.args...)...)
-			cmd.Env = append(os.Environ(),
+			cmd.Env = append(sandboxEnv(t),
 				"CLAUDE_PLUGIN_OPTION_PORT="+port,
 				"ANTHROPIC_BASE_URL=",
 				"ANTHROPIC_UPSTREAM=",
@@ -1760,7 +1806,7 @@ func TestRejectingAValueDoesNotEatTheNextFlag(t *testing.T) {
 	// --upstream has no value; --bin follows it and must survive.
 	cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "start-proxy.sh"),
 		"--unrouted", "--upstream", "--bin", fake)
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(sandboxEnv(t),
 		"CLAUDE_PLUGIN_OPTION_PORT="+port,
 		"ANTHROPIC_BASE_URL=",
 		"ANTHROPIC_UPSTREAM=",
@@ -1963,7 +2009,7 @@ func runStatusline(t *testing.T, env map[string]string, stdin string, args ...st
 	t.Helper()
 	py := requireTool(t, "python3")
 	cmd := exec.Command(py, append([]string{filepath.Join(scriptsDir(t), "statusline.py")}, args...)...)
-	cmd.Env = append(os.Environ(), "TMPDIR="+t.TempDir())
+	cmd.Env = append(sandboxEnv(t), "TMPDIR="+t.TempDir())
 	for k, v := range env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
@@ -2469,7 +2515,7 @@ func TestStatuslineCachesPerSession(t *testing.T) {
 	tmp := t.TempDir() // shared TMPDIR on purpose: this is what could let the cache files collide
 	run := func(sessionID string) string {
 		cmd := exec.Command(py, filepath.Join(scriptsDir(t), "statusline.py"))
-		cmd.Env = append(os.Environ(), "TMPDIR="+tmp,
+		cmd.Env = append(sandboxEnv(t), "TMPDIR="+tmp,
 			"ANTHROPIC_BASE_URL=http://127.0.0.1:"+port+"/anthropic",
 			"CLAUDE_PLUGIN_OPTION_PORT="+port)
 		cmd.Stdin = strings.NewReader(statuslinePayload(sessionID, 1.00, 10000, 1000))
@@ -2516,7 +2562,7 @@ func TestStatuslineCachesStatsAcrossQuickRenders(t *testing.T) {
 	tmp := t.TempDir()
 	run := func() string {
 		cmd := exec.Command(py, filepath.Join(scriptsDir(t), "statusline.py"))
-		cmd.Env = append(os.Environ(), "TMPDIR="+tmp,
+		cmd.Env = append(sandboxEnv(t), "TMPDIR="+tmp,
 			"ANTHROPIC_BASE_URL=http://127.0.0.1:"+port+"/anthropic",
 			"CLAUDE_PLUGIN_OPTION_PORT="+port)
 		cmd.Stdin = strings.NewReader("{}")
@@ -2590,7 +2636,7 @@ func runKeepaliveBlock(t *testing.T, needle, preset string, env map[string]strin
 			needle, m, block)
 	}
 	cmd := exec.Command("bash", "-c", block)
-	cmd.Env = append(os.Environ(), "CLAUDE_PLUGIN_OPTION_PORT=", "CLAUDE_PLUGIN_OPTION_PRESET=")
+	cmd.Env = append(sandboxEnv(t), "CLAUDE_PLUGIN_OPTION_PORT=", "CLAUDE_PLUGIN_OPTION_PRESET=")
 	for k, v := range env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
@@ -2783,7 +2829,7 @@ func TestStartProxyPicksUpAKeepaliveConfig(t *testing.T) {
 			}
 
 			cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "start-proxy.sh"))
-			cmd.Env = append(os.Environ(),
+			cmd.Env = append(sandboxEnv(t),
 				"CLAUDE_PLUGIN_OPTION_PORT="+port,
 				"ANTHROPIC_BASE_URL=http://127.0.0.1:"+port+"/anthropic",
 				"CONTEXT_GURU_BIN="+fake,
@@ -3034,7 +3080,7 @@ func TestCheckProxyRecoveryCommandIsTheRealLaunchPath(t *testing.T) {
 				t.Fatal(err)
 			}
 			cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "check-proxy.sh"))
-			cmd.Env = append(os.Environ(),
+			cmd.Env = append(sandboxEnv(t),
 				"CLAUDE_PLUGIN_ROOT="+root,
 				"CLAUDE_PLUGIN_OPTION_PORT="+port,
 				"CLAUDE_PLUGIN_OPTION_PRESET="+preset,
@@ -3090,7 +3136,7 @@ func TestCheckProxyRecoveryCommandIsTheRealLaunchPath(t *testing.T) {
 			// which is the whole reason the printed command has to pass them as flags. Only CONTEXT_GURU_BIN
 			// and the state/tmp redirections are kept, because the test cannot install a real binary.
 			run := exec.Command("bash", "-c", recover)
-			run.Env = append(os.Environ(),
+			run.Env = append(sandboxEnv(t),
 				"CLAUDE_PLUGIN_OPTION_PORT=", "CLAUDE_PLUGIN_OPTION_PRESET=", "CLAUDE_PLUGIN_OPTION_IDLE_EXIT=",
 				"CLAUDE_PLUGIN_OPTION_UPSTREAM=", "ANTHROPIC_BASE_URL=", "ANTHROPIC_UPSTREAM=",
 				"CONTEXT_GURU_BIN="+fake,
@@ -3155,7 +3201,7 @@ func TestCheckProxySaysSoWhenThereIsNoStarterToPointAt(t *testing.T) {
 	dir := t.TempDir()
 	port := freePort(t)
 	cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "check-proxy.sh"))
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(sandboxEnv(t),
 		"CLAUDE_PLUGIN_ROOT="+filepath.Join(dir, "not-the-plugin"),
 		"CLAUDE_PLUGIN_OPTION_PORT="+port,
 		"ANTHROPIC_BASE_URL=http://127.0.0.1:"+port+"/anthropic",
@@ -3198,7 +3244,7 @@ func TestStartProxyTakesPresetAndIdleExitAsArguments(t *testing.T) {
 	cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "start-proxy.sh"),
 		"--unrouted", "--bin", fake, "--port", port, "--preset", "house", "--idle-exit", "90m")
 	// The options say something DIFFERENT, so a passing test cannot be reading them instead.
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(sandboxEnv(t),
 		"CLAUDE_PLUGIN_OPTION_PRESET=codesmart",
 		"CLAUDE_PLUGIN_OPTION_IDLE_EXIT=24h",
 		"ANTHROPIC_BASE_URL=",
@@ -3368,7 +3414,7 @@ func TestStartProxyReportsThePresetActuallyInEffect(t *testing.T) {
 			}
 
 			cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "start-proxy.sh"))
-			cmd.Env = append(os.Environ(),
+			cmd.Env = append(sandboxEnv(t),
 				"CLAUDE_PLUGIN_OPTION_PORT="+port,
 				"CLAUDE_PLUGIN_OPTION_PRESET="+optionPreset,
 				"ANTHROPIC_BASE_URL=http://127.0.0.1:"+port+"/anthropic",
@@ -3442,7 +3488,7 @@ func TestTheConfiguredPortCanActuallyBeHonoured(t *testing.T) {
 		})
 		py := requireTool(t, "python3")
 		cmd := exec.Command(py, filepath.Join(scriptsDir(t), "settings.py"), "config")
-		cmd.Env = append(os.Environ(), "CLAUDE_CONFIG_DIR="+cfg)
+		cmd.Env = append(sandboxEnv(t), "CLAUDE_CONFIG_DIR="+cfg)
 		cmd.Dir = dir // so the project-scope candidates do not accidentally match
 		out, err := cmd.CombinedOutput()
 		if err != nil {
@@ -3473,7 +3519,7 @@ func TestTheConfiguredPortCanActuallyBeHonoured(t *testing.T) {
 		cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "start-proxy.sh"),
 			"--unrouted", "--bin", fake, "--port", port)
 		// Deliberately NO CLAUDE_PLUGIN_OPTION_PORT: that is the situation a Bash tool call is in.
-		cmd.Env = append(os.Environ(),
+		cmd.Env = append(sandboxEnv(t),
 			"CLAUDE_PLUGIN_OPTION_PORT=",
 			"ANTHROPIC_BASE_URL=",
 			"CONTEXT_GURU_BIN=",
@@ -3520,7 +3566,7 @@ func TestTheConfiguredPortCanActuallyBeHonoured(t *testing.T) {
 		})
 		py := requireTool(t, "python3")
 		cmd := exec.Command(py, filepath.Join(scriptsDir(t), "settings.py"), "config")
-		cmd.Env = append(os.Environ(), "CLAUDE_CONFIG_DIR="+cfg)
+		cmd.Env = append(sandboxEnv(t), "CLAUDE_CONFIG_DIR="+cfg)
 		cmd.Dir = dir
 		out, err := cmd.CombinedOutput()
 		if err != nil {
@@ -3545,7 +3591,7 @@ func TestTheConfiguredPortCanActuallyBeHonoured(t *testing.T) {
 		dir := t.TempDir()
 		cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "start-proxy.sh"),
 			"--unrouted", "--port", "not-a-port")
-		cmd.Env = append(os.Environ(), "ANTHROPIC_BASE_URL=", "CONTEXT_GURU_BIN=/nonexistent/x",
+		cmd.Env = append(sandboxEnv(t), "ANTHROPIC_BASE_URL=", "CONTEXT_GURU_BIN=/nonexistent/x",
 			"CONTEXT_GURU_HEALTH_BUDGET=1", "XDG_STATE_HOME="+dir, "TMPDIR="+dir)
 		out, _ := cmd.CombinedOutput()
 		if !strings.Contains(string(out), "ignoring --port") {
@@ -3681,6 +3727,63 @@ func TestInstallLeavesAWayBackOutsideThePlugin(t *testing.T) {
 // TestTheHatchNeedsNothingButPOSIXSh: the hatch runs in a state where the proxy is down and Claude
 // cannot talk, so anything it depends on is a way for it to be unavailable too. Asserted against
 // the script's text, since "it happened to work on this machine" is not the claim.
+// TestTheHatchRunsUnderEveryShellItClaims does what the static check below cannot: it RUNS the hatch
+// under each POSIX shell available on this machine and asserts it actually recovers.
+//
+// S7 in review, and the repo has a commit titled "assert the fallback CONDITION, not one sentence that
+// expressed it" — the static test asserts a shebang string and five banned words, which is a proxy for
+// portability, not portability. `dash` and `busybox sh` are where a bashism actually shows up, and the
+// filter now contains an awk program, which the word list would never have caught.
+func TestTheHatchRunsUnderEveryShellItClaims(t *testing.T) {
+	var shells []string
+	for _, sh := range []string{"sh", "dash", "bash", "busybox"} {
+		if p, err := exec.LookPath(sh); err == nil {
+			shells = append(shells, p)
+		}
+	}
+	if len(shells) == 0 {
+		t.Fatal("no POSIX shell on PATH at all")
+	}
+	for _, sh := range shells {
+		name := filepath.Base(sh)
+		t.Run(name, func(t *testing.T) {
+			state, home, proj := t.TempDir(), t.TempDir(), t.TempDir()
+			path := filepath.Join(proj, "settings.json")
+			writeJSON(t, path, map[string]any{"model": "opus",
+				"permissions": map[string]any{"allow": []string{"Bash(ls:*)"}}})
+			pristine, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, code := settingsIn(t, state, home, "add", "--file", path, "--url", ourURL); code != 0 {
+				t.Fatal("add failed")
+			}
+			args := []string{filepath.Join(state, "context-guru-reset"), "--yes"}
+			if name == "busybox" {
+				args = append([]string{"sh"}, args...)
+			}
+			cmd := exec.Command(sh, args...)
+			cmd.Dir = proj
+			cmd.Env = sandboxEnv(t, "CONTEXT_GURU_STATE="+state, "HOME="+home)
+			b, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("%s: %v\n%s", name, err, b)
+			}
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != string(pristine) {
+				t.Errorf("%s: did not restore the file\n got:  %s\n want: %s\n%s",
+					name, got, pristine, b)
+			}
+			if !strings.Contains(string(b), "Done. 1 file(s) put back.") {
+				t.Errorf("%s: no success summary:\n%s", name, b)
+			}
+		})
+	}
+}
+
 func TestTheHatchNeedsNothingButPOSIXSh(t *testing.T) {
 	b, err := os.ReadFile(filepath.Join(scriptsDir(t), "reset.sh"))
 	if err != nil {
@@ -3812,9 +3915,15 @@ func TestHatchRestoresWithThePluginDeleted(t *testing.T) {
 	}
 	// Reversible in its own right: whatever was there before the restore is kept, for the user who
 	// runs this and then finds the routing was not their problem.
-	pre, err := filepath.Glob(path + ".context-guru-prereset-*")
+	// Under the STATE directory, not beside the settings file (S6): these are complete copies of a
+	// file that can hold a credential, and the old location dropped them inside the user's git tree.
+	pre, err := filepath.Glob(filepath.Join(state, "prereset", "*"))
 	if err != nil || len(pre) == 0 {
 		t.Errorf("the hatch overwrote the routed file without keeping a copy of it")
+	}
+	stray, _ := filepath.Glob(path + ".context-guru-prereset-*")
+	if len(stray) != 0 {
+		t.Errorf("left a full copy of a settings file in the project tree: %v", stray)
 	}
 }
 
@@ -3854,7 +3963,7 @@ func TestHatchSecondRunChangesNothing(t *testing.T) {
 	if _, code := runHatch(t, state, home, proj, "--yes"); code != 0 {
 		t.Fatal("first hatch run failed")
 	}
-	before, _ := filepath.Glob(path + ".context-guru-prereset-*")
+	before, _ := filepath.Glob(filepath.Join(state, "prereset", "*"))
 
 	out, code := runHatch(t, state, home, proj, "--yes")
 	if code != 0 {
@@ -3863,7 +3972,7 @@ func TestHatchSecondRunChangesNothing(t *testing.T) {
 	if !strings.Contains(out, "already matches") && !strings.Contains(out, "Nothing to restore") {
 		t.Errorf("the second run did not report itself as a no-op:\n%s", out)
 	}
-	after, _ := filepath.Glob(path + ".context-guru-prereset-*")
+	after, _ := filepath.Glob(filepath.Join(state, "prereset", "*"))
 	if len(after) != len(before) {
 		t.Errorf("the second run wrote %d more backup(s) for no reason", len(after)-len(before))
 	}
@@ -4019,7 +4128,7 @@ func TestDeadProxyNoteNamesTheEscapeHatch(t *testing.T) {
 	port := freePort(t) // nothing listening: refused fast, so the hook goes straight to the note
 
 	cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "check-proxy.sh"))
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(sandboxEnv(t),
 		"CLAUDE_PLUGIN_ROOT="+root,
 		"CLAUDE_PLUGIN_OPTION_PORT="+port,
 		"ANTHROPIC_BASE_URL=http://127.0.0.1:"+port+"/anthropic",
@@ -4629,6 +4738,20 @@ var redactShapes = []struct {
 	{"aws access key id", `  "AWS_ACCESS_KEY_ID": "AKIAREALAWSKEY0000",`, "REALAWSKEY"},
 	{"bare exported base URL with userinfo", `https://svc:REALURLPASS@gw.corp/anthropic`, "REALURLPASS"},
 
+	// The four shapes the second review found escaping the denylist. Each is the reason the
+	// `"key": value` case is now an allowlist: none of these key names or value shapes was on any list.
+	{"sk_live_ (underscore, not sk-)", `  "STRIPE_KEY": "sk_live_REALSTRIPEKEY",`, "REALSTRIPEKEY"},
+	{"secret in a URL path", `  "HOOK": "https://hooks.slack.com/services/T00/B00/REALWEBHOOK",`, "REALWEBHOOK"},
+	{"credential in ?auth=", `  "ANTHROPIC_BASE_URL": "https://gw.corp/anthropic?auth=REALAUTHSECRET",`, "REALAUTHSECRET"},
+	// apiKeyHelper is a real Claude Code settings key whose entire purpose is producing a credential,
+	// and a non-string value escaped a rule that required a quote straight after the colon.
+	{"apiKeyHelper with an object value", `  "apiKeyHelper": {"cmd": "echo REALHELPERSECRET"},`, "REALHELPERSECRET"},
+	// The property the allowlist buys, and the reason it is worth the inversion: a credential key
+	// nobody has thought of yet is covered on the day it is invented, not the day a rule is added.
+	{"an entirely unknown key", `  "SOME_FUTURE_CREDENTIAL": "REALFUTURESECRET",`, "REALFUTURESECRET"},
+	{"a secret in a non-permission array", `      "REALARRAYSECRET",`, "REALARRAYSECRET"},
+	{"a deep path on a routing key", `  "ANTHROPIC_BASE_URL": "https://gw/a/b/REALDEEPSECRET",`, "REALDEEPSECRET"},
+
 	{"permission grant must survive", `      "Bash(git push:*)",`, ""},
 	{"model must survive", `  "model": "opus",`, ""},
 	{"theme must survive", `  "theme": "dark",`, ""},
@@ -4640,6 +4763,10 @@ var redactShapes = []struct {
 	{"a corporate base URL must survive", `  "ANTHROPIC_BASE_URL": "https://gateway.corp.example/anthropic",`, ""},
 	{"ANTHROPIC_UPSTREAM must survive", `  "ANTHROPIC_UPSTREAM": "https://gateway.corp.example",`, ""},
 	{"CONTEXT_GURU_BIN must survive", `  "CONTEXT_GURU_BIN": "/home/user/.local/bin/context-guru-proxy",`, ""},
+	// Structure must survive, or the diff becomes unreadable: a container opening is not a value, and
+	// its members are judged on their own lines.
+	{"a container opening must survive", `  "apiKeyHelper": {`, ""},
+	{"a diff marker must survive", `> "model": "sonnet",`, ""},
 }
 
 // TestRedactCoversEveryKnownCredentialShape drives the real filter, lifted out of reset.sh, rather
@@ -4651,16 +4778,16 @@ func TestRedactCoversEveryKnownCredentialShape(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Slice out REDACT_NAME through the end of the redact() function.
-	_, rest, ok := strings.Cut(string(body), "REDACT_NAME=")
+	_, rest, ok := strings.Cut(string(body), "REDACT_MARK=")
 	if !ok {
-		t.Fatal("reset.sh no longer defines REDACT_NAME; this test is extracting the wrong thing")
+		t.Fatal("reset.sh no longer defines REDACT_MARK; this test is extracting the wrong thing")
 	}
 	fnEnd := strings.Index(rest, "\n}\n")
 	if fnEnd < 0 {
 		t.Fatal("could not find the end of redact(); extraction would be silently partial")
 	}
-	fn := "REDACT_NAME=" + rest[:fnEnd+3]
-	if !strings.Contains(fn, "redact()") || !strings.Contains(fn, "sed") {
+	fn := "REDACT_MARK=" + rest[:fnEnd+3]
+	if !strings.Contains(fn, "redact()") || !strings.Contains(fn, "awk") {
 		t.Fatalf("extracted fragment does not look like the filter:\n%s", fn)
 	}
 	fnPath := filepath.Join(t.TempDir(), "redact.sh")

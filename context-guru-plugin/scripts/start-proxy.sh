@@ -249,7 +249,13 @@ command -v setsid >/dev/null 2>&1 || STARTER=(nohup)   # macOS has no setsid
 # was a 404. Its default DB path is `./context-guru-dashboard.db` — the current directory, i.e.
 # the user's repository — so the path must be set explicitly or the plugin litters the project it
 # was invited into.
-STATE="${XDG_STATE_HOME:-$HOME/.local/state}/context-guru"
+# CONTEXT_GURU_STATE first, like settings.py, reset.sh and check-proxy.sh. S10 in review: this was the
+# ONE script that ignored it, which had two consequences. A user who relocates their state directory
+# got the pidfile written somewhere else, and uninstall looks for it here — one way it loses track of a
+# running proxy. And it defeated the test isolation this PR added: pinning CONTEXT_GURU_STATE does not
+# isolate the hook tests if the hook they spawn does not read it, which is how a `go test` run wrote
+# four pidfiles into a reviewer's real ~/.local/state/context-guru.
+STATE="${CONTEXT_GURU_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/context-guru}"
 mkdir -p "$STATE" 2>/dev/null || STATE="${TMPDIR:-/tmp}"
 PIDFILE="${STATE}/proxy-${PORT}.pid"
 

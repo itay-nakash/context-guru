@@ -18,7 +18,9 @@
 #     `/plugin uninstall`, a marketplace refresh or a wiped plugin cache all take it with them;
 #   * the primary path is `cp`, restoring a copy of each settings file taken BEFORE the first
 #     edit, so recovery does not depend on parsing anything;
-#   * it takes its own backup before it writes, so running it is itself reversible;
+#   * it takes its own backup before it writes, so running it is itself reversible. That copy goes
+#     under the state directory, NOT beside the settings file: it is a complete copy of a file that
+#     can hold a credential, and the old location dropped one inside the user's git working tree;
 #   * it prints what it will do and asks, unless told `--yes`.
 #
 # It restores ROUTING. It does not fix a credential — see the report it prints at the end, which
@@ -58,7 +60,7 @@ usage: $PROG [--dry-run] [--yes] [--state DIR]
 
 What it does, in order:
   1. reads the record of every settings file context-guru edited;
-  2. copies each of those aside (.context-guru-prereset-*) so this is reversible too;
+  2. copies each of those into \${STATE}/prereset/ so this is reversible too;
   3. restores each from the copy taken before context-guru's first edit — or deletes the
      file, if context-guru is the reason it exists;
   4. verifies no routing key is left, and reports anything it could not fix.
@@ -86,50 +88,219 @@ say()  { printf '%s\n' "$*"; }
 warn() { printf '%s\n' "$*" >&2; }
 
 # ---------------------------------------------------------------------------
-# redact: a filter for anything that prints FILE CONTENT.
+# redact: a filter for anything that prints FILE CONTENT or an environment value.
 #
-# Found in review, and it contradicted this script's own stated principle 150 lines below: the
-# whole-file warning diffs the settings file, `env` is exactly where people keep
-# ANTHROPIC_API_KEY, and so `--dry-run` — the invocation the docs tell people to run FIRST —
-# printed a live key twice, once per side of the diff.
+# Applied at every site that echoes something read off disk or out of the environment — the plan
+# diff, the verify pass, the no-record grep, and the exported-base-URL lines in report_environment.
+# "Remember to filter this one too" is how the first three leaks happened.
 #
-# Who reads this output is what makes it worse than the usual secret-in-a-log: somebody debugging
-# a 401, whose next move is very likely to paste the whole thing into an issue, a chat or a
-# screenshot, precisely BECAUSE the output is designed to be read and acted on.
+# WHY THIS IS AN ALLOWLIST FOR `"key": value` LINES.
 #
-# Applied at every site that prints file content rather than at the one the reviewer found — the
-# diff, the verify pass and the no-record grep all echo lines from the user's settings — because
-# "remember to filter this one too" is how the first leak happened.
+# It began as a denylist of credential-ish key names and value shapes, and it leaked three times in
+# three different shapes — the last round found `sk_live_` (the rule was literally `sk-`), secrets in
+# a URL PATH, `?auth=` (the query rule carried its own narrower name list instead of reusing the one
+# above it), and `"apiKeyHelper": {"cmd": …}` — a real Claude Code settings key whose entire purpose
+# is producing a credential, which escaped because the rule required a quote straight after the colon.
+# A denylist in a tool whose output the docs invite the user to paste into a bug report will leak every
+# shape nobody has thought of yet.
 #
-# Redacts the VALUE and keeps the line, so the diff still shows THAT a credential line changed,
-# which is the whole point of showing a diff. Three shapes:
-#   * any JSON key whose name contains key/token/secret/password/credential, in any case;
-#   * an Anthropic/OpenAI-style `sk-...` value, whatever the field is called;
-#   * credentials embedded in a URL (https://user:pass@host).
+# The objection to inverting it was correct too: redact every value and the diff no longer shows the
+# permission grants it exists to show, which defeats the purpose of printing a diff at all. Both
+# constraints are satisfiable, because the two cases have different shapes:
 #
-# Case-insensitivity is spelled out with bracket classes on purpose: BSD sed (macOS, where this
-# script runs most) has no `I` flag on `s///`, so `[Kk][Ee][Yy]` is the portable spelling.
+#   * `"key": value`  -> print the value only for keys known to be safe (settings that are structural,
+#     enumerated, or the routing itself). Anything unrecognised is redacted, so a NEW credential key
+#     is covered the day it is invented rather than the day somebody adds a rule.
+#   * a bare array element -> print it only if it looks like a permission grant, `Tool(...)`. That is
+#     the shape the diff exists to show, and it is narrow enough to be an allowlist rather than a
+#     hope.
+#
+# The old denylist rules are kept as a second layer underneath, for content that is neither of those
+# shapes (a bare URL from the environment, a value inside a safe key).
+#
+# ROUTING KEYS STAY VISIBLE. ANTHROPIC_BASE_URL / ANTHROPIC_UPSTREAM / CONTEXT_GURU_BIN are the
+# diagnostic — a locked-out user has to see which port they are pointed at — so those keep scheme,
+# host and first path segment and lose only userinfo, query and any deeper path.
+#
+# awk, not sed, because "print this value unless its key is in a set" needs a negative test that
+# POSIX EREs cannot express; the sed version needed a lookahead. awk is as portable as sed (busybox
+# and dash-only systems both have one) and the logic is legible, which matters more here than brevity.
 # ---------------------------------------------------------------------------
-# This is a DENYLIST, and a denylist on a recovery tool is a list that will be wrong again — it has
-# now been wrong three times, each in a different shape. It is not inverted to an allowlist because
-# on a diff of arbitrary JSON that would redact the `permissions` entries the diff exists to show,
-# which is a worse failure. What keeps it honest instead is a table-driven test with one row per
-# shape (TestRedactCoversEveryKnownCredentialShape): the next miss should be a row somebody forgot
-# to add, not an invisible leak. ADD A ROW WHEN YOU ADD A RULE.
-#
-# Name half. HEADER is not decoration: ANTHROPIC_CUSTOM_HEADERS is how a Context Guru credential is
-# carried on this project's own dev machines, so the single most likely credential in a context-guru
-# user's env block had a name containing none of key/token/secret/password/credential. AUTH catches
-# `authorization: Bearer …`, the other natural way to put a credential in an env block, and
-# `authToken` for free.
-REDACT_NAME='[Kk][Ee][Yy]|[Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Cc][Rr][Ee][Dd][Ee][Nn][Tt][Ii][Aa][Ll]|[Aa][Uu][Tt][Hh]|[Hh][Ee][Aa][Dd][Ee][Rr]|[Ss][Ee][Ss][Ss][Ii][Oo][Nn]|[Cc][Oo][Oo][Kk][Ii][Ee]|[Ss][Ii][Gg][Nn][Aa][Tt][Uu][Rr][Ee]'
+REDACT_MARK='<value not shown>'
 redact() {
-  sed -E -e "s/(\"[A-Za-z0-9_-]*(${REDACT_NAME})[A-Za-z0-9_-]*\"[[:space:]]*:[[:space:]]*\")[^\"]*/\1<value not shown>/g" \
-         -e 's/sk-[A-Za-z0-9_-]{6,}/sk-<value not shown>/g' \
-         -e 's#(ghp_|github_pat_|xox[baprs]-|AKIA|eyJ)[A-Za-z0-9_./+-]{6,}#\1<value not shown>#g' \
-         -e "s/([Bb]earer[[:space:]]+)[A-Za-z0-9_.~+/=-]{8,}/\1<value not shown>/g" \
-         -e "s/([?\&][A-Za-z0-9_-]*([Kk][Ee][Yy]|[Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt])=)[^\&\"[:space:]]*/\1<value not shown>/g" \
-         -e 's#(://)[^/@[:space:]"]*:[^/@[:space:]"]*@#\1<credentials not shown>@#g'
+  awk -v mark="$REDACT_MARK" '
+  BEGIN {
+    # Values printed in full. Structural, enumerated, or the routing itself.
+    n = split("permissions allow deny ask additionaldirectories model theme statusline type " \
+              "includecoauthoredby cleanupperioddays verbose autoupdates preferredNotifChannel " \
+              "env hooks matcher outputstyle alwaysthinkingenabled", a, " ")
+    for (i = 1; i <= n; i++) SAFE[tolower(a[i])] = 1
+    # Routing: shown, but stripped back to what identifies the endpoint.
+    n = split("anthropic_base_url anthropic_upstream context_guru_bin", a, " ")
+    for (i = 1; i <= n; i++) ROUTE[tolower(a[i])] = 1
+  }
+  function shapes(t) {
+    # The second layer. sk- AND sk_ (sk_live_/sk_test_ escaped a `sk-`-only rule).
+    gsub(/sk[-_][A-Za-z0-9_-]{6,}/, "sk_" mark, t)
+    gsub(/ghp_[A-Za-z0-9_]{6,}/, "ghp_" mark, t)
+    gsub(/github_pat_[A-Za-z0-9_]{6,}/, "github_pat_" mark, t)
+    gsub(/xox[baprs]-[A-Za-z0-9-]{6,}/, "xoxb-" mark, t)
+    gsub(/AKIA[A-Z0-9]{6,}/, "AKIA" mark, t)
+    gsub(/eyJ[A-Za-z0-9_.\/+-]{6,}/, "eyJ" mark, t)
+    gsub(/[Bb]earer[ \t]+[A-Za-z0-9_.~+\/=-]{8,}/, "Bearer " mark, t)
+    t = url_creds(t)
+    return t
+  }
+  function url_creds(t,   q, head, qs, n, parts, i, kv, eq, name, rest, tail, out) {
+    # user:pass@host, and credential-named query parameters.
+    #
+    # The query half is rebuilt by splitting on & rather than by a substitution loop. The loop version
+    # did not terminate: its replacement text contains a space, so the [^&" \t]+ value pattern matched
+    # the "<value" prefix of what had just been written and it replaced forever. A split has no such
+    # failure mode, and this is a recovery tool — it must not be able to hang.
+    #
+    # The name test is `key|token|secret|auth|pass|sig|cred` applied to a lowercased name, which is the
+    # same vocabulary the rest of the filter uses. The previous rule carried its own narrower copy
+    # (key|token|secret only), which is why ?auth= printed in the clear — an internal inconsistency
+    # rather than a missing idea.
+    gsub(/:\/\/[^\/@ \t"]*:[^\/@ \t"]*@/, "://<credentials not shown>@", t)
+    q = index(t, "?")
+    if (q == 0) return t
+    head = substr(t, 1, q)
+    qs = substr(t, q + 1)
+    n = split(qs, parts, "&")
+    out = ""
+    for (i = 1; i <= n; i++) {
+      kv = parts[i]
+      eq = index(kv, "=")
+      name = (eq > 0 ? substr(kv, 1, eq - 1) : kv)
+      if (eq > 0 && tolower(name) ~ /key|token|secret|auth|pass|sig|cred/) {
+        rest = substr(kv, eq + 1)
+        tail = ""
+        if (match(rest, /["},]+$/)) tail = substr(rest, RSTART)
+        kv = name "=" mark tail
+      }
+      out = out (i > 1 ? "&" : "") kv
+    }
+    return head out
+  }
+  function route_value(v,   lead, trail, i, c, cnt, head, rest, q, out) {
+    # Keep scheme://host and one path segment; drop the query and anything deeper. A secret can sit in
+    # a deep path (a Slack webhook is nothing but path), and the diagnostic only needs the endpoint.
+    #
+    # The surrounding quotes are lifted off first and put back at the end. Without that, the segment
+    # walk below consumed the closing quote as if it were part of the URL and re-processed a query
+    # url_creds had already redacted, emitting `…/anthropic?<value not shown>,` with the parameter
+    # name and the closing quote both gone — valid redaction, unreadable JSON.
+    if (substr(v, 1, 1) == "\"") { lead = "\""; v = substr(v, 2) }
+    if (substr(v, length(v), 1) == "\"") { trail = "\""; v = substr(v, 1, length(v) - 1) }
+    v = url_creds(v)
+    if (match(v, /:\/\//)) {
+      head = substr(v, 1, RSTART + RLENGTH - 1)
+      rest = substr(v, RSTART + RLENGTH)
+      cnt = 0
+      out = ""
+      for (i = 1; i <= length(rest); i++) {
+        c = substr(rest, i, 1)
+        if (c == "/") { cnt++; if (cnt > 1) { out = out "/" mark; break } }
+        out = out c
+      }
+      return lead head out trail
+    }
+    return lead v trail
+  }
+  # Walks the line and judges EVERY `"key": value` on it, rather than only one at the start.
+  #
+  # The first version assumed the indented, one-key-per-line shape that settings.py writes. A test
+  # caught what that misses: a hand-written settings file is usually COMPACT — the whole document on one
+  # line — and that is exactly the `<` side of every diff this filter is used on. Such a line does not
+  # begin with a key, so nothing engaged and an `authToken` value printed in the clear. Scanning also
+  # handles nesting for free: `"apiKeyHelper": {"cmd": "…"}` puts `cmd` on the same line, and `cmd` is
+  # judged on its own merits.
+  function scan(t,   out, i, n, rest, kq, key, lk, ch, j, val) {
+    out = ""; i = 1; n = length(t)
+    while (i <= n) {
+      rest = substr(t, i)
+      if (match(rest, /^"[^"]*"[ \t]*:[ \t]*/)) {
+        kq = substr(rest, 1, RLENGTH)
+        key = kq; sub(/^"/, "", key); sub(/"[ \t]*:[ \t]*$/, "", key)
+        lk = tolower(key)
+        out = out kq
+        i += RLENGTH
+        ch = substr(t, i, 1)
+        if (ch == "{" || ch == "[") { out = out ch; i++; continue }
+        if (ch == "\"") {
+          j = i + 1
+          while (j <= n) {
+            if (substr(t, j, 1) == "\\") { j += 2; continue }   # an escaped quote is not the end
+            if (substr(t, j, 1) == "\"") break
+            j++
+          }
+          val = substr(t, i, j - i + 1)
+          i = j + 1
+        } else {
+          j = i
+          while (j <= n && substr(t, j, 1) !~ /[,}\]]/) j++
+          val = substr(t, i, j - i)
+          i = j
+        }
+        if (lk in SAFE) out = out shapes(val)
+        else if (lk in ROUTE) out = out route_value(val)
+        else out = out "\"" mark "\""
+        continue
+      }
+      out = out substr(t, i, 1); i++
+    }
+    return out
+  }
+  {
+    line = $0
+    pre = ""
+    # Preserve a diff marker ("< ", "> ") or a grep -n line number, then reason about the rest.
+    if (match(line, /^[<>][ \t]?/) || match(line, /^[0-9]+:/)) {
+      pre = substr(line, 1, RLENGTH); line = substr(line, RLENGTH + 1)
+    }
+    lead = ""
+    if (match(line, /^[ \t]+/)) { lead = substr(line, 1, RLENGTH); line = substr(line, RLENGTH + 1) }
+
+    if (line ~ /^"/ && line !~ /^"[^"]*"[ \t]*:/) {
+      # A bare array element. Allowlisted to the permission-grant shape, Tool(...) — what the diff is
+      # for — and redacted otherwise.
+      if (line ~ /^"[A-Za-z][A-Za-z0-9_]*\(.*\)",?$/) { print pre lead shapes(line); next }
+      print pre lead "\"" mark "\"" (line ~ /,$/ ? "," : "")
+      next
+    }
+    # shapes() over the scanned result, not instead of it. scan() copies anything that is not a
+    # `"key": value` pair verbatim — which is correct for structure, but a bare value with no key at all
+    # (report_environment hands this filter a raw exported URL) then reached the output untouched, and a
+    # `user:pass@host` in it printed in the clear. The two layers are not alternatives.
+    print pre lead shapes(scan(line))
+  }'
+}
+
+# Does this URL point at this machine? S1 in review, and shellcheck SC2102 flagged the shape: this was a
+# `case` pattern list in which `[::1]` is an unquoted BRACKET EXPRESSION — a glob matching one of the
+# characters `:` and `1`, not the literal string — so it never matched an IPv6 loopback. With the three
+# shapes the patterns simply lacked (no port, 0.0.0.0, https), FOUR of six loopback forms reported
+# "clean" and exited 0 while the user's shell was still routed at a dead proxy: silence on the exact
+# condition this report exists to surface.
+#
+# settings.py::_is_loopback already handled all six, and the Go test named for that property tests the
+# PYTHON function. Nothing tested this shell path; TestTheHatchRunsUnderEveryShellItClaims and the
+# exported-base-URL test now do, under every shell on the box.
+is_loopback_url() {
+  _u="${1#http://}"
+  _u="${_u#https://}"
+  [ "$_u" != "$1" ] || return 1          # no http(s) scheme: not ours to judge
+  _host="${_u%%/*}"                      # strip any path
+  case "$_host" in
+    \[*\]*) _host="${_host%%\]*}]" ;;    # [::1] or [::1]:8787 -> [::1]
+    *) _host="${_host%%:*}" ;;           # host:port -> host
+  esac
+  case "$_host" in
+    127.0.0.1|localhost|0.0.0.0|"[::1]"|::1) return 0 ;;
+  esac
+  return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -167,8 +338,7 @@ report_environment() {
   fi
 
   if [ -n "${base:-}" ]; then
-    case "$base" in
-      http://127.0.0.1:*|http://localhost:*|http://[::1]:*)
+    if is_loopback_url "$base"; then
         say "  ! ANTHROPIC_BASE_URL is exported in THIS SHELL and points at a local proxy:"
         # Through redact, like every other printer of real content. This was the fourth site and the
         # worst one: it sits in the function whose own header promises values are never printed, and
@@ -177,10 +347,10 @@ report_environment() {
         say "      $(printf '%s' "$base" | redact)"
         say "    A settings file cannot override an exported variable, so this shell stays"
         say "    routed until you unset it. Fix the line reported below, then open a new shell."
-        INCOMPLETE=1 ;;
-      *)
-        say "  - ANTHROPIC_BASE_URL is exported in this shell: $(printf '%s' "$base" | redact)" ;;
-    esac
+        INCOMPLETE=1
+    else
+      say "  - ANTHROPIC_BASE_URL is exported in this shell: $(printf '%s' "$base" | redact)"
+    fi
   fi
 
   # Where those exports come from. Nothing here is modified — the file and line are the point,
@@ -189,7 +359,13 @@ report_environment() {
   for rc in "$HOME/.zshrc" "$HOME/.zshenv" "$HOME/.zprofile" "$HOME/.bashrc" \
             "$HOME/.bash_profile" "$HOME/.profile"; do
     [ -f "$rc" ] || continue
-    hits="$(grep -nE '^[[:space:]]*(export[[:space:]]+)?ANTHROPIC_(API_KEY|AUTH_TOKEN|BASE_URL|UPSTREAM)=' "$rc" 2>/dev/null \
+    # ANTHROPIC_* rather than four hand-listed names. S2 in review: a credential in
+    # ANTHROPIC_CUSTOM_HEADERS — the variable this project's own machines use for exactly that —
+    # produced "No ANTHROPIC_* assignments found in your shell startup files", a false all-clear
+    # printed under a heading that claims to have looked. `declare -x` / `typeset -x` are accepted
+    # too, since bash users do write those. The `=.*` truncation below is what keeps this safe, and it
+    # is why widening the NAME side costs nothing: the value never survives to be printed.
+    hits="$(grep -nE '^[[:space:]]*((export|declare|typeset)[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*)?ANTHROPIC_[A-Z0-9_]+=' "$rc" 2>/dev/null \
             | sed 's/=.*/=<value not shown>/' || true)"
     [ -n "$hits" ] || continue
     [ "$found" = 0 ] && say "" && say "  ANTHROPIC_* set from shell startup files:"
@@ -273,6 +449,12 @@ say "Record: $MANIFEST"
 say ""
 say "Files context-guru edited:"
 
+PRESET_DIR="$STATE/prereset"
+mkdir -p "$PRESET_DIR" 2>/dev/null && chmod 700 "$PRESET_DIR" 2>/dev/null
+# If the state directory is not writable, fall back to beside the file rather than losing the copy
+# entirely — an unwritable state dir must not turn a reversible restore into an irreversible one.
+[ -d "$PRESET_DIR" ] && [ -w "$PRESET_DIR" ] || PRESET_DIR=""
+
 PLAN="$(mktemp "${TMPDIR:-/tmp}/cg-reset-plan.XXXXXX")"
 # ENV_TMP is in here too (set later, in the empty-plan branch): an interrupt between its mktemp and
 # its rm would otherwise leak a temp file into TMPDIR.
@@ -292,7 +474,13 @@ while IFS='	' read -r existed original path; do
     say "  $path"
     say "      DELETE (context-guru created this file; it did not exist before)"
     printf 'delete\t-\t%s\n' "$path" >> "$PLAN"
-  elif [ -f "$original" ]; then
+  elif [ -s "$original" ]; then
+    # -s, not -f. B1 in review: a Ctrl-C during the first install used to leave a TRUNCATED copy that
+    # O_EXCL then made permanent, and `-f` accepted it — so the hatch cheerfully restored an 8-byte
+    # fragment over a real settings file and reported success. settings.py can no longer produce such
+    # a file (copy_once writes to a temp and hardlinks it into place), but this side must refuse one
+    # anyway: the copies are durable state that older versions of the plugin already wrote, and a
+    # recovery tool should not depend on its writer having been correct.
     say "  $path"
     if cmp -s "$original" "$path"; then
       # Already identical to the pre-install copy, so a restore would copy a file onto itself and
@@ -317,7 +505,7 @@ while IFS='	' read -r existed original path; do
       say "      ! this reverts the WHOLE file, not just the routing. Anything you changed in it"
       say "        since installing goes back too — permission grants Claude Code appended as you"
       say "        approved tools, a model or theme you set. Your current version is copied to"
-      say "        *.context-guru-prereset-* first, so this is undoable."
+      say "        \$STATE/prereset/ first (a *-prereset-* file there), so this is undoable."
       # The diff is shown as EVIDENCE, with no claim about which side of it is the user's.
       #
       # The first version of this counted "lines that are not context-guru's" by grepping our key
@@ -449,7 +637,16 @@ say ""
 while IFS='	' read -r action original path; do
   # Reversible in its own right: whatever is there NOW is copied aside first, so a user who runs
   # this and then discovers the routing was not the problem has the routed version back.
-  pre="$path.context-guru-prereset-$STAMP"
+  # Written under the STATE directory, not beside the settings file. S6 in review: these are complete
+  # copies of a settings file — credentials included — and the old location put a new family of them
+  # inside the user's project working tree, untracked and not covered by any .gitignore this plugin
+  # controls. `git status` listing them was the only thing standing between that and a committed
+  # credential. The state directory is 0700, outside every repo, and already holds the originals.
+  if [ -n "$PRESET_DIR" ]; then
+    pre="$PRESET_DIR/$(printf '%s' "$path" | tr -c 'A-Za-z0-9._-' '_')-$STAMP"
+  else
+    pre="$path.context-guru-prereset-$STAMP"
+  fi
   if [ -e "$path" ] && [ ! -e "$pre" ]; then
     if cp -p "$path" "$pre" 2>/dev/null || cp "$path" "$pre"; then
       say "  saved current state: $pre"
@@ -471,11 +668,18 @@ while IFS='	' read -r action original path; do
       # cp onto the existing path, never `mv`: the settings file may be a symlink into a dotfiles
       # repository, and replacing the link would silently take the edit away from the file the
       # user actually manages. Same reason settings.py resolves the path before writing.
-      if cp "$original" "$path"; then
+      # Compared after the copy, not assumed from cp's exit status. The advertised property was
+      # "verify instead of trusting cp", and what the verify pass actually did was grep for key names
+      # — which a truncated or empty file passes trivially, because it contains no keys at all. A
+      # short write, a full disk or a signal mid-copy all end here, and none of them may be counted as
+      # a restore.
+      if cp "$original" "$path" && cmp -s "$original" "$path"; then
         say "  restored: $path"
         RESTORED=$((RESTORED + 1))
       else
-        warn "  ! could not restore $path from $original"; INCOMPLETE=1; FILES_UNFIXED=1
+        warn "  ! restoring $path from $original did not produce an identical file; the copy of your"
+        warn "    current version is at $pre and nothing was counted as restored"
+        INCOMPLETE=1; FILES_UNFIXED=1
       fi ;;
   esac
 done < "$PLAN"

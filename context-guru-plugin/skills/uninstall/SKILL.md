@@ -141,7 +141,12 @@ Ask before either of these; neither is implied by "stop routing my sessions":
   proxy.
 - **Delete the state directory** — `~/.local/state/context-guru` holds the pidfile and the
   dashboard database (session metadata and token counts, no prompt content unless they enabled
-  content capture). Nothing reads it once the proxy is gone.
+  content capture). **Say what else is in there before they agree:** `originals/` holds the copy of
+  each settings file taken before this plugin first edited it, `prereset/` holds copies taken by the
+  escape hatch, and `context-guru-reset` is the hatch itself. Deleting the directory is what makes
+  the routing removal irreversible and leaves them with no hatch — fine once they are working again
+  and have confirmed it, but it is not the tidy-up-the-leftovers item it looks like. The settings
+  copies are also the reason it is `0700`: they can contain a credential.
 
 ## 4. Confirm the end state
 

@@ -402,8 +402,11 @@ What it does:
 
 1. reads its record of every settings file the install edited — kept in
    `~/.local/state/context-guru/reset-manifest.tsv`;
-2. copies each of those aside as `*.context-guru-prereset-*`, so running the hatch is itself
-   reversible;
+2. copies each of those into `~/.local/state/context-guru/prereset/`, so running the hatch is itself
+   reversible. Deliberately **not** beside the settings file: these are complete copies of a file that
+   can hold a credential, and the old location dropped a new family of them inside your project's git
+   working tree, where `git status` noticing them was the only thing between that and a committed
+   secret;
 3. restores each one from a copy taken **before the first edit**, held in
    `~/.local/state/context-guru/originals/` — or deletes the file, when the install is the reason
    it exists;
@@ -416,6 +419,21 @@ deleted. The copy under `originals/` is written once, with `O_EXCL`, and never p
 
 It never signals a process, never touches the network, and never edits a file it has no record of
 editing. Any proxy still running exits on its own idle timeout.
+
+### What it prints, and what it will not print
+
+The plan shows a diff before it asks, because a restore reverts the whole file — including permission
+grants Claude Code appended as you approved tools. That output is filtered, and the filter is an
+**allowlist** for `"key": value` lines: values are printed only for keys known to be safe (the
+routing keys, `model`, `theme`, `permissions` and friends), and anything else — including a
+credential key nobody has thought of yet — is replaced with `<value not shown>`. Permission grants
+stay visible because that is what the diff is for, and the routing keys keep scheme, host and first
+path segment so you can still see which port you were pointed at.
+
+It is an allowlist rather than a denylist of credential-ish names because the earlier denylist leaked
+four times, in four shapes nobody had listed: `sk_live_`, a secret in a URL path, `?auth=`, and
+`apiKeyHelper` with an object value. The same filter runs over every place this script echoes
+content — the diff, the verify pass, the no-record grep, and the exported-variable lines.
 
 ### It restores routing, not credentials
 

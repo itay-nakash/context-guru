@@ -112,8 +112,47 @@ def apply_statusline(data: dict, command: str) -> None:
     meta[STATUSLINE_META] = command
 
 
+# Values that are URLs get their credentials taken out before they are printed. S4 in review, and
+# pre-existing rather than introduced here — but it contradicts the principle this PR spent three
+# rounds enforcing in reset.sh, and the leak is the same: `replaced=`, `previous=`, `was=`, `restored=`
+# and `base_url=` all echo a base URL the user set, and a base URL can carry `user:pass@` or a
+# credential in a query parameter. The install skill prints these lines to the user, which is exactly
+# the output a person debugging a 401 pastes into an issue.
+_URL_FACTS = ("base_url", "replaced", "previous", "was", "restored", "existing", "proposed",
+              "upstream")
+
+
+def redact_url(value: str) -> str:
+    """Strip userinfo and query-string credentials from a URL, leaving the part that identifies it.
+
+    Deliberately keeps scheme/host/path: the whole diagnostic value of these lines is telling the user
+    WHICH endpoint they were pointed at, and "<redacted>" would answer the wrong question.
+    """
+    if not isinstance(value, str) or "://" not in value:
+        return value
+    scheme, _, rest = value.partition("://")
+    host, slash, tail = rest.partition("/")
+    if "@" in host:
+        host = "<credentials not shown>@" + host.rsplit("@", 1)[1]
+    out = f"{scheme}://{host}{slash}{tail}"
+    if "?" in out:
+        head, _, query = out.partition("?")
+        parts = []
+        for kv in query.split("&"):
+            name = kv.split("=", 1)[0]
+            if any(w in name.lower() for w in ("key", "token", "secret", "auth", "password",
+                                               "credential", "sig")):
+                parts.append(f"{name}=<value not shown>")
+            else:
+                parts.append(kv)
+        out = head + "?" + "&".join(parts)
+    return out
+
+
 def emit(**facts: object) -> None:
     for k, v in facts.items():
+        if k in _URL_FACTS and isinstance(v, str):
+            v = redact_url(v)
         print(f"{k}={v}")
 
 
@@ -156,8 +195,18 @@ def backup(path: str) -> str:
             fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:
             continue
-        with os.fdopen(fd, "wb") as out, open(path, "rb") as src:
-            shutil.copyfileobj(src, out)
+        try:
+            with os.fdopen(fd, "wb") as out, open(path, "rb") as src:
+                shutil.copyfileobj(src, out)
+        except BaseException:
+            # Same hole copy_once had (B1): a Ctrl-C here left a TRUNCATED file that the install skill
+            # then reported as `backup=<path>` — "that is their undo". A partial copy presented as an
+            # undo is worse than no backup, because it is trusted.
+            try:
+                os.unlink(dest)
+            except OSError:
+                pass
+            raise
         shutil.copystat(path, dest)
         prune_backups(path)
         return dest
@@ -281,6 +330,75 @@ def _write_atomic(path: str, data: bytes, mode: int = 0o600) -> None:
         except OSError:
             pass
         raise
+
+
+# 0700, and re-asserted rather than assumed. B3 in review: the COPIES were hardened to 0600 and the
+# DIRECTORIES were not, so under a permissive umask (`umask 000` reproduces it) both came out
+# drwxrwxrwx. Another local account could then replace an entry in originals/ and have reset.sh write
+# attacker-chosen content into the victim's ~/.claude/settings.json — a file that controls where all
+# their model traffic goes and can hold a credential. mkdir's mode argument is masked by the umask, so
+# the explicit chmod is what actually sets it.
+STATE_DIR_MODE = 0o700
+
+
+def ensure_state_dir(*parts: str) -> str:
+    """makedirs the state path, force 0700 on every level we own, and return it. Raises on failure."""
+    path = os.path.join(*parts)
+    os.makedirs(path, mode=STATE_DIR_MODE, exist_ok=True)
+    # Tighten what already existed too: a directory created by an older version of this script (or by
+    # anything else) may be group- or world-writable, and trusting it is the whole vulnerability.
+    for level in (path, os.path.dirname(path)):
+        try:
+            if level and os.path.isdir(level) and (os.stat(level).st_mode & 0o077):
+                os.chmod(level, STATE_DIR_MODE)
+        except OSError:
+            pass
+    return path
+
+
+def copy_once(src: str, dest: str) -> str:
+    """Copy `src` to `dest` exactly once, atomically. Returns `dest`, or "" if it could not be done.
+
+    B1 in review, and the most serious defect the hatch has had: this used to open `dest` with
+    O_EXCL and stream into it. Only OSError unlinked a partial, and **KeyboardInterrupt is a
+    BaseException** — so a Ctrl-C during the first install (the install is the slow, interruptible
+    part, and a user watching it hang is exactly who presses Ctrl-C) left a TRUNCATED file at `dest`.
+    O_EXCL then guaranteed by design that it was never replaced. reset.sh gated on `-f` rather than
+    `-s`, and its "verify" step greps for key names — which a destroyed file passes trivially — so the
+    hatch restored an 8-byte fragment over a real settings file, printed "Done. 1 file(s) put back.",
+    and exited 0. Reproduced.
+
+    The irony was precise: the never-overwrite property that makes this copy trustworthy is exactly
+    what turned a transient interrupt into permanent, unrecoverable state.
+
+    So: stream into a temp name, fsync it, then hardlink it into place. os.link is atomic and fails if
+    the destination exists, which preserves never-overwrite *without* a partially written destination
+    ever being reachable. The temp is removed on every path including BaseException — which is allowed
+    to propagate, because a user pressing Ctrl-C means it.
+    """
+    tmp = f"{dest}.partial-{os.getpid()}"
+    try:
+        try:
+            fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except OSError:
+            return ""
+        with os.fdopen(fd, "wb") as out, open(src, "rb") as fh:
+            shutil.copyfileobj(fh, out)
+            out.flush()
+            os.fsync(out.fileno())
+        try:
+            os.link(tmp, dest)
+        except FileExistsError:
+            # Already recorded by an earlier run. That copy is authoritative; keep it.
+            return dest if os.path.exists(dest) else ""
+        except OSError:
+            return ""
+        return dest
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 def install_hatch(state: str) -> str:
@@ -455,7 +573,7 @@ def _record_touch(real: str, existed: bool) -> None:
     """
     state = state_dir()
     try:
-        os.makedirs(os.path.join(state, "originals"), exist_ok=True)
+        ensure_state_dir(state, "originals")
     except OSError as exc:
         HATCH_FACTS["reset_hatch"] = "unavailable"
         HATCH_FACTS["reset_hatch_detail"] = f"cannot write {state}: {exc}"
@@ -476,24 +594,7 @@ def _record_touch(real: str, existed: bool) -> None:
         # manifest entry is known.
         skipped_copy = True
     elif existed:
-        dest = os.path.join(state, "originals", _slug(real) + ".original")
-        try:
-            fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError:
-            original = dest          # already recorded, by an earlier run; keep THAT one
-        except OSError:
-            original = ""
-        else:
-            try:
-                with os.fdopen(fd, "wb") as out, open(real, "rb") as srcf:
-                    shutil.copyfileobj(srcf, out)
-                original = dest
-            except OSError:
-                try:
-                    os.unlink(dest)  # a half copy is worse than none: it would restore garbage
-                except OSError:
-                    pass
-                original = ""
+        original = copy_once(real, os.path.join(state, "originals", _slug(real) + ".original"))
 
     jsonp, tsvp = _manifest_paths(state)
     entries: list[dict] = []
@@ -634,7 +735,7 @@ def _ensure_hatch(file: str) -> None:
     """
     state = state_dir()
     try:
-        os.makedirs(os.path.join(state, "originals"), exist_ok=True)
+        ensure_state_dir(state, "originals")
     except OSError as exc:
         HATCH_FACTS["reset_hatch"] = "unavailable"
         HATCH_FACTS["reset_hatch_detail"] = f"cannot write {state}: {exc}"
@@ -667,7 +768,17 @@ def _ensure_hatch(file: str) -> None:
 
 
 def cmd_add(args: argparse.Namespace) -> int:
-    # SCOPE GATE, before anything is read or written.
+    # SCOPE GATE — on the ROUTING, which is the only thing whose scope matters.
+    #
+    # B2 in review: this was the first statement in the function, above the statusline-only early
+    # return, so `add --file ~/.claude/settings.json --statusline <cmd>` — a call that writes no
+    # routing key at all — was refused with `reason=user_scope_needs_flag`. Six documented invocations
+    # broke, four in skills/statusline/SKILL.md and two in docs/how-to/install-plugin.md, a file this
+    # PR edits. A statusline IS machine-wide by design and routes nothing, so the refusal text
+    # ("this file routes EVERY project", "project scope is the default") was wrong for it as well.
+    #
+    # Gated on args.url for that reason: the blast-radius argument is entirely about where model
+    # traffic is pointed. A statusline that fails renders a blank status line and breaks nothing.
     #
     # A project-scope install that goes wrong breaks one project. The same mistake in
     # ~/.claude/settings.json breaks EVERY Claude Code session on the machine — including the ones
@@ -680,7 +791,7 @@ def cmd_add(args: argparse.Namespace) -> int:
     # lockout. So the refusal lives here, where nothing can talk it round, and takes an explicit
     # flag that means the user was asked. Removal is deliberately NOT gated: uninstall must be able
     # to clean every scope, and blocking recovery would be the wrong side to err on.
-    if is_user_scope(args.file) and not getattr(args, "user_scope", False):
+    if args.url and is_user_scope(args.file) and not getattr(args, "user_scope", False):
         emit(result="error", reason="user_scope_needs_flag", file=args.file,
              note="this file routes EVERY project on the machine, so it needs --user-scope as "
                   "well. Confirm with the user first, naming that blast radius; project scope "
