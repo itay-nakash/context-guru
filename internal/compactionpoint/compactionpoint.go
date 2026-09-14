@@ -64,17 +64,32 @@ import (
 //  4. UNKNOWN -- never observed, and case 1 vs case 3 indistinguishable. C == W as a GUESS, which
 //     must not report alike with case 3.
 //
-// # WHY max_tokens EXPLAINS THE TABLE BUT IS NOT A SOURCE
+// # C IS NOT ON THE WIRE, and max_tokens is NOT a substitute -- both checked
 //
-// Claude Code sends max_tokens on every request (32,000 on haiku), and W - max_tokens = 168,000 --
-// which is the threshold its own indicator reports. So the client reserves a full response's worth of
-// headroom in its own accounting, and that derivation is available per request with no state at all.
+// The tempting shortcut, and why it is not taken. Claude Code sends max_tokens on every request
+// (32,000 on haiku), and W - max_tokens = 168,000, which is close to the ~167,000 threshold its own
+// indicator reports. It is ONE data point and it is probably a coincidence:
 //
-// It is deliberately NOT used as a source here, because it lands in the CLIENT's ruler and converting
-// it to billed tokens needs a ratio we would be guessing. It earns its place as the EXPLANATION of
-// why the table's numbers are what they are -- and it makes the Opus entry consistent rather than
-// merely asserted: at W = 1,000,000 the same reserve leaves a client threshold above what the billed
-// ratio could reach, so C clamps to W, which is exactly the "runs to 100%" behaviour reported there.
+//   - max_tokens is the OUTPUT budget. Reading it as a compaction threshold requires the client to
+//     have chosen a "reserve one full response" policy, and nothing observed says it did.
+//   - THERE IS EVIDENCE AGAINST the mechanism that would make it non-arbitrary. If the provider
+//     enforced `input + max_tokens <= W`, the client would be FORCED to compact around
+//     W - max_tokens. It does not: a captured request billed 199,184 input with max_tokens 32,000 on
+//     a 200,000 window -- 231,184 together -- and succeeded. So W - max_tokens is not a constraint
+//     the provider imposes, and the client landing near it would be policy we have not seen.
+//   - It is in the CLIENT's ruler anyway, so using it would need a billed conversion ratio we would
+//     be guessing (1.186 on the one observation).
+//
+// AND THE PROVIDER DOES NOT TELL US EITHER. A real Claude Code request was captured and inspected in
+// full: `max_tokens`, `messages`, `metadata` (device and session ids), `model`, `output_config` (a
+// JSON output schema), `system`, `temperature`, `thinking`, `tools`, `stream`. No `context_management`
+// block, and nothing anywhere in the record naming context, compaction, a limit, a window, a budget or
+// a threshold. That is not surprising on reflection -- where the CLIENT compacts is the client's own
+// policy, so the provider has no reason to know it.
+//
+// So the only sound source is DIRECT OBSERVATION in billed tokens, which is case 1 below and already
+// works. scripts/scenarios/d-maxtokens-rule.sh exists to FALSIFY the max_tokens shortcut on a second
+// model rather than to adopt it -- cheap insurance against someone building on the coincidence.
 //
 // # THE STATISTIC, once a deployment has several observations
 //
@@ -146,10 +161,11 @@ var table = []struct {
 		Frac:   1.00,
 		Source: Assumed,
 		Note: "reported behaviour: Claude Code on Opus runs to essentially 100% of the window before " +
-			"compacting. Not observed in billed tokens by any run. Consistent with the max_tokens " +
-			"reserve at a 1M window leaving a client threshold the billed ratio cannot reach, so C " +
-			"clamps to W. 1.00 is the LEAST conservative value available, and too-high is the " +
-			"dangerous direction for the trigger.",
+			"compacting. Not observed in billed tokens by any run, and NOT corroborated by the " +
+			"max_tokens derivation -- that shortcut is one data point on haiku with evidence against " +
+			"its mechanism, so it cannot be cited in support of this entry. 1.00 is the LEAST " +
+			"conservative value available and too-high is the dangerous direction for the trigger, so " +
+			"a measurement here can only move published savings down.",
 	}},
 	{"claude-sonnet-5", Point{
 		Frac:   1.00,

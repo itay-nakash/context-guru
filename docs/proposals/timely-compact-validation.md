@@ -448,17 +448,30 @@ figure a reader actually trusts.
 `C` currently comes from a per-model table with **one** measured entry. This arm tests the rule that
 would remove the table entirely.
 
-**The observation that suggests a rule.** On a real Claude Code session on haiku, `max_tokens` was
-32,000 on every single request, and:
+**The tempting shortcut, and why this arm exists to falsify it rather than adopt it.** On a real
+Claude Code session on haiku, `max_tokens` was 32,000 on every request, and `W − max_tokens = 168,000`
+— close to the ~167,000 threshold the client's own indicator reports.
+
+That is **one data point and probably a coincidence.** `max_tokens` is the *output* budget; reading it
+as a compaction threshold requires the client to have chosen a "reserve one full response" policy, and
+nothing observed says it did. There is also **evidence against the mechanism that would make it
+non-arbitrary**: if the provider enforced `input + max_tokens ≤ W` the client would be *forced* to
+compact around `W − max_tokens`, and it does not — a captured request billed **199,184** input with
+`max_tokens` 32,000 on a **200,000** window, 231,184 together, and succeeded.
+
+**And `C` is not on the wire at all.** A real Claude Code request was captured and inspected in full:
 
 ```
-W − max_tokens = 200,000 − 32,000 = 168,000
+max_tokens  messages  metadata  model  output_config  system  temperature  thinking  tools  stream
 ```
 
-which is the threshold the client's own context indicator reports. So the client appears to reserve a
-full response's worth of headroom in its own accounting. If that is the rule, `C` follows from two
-numbers **already on every request** — and `max_tokens` is the quantity to watch when a deployment
-changes its output budget.
+No `context_management` block, and nothing anywhere in the record naming context, compaction, a limit,
+a window, a budget or a threshold. On reflection that is expected — where the client compacts is the
+client's own policy, so the provider has no reason to know it, and there is nothing for it to return
+as metadata.
+
+So the only sound source for `C` is **direct observation in billed tokens** (case 1), which already
+works. This arm is cheap insurance against someone building on the coincidence.
 
 **An earlier version of this arm was worthless and is worth recording as such.** It set a settings key
 named `autoCompactThreshold` and looked for the compaction point to move. **That key was invented** —
