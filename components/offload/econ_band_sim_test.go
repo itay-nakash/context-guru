@@ -174,6 +174,62 @@ func TestEconGatePassRateByBand(t *testing.T) {
 		}
 	}
 
+	// THE PROPOSED CONFIGURATION, END TO END. The sweeps above vary one term at a time, which cannot
+	// answer "will it fire enough" -- that is a JOINT question over the inventory floor and the gate,
+	// and multiplying a pass rate from one table by a qualification rate from another assumes they are
+	// independent when the floor selects for large requests and the gate selects against them.
+	//
+	// Reported as a fraction of ALL decision points, because a firing rate conditioned on qualifying
+	// hides exactly what min_inventory costs. Compared against iteration 024's measured 28% of runs
+	// (626 asks over 2,207 requests), which is the only firing rate that ever produced reward.
+	t.Logf("=== PROPOSED CONFIG END TO END: premium 20, credit on, min_inventory as shown")
+	t.Logf("  %-8s %-6s %6s %8s %9s %12s %12s", "window", "minInv", "pts", "qualify", "ask/all", "askMass", "askDead")
+	for _, w := range []int{64000, 128000} {
+		for _, floor := range []int{0, 3, 10} {
+			for _, ap := range []struct {
+				label string
+				v     float64
+			}{{"prior 1.0", 1.0}, {"floored .05", approvalFloor}} {
+				var pts, qual, ask, mass, dead int
+				for _, b := range batches {
+					c := &components.Ctx{Ctx: context.Background(), CtxWindow: w}
+					req := simReq(b)
+					saved, shallowest, dd := 0, len(req.Input), 0
+					for _, cd := range b.Candidates {
+						saved += cd.Tokens
+						if cd.MsgIdx < shallowest {
+							shallowest = cd.MsgIdx
+						}
+						if !cd.FutureReferenced {
+							dd += cd.Tokens
+						}
+					}
+					if saved <= 0 || shallowest >= len(req.Input) {
+						continue
+					}
+					pts++
+					if len(b.Candidates) < floor {
+						continue // min_inventory declines before the gate is consulted
+					}
+					qual++
+					pricing := rewritePricing{askUSD: askCostPrior(req, c), approval: ap.v,
+						premium: 20, creditRemoval: true}
+					if _, _, ok := prefixRewritePaysWith(req, saved, shallowest, pricing, c); ok {
+						ask++
+						mass += saved
+						dead += dd
+					}
+				}
+				if pts == 0 {
+					continue
+				}
+				t.Logf("  %-8d %-6d %6d %7.0f%% %8.0f%% %12d %12d  [%s]",
+					w, floor, pts, 100*float64(qual)/float64(pts), 100*float64(ask)/float64(pts),
+					mass, dead, ap.label)
+			}
+		}
+	}
+
 	// WHAT THE GATE IS ANTI-CORRELATED WITH, measured rather than argued: bucket the decision points by
 	// how full the request is and report the pass rate in each. If the gate refuses hardest where the
 	// request is fullest, the mechanism cannot act when it matters, and that is a property of the
