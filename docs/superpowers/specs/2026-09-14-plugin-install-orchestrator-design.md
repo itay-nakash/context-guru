@@ -219,21 +219,61 @@ them: the script was found and ran (so the path expanded), yet the script's own 
 > ever moved to the `` !`` `` path: `-x "/scripts/start-proxy.sh"` is false, and the branch is skipped
 > without an error.
 
-**3. The auto-mode classifier does NOT inspect a `` !`` `` block.** Measured with a control, which is
-the only way this claim means anything — the same command string, the same permission mode, two code
-paths:
+**3. RETRACTED — the classifier's treatment of the two paths is NOT established.** A second probe
+added the control the first one lacked. Four trials, one per cell:
 
-| path | outcome |
-|---|---|
-| `` !`start-proxy.sh --unrouted --upstream https://…` `` in a skill body | **ran** |
-| the identical command as a model Bash tool call | **denied** — *"`--unrouted` read as a routing/egress bypass … aimed at an internal-looking upstream host"* |
+| # | path | outcome |
+|---|---|---|
+| 2a | `` !`start-proxy.sh --unrouted --upstream https://…` `` in a skill body | ran |
+| 2b | identical command, model tool call, from a **bare prompt** | **denied** — *"`--unrouted` read as a routing/egress bypass … aimed at an internal-looking upstream host"* |
+| 3a | model tool call from a skill **with** `allowed-tools` naming the script | ran |
+| 3b | model tool call from a skill **without** `allowed-tools` — the control | ran |
 
-The denial reason is almost the wording the 2026-09-14 install hit.
+3b is what breaks the original conclusion. The control ran, so `allowed-tools` is not what separated
+3a from 2b — and 2b differed from 3b in **two** ways at once: bare prompt vs skill invocation, and a
+different script path, which the denial text explicitly cited ("an unverified script from
+`/tmp/cgprobe`"). With the variable not isolated, the denial cannot be attributed to the code path.
 
-**4. Unanswered:** whether `~/.local/bin` is on the PATH of the shell `!` uses. It is on the author's
-machine; that is one data point, not a fact about users.
+**And the classifier is itself a model, so it is probabilistic.** One trial per cell cannot establish
+that any path is exempt; it can only show that a denial is *possible* on one and was *not observed* on
+another. Honest summary: `` !`` `` blocks were not gated in 2 trials, tool calls were gated in 1 of 3.
+Establishing exemption needs on the order of ten trials per cell with exactly one variable moving.
 
-#### What finding 3 means, and what it must not be used for
+**Nothing in the design may depend on predicting it.** The install must behave correctly whether or
+not the prompt appears — which is why the recommendation below stops trying to make the gate disappear
+and makes it *legible* instead. Findings 1 and 2 are unaffected: those are deterministic mechanism
+facts, not statistics.
+
+**4. A `` !`` `` block that exits NON-ZERO takes the whole skill invocation with it, silently.**
+Found while implementing this (PR #250), not by probing for it: `--plan` exited 2 when a base URL was
+already set — the commonest state of a hosted machine, and precisely the case the plan exists to
+describe — and the real session then produced **no output at all**. The model never saw the plan, never
+asked its question, and the run looked successful because nothing had been written.
+
+The consequence is a rule rather than a nuance: **anything a `` !`` `` block runs must always exit 0.**
+A plan reports; `needs_decision` is data for the caller to act on, not an error to propagate. Only a
+command that actually declines to act — the writing path — exits non-zero. It also gives the confirm
+step a second, independent reason to stay an ordinary tool call: a denial there must be *recoverable*,
+and a denial inside a `` !`` `` block would be invisible.
+
+**5. A skill can pre-approve its own gated command.** The install skill's first draft declared
+`allowed-tools: Bash(.../install.sh)`, and the command that starts a traffic-intercepting proxy and
+repoints `ANTHROPIC_BASE_URL` then ran with **no prompt at all**. The `` !`` `` block needs no such
+grant, so that line could only ever pre-approve the one step whose gate this document calls a feature.
+
+It is removed, with a test that fails if it returns — but the honest reading is uncomfortable and
+belongs here: **a plugin author can declare away the question the classifier exists to ask.** Removing
+the line does not create a gate either; measured after removal, the command still ran unprompted,
+consistent with finding 3's retraction. What was removed is a declaration that *guaranteed* no gate
+would ever fire. And in a non-interactive session (`claude -p`) the install completes with no human
+answer and no prompt, because there is no human to ask — so a design that treats the approval prompt
+as its consent mechanism is trusting something probabilistic, declarable-away, and absent by
+construction in unattended runs.
+
+**6. Unanswered:** whether `~/.local/bin` is on the PATH of the shell `!` uses. It is on the author's
+machine; that is one data point, not a fact about users. It only affects Appendix A.
+
+#### What finding 3 must not be used for
 
 It would be technically sufficient to put the whole install in a `` !`` `` block and never be gated
 again. **The design must not do that.** This repo's own position on the denial is that it is *correct*:
@@ -360,8 +400,9 @@ offer.
 `4` crash.
 
 ```
-result=routed|planned|repaired|unchanged|error
+result=routed|planned|needs_decision|unchanged|error
 mode=local|attach
+already_routed=false
 scope=project|team|user
 file=/abs/path
 port=8787
@@ -379,6 +420,13 @@ permission_rule=Bash(/abs/plugin/root/**)
 
 `--plan` emits the same keys with `result=planned` and writes nothing, so the model can ask its one
 question with real values instead of `<target>` placeholders.
+
+**A plan ALWAYS exits 0**, and this is the single most important line in the contract. It reports
+`result=needs_decision` (with a `reason=`) for anything needing a human — a base URL already set,
+machine-wide scope without its flag, an unusable `--base-url` — rather than exiting non-zero. See
+finding 4 under *Measured*: a non-zero `` !`` `` block silently destroys the whole invocation, so an
+exit code there is not a signal, it is a way of losing the message. `already_routed=true` distinguishes
+a re-run from a fresh install, so a repair is not narrated as a first-time one.
 
 **What `--plan` is not for: getting the user to approve a plan.** An earlier revision argued it was
 "approvable on its own", which quietly assumed a user reads `key=value` output and understands the
@@ -513,6 +561,15 @@ routed to a foreign endpoint / unparseable.
 
 Go is not installed on this laptop, so these run on the eval box per that section of the root
 `CLAUDE.md`; the shell and Python paths are exercisable there too.
+
+## Status: implemented in #250
+
+This document is the design; the implementation is PR #250, stacked on #249 (which supplies the named
+cache strategies the install writes). Two of its conclusions were corrected BY that implementation
+rather than before it — the plan's exit contract (finding 4) and the self-granted permission
+(finding 5) — which is the argument for building a thin end-to-end run early instead of trusting a
+design review. A third, smaller one was caught by the first smoke run: `settings.py show` prints the
+sentinel `(unset)`, and reading that as a real value made every clean project look already-routed.
 
 ## Recommendation
 
