@@ -30,6 +30,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tidwall/gjson"
+
 	"github.com/rossoctl/context-guru/internal/cheapmodel"
 	"github.com/rossoctl/context-guru/internal/extract"
 )
@@ -141,11 +143,25 @@ func renderEvidence(e map[string]any) string {
 	return strings.TrimSpace(b.String())
 }
 
-// buildPrompt assembles the offline equivalent of a prefix ask: the conversation, then the inventory.
-// In production the conversation is already in the provider's cache and only the inventory is sent;
-// here both go on the wire, which is why the prompt cost is driven by the TRANSCRIPT and not by the
-// candidate mass.
-func buildPrompt(b batch, arm string) (string, error) {
+// buildAsk assembles the inventory question — the SHIPPED prompt, via extract.BuildPrefixAsk.
+//
+// This used to return the ask CONCATENATED ONTO the flattened transcript, as one user message, and that
+// was a different question from the one production asks. Live, the transcript is the request's own
+// `messages` array and the ask is a trailing user message (cheapmodel.CompletePrefixed,
+// proxy/prefixask.go:115), so the model's prior outputs arrive in ASSISTANT role — they are its own
+// turns. Flattened into one user message they become quoted text the user pasted, which changes three
+// things at once:
+//
+//   - criterion (c) — "a step you have EXPLICITLY STATED you will take" — stops being a claim about
+//     the model's own utterances and becomes a claim about a document.
+//   - the contract's own sentence "The conversation above is your own. Read the tool outputs from it
+//     directly" becomes false.
+//   - "above" changes referent, from prior messages to earlier bytes of the same message.
+//
+// The measured symptom: the flattened harness dropped 85% of candidates on ~8-candidate batches while
+// the live component dropped 33% and iteration 024 dropped 43% at comparable inventory. A harness that
+// overstates drop willingness is useless for asking whether a drop is worthwhile.
+func buildAsk(b batch, arm string) (string, error) {
 	items := make([]extract.AdjudicationItem, 0, len(b.Candidates))
 	for i, c := range b.Candidates {
 		items = append(items, extract.AdjudicationItem{
@@ -165,12 +181,43 @@ func buildPrompt(b batch, arm string) (string, error) {
 		}
 		ask = strings.Replace(ask, clauseBefore, clauseAfter, 1)
 	}
-	var sb strings.Builder
-	for _, m := range b.Transcript {
-		fmt.Fprintf(&sb, "[%s]\n%s\n\n", m.Role, m.Text)
+	return ask, nil
+}
+
+// buildPrefixBody renders the decision point as a request body whose `messages` array carries the
+// conversation, so CompletePrefixed can append the ask exactly as production does.
+//
+// WHAT THIS CANNOT REPRODUCE, stated because it bounds every number the tool reports: the corpus
+// records each message as a role and a flat string, not as content blocks, so tool results arrive here
+// as user-role text rather than as `tool_result` blocks inside a user message, and assistant tool calls
+// lose their `tool_use` blocks. Role attribution is faithful; block structure is not. That is a strict
+// improvement on one flattened user message and still not the live request.
+//
+// Consecutive same-role messages are MERGED. The provider accepts them, but merging keeps the turn
+// count meaningful: an agent trace maps many tool results onto one logical user turn, and leaving them
+// split would make the conversation look like dozens of user turns to a model being asked which of its
+// own turns are spent.
+func buildPrefixBody(b batch, model string) ([]byte, error) {
+	type msg struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
 	}
-	sb.WriteString(ask)
-	return sb.String(), nil
+	var msgs []msg
+	for _, m := range b.Transcript {
+		role := "user"
+		if m.Role == "assistant" {
+			role = "assistant"
+		}
+		if n := len(msgs); n > 0 && msgs[n-1].Role == role {
+			msgs[n-1].Content += "\n\n" + m.Text
+			continue
+		}
+		msgs = append(msgs, msg{Role: role, Content: m.Text})
+	}
+	if len(msgs) == 0 {
+		return nil, fmt.Errorf("decision point has no transcript")
+	}
+	return json.Marshal(map[string]any{"model": model, "messages": msgs})
 }
 
 func main() {
@@ -211,17 +258,25 @@ func main() {
 		all = all[:*n]
 	}
 
-	// Build every prompt FIRST, so a prompt-assembly failure costs nothing.
-	prompts := make([]string, len(all))
+	// Build every prompt FIRST, so a prompt-assembly failure costs nothing. Two parts now, matching
+	// the live split: the conversation as a request body, and the ask as the trailing user message
+	// CompletePrefixed appends to it.
+	asks := make([]string, len(all))
+	bodies := make([][]byte, len(all))
 	inTok := 0
 	for i, b := range all {
-		p, err := buildPrompt(b, *arm)
+		a, err := buildAsk(b, *arm)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(3)
 		}
-		prompts[i] = p
-		inTok += tok(p)
+		body, err := buildPrefixBody(b, os.Getenv("CG_ARM_MODEL"))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(3)
+		}
+		asks[i], bodies[i] = a, body
+		inTok += tok(a) + tok(string(body))
 	}
 	nCand := 0
 	for _, b := range all {
@@ -264,9 +319,35 @@ func main() {
 		a := extract.Judge(vs[0], flat)
 		fmt.Printf("  judge round-trip: drop=%v fabricated=%v criterionMissing=%v\n",
 			a.Drop, a.QuoteFabricated, a.CriterionMissing)
-		fmt.Printf("  prompt[0] first 200 chars: %.200s...\n", prompts[0])
-		fmt.Printf("  arm %s clause present in prompt[0]: %v\n", *arm,
-			strings.Contains(prompts[0], map[string]string{"A": clauseBefore, "B": clauseAfter}[*arm]))
+		// SHAPE ASSERTIONS, so a dry run proves the request is the live shape rather than merely
+		// building. Checked here because the failure they catch — the transcript leaking into the ask,
+		// or the conversation collapsing to one message — is silent on the wire and expensive to find
+		// after spending.
+		nMsgs := len(gjson.GetBytes(bodies[0], "messages").Array())
+		fmt.Printf("  prefix body: %d messages, %d bytes | ask: %d bytes\n",
+			nMsgs, len(bodies[0]), len(asks[0]))
+		if nMsgs < 2 {
+			fmt.Fprintln(os.Stderr, "SHAPE FAILURE: the conversation collapsed to fewer than 2 messages; "+
+				"this is the flattened prompt the fix exists to remove")
+			os.Exit(6)
+		}
+		roles := map[string]int{}
+		for _, m := range gjson.GetBytes(bodies[0], "messages").Array() {
+			roles[m.Get("role").String()]++
+		}
+		fmt.Printf("  roles in the conversation: %v (assistant>0 is what makes criterion (c) meaningful)\n", roles)
+		if roles["assistant"] == 0 {
+			fmt.Fprintln(os.Stderr, "SHAPE WARNING: no assistant-role messages; the model is not being "+
+				"shown its own turns and criterion (a)/(c) cannot be answered as intended")
+		}
+		if len(b0.Transcript) > 0 && strings.Contains(asks[0], b0.Transcript[0].Text) {
+			fmt.Fprintln(os.Stderr, "SHAPE FAILURE: transcript text found inside the ask; the ask must "+
+				"carry only the inventory")
+			os.Exit(6)
+		}
+		fmt.Printf("  ask[0] first 200 chars: %.200s...\n", asks[0])
+		fmt.Printf("  arm %s clause present in ask[0]: %v\n", *arm,
+			strings.Contains(asks[0], map[string]string{"A": clauseBefore, "B": clauseAfter}[*arm]))
 		fmt.Println("\nDRY RUN ONLY -- no calls made, nothing spent.")
 		return
 	}
@@ -276,7 +357,10 @@ func main() {
 		APIKey:     os.Getenv("CG_ARM_KEY"),
 		Model:      os.Getenv("CG_ARM_MODEL"),
 		AuthScheme: os.Getenv("CG_ARM_AUTH"),
-		MaxTokens:  4096,
+		// PrefixAskMaxTokens is what production gives an adjudication (16,000). The 4,096 that stood
+		// here was this tool's own invention and a smaller budget than the code under test uses, which
+		// would have made truncation a property of the harness.
+		MaxTokens:  cheapmodel.PrefixAskMaxTokens,
 	}
 	if model.APIKey == "" || model.Model == "" {
 		fmt.Fprintln(os.Stderr, "CG_ARM_KEY and CG_ARM_MODEL are required for a live run")
@@ -305,9 +389,9 @@ func main() {
 	unparseable, truncated, partial := 0, 0, 0
 	for i, b := range all {
 		ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
-		reply, err := model.Complete(ctx, prompts[i])
+		reply, _, err := model.CompletePrefixed(ctx, bodies[i], asks[i])
 		cancel()
-		spentIn += tok(prompts[i])
+		spentIn += tok(asks[i]) + tok(string(bodies[i]))
 		spentOut += tok(reply)
 		if err != nil {
 			failed++
