@@ -251,29 +251,55 @@ gate needs, so the two are compared rather than assumed.
 That is also why the forced arms use `min_request_frac: 0.5`. It is a test lever, not a
 recommendation, and arm A is the arm that measures why the lever is needed.
 
-### Why the span is 10%, and why it is derived rather than configured
+### Why the span is what it is: an attribution boundary whose far end belongs to the CLIENT
 
-The span is `1 - fill_threshold` of the window, computed from the threshold rather than set beside it.
-It is an **attribution boundary**, not a tuning knob.
+The span is `client_ceiling - fill_threshold`, derived rather than configured beside them.
 
 We fire at the threshold. In the counterfactual world where we did *not* compact, that conversation
-keeps growing — and it does not grow forever, because the **client** compacts when it reaches its own
-ceiling. Past that point both worlds are running on a summarized transcript, and nothing further is
-attributable to us. So the span is exactly the distance from where we fired to where the client would
-have acted: at the shipped 0.9, that is 0.10.
+keeps growing — and not forever, because the **client** compacts when it reaches its own ceiling. Past
+that point both worlds are running on a summarized transcript, and nothing further is attributable to
+us. So the span is exactly the distance between those two points.
 
-Deriving it matters for any other threshold. An operator who moves the trigger to 0.5 needs a 0.50
-span; a fixed 0.10 would stop crediting at 0.6 fill while the counterfactual client kept going to
-1.0, under-reporting the component by four fifths — silently, and in the direction that looks like
-the feature not working.
+**The ceiling is an assumption about the client, not a property of the model.** An earlier version of
+this computed `1 - fill`, which silently asserted the client runs the transcript to the model's limit.
+It is now a parameter (`?ceiling=`, default 1.00), and [#239](https://github.com/rossoctl/context-guru/issues/239)
+is the issue for learning it instead.
 
-Arm A is what makes 1.0 the right ceiling on this client: Claude Code let a haiku session reach
-**0.996** of the window before compacting. A client that capped lower would make this span too *wide*,
-crediting turns past the point its own compaction would have fired — which is [#239](https://github.com/rossoctl/context-guru/issues/239).
+### Which ruler the ceiling is measured in — the third instance of this problem in this feature
 
-The two axes line up, which is worth stating because it is not obvious: the fill is measured in
-provider-billed input (prefix plus new), the span in new content only. They agree because adding X
-tokens of new content raises billed input by X — the prefix is re-sent either way.
+Arm A caught the client compacting, and the same moment reads three different ways:
+
+| ruler | value at the client's ceiling | as a fraction |
+|---|---|---|
+| provider-billed input | 199,184 | **0.996** |
+| Claude Code's own count | ~167,000 | 0.835 |
+| our message-text count (`tokens_before`) | 147,493 | 0.737 |
+
+The fill gate compares against **billed** input, because a context window is stated in billed tokens.
+So the ceiling has to be expressed in billed tokens too, and **0.996 is the figure that belongs here**
+— which is why the default is 1.00 and not the 0.835 the client's own indicator would suggest. Quoting
+the client's number here would be the same units error `Trigger.Fires` shipped with, one level up.
+
+It is still one client, one model, one version. A deployment whose client compacts earlier — a
+configured auto-compact threshold, a different agent, a wrapper of its own — needs its own value.
+
+### The case the old formula could not express
+
+If the ceiling sits at or below the fill threshold, **the client compacts before we would ever fire**,
+so there is no window in which anything is attributable to us and the component cannot help on that
+deployment at all. The panel now reports `coverage.no_attributable_span` and emits no episodes. The
+previous version substituted the shipped 0.10 span, inventing a window the configuration says does not
+exist and publishing credits for turns the client had already compacted away.
+
+That is not hypothetical: 0.835 against a 0.9 trigger is exactly the pair the client's own indicator
+implies, and whether it is the *right* pair depends on which ruler the client actually thresholds in —
+which is the open question #239 exists for.
+
+### Why the two axes line up
+
+Worth stating because it is not obvious: the fill is measured in provider-billed input (prefix plus
+new), the span in new content only. They agree because adding X tokens of new content raises billed
+input by X — the prefix is re-sent either way.
 
 ### Arm B — the cold credit has to accumulate
 

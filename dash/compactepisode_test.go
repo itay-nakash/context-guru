@@ -109,7 +109,7 @@ func cgCost(usd float64) func(*compactRow) {
 }
 
 func walk(rows []compactRow, w windowFn, p priceFn) *CompactionEpisodes {
-	return walkCompactEpisodes(rows, w, p, 0.10, 0.90)
+	return walkCompactEpisodes(rows, w, p, 0.10, 0.90, defaultClientCeilingFrac)
 }
 
 // offUSD reports whether a dollar figure misses its target, with a tolerance.
@@ -504,7 +504,7 @@ func TestTheTurnThatClosesOneSpanAndOpensAnotherIsCreditedOnce(t *testing.T) {
 		// double-charge this test exists to catch was invisible — the review that found the bug
 		// found this fixture hiding it. A hit makes the write OURS and the debit non-zero.
 		row(2, testSpan+8_000, fresh, saved(500_000), miss(CacheHit), wrote(8_000), cgCost(0.03)),
-	}, exactWindow, testPrice, 0.10, 0.90)
+	}, exactWindow, testPrice, 0.10, 0.90, defaultClientCeilingFrac)
 
 	if len(out.Episodes) != 2 {
 		t.Fatalf("want 2 episodes (one closed, one opened by the same turn), got %d: %+v",
@@ -546,7 +546,7 @@ func TestTheTurnThatClosesOneSpanAndOpensAnotherIsCreditedOnce(t *testing.T) {
 // The assumptions the server states must actually describe what it did. The KV-cache page's rule:
 // the arithmetic is served, not restated in a template nothing tests.
 func TestTheServerStatesTheFractionsItActuallyUsed(t *testing.T) {
-	out := walkCompactEpisodes(nil, exactWindow, testPrice, 0.25, 0.5)
+	out := walkCompactEpisodes(nil, exactWindow, testPrice, 0.25, 0.5, defaultClientCeilingFrac)
 	if out.Assumptions.SpanFrac != 0.25 || out.Assumptions.FillFrac != 0.5 {
 		t.Errorf("assumptions = %+v, want the 0.25/0.5 actually used", out.Assumptions)
 	}
@@ -554,8 +554,12 @@ func TestTheServerStatesTheFractionsItActuallyUsed(t *testing.T) {
 		t.Errorf("coverage fill_frac = %v, want 0.5", out.Coverage.FillFrac)
 	}
 	// A zero falls back to the shipped default rather than producing a degenerate span.
-	def := walkCompactEpisodes(nil, exactWindow, testPrice, 0, 0)
-	if def.Assumptions.SpanFrac != spanFor(defaultFillFrac) || def.Assumptions.FillFrac != defaultFillFrac {
+	def := walkCompactEpisodes(nil, exactWindow, testPrice, 0, 0, 0)
+	wantSpan, ok := spanFor(defaultFillFrac, defaultClientCeilingFrac)
+	if !ok {
+		t.Fatal("the shipped fill and ceiling must leave an attributable span")
+	}
+	if def.Assumptions.SpanFrac != wantSpan || def.Assumptions.FillFrac != defaultFillFrac {
 		t.Errorf("assumptions with zero fractions = %+v, want the shipped defaults", def.Assumptions)
 	}
 	if def.Assumptions.KnownOmission == "" {
@@ -965,7 +969,7 @@ func TestAtProductionScaleTheSpanSurvivesMoreThanOneTurn(t *testing.T) {
 			CacheWrite: 275, MissReason: CacheHit, TokensBefore: 122_562,
 			SavedGross: 105_469, SavedUSD: 0.01},
 	}
-	out := walkCompactEpisodes(rows, window, testPrice, 0.10, 0.50)
+	out := walkCompactEpisodes(rows, window, testPrice, 0.10, 0.50, defaultClientCeilingFrac)
 	e := only(t, out)
 
 	// t0's 167,263-token write is a re-creation of an expired prefix, not new content, so it must
@@ -1016,42 +1020,87 @@ func TestAtProductionScaleTheSpanSurvivesMoreThanOneTurn(t *testing.T) {
 	}
 }
 
-// THE SPAN IS AN ATTRIBUTION BOUNDARY DERIVED FROM THE FILL THRESHOLD, not a free constant that
-// happens to be 0.10.
+// THE SPAN IS AN ATTRIBUTION BOUNDARY, and its far end belongs to the CLIENT rather than to the model.
 //
-// We fire at the threshold. In the world where we did not compact, the conversation keeps growing
-// until the CLIENT compacts at its own ceiling — measured at 0.996 of the window on a real Claude
-// Code session (scripts/scenarios/a-firing-rate.sh). Past that point both worlds are running on a
-// summarized transcript and nothing further is attributable to us. So the span is exactly the
-// distance from where we fired to where the client would have acted.
+// We fire at the fill threshold. In the world where we did not compact, the conversation keeps growing
+// until the CLIENT compacts at its own ceiling; past that point both worlds are running on a
+// summarized transcript and nothing further is attributable to us. So the span is
+// `ceiling - fill`.
 //
-// The consequence that makes deriving it worth doing: an operator who moves the trigger to 0.5 needs
-// a 0.50 span. A fixed 0.10 would stop crediting at 0.6 fill while the counterfactual client kept
-// going to 1.0, under-reporting the component by four fifths — silently, and in the direction that
-// looks like the feature not working.
-func TestTheSpanIsDerivedFromTheFillThreshold(t *testing.T) {
-	for _, tc := range []struct{ fill, want float64 }{
-		{0.90, 0.10}, // the shipped pair
-		{0.50, 0.50},
-		{0.75, 0.25},
-		{0.99, 0.01},
+// AN EARLIER VERSION COMPUTED `1 - fill`, which silently asserted the client runs the transcript all
+// the way to the model's limit. That is an assumption about the client, not arithmetic about the
+// model. It is now a parameter, and the case below where the ceiling sits BELOW the trigger is the one
+// that assumption made unrepresentable.
+func TestTheSpanRunsFromOurTriggerToTheClientsCeiling(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		fill, ceiling float64
+		want          float64
+		wantOK        bool
+	}{
+		{"the shipped pair", 0.90, 1.00, 0.10, true},
+		{"a lower trigger needs a wider span, or it stops crediting while the client keeps going",
+			0.50, 1.00, 0.50, true},
+		{"a client that compacts early narrows the span", 0.80, 0.90, 0.10, true},
+		// THE CASE THE OLD FORMULA COULD NOT EXPRESS. Claude Code's own indicator reads ~167,000 of a
+		// 200,000 haiku window, so a deployment whose client really does act there while our trigger
+		// sits at 0.9 would have the client compacting FIRST, every time. There is then no window in
+		// which anything is attributable to us, and this component cannot help on that deployment.
+		{"the client compacts before we would ever fire", 0.90, 0.835, 0, false},
+		{"the ceiling exactly at the trigger leaves nothing", 0.90, 0.90, 0, false},
 	} {
-		if got := spanFor(tc.fill); math.Abs(got-tc.want) > 1e-9 {
-			t.Errorf("spanFor(%v) = %v, want %v — the span is the distance from our trigger to the "+
-				"client's own ceiling", tc.fill, got, tc.want)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := spanFor(tc.fill, tc.ceiling)
+			if ok != tc.wantOK {
+				t.Fatalf("spanFor(%v, %v) ok = %v, want %v", tc.fill, tc.ceiling, ok, tc.wantOK)
+			}
+			if ok && math.Abs(got-tc.want) > 1e-9 {
+				t.Errorf("spanFor(%v, %v) = %v, want %v", tc.fill, tc.ceiling, got, tc.want)
+			}
+		})
 	}
-	// A threshold at or past the whole window leaves nothing attributable; fall back rather than
-	// emit a degenerate span that closes every episode on its own t0.
-	for _, bad := range []float64{1.0, 1.5} {
-		if got := spanFor(bad); got != 1-defaultFillFrac {
-			t.Errorf("spanFor(%v) = %v, want the shipped fallback %v", bad, got, 1-defaultFillFrac)
-		}
+}
+
+// A trigger at or above the client's ceiling is REPORTED as its own condition, not as an empty result.
+//
+// "No episodes" and "no episodes are POSSIBLE here" are different facts, and only the second one names
+// a configuration to change. The previous version substituted the shipped 0.10 span in this case,
+// which invented a window the configuration says does not exist and would have published credits for
+// turns the client had already compacted away.
+func TestATriggerAboveTheClientCeilingIsReportedNotSilentlyRescaled(t *testing.T) {
+	rows := []compactRow{
+		row(1, 1_000, fresh),
+		row(2, testSpan, saved(400_000), miss(CacheTTLExpiry)),
 	}
-	// And the walk really uses it: a 0.5 fill must produce a 0.5 span end to end, not a 0.1 one.
-	out := walkCompactEpisodes([]compactRow{row(1, 1_000, fresh)}, exactWindow, testPrice, 0, 0.50)
+	// Precondition: these rows DO produce an episode when a span exists, so a zero below is about the
+	// ceiling and not about the fixture.
+	if got := walkCompactEpisodes(rows, exactWindow, testPrice, 0, 0.90, 1.00); len(got.Episodes) != 1 {
+		t.Fatalf("precondition: want 1 episode with a valid span, got %d", len(got.Episodes))
+	}
+
+	out := walkCompactEpisodes(rows, exactWindow, testPrice, 0, 0.90, 0.835)
+	if len(out.Episodes) != 0 {
+		t.Errorf("a trigger above the client's ceiling must produce no episodes, got %d",
+			len(out.Episodes))
+	}
+	if !out.Coverage.NoAttributableSpan {
+		t.Error("no_attributable_span must be set, or the panel reports an empty dataset where the " +
+			"truth is that this configuration cannot help at all")
+	}
+	if out.Assumptions.ClientCeilingFrac != 0.835 {
+		t.Errorf("client_ceiling_frac = %v, want the 0.835 it was given — the page prints this, so a "+
+			"value the measurement did not use would be a lie", out.Assumptions.ClientCeilingFrac)
+	}
+}
+
+// And the derivation reaches the served assumptions end to end, or the page prints a number the
+// measurement did not use.
+func TestTheDerivedSpanReachesTheServedAssumptions(t *testing.T) {
+	out := walkCompactEpisodes([]compactRow{row(1, 1_000, fresh)}, exactWindow, testPrice, 0, 0.50, 1.00)
 	if got := out.Assumptions.SpanFrac; math.Abs(got-0.50) > 1e-9 {
-		t.Errorf("the walk reported span_frac = %v for a 0.50 fill; the derivation must reach the "+
-			"served assumptions, or the page prints a number the measurement did not use", got)
+		t.Errorf("span_frac = %v for a 0.50 fill against a 1.00 ceiling, want 0.50", got)
+	}
+	if got := out.Assumptions.ClientCeilingFrac; math.Abs(got-1.00) > 1e-9 {
+		t.Errorf("client_ceiling_frac = %v, want 1.00", got)
 	}
 }

@@ -213,6 +213,11 @@ type CompactionEpisodeGroup struct {
 // decides whether the trigger is worth its default is how many qualifying conversations produced
 // NO episode at all, and what the cold rewrites cost them.
 type CompactionCoverage struct {
+	// NoAttributableSpan is set when the fill threshold sits at or above the client's own compaction
+	// ceiling: the client compacts before we would ever fire, so there is no window in which anything
+	// is attributable to us and this component cannot help on this deployment. A configuration to
+	// change, not an empty dataset — which is why it is a flag rather than a zero count.
+	NoAttributableSpan bool `json:"no_attributable_span"`
 	// FillFrac is the threshold a conversation had to reach to qualify, as a fraction of its
 	// window, measured in billed input. Reported because it is a parameter, not a law.
 	FillFrac float64 `json:"fill_frac"`
@@ -253,6 +258,10 @@ type CompactionAssumptions struct {
 	// SpanRule says WHY the span is the width it is: it is an attribution boundary derived from the
 	// fill threshold, not a tuning knob. See spanFor.
 	SpanRule string `json:"span_rule"`
+	// ClientCeilingFrac is where the CLIENT is assumed to compact its own transcript, as a fraction of
+	// the window in provider-billed tokens. It is the far end of the span and it belongs to the client,
+	// not to the model — see spanFor.
+	ClientCeilingFrac float64 `json:"client_ceiling_frac"`
 }
 
 // CompactionEpisodes is the whole view.
@@ -275,63 +284,80 @@ const (
 	// defaultFillFrac matches summarize's own shipped min_request_frac, so the coverage
 	// population is the one the trigger is actually deciding about.
 	defaultFillFrac = 0.90
+	// defaultClientCeilingFrac is where the CLIENT is assumed to compact its own transcript, as a
+	// fraction of the model window measured in PROVIDER-BILLED input — the same ruler the fill gate
+	// uses, and deliberately not the ruler the client's own indicator uses.
+	//
+	// 0.996 was measured on a real Claude Code session on haiku
+	// (scripts/scenarios/a-firing-rate.sh): the last turn before the client compacted billed 199,184
+	// of a 200,000 window. Rounded to 1.0 rather than pinned at 0.996, because the measurement is one
+	// client on one model and a spuriously precise default invites treating it as established.
+	//
+	// It is an assumption about the CLIENT, not a property of the model, and it is a parameter for
+	// that reason. See spanFor, and #239 for learning it rather than assuming it.
+	defaultClientCeilingFrac = 1.00
 	// episodeListCap bounds the drill-down list. The aggregates are unbounded.
 	episodeListCap = 200
 )
 
-// spanFor is the span, DERIVED from the fill threshold rather than configured beside it:
-// `1 - fillFrac` of the window's worth of NEW content after t0.
+// spanFor is the span: the distance from where WE fire to where the CLIENT would have compacted
+// anyway, in the units the fill is measured in. ok=false means that distance does not exist.
 //
-// # It is an ATTRIBUTION BOUNDARY, not a measurement window, and that is the whole reason for the
-// # number
+// # It is an ATTRIBUTION boundary, and the far end of it belongs to the CLIENT, not to the model
 //
-// We fire at fillFrac of the window. In the counterfactual world where we did NOT compact, that
-// conversation keeps growing — and it does not grow forever, because the CLIENT compacts when it
-// reaches its own ceiling. Past that point the counterfactual world has compacted too, so from there
-// on the two worlds are both running on a summarized transcript and there is nothing left that our
-// compaction can be credited for.
+// We fire at fillFrac of the window. In the counterfactual world where we did NOT compact, the
+// conversation keeps growing — and not forever, because the client compacts when it reaches its own
+// ceiling. Past that point both worlds are running on a summarized transcript and nothing further is
+// attributable to us. So the span is `ceilingFrac - fillFrac`.
 //
-// So the span is exactly the distance from where we fired to where the client would have acted:
-// `1 - fillFrac` of the window. At the shipped 0.9 that is 0.10 — the same number this file used to
-// carry as a free constant with a much weaker justification ("not a tuned optimum"). Deriving it
-// means an operator who moves the trigger to 0.5 gets a 0.50 span automatically, instead of a 0.10
-// span that stops crediting at 0.6 while the counterfactual client keeps going to 1.0 and silently
-// under-reports the component by four fifths.
+// THE CEILING IS THE CLIENT'S, AND IT IS NOT THE MODEL WINDOW. An earlier version of this function
+// computed `1 - fillFrac`, which silently asserted that the client runs the transcript all the way to
+// the model's limit. That is an assumption about the client, not arithmetic about the model, and the
+// repo owner caught it being stated as the latter.
 //
-// # The two axes line up, which is not obvious and is worth stating
+// # What is actually measured, and in which ruler — this is the third ruler problem in this file
 //
-// The fill is measured in the provider's BILLED input (prefix plus new). The span is measured in NEW
-// content only. Those agree here because adding X tokens of new content to a conversation raises its
-// billed input by X: the prefix is re-sent either way. So "10% of the window of new content" really
-// is the distance from 0.9 fill to 1.0 fill, on the incoming transcript the client's own ceiling
-// applies to.
+// On the one client run available (scripts/scenarios/a-firing-rate.sh, real Claude Code on haiku) the
+// last turn before the client compacted read:
 //
-// # ARM A's measurement is what makes 1.0 the right ceiling on this client
+//	provider-billed input         199,184   = 0.996 of the window   <-- the ruler THIS gate uses
+//	Claude Code's own count        ~167,000  = 0.835                 <-- the ruler the CLIENT uses
+//	our own message-text count     147,493   = 0.737                 <-- the ruler tokens_before uses
 //
-// Claude Code let a haiku session reach 0.996 of the window before compacting — see
-// scripts/scenarios/a-firing-rate.sh. So the client's ceiling really is ~1.0 here, and the boundary
-// is not an assumption. A client that capped lower would make this span too WIDE, crediting turns
-// past the point where its own compaction would have fired. #239 is the issue for learning that
-// ceiling per client rather than assuming the model window.
+// The fill gate compares against BILLED input, because a context window is stated in billed tokens.
+// So the ceiling has to be expressed in billed tokens too, and 0.996 is the measured figure — which is
+// why the default is 1.0 rather than the 0.835 the client's own indicator would suggest. Quoting the
+// client's number here would be the same units error Trigger.Fires shipped with.
 //
-// # What the span does NOT do
+// It is still a measurement of ONE client, ONE model and ONE version. A deployment whose client
+// compacts earlier — a configured auto-compact threshold, a different agent, a wrapper of its own —
+// needs its own value, which is why this is a parameter with an override (`?ceiling=`) rather than a
+// constant. Learning it per client is #239, and this is the first place the answer changes a published
+// number rather than only a firing decision.
 //
-// It does not bound wall-clock time, and it must not be read as though it did. A cold event happens
-// because of ELAPSED TIME while the span advances on NEW CONTENT, and those are independent — a
-// session can go cold having added 2% of the window, or add 10% in thirty seconds and never go cold.
-// They are anti-correlated in the helpful direction: a session idle enough for its entry to lapse is
-// by definition not accruing new content, so the span is not closing while a cold event becomes
-// possible. An earlier reading of a scenario run concluded the opposite; that run's own bridging
-// turns had read two large files and consumed the whole span before the idle gaps began.
-func spanFor(fillFrac float64) float64 {
-	span := 1 - fillFrac
+// # ok=false is a real answer, not an error
+//
+// If the ceiling is at or below the fill threshold, the client compacts BEFORE we would ever fire, so
+// there is no window in which anything is attributable to us — and on that deployment this component
+// cannot help at all. That is worth reporting loudly. The previous version substituted the shipped
+// 0.10 in that case, which invented a span the configuration says does not exist and would have
+// published credits for turns the client had already compacted away.
+//
+// # What the span does NOT bound
+//
+// Wall-clock time. A cold event happens because of ELAPSED TIME while the span advances on NEW
+// CONTENT, and those are independent — anti-correlated in the helpful direction, in fact: a session
+// idle enough for its entry to lapse is by definition not accruing new content, so the span cannot be
+// closing while a cold event becomes possible. A session can go cold having added 2% of the window,
+// and the next turn then pays a write that uncompacted would have covered most of it. An earlier
+// reading of a scenario run concluded the opposite; that run's own bridging turns had read two large
+// files and consumed the whole span before the idle gaps began.
+func spanFor(fillFrac, ceilingFrac float64) (float64, bool) {
+	span := ceilingFrac - fillFrac
 	if span <= 0 {
-		// A fill threshold at or above the whole window leaves no attributable span. Fall back to
-		// the shipped shape rather than emitting a degenerate span that closes every episode on its
-		// own t0 and measures nothing.
-		return 1 - defaultFillFrac
+		return 0, false
 	}
-	return span
+	return span, true
 }
 
 // windowFn resolves a model's context window and says whether it is exact. Injected so the walk
@@ -349,18 +375,22 @@ type priceFn func(model string) kvcache.Pricing
 // window is a guess — is a sequence of rows, and a test that has to build a database to express
 // one is a test nobody writes the fifth variant of.
 func walkCompactEpisodes(rows []compactRow, window windowFn, price priceFn,
-	spanFrac, fillFrac float64) *CompactionEpisodes {
+	spanFrac, fillFrac, ceilingFrac float64) *CompactionEpisodes {
 	// fillFrac FIRST: the span derives from it. Reversing these two silently derived the span from a
-	// zero fill, i.e. 1.0 — a span ten times too wide.
+	// zero fill, i.e. the whole ceiling — a span ten times too wide.
 	if fillFrac <= 0 {
 		fillFrac = defaultFillFrac
 	}
+	if ceilingFrac <= 0 {
+		ceilingFrac = defaultClientCeilingFrac
+	}
+	spanOK := true
 	if spanFrac <= 0 {
-		spanFrac = spanFor(fillFrac)
+		spanFrac, spanOK = spanFor(fillFrac, ceilingFrac)
 	}
 	out := &CompactionEpisodes{
 		Coverage:    CompactionCoverage{FillFrac: fillFrac},
-		Assumptions: compactAssumptions(spanFrac, fillFrac),
+		Assumptions: compactAssumptions(spanFrac, fillFrac, ceilingFrac),
 		Scanned:     int64(len(rows)),
 	}
 	groups := map[string]*CompactionEpisodeGroup{}
@@ -371,6 +401,15 @@ func walkCompactEpisodes(rows []compactRow, window windowFn, price priceFn,
 			groups[p] = g
 		}
 		return g
+	}
+
+	// THE TRIGGER IS AT OR ABOVE THE CLIENT'S OWN CEILING, so the client compacts before we would
+	// ever fire and nothing is attributable to us on this deployment. Reported as its own condition
+	// rather than as an empty result, because "no episodes" and "no episodes are POSSIBLE here" are
+	// different facts and only the second one names a configuration to change.
+	if !spanOK {
+		out.Coverage.NoAttributableSpan = true
+		return out
 	}
 
 	for _, conv := range groupConversations(rows) {
@@ -904,11 +943,12 @@ func spanTS(first, last int64, conv []compactRow) (int64, int64) {
 	return first, last
 }
 
-func compactAssumptions(spanFrac, fillFrac float64) CompactionAssumptions {
+func compactAssumptions(spanFrac, fillFrac, ceilingFrac float64) CompactionAssumptions {
 	return CompactionAssumptions{
-		SpanFrac:    spanFrac,
-		FillFrac:    fillFrac,
-		SpanMeasure: "provider-billed NEW content (fresh input, plus the newly-written tail on turns whose cache hit), in the units the context window is stated in",
+		SpanFrac:          spanFrac,
+		FillFrac:          fillFrac,
+		ClientCeilingFrac: ceilingFrac,
+		SpanMeasure:       "provider-billed NEW content (fresh input, plus the newly-written tail on turns whose cache hit), in the units the context window is stated in",
 		CreditSource: "the tokens summarize removed on each turn (request_components.saved_gross), " +
 			"priced at the rate THAT turn's cache verdict earns: the cache-creation rate where the " +
 			"entry had lapsed, the cache-read rate where it hit. Nothing removed inside a span is " +
@@ -921,13 +961,16 @@ func compactAssumptions(spanFrac, fillFrac float64) CompactionAssumptions {
 		ColdLabel:       "turns whose cache_miss_reason is ttl_expiry — the entry had lapsed, so an uncompacted prefix would have been re-written in full",
 		ReadLabel:       "turns whose cache_miss_reason is hit — the re-sent remainder, billed at the cache-read rate",
 		SpanMeasureNote: "the span closes on cumulative NEW content since t0 — fresh input plus the newly-written tail on turns whose cache hit. It excludes the re-sent prefix (a cache read) and the re-creation of an expired one (a cache write on a miss), because counting either makes one turn exceed the whole span",
-		SpanRule: "the span is 1 minus the fill threshold, derived rather than configured separately, " +
-			"because it is an ATTRIBUTION boundary: we fire at the threshold, and in the world where we " +
-			"had not compacted the conversation keeps growing until the CLIENT compacts at its own " +
-			"ceiling. Past that point both worlds are running on a summarized transcript and nothing " +
-			"further is attributable to us. It bounds new content, NOT wall-clock time — a session can " +
-			"go cold having added 2% of the window, and a session that adds 10% in thirty seconds never " +
-			"goes cold at all",
+		SpanRule: "the span is the CLIENT's compaction ceiling minus the fill threshold, derived rather " +
+			"than configured separately, because it is an ATTRIBUTION boundary: we fire at the threshold, " +
+			"and in the world where we had not compacted the conversation keeps growing until the CLIENT " +
+			"compacts at its own ceiling. Past that point both worlds are running on a summarized " +
+			"transcript and nothing further is attributable to us. The ceiling is an assumption about the " +
+			"client rather than a property of the model, measured at 0.996 of the window on one real " +
+			"Claude Code session on haiku and stated in PROVIDER-BILLED tokens — not in the client's own " +
+			"count, which read ~167,000 of 200,000 on the same turn. It bounds new content, NOT " +
+			"wall-clock time: a session can go cold having added 2% of the window, and a session that " +
+			"adds 10% in thirty seconds never goes cold at all",
 		DebitBound: "cache-creation tokens on a summarizing turn, charged ONLY where the entry was still live: on a turn whose cache had already expired the write was due whatever we did, so none of it is our cost. Where it is charged it is an upper bound, since some of that write was transcript growth that would have been paid anyway",
 		VoidRule:   "an episode whose span contains a drop in our own message-token count is voided — the client compacted, so the remainder is not comparable",
 		WindowRule: "a conversation whose model window is not exactly published contributes nothing and is counted as window_unknown",
@@ -986,7 +1029,7 @@ func (d *DB) compactEpisodeDataset(f Filter) ([]compactRow, error) {
 // published is treated as inexact and its conversations are excluded rather than measured against
 // a guess.
 func (d *DB) CompactionEpisodesFor(f Filter, windows modelinfo.Resolver, p modelinfo.Pricer,
-	cfg KVCacheSimConfig, spanFrac, fillFrac float64) (*CompactionEpisodes, error) {
+	cfg KVCacheSimConfig, spanFrac, fillFrac, ceilingFrac float64) (*CompactionEpisodes, error) {
 	rows, err := d.compactEpisodeDataset(f)
 	if err != nil && err != sql.ErrNoRows {
 		return nil, err
@@ -1006,7 +1049,7 @@ func (d *DB) CompactionEpisodesFor(f Filter, windows modelinfo.Resolver, p model
 			w, exact, ok := modelinfo.Exact(windows, ctx, model)
 			return w, exact && ok
 		},
-		list.For, spanFrac, fillFrac)
+		list.For, spanFrac, fillFrac, ceilingFrac)
 	out.Pricing = list
 	return out, nil
 }
@@ -1036,13 +1079,13 @@ func (a *API) compactionEpisodes(w http.ResponseWriter, r *http.Request) {
 	defer releaseKVCache()
 	// The fill is read FIRST, because the span derives from it.
 	fill := queryFrac(r, "fill", defaultFillFrac)
+	ceiling := queryFrac(r, "ceiling", defaultClientCeilingFrac)
+	// span=0 means DERIVE it from the fill and the ceiling (see spanFor). `?span=` stays as an override,
+	// because an operator investigating whether a span contains any cold event has a legitimate reason
+	// to widen it — and because the arms in scripts/scenarios/ use it to separate "the credit is wrong"
+	// from "the span was too narrow to contain the event".
 	out, err := a.db(r).CompactionEpisodesFor(f, a.windows, a.pricer,
-		// The span DERIVES from the fill unless it is overridden: see spanFor. `?span=` stays, because
-		// an operator investigating whether a span contains any cold event has a legitimate reason to
-		// widen it — and because the two arms in scripts/scenarios/ use it to separate "the credit is
-		// wrong" from "the span was too narrow to contain the event".
-		kvCacheConfigFrom(r), queryFrac(r, "span", spanFor(fill)),
-		fill)
+		kvCacheConfigFrom(r), queryFrac(r, "span", 0), fill, ceiling)
 	if err != nil {
 		httpErr(w, http.StatusInternalServerError, err.Error())
 		return
