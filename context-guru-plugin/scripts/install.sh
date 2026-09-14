@@ -32,6 +32,351 @@ BIN=context-guru-proxy
 emit() { printf '%s\n' "$*"; }
 die()  { emit "result=error"; emit "reason=$1"; exit 1; }
 
+# =========================================================================================
+# --route: the orchestrator
+# =========================================================================================
+#
+# Steps 1-7 of skills/install/SKILL.md, as ONE script. The argument for moving them here is in
+# docs/superpowers/specs/2026-09-14-plugin-install-orchestrator-design.md; the short version is
+# that every defect in that skill's history has the same shape — the prose was right and the
+# command a model emitted differed from it — and an ordering expressed as a numbered paragraph is
+# a request, while the same ordering expressed as line order in a script is a fact.
+#
+# Two modes:
+#   --mode local  (default)  install the binary, start a proxy on 127.0.0.1:<resolved port>,
+#                            route to it. The URL is DERIVED and never passed in.
+#   --mode attach            the proxy already exists elsewhere (a DAM gateway, a shared pod).
+#                            Steps 1 and 5 are SKIPPED — nothing installed, nothing started —
+#                            and --base-url is supplied and validated.
+#
+# Everything that needs a human is a FLAG, and there are exactly two such decisions: --scope and
+# --on-conflict. They travel in argv rather than in a state file, deliberately: a gated command
+# that reads its decisions from a file elsewhere shows the user nothing when they are asked to
+# approve it, which turns one meaningful consent into two meaningless ones.
+#
+# SELF-LOCATION, and why it is not $CLAUDE_PLUGIN_ROOT: measured 2026-09-14, that variable is
+# substituted into a `!`-block's command STRING but is NOT exported to the child process. A script
+# reading it from its own environment gets nothing. So this locates its siblings from $0.
+
+route_here() { CDPATH= cd -- "$(dirname -- "$0")" && pwd -P; }
+
+# Every fact the plan and the confirm both report. Kept in one place so `--plan` cannot describe a
+# different install from the one `--confirm` performs.
+R_MODE=local R_SCOPE=project R_ONCONFLICT= R_BASEURL= R_HEALTHURL= R_NOHEALTH=0
+R_STRATEGY= R_UPSTREAM= R_USERSCOPE=0 R_PLAN=0 R_CONFIRM=0
+R_PORT= R_PRESET= R_IDLE= R_BIN= R_ONPATH= R_FILE= R_EXISTING= R_CHAINED=false
+R_ALREADY=false
+
+route_die() { emit "result=error"; emit "reason=$1"; [ -n "${2:-}" ] && emit "detail=$2"; exit 3; }
+
+# route_refuse is for the WRITING path: exit 2, a refusal a caller can distinguish from a failure.
+#
+# route_needs is for anything the PLAN discovers, and under --plan it exits 0. That distinction is
+# not cosmetic, and getting it wrong made this script unusable in the exact shape it was designed
+# for: the install skill runs `--route --plan` from a `!` block, the commonest real state of a
+# hosted machine is "a base URL is already set", and the first version exited 2 there. Measured in a
+# real sandboxed session, the whole skill invocation then produced NO OUTPUT AT ALL — the model
+# never saw the plan, never asked the question, and the run looked like a success because nothing
+# had been written.
+#
+# So: a plan REPORTS. `needs_decision` is data for the caller to act on, not an error to propagate,
+# and only a command that actually declines to do something exits non-zero.
+route_refuse() { emit "result=refused"; emit "reason=$1"; [ -n "${2:-}" ] && emit "note=$2"; exit 2; }
+route_needs() {
+  if [ "$R_PLAN" = 1 ]; then
+    emit "result=needs_decision"; emit "reason=$1"
+    [ -n "${2:-}" ] && emit "note=$2"
+    [ -n "$R_EXISTING" ] && emit "existing_base_url=$R_EXISTING"
+    emit "permission_rule=$(route_permission_rule)"
+    exit 0
+  fi
+  route_refuse "$1" "${2:-}"
+}
+
+# One value from a key=value block, last occurrence wins (install.sh prints result= last).
+kv() { printf '%s\n' "$1" | sed -n "s/^$2=//p" | tail -1; }
+
+route_scope_file() {
+  case "$R_SCOPE" in
+    project) printf '%s\n' "$PWD/.claude/settings.local.json" ;;
+    team)    printf '%s\n' "$PWD/.claude/settings.json" ;;
+    user)    printf '%s\n' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json" ;;
+    *)       route_refuse "unknown_scope" "--scope must be project, team or user" ;;
+  esac
+}
+
+# The rule the plugin cannot enforce for itself: a permission rule covers a command by PREFIX, so
+# one rule over this directory covers every command the install runs. Printed as a fact so the
+# absolute path is never hand-typed by a model.
+route_permission_rule() { printf 'Bash(%s/**)\n' "$(dirname -- "$(route_here)")"; }
+
+route_resolve_options() {
+  local cfg
+  cfg=$("$(route_here)/settings.py" config 2>/dev/null) || cfg=""
+  # Per-option fallback, never "source= was set so everything is set". `settings.py config` prints
+  # a line only for keys the user actually configured, so a partial config — port set, preset
+  # never touched — reports a real source= and simply omits option_preset=.
+  R_PORT=$(kv "$cfg" option_port);            : "${R_PORT:=8787}"
+  R_PRESET=$(kv "$cfg" option_preset);        : "${R_PRESET:=cache}"
+  R_IDLE=$(kv "$cfg" option_idle_exit);       : "${R_IDLE:=24h}"
+  [ -z "$R_STRATEGY" ] && R_STRATEGY=$(kv "$cfg" option_cache_strategy)
+  : "${R_STRATEGY:=5-min-ping}"
+  [ -z "$R_UPSTREAM" ] && R_UPSTREAM=$(kv "$cfg" option_upstream)
+}
+
+route_inspect() {
+  local shown
+  R_FILE=$(route_scope_file) || exit $?
+  shown=$("$(route_here)/settings.py" show --file "$R_FILE" 2>/dev/null) || shown=""
+  R_EXISTING=$(kv "$shown" base_url)
+  # `settings.py show` prints the SENTINEL `(unset)` rather than an empty value, and reading that
+  # as a real base URL made every clean project look already-routed — so the install refused with
+  # `base_url_already_set` and named `(unset)` as the conflicting endpoint. Caught by the first
+  # smoke run; it is the exact class of bug this script exists to remove, arriving in the script
+  # itself. Normalise every "absent" spelling the siblings use, not just the one seen.
+  case "$R_EXISTING" in "(unset)"|"(none)"|"") R_EXISTING= ;; esac
+  # The environment matters as much as the file: on a hosted or containerised agent the base URL is
+  # often set in the process environment and no settings file mentions it at all, so `show` reports
+  # exists=false while the session is already routed somewhere.
+  [ -z "$R_EXISTING" ] && R_EXISTING="${ANTHROPIC_BASE_URL:-}"
+  # Already ours is NOT a conflict — but it is not nothing either, and reporting it as an empty
+  # existing_base_url would let a re-run be narrated as a fresh install. Say which it is.
+  case "$R_EXISTING" in
+    *"127.0.0.1:${R_PORT}"*) R_EXISTING=; R_ALREADY=true ;;
+  esac
+}
+
+# The URL is DERIVED in local mode and never accepted as an argument, which is what makes the
+# malformed-URL class unreachable from this path. In attach mode it is supplied, and validated by
+# settings.py's valid_base_url() before anything is written.
+route_url() {
+  if [ "$R_MODE" = attach ]; then printf '%s\n' "$R_BASEURL"
+  else printf 'http://127.0.0.1:%s/anthropic\n' "$R_PORT"; fi
+}
+
+route_health_url() {
+  if [ -n "$R_HEALTHURL" ]; then printf '%s\n' "$R_HEALTHURL"
+  elif [ "$R_MODE" = attach ]; then
+    # Strip the trailing /anthropic and ask for /healthz beside it. Not assumable on a gateway,
+    # which is why --health-url and --no-health-check both exist.
+    printf '%s\n' "${R_BASEURL%/anthropic}/healthz"
+  else printf 'http://127.0.0.1:%s/healthz\n' "$R_PORT"; fi
+}
+
+route_health_ok() {
+  [ "$R_NOHEALTH" = 1 ] && return 0
+  command -v curl >/dev/null 2>&1 || return 0   # fail open: no curl is not evidence of a dead proxy
+  curl -fsS --max-time 5 "$(route_health_url)" >/dev/null 2>&1
+}
+
+route_report() {
+  emit "mode=$R_MODE"
+  emit "scope=$R_SCOPE"
+  emit "file=$R_FILE"
+  emit "port=$R_PORT"
+  emit "preset=$R_PRESET"
+  emit "idle_exit=$R_IDLE"
+  emit "cache_strategy=$R_STRATEGY"
+  emit "base_url=$(route_url)"
+  emit "health_url=$(route_health_url)"
+  emit "existing_base_url=$R_EXISTING"
+  emit "already_routed=$R_ALREADY"
+  emit "chained=$R_CHAINED"
+  emit "upstream=$R_UPSTREAM"
+  emit "permission_rule=$(route_permission_rule)"
+}
+
+route_main() {
+  route_resolve_options
+
+  if [ "$R_MODE" = attach ]; then
+    [ -n "$R_BASEURL" ] || route_needs "attach_needs_base_url" \
+      "--mode attach has no local port to derive a URL from; pass --base-url"
+    # Validate BEFORE doing anything, not at the write. `attach` exists precisely so a human can
+    # type a URL, and the first version of this only found a typo at step 7 — after a health check
+    # had been spent — reporting it as `settings_write_failed`, which names the wrong step.
+    local vout
+    vout=$("$(route_here)/settings.py" check-url --url "$R_BASEURL" 2>&1) || {
+      if [ "$R_PLAN" = 1 ]; then
+        emit "result=needs_decision"; emit "reason=invalid_base_url"
+        emit "detail=$(kv "$vout" detail)"; emit "url=$R_BASEURL"
+        emit "note=the supplied --base-url cannot be used; nothing was checked or written"
+        exit 0
+      fi
+      emit "result=refused"; emit "reason=invalid_base_url"
+      emit "detail=$(kv "$vout" detail)"; emit "url=$R_BASEURL"
+      emit "note=nothing was started and nothing was written. In attach mode the URL is the one \
+thing that cannot be derived, so it is the one thing checked first."
+      exit 2
+    }
+  else
+    [ -z "$R_BASEURL" ] || route_needs "base_url_is_local_mode_nonsense" \
+      "--base-url is for --mode attach; in local mode the URL is derived from the resolved port"
+  fi
+  [ "$R_SCOPE" = user ] && [ "$R_USERSCOPE" != 1 ] && route_needs "user_scope_needs_flag" \
+    "--scope user routes EVERY project on this machine, including every project that has nothing to \
+do with context-guru. Confirm with the user, then add --i-understand-machine-wide"
+
+  route_inspect
+
+  # THE ONE DECISION THAT CANNOT BE DEFAULTED. A base URL already set may be their company gateway,
+  # a benchmark endpoint or another proxy; replacing it silently breaks their setup while looking
+  # like success, and guessing which it is is not something a script can do.
+  if [ -n "$R_EXISTING" ] && [ -z "$R_ONCONFLICT" ]; then
+    if [ "$R_PLAN" = 1 ]; then
+      # THE COMMON CASE on a hosted machine, and the reason route_needs exists. Report the whole
+      # plan alongside it: the model has one question to ask and needs the real values to ask it.
+      emit "result=needs_decision"; emit "reason=base_url_already_set"
+      emit "note=ask the user, then re-run with --on-conflict chain (usually right: our proxy sits \
+in front and theirs keeps handling auth), replace (theirs is recorded and uninstall puts it back), \
+or abort"
+      route_report
+      exit 0
+    fi
+    emit "result=refused"; emit "reason=base_url_already_set"
+    emit "existing_base_url=$R_EXISTING"
+    emit "note=pass --on-conflict chain (usually right: our proxy sits in front and theirs keeps \
+handling auth), replace (theirs is recorded and uninstall puts it back), or abort"
+    exit 2
+  fi
+  if [ -n "$R_EXISTING" ] && [ "$R_ONCONFLICT" = abort ]; then
+    emit "result=aborted"; emit "existing_base_url=$R_EXISTING"
+    emit "note=nothing was changed, at the caller's request"; exit 0
+  fi
+  if [ -n "$R_EXISTING" ] && [ "$R_ONCONFLICT" = chain ]; then
+    R_CHAINED=true
+    [ -z "$R_UPSTREAM" ] && R_UPSTREAM="$R_EXISTING"
+  fi
+
+  if [ "$R_PLAN" = 1 ]; then
+    emit "result=planned"
+    if [ "$R_MODE" = attach ]; then emit "binary=(not needed in attach mode)"
+    else emit "binary=would_check"; fi
+    route_report
+    emit "note=nothing was written, nothing started. Re-run without --plan to perform this."
+    exit 0
+  fi
+
+  # ---- step 1: the binary (local only) --------------------------------------------------
+  # Re-invokes THIS script with no arguments rather than refactoring its linear body: the installer
+  # already speaks key=value and already exits early on `result=present`, and $0 is the same
+  # self-location the rest of this function uses.
+  if [ "$R_MODE" = local ]; then
+    local iout ires
+    iout=$("$0" 2>&1); ires=$(kv "$iout" result)
+    case "$ires" in
+      present|installed) : ;;
+      *) emit "result=error"; emit "reason=binary_install_failed"
+         emit "detail=$(kv "$iout" reason)"
+         emit "note=nothing else was touched. A checksum failure must never be worked around."
+         exit 3 ;;
+    esac
+    R_ONPATH=$(kv "$iout" on_path)
+    [ "$R_ONPATH" = false ] && R_BIN=$(kv "$iout" path)
+  fi
+
+  # ---- step 4b: the cache strategy, BEFORE the proxy starts -----------------------------
+  # start-proxy.sh reads that file only when it STARTS a proxy, so a strategy written afterwards
+  # does nothing until something restarts it. Written here, the very first proxy has it.
+  local sout
+  sout=$("$(route_here)/settings.py" strategy set --name "$R_STRATEGY" \
+           --port "$R_PORT" --preset "$R_PRESET" 2>&1) || true
+  case "$(kv "$sout" result)" in
+    set|cleared|unchanged) : ;;
+    *) emit "strategy_warning=$(kv "$sout" reason)" ;;   # not fatal: a working proxy beats no proxy
+  esac
+
+  # ---- step 5: start the proxy (local only), BEFORE writing any settings ----------------
+  # Claude Code picks a settings `env` change up while the session is RUNNING. Writing the key
+  # first once killed the installing session: its next API call went to a dead port and died with
+  # Connection refused, never reaching the step that starts the proxy.
+  if [ "$R_MODE" = local ]; then
+    local sp=("$(route_here)/start-proxy.sh" --unrouted --port "$R_PORT"
+              --preset "$R_PRESET" --idle-exit "$R_IDLE")
+    [ -n "$R_UPSTREAM" ] && sp+=(--upstream "$R_UPSTREAM")
+    [ -n "$R_BIN" ] && sp+=(--bin "$R_BIN")
+    "${sp[@]}" || true
+  fi
+
+  # ---- step 6: prove something answers, BEFORE routing to it ----------------------------
+  if ! route_health_ok; then
+    emit "result=error"; emit "reason=health_check_failed"
+    emit "health_url=$(route_health_url)"
+    emit "note=SETTINGS WERE NOT TOUCHED. An unrouted project with no proxy is a working project; \
+a routed one with no proxy is a broken one."
+    exit 3
+  fi
+
+  # ---- step 7: write the one key -------------------------------------------------------
+  local aout acode=0
+  local add=("$(route_here)/settings.py" add --file "$R_FILE" --url "$(route_url)")
+  [ -n "$R_UPSTREAM" ] && add+=(--upstream "$R_UPSTREAM")
+  [ -n "$R_BIN" ] && add+=(--bin "$R_BIN")
+  [ "$R_SCOPE" = user ] && add+=(--user-scope)
+  [ "$R_ONCONFLICT" = replace ] && add+=(--force)
+  aout=$("${add[@]}" 2>&1) || acode=$?
+  local ares; ares=$(kv "$aout" result)
+  case "$ares" in
+    added|completed|unchanged|repointed) : ;;
+    *) emit "result=error"; emit "reason=settings_write_failed"
+       emit "detail=$(kv "$aout" reason)"; emit "exit=$acode"
+       emit "note=the proxy may be running; no routing was written."
+       exit 3 ;;
+  esac
+
+  # ---- step 8: re-check, and UNDO the routing if nothing answers ------------------------
+  # The rollback is automatic on purpose. The skill used to ask the model to OFFER removing the key
+  # here, and a routed project with no proxy is the one state strictly worse than not installing —
+  # too important to depend on a model choosing to offer it.
+  if ! route_health_ok; then
+    "$(route_here)/settings.py" remove --file "$R_FILE" --url "$(route_url)" >/dev/null 2>&1 || true
+    emit "result=error"; emit "reason=health_check_failed_after_write"
+    emit "rolled_back=true"
+    emit "note=the routing key was REMOVED again, so the project is unrouted rather than broken."
+    exit 3
+  fi
+
+  emit "result=routed"
+  emit "settings_result=$ares"
+  emit "backup=$(kv "$aout" backup)"
+  emit "reset_hatch=$(kv "$aout" reset_hatch)"
+  emit "replaced=$(kv "$aout" replaced)"
+  route_report
+}
+
+# --- argument parsing. Unknown flags are refused rather than ignored: a silently dropped --scope
+# --- would write the wrong file and report success.
+if [ "${1:-}" = --route ]; then
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --plan)     R_PLAN=1 ;;
+      --confirm)  R_CONFIRM=1 ;;
+      --mode)     R_MODE="${2:?--mode needs a value}"; shift ;;
+      --scope)    R_SCOPE="${2:?--scope needs a value}"; shift ;;
+      --on-conflict) R_ONCONFLICT="${2:?--on-conflict needs a value}"; shift ;;
+      --cache-strategy) R_STRATEGY="${2:?--cache-strategy needs a value}"; shift ;;
+      --base-url) R_BASEURL="${2:?--base-url needs a value}"; shift ;;
+      --health-url) R_HEALTHURL="${2:?--health-url needs a value}"; shift ;;
+      --upstream) R_UPSTREAM="${2:?--upstream needs a value}"; shift ;;
+      --no-health-check) R_NOHEALTH=1 ;;
+      --i-understand-machine-wide) R_USERSCOPE=1 ;;
+      *) emit "result=error"; emit "reason=unknown_flag"; emit "flag=$1"
+         emit "note=refused rather than ignored: a dropped flag writes the wrong file and reports success"
+         exit 2 ;;
+    esac
+    shift
+  done
+  case "$R_MODE" in local|attach) : ;; *)
+    emit "result=error"; emit "reason=unknown_mode"; emit "mode=$R_MODE"; exit 2 ;;
+  esac
+  case "$R_ONCONFLICT" in ""|chain|replace|abort) : ;; *)
+    emit "result=error"; emit "reason=unknown_on_conflict"; emit "value=$R_ONCONFLICT"; exit 2 ;;
+  esac
+  route_main
+  exit 0
+fi
+
 # --- 1. already there, and is it the version we want? -------------------------------------
 #
 # This used to return `result=present` for ANY binary on PATH regardless of version, and read

@@ -769,6 +769,15 @@ def _ensure_hatch(file: str) -> None:
 
 
 def cmd_add(args: argparse.Namespace) -> int:
+    # SHAPE GATE, before anything is read or written. See valid_base_url() for why this is not
+    # is_ours() and why it does not touch --upstream. Exit 2 rather than 1: this is a refusal a
+    # caller can distinguish from a failure, the same code the scope and conflict gates use.
+    if args.url:
+        if why := valid_base_url(args.url):
+            emit(result="error", reason="invalid_base_url", detail=why, url=args.url,
+                 note="refused before writing: a routing key pointing at this would break every "
+                      "request, and `add` reporting success is what made that hard to notice")
+            return 2
     # SCOPE GATE — on the ROUTING, which is the only thing whose scope matters.
     #
     # B2 in review: this was the first statement in the function, above the statusline-only early
@@ -1231,6 +1240,77 @@ def _render_strategy(name: str, preset: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def valid_base_url(url: str) -> str:
+    """Is this a base URL we are willing to WRITE into somebody's routing key? Returns "" if so,
+    else a short reason.
+
+    This is the guard that did not exist, and its absence had a straightforward consequence: `add`
+    accepted any string at all — verified, `127.0.0.1/anthropic` with no scheme and no port — wrote
+    it into `env.ANTHROPIC_BASE_URL`, and reported `result=added` with exit 0. The project is then
+    routed to something unroutable, which is the hang state this whole design exists to avoid, and
+    the report says it worked.
+
+    Three things it deliberately is NOT:
+
+    * NOT `is_ours()`. That answers "did we write this?" from the recorded
+      `$context-guru.installed_base_url`, never from the URL's shape — because litellm's default is
+      `http://127.0.0.1:4000/anthropic` and two local proxies are indistinguishable by URL.
+      Provenance and validity are different questions.
+    * NOT `_is_loopback()`, which is deliberately generous: every shape it missed was a false
+      NEGATIVE, and a false negative there re-introduces a different defect.
+    * NOT applied to `--upstream`. That is somebody else's gateway and its shape is theirs — the
+      tests alone carry `http://gw.example:4000/v1?tenant=acme&mode=chain`. We validate the URL
+      whose shape WE control.
+
+    And it is applied on `add` only, never on `remove`: removal is the recovery path, so it has to
+    be able to clean up a malformed value that is already in the file. Strict on write, permissive
+    on removal.
+    """
+    if not isinstance(url, str) or not url.strip():
+        return "empty"
+    if "://" not in url:
+        return "no_scheme"
+    scheme, _, rest = url.partition("://")
+    if scheme.lower() not in ("http", "https"):
+        return "bad_scheme"
+    if not rest or rest.startswith("/"):
+        return "no_host"
+    hostport, _, path = rest.partition("/")
+    # A bracketed v6 literal keeps its brackets; the port is whatever follows the closing one.
+    if hostport.startswith("["):
+        host, _, after = hostport.partition("]")
+        host += "]"
+        port = after[1:] if after.startswith(":") else ""
+    else:
+        host, _, port = hostport.partition(":")
+    if not host:
+        return "no_host"
+    if port and not port.isdigit():
+        return "bad_port"
+    if port and not (0 < int(port) < 65536):
+        return "port_out_of_range"
+    # The path the proxy serves the Anthropic dialect on. Writing a base URL without it routes the
+    # session to a 404 on every call, which looks exactly like a broken proxy.
+    if path.rstrip("/").rsplit("/", 1)[-1] != "anthropic":
+        return "path_not_anthropic"
+    # An explicit port is required for loopback and NOT otherwise: our own proxy is always on a
+    # chosen port, while a gateway on `https://gw.internal/anthropic` is legitimately at 443.
+    # `http://127.0.0.1/anthropic` is the malformed shape actually observed in the wild.
+    if _is_loopback(url) and not port:
+        return "loopback_without_port"
+    return ""
+
+
+def cmd_check_url(args: argparse.Namespace) -> int:
+    """Validate a base URL and write nothing. Exit 0 if usable, 2 with a reason if not."""
+    why = valid_base_url(args.url)
+    if why:
+        emit(result="error", reason="invalid_base_url", detail=why, url=args.url)
+        return 2
+    emit(result="ok", url=args.url)
+    return 0
+
+
 def cmd_strategy(args) -> int:
     if args.op == "list":
         emit(result="ok", default=DEFAULT_STRATEGY)
@@ -1348,6 +1428,13 @@ def main() -> int:
 
     # `strategy` is the named-cache-strategy surface: the one place that decides what a name means,
     # so the skills that use it carry a NAME rather than four tuning numbers in a heredoc.
+    # check-url exists so a caller can validate a supplied base URL BEFORE acting on it. Without
+    # it the only enforcement point was `add`, i.e. after a proxy had been started and a health
+    # check spent — a typo cost real work and surfaced as `settings_write_failed`, which names the
+    # wrong step.
+    cu = sub.add_parser("check-url")
+    cu.add_argument("--url", required=True)
+
     st = sub.add_parser("strategy")
     st.add_argument("op", choices=("list", "show", "set", "clear"))
     st.add_argument("--name", default="",
@@ -1369,7 +1456,8 @@ def main() -> int:
         if args.op == "set" and not args.name:
             ap.error("strategy set needs --name; one of " + ", ".join(STRATEGIES))
     rc = {"add": cmd_add, "remove": cmd_remove, "show": cmd_show,
-          "config": cmd_config, "strategy": cmd_strategy}[args.cmd](args)
+          "config": cmd_config, "strategy": cmd_strategy,
+          "check-url": cmd_check_url}[args.cmd](args)
 
     # The hatch facts are printed HERE rather than from inside save(), so the `result=` line the
     # caller keys on stays first, and so every writing path reports them without six call sites

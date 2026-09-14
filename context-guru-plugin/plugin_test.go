@@ -3094,10 +3094,16 @@ func TestEverySkillStatesThePerOptionFallback(t *testing.T) {
 				e.Name())
 		}
 	}
-	if checked < 4 {
-		t.Fatalf("only %d skills were found to read `settings.py config`; expected at least the four "+
-			"(install, status, uninstall, cache-strategy-picker), so this guard proved less than it "+
-			"claims", checked)
+	// Three, not four, since install/SKILL.md stopped reading the options directly: the orchestrator
+	// (`install.sh --route`) resolves them, with the same per-option fallback enforced in shell and
+	// covered by TestRoutePlanResolvesTheConfiguredPortPerOption. A skill that delegates cannot state
+	// a fallback it no longer performs, so requiring it to would force prose back into a file whose
+	// whole point is that it no longer carries the mechanism. The remaining three (status, uninstall,
+	// cache-strategy-picker) still substitute the values themselves and still need the rule.
+	if checked < 3 {
+		t.Fatalf("only %d skills were found to read `settings.py config`; expected at least the three "+
+			"(status, uninstall, cache-strategy-picker), so this guard proved less than it claims",
+			checked)
 	}
 	t.Logf("checked %d skills that read the configured options", checked)
 }
@@ -5141,5 +5147,543 @@ func TestASuccessfulRestoreSaysSoEvenWhenTheShellIsRouted(t *testing.T) {
 	}
 	if !strings.Contains(out, "environment report above") {
 		t.Errorf("did not point at what is actually left:\n%s", out)
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// install.sh --route: the orchestrator
+// ---------------------------------------------------------------------------------------------
+//
+// These tests exist because the seven steps they cover used to be seven paragraphs of prose in
+// skills/install/SKILL.md, and every defect in that file's history had one shape: the prose was
+// right and the command a model emitted differed from it. Asserting on a script means asserting on
+// what will actually run.
+//
+// Two properties get the most attention here, because both have already shipped as defects:
+//   - `--plan` must write NOTHING. It is the only command in this design that is safe to run
+//     before the user has agreed to anything, and a plan with a side effect is not a plan.
+//   - the ORDER of "start the proxy" and "write the routing key" is load-bearing. Claude Code picks
+//     an env change up while the session is running, so writing first once killed the installing
+//     session with Connection refused before it reached the step that starts the proxy.
+
+// routeEnv builds the environment a --route run sees: a sandbox HOME and state directory, a
+// controlled PATH, and — critically — ANTHROPIC_BASE_URL REMOVED.
+//
+// That last one is not tidiness. The developer's own shell has a base URL set (that is what this
+// plugin does), and inheriting it made every "clean project" fixture look already-routed, so the
+// orchestrator refused with base_url_already_set. The leak was caught by a smoke run; without this
+// helper it would have made the conflict tests below pass for the wrong reason.
+func routeEnv(t *testing.T, home, state, extraPath string) []string {
+	t.Helper()
+	env := []string{}
+	for _, kv := range sandboxEnv(t) {
+		if strings.HasPrefix(kv, "ANTHROPIC_BASE_URL=") {
+			continue
+		}
+		env = append(env, kv)
+	}
+	path := os.Getenv("PATH")
+	if extraPath != "" {
+		path = extraPath + string(os.PathListSeparator) + path
+	}
+	return append(env,
+		"HOME="+home,
+		"XDG_STATE_HOME="+state,
+		"CLAUDE_CONFIG_DIR="+filepath.Join(home, ".claude"),
+		"PATH="+path,
+	)
+}
+
+// runRoute runs install.sh --route in `dir` and returns the parsed key=value facts.
+func runRoute(t *testing.T, dir string, env []string, args ...string) (map[string]string, int) {
+	t.Helper()
+	requireTool(t, "bash")
+	argv := append([]string{filepath.Join(scriptsDir(t), "install.sh"), "--route"}, args...)
+	cmd := exec.Command("bash", argv...)
+	cmd.Dir = dir
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	code := 0
+	if ee, ok := err.(*exec.ExitError); ok {
+		code = ee.ExitCode()
+	} else if err != nil {
+		t.Fatalf("running install.sh --route %v: %v (%s)", args, err, out)
+	}
+	facts := map[string]string{}
+	for _, line := range strings.Split(string(out), "\n") {
+		if k, v, ok := strings.Cut(strings.TrimSpace(line), "="); ok {
+			facts[k] = v
+		}
+	}
+	t.Logf("install.sh --route %v -> exit %d\n%s", args, code, out)
+	return facts, code
+}
+
+// writePluginOptions writes the CONFIGURED plugin options where `settings.py config` reads them.
+// The shape matters and is easy to get wrong: pluginConfigs[<plugin>@<marketplace>].options.
+func writePluginOptions(t *testing.T, home string, opts map[string]any) {
+	t.Helper()
+	dir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeJSON(t, filepath.Join(dir, "settings.json"), map[string]any{
+		"pluginConfigs": map[string]any{
+			"context-guru@context-guru": map[string]any{"options": opts},
+		},
+	})
+}
+
+// TestRoutePlanWritesNothing. --plan is the command that runs before the user has agreed to
+// anything — it is what a `!` block in the skill executes at render time, unprompted. If it can
+// create a settings file, a state directory or a strategy config, then rendering the skill is
+// itself an install, which is exactly the consent this design is careful about.
+func TestRoutePlanWritesNothing(t *testing.T) {
+	home, state, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	facts, code := runRoute(t, proj, routeEnv(t, home, state, ""), "--plan", "--scope", "project")
+	if code != 0 || facts["result"] != "planned" {
+		t.Fatalf("exit %d result=%q, want 0/planned: %v", code, facts["result"], facts)
+	}
+	for _, p := range []string{
+		filepath.Join(proj, ".claude", "settings.local.json"),
+		filepath.Join(state, "context-guru"),
+	} {
+		if _, err := os.Stat(p); err == nil {
+			t.Errorf("--plan created %s; a plan with a side effect is not a plan, and this one runs "+
+				"before the user has been asked anything", p)
+		}
+	}
+	// It also has to be USEFUL, or the skill is back to placeholders: the plan is what lets the model
+	// ask its one question with the user's real file and real endpoint in it.
+	for _, k := range []string{"file", "port", "preset", "cache_strategy", "base_url", "permission_rule"} {
+		if facts[k] == "" {
+			t.Errorf("the plan omits %q, so the model has nothing concrete to report or ask about", k)
+		}
+	}
+}
+
+// TestRoutePlanResolvesTheConfiguredPortPerOption is the defect that shipped once, in the shape
+// `${CLAUDE_PLUGIN_OPTION_PORT:-8787}`: plugin options never reach a Bash tool call, so a shell
+// default silently won. The routing key then named 8787 while every later hook read the CONFIGURED
+// port, self-gated on it, saw an unrouted project and did nothing — leaving the one running proxy
+// with no auto-restart behind it, silently, until it idled out.
+//
+// It also pins the PER-OPTION fallback: `settings.py config` prints a line only for keys the user
+// actually set, so a partial config (port set, preset never touched) must not be read as "the rest
+// are configured too" or as "nothing is configured".
+func TestRoutePlanResolvesTheConfiguredPortPerOption(t *testing.T) {
+	home, state, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	// Deliberately partial: port and strategy set, preset and idle_exit never touched.
+	writePluginOptions(t, home, map[string]any{"port": 4041, "cache_strategy": "split"})
+	facts, code := runRoute(t, proj, routeEnv(t, home, state, ""), "--plan", "--scope", "project")
+	if code != 0 {
+		t.Fatalf("exit %d: %v", code, facts)
+	}
+	if facts["port"] != "4041" {
+		t.Errorf("port=%q, want 4041: a defaulted 8787 is the shipped defect this test exists for",
+			facts["port"])
+	}
+	if facts["base_url"] != "http://127.0.0.1:4041/anthropic" {
+		t.Errorf("base_url=%q does not carry the configured port; the routing key and the hooks would "+
+			"then disagree about which proxy this project uses", facts["base_url"])
+	}
+	if facts["health_url"] != "http://127.0.0.1:4041/healthz" {
+		t.Errorf("health_url=%q does not carry the configured port, so the check would prove nothing "+
+			"about the proxy this install actually starts", facts["health_url"])
+	}
+	if facts["cache_strategy"] != "split" {
+		t.Errorf("cache_strategy=%q, want the configured split", facts["cache_strategy"])
+	}
+	// The two the user never set must fall back individually, not be blanked because the file existed.
+	if facts["preset"] != "cache" {
+		t.Errorf("preset=%q; an unconfigured option must fall back to the plugin.json default on its "+
+			"own, and an EMPTY preset silently disables compaction", facts["preset"])
+	}
+	if facts["idle_exit"] != "24h" {
+		t.Errorf("idle_exit=%q, want the 24h default", facts["idle_exit"])
+	}
+}
+
+// TestRouteRefusesAnExistingBaseURLUntilTold. Replacing somebody's gateway silently breaks their
+// setup while looking like success, and which of chain/replace/abort is right depends on whose
+// endpoint it is — not something a script can know. So it must stop, and it must NAME the value.
+func TestRouteRefusesAnExistingBaseURLUntilTold(t *testing.T) {
+	const theirs = "https://gateway.corp.example/v1"
+	home, state, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	env := append(routeEnv(t, home, state, ""), "ANTHROPIC_BASE_URL="+theirs)
+
+	// Exit 0, NOT 2. The plan runs from a `!` block in the skill, and a non-zero exit there produced
+	// an invocation with NO OUTPUT AT ALL in a real sandboxed session — the model never saw the plan
+	// and never asked the question, while the run looked fine because nothing had been written. A
+	// plan reports; `needs_decision` is data, not a failure.
+	facts, code := runRoute(t, proj, env, "--plan", "--scope", "project")
+	if code != 0 || facts["result"] != "needs_decision" || facts["reason"] != "base_url_already_set" {
+		t.Fatalf("exit %d result=%q reason=%q, want 0/needs_decision/base_url_already_set: %v",
+			code, facts["result"], facts["reason"], facts)
+	}
+	if facts["existing_base_url"] != theirs {
+		t.Errorf("the refusal does not name what is already set (%q); the user cannot answer the "+
+			"question without it", facts["existing_base_url"])
+	}
+
+	// Told to chain: their endpoint becomes the upstream, so their gateway keeps holding the
+	// credential and doing model-name rewriting. Forgetting to carry it is how chaining works until
+	// the running proxy idles out and the next one is aimed at api.anthropic.com.
+	facts, code = runRoute(t, proj, env, "--plan", "--scope", "project", "--on-conflict", "chain")
+	if code != 0 || facts["result"] != "planned" {
+		t.Fatalf("chain: exit %d result=%q: %v", code, facts["result"], facts)
+	}
+	if facts["chained"] != "true" || facts["upstream"] != theirs {
+		t.Errorf("chained=%q upstream=%q; chaining has to record THEIR endpoint as the upstream",
+			facts["chained"], facts["upstream"])
+	}
+
+	// Told to abort: exit 0 and change nothing. A refusal the user asked for is not a failure.
+	facts, code = runRoute(t, proj, env, "--scope", "project", "--on-conflict", "abort")
+	if code != 0 || facts["result"] != "aborted" {
+		t.Errorf("abort: exit %d result=%q, want 0/aborted", code, facts["result"])
+	}
+	if _, err := os.Stat(filepath.Join(proj, ".claude", "settings.local.json")); err == nil {
+		t.Error("abort wrote a settings file anyway")
+	}
+}
+
+// TestRouteRefusesMachineWideWithoutTheFlag. A project-scope mistake costs one project; the same
+// mistake machine-wide takes out every session the user could use to fix it. The refusal lives in
+// the script rather than only in the skill's prose, because a default that exists only in a prompt
+// can be read differently, and what it guards against is a machine-wide lockout.
+func TestRouteRefusesMachineWideWithoutTheFlag(t *testing.T) {
+	home, state, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	env := routeEnv(t, home, state, "")
+	// Under --plan this is a reported decision at exit 0 (see TestRoutePlanAlwaysExitsZero).
+	facts, code := runRoute(t, proj, env, "--plan", "--scope", "user")
+	if code != 0 || facts["reason"] != "user_scope_needs_flag" {
+		t.Fatalf("exit %d reason=%q, want 0/user_scope_needs_flag: %v", code, facts["reason"], facts)
+	}
+	// But the WRITING path must still refuse it, with a code a caller can act on.
+	if f, c := runRoute(t, proj, env, "--scope", "user"); c != 2 || f["result"] != "refused" {
+		t.Errorf("confirm with --scope user: exit %d result=%q, want 2/refused — a machine-wide "+
+			"install must not be reachable without the flag", c, f["result"])
+	}
+	facts, code = runRoute(t, proj, env, "--plan", "--scope", "user", "--i-understand-machine-wide")
+	if code != 0 || facts["result"] != "planned" {
+		t.Fatalf("with the flag: exit %d result=%q: %v", code, facts["result"], facts)
+	}
+	if want := filepath.Join(home, ".claude", "settings.json"); facts["file"] != want {
+		t.Errorf("file=%q, want the machine-wide file %q", facts["file"], want)
+	}
+}
+
+// TestRouteRefusesUnknownFlagsRatherThanIgnoringThem. A silently dropped --scope writes the wrong
+// file and reports success, which is the worst available outcome: the user is told the thing they
+// asked for happened somewhere it did not.
+func TestRouteRefusesUnknownFlagsRatherThanIgnoringThem(t *testing.T) {
+	home, state, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	env := routeEnv(t, home, state, "")
+	for _, tc := range []struct {
+		args   []string
+		reason string
+	}{
+		{[]string{"--plan", "--frobnicate"}, "unknown_flag"},
+		{[]string{"--plan", "--mode", "sideways"}, "unknown_mode"},
+		{[]string{"--plan", "--on-conflict", "maybe"}, "unknown_on_conflict"},
+	} {
+		facts, code := runRoute(t, proj, env, tc.args...)
+		if code == 0 || facts["reason"] != tc.reason {
+			t.Errorf("%v: exit %d reason=%q, want nonzero/%s", tc.args, code, facts["reason"], tc.reason)
+		}
+	}
+}
+
+// TestRouteAttachModeSkipsInstallAndStart. `attach` is not a smaller `local`: on a gateway
+// deployment the proxy is landed in the gateway, so there is nothing to install and starting a
+// second proxy alongside it is the double-interception case. The URL is also the one thing that
+// cannot be derived there, so it is the one thing validated first — before a health check is spent,
+// and reported as an invalid URL rather than as a failed write, which names the wrong step.
+func TestRouteAttachModeSkipsInstallAndStart(t *testing.T) {
+	home, state, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	env := routeEnv(t, home, state, "")
+
+	t.Run("needs a base url", func(t *testing.T) {
+		facts, code := runRoute(t, proj, env, "--plan", "--mode", "attach")
+		if code != 0 || facts["reason"] != "attach_needs_base_url" {
+			t.Errorf("plan: exit %d reason=%q, want 0/attach_needs_base_url", code, facts["reason"])
+		}
+		if f, c := runRoute(t, proj, env, "--mode", "attach"); c != 2 {
+			t.Errorf("confirm without --base-url: exit %d, want 2 (%v)", c, f)
+		}
+	})
+	t.Run("rejects a malformed one before doing anything", func(t *testing.T) {
+		// The exact shape observed in the wild: no scheme, no port.
+		facts, code := runRoute(t, proj, env, "--mode", "attach",
+			"--base-url", "127.0.0.1/anthropic", "--no-health-check", "--scope", "project")
+		if code != 2 || facts["reason"] != "invalid_base_url" {
+			t.Errorf("exit %d reason=%q, want 2/invalid_base_url: %v", code, facts["reason"], facts)
+		}
+		if facts["detail"] != "no_scheme" {
+			t.Errorf("detail=%q, want no_scheme so the caller can say WHY", facts["detail"])
+		}
+		if _, err := os.Stat(filepath.Join(proj, ".claude", "settings.local.json")); err == nil {
+			t.Error("a malformed base URL was written into a routing key")
+		}
+	})
+	t.Run("a base url in local mode is refused", func(t *testing.T) {
+		facts, code := runRoute(t, proj, env, "--plan", "--scope", "project",
+			"--base-url", "https://gw/anthropic")
+		if code != 0 || facts["reason"] != "base_url_is_local_mode_nonsense" {
+			t.Errorf("plan: exit %d reason=%q: in local mode the URL is derived, so accepting one "+
+				"would reopen the class this design closes", code, facts["reason"])
+		}
+	})
+	t.Run("plans no binary and no start", func(t *testing.T) {
+		facts, code := runRoute(t, proj, env, "--plan", "--mode", "attach",
+			"--base-url", "https://gw.internal/anthropic")
+		if code != 0 {
+			t.Fatalf("exit %d: %v", code, facts)
+		}
+		if !strings.Contains(facts["binary"], "not needed") {
+			t.Errorf("binary=%q; attach must not plan a binary install", facts["binary"])
+		}
+		if facts["health_url"] != "https://gw.internal/healthz" {
+			t.Errorf("health_url=%q; it should sit beside the base URL, not on a local port",
+				facts["health_url"])
+		}
+	})
+}
+
+// fakeProxyDir writes a fake context-guru-proxy that answers /healthz on `port`, and returns the
+// directory to put on PATH.
+//
+// It MUST answer --version and exit: install.sh probes the installed version by running the binary,
+// and the first version of this fixture served forever on that probe, hanging the run before a
+// single assertion could fail. A fake that does not exit where the real one does is not a fake.
+func fakeProxyDir(t *testing.T, port string, listen bool) string {
+	t.Helper()
+	py := requireTool(t, "python3")
+	dir := t.TempDir()
+	body := "sleep 300\n"
+	if listen {
+		body = "exec " + py + " -c '\n" +
+			"import http.server\n" +
+			"class H(http.server.BaseHTTPRequestHandler):\n" +
+			"    def do_GET(self):\n" +
+			"        self.send_response(200); self.end_headers(); self.wfile.write(b\"ok\")\n" +
+			"    def log_message(self, *a): pass\n" +
+			"http.server.HTTPServer((\"127.0.0.1\", " + port + "), H).serve_forever()\n'\n"
+	}
+	script := "#!/usr/bin/env bash\n" +
+		"if [ \"$1\" = --version ]; then echo 'context-guru-proxy vfake (commit none)'; exit 0; fi\n" +
+		body
+	if err := os.WriteFile(filepath.Join(dir, "context-guru-proxy"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// TestRouteWritesRoutingOnlyAfterSomethingAnswers is the ordering property, from both sides.
+//
+// The failure it prevents was observed in a real session driving the old prose: the routing key was
+// written, the proxy had not been started yet, and the session's next API call went to 127.0.0.1 and
+// died with Connection refused before reaching the step that starts the proxy. The installer
+// produced the hang state the whole design exists to avoid.
+func TestRouteWritesRoutingOnlyAfterSomethingAnswers(t *testing.T) {
+	t.Run("a healthy proxy: routing is written", func(t *testing.T) {
+		home, state, proj := t.TempDir(), t.TempDir(), t.TempDir()
+		port := freePort(t)
+		writePluginOptions(t, home, map[string]any{"port": port})
+		env := routeEnv(t, home, state, fakeProxyDir(t, port, true))
+		facts, code := runRoute(t, proj, env, "--scope", "project")
+		t.Cleanup(func() {
+			if b, e := os.ReadFile(filepath.Join(state, "context-guru", "proxy-"+port+".pid")); e == nil {
+				exec.Command("kill", strings.TrimSpace(string(b))).Run() //nolint:errcheck
+			}
+		})
+		if code != 0 || facts["result"] != "routed" {
+			t.Fatalf("exit %d result=%q: %v", code, facts["result"], facts)
+		}
+		b, err := os.ReadFile(filepath.Join(proj, ".claude", "settings.local.json"))
+		if err != nil {
+			t.Fatalf("no settings written: %v", err)
+		}
+		if !strings.Contains(string(b), "http://127.0.0.1:"+port+"/anthropic") {
+			t.Errorf("the routing key does not name the resolved port:\n%s", b)
+		}
+		// The strategy has to be written BEFORE the proxy starts, or it does nothing until something
+		// restarts it — start-proxy.sh reads that file only when it starts one.
+		if _, err := os.Stat(filepath.Join(state, "context-guru", "keepalive-"+port+".yaml")); err != nil {
+			t.Errorf("no cache strategy config was written before the proxy started: %v", err)
+		}
+		// And the undo has to be reported, because it is the only thing that works when routing breaks.
+		if facts["reset_hatch"] == "" || facts["reset_hatch"] == "unavailable" {
+			t.Errorf("reset_hatch=%q; the skill is required to print this verbatim and cannot if it "+
+				"is not reported", facts["reset_hatch"])
+		}
+	})
+
+	t.Run("a proxy that never answers: settings are NOT touched", func(t *testing.T) {
+		home, state, proj := t.TempDir(), t.TempDir(), t.TempDir()
+		port := freePort(t)
+		writePluginOptions(t, home, map[string]any{"port": port})
+		env := routeEnv(t, home, state, fakeProxyDir(t, port, false))
+		facts, code := runRoute(t, proj, env, "--scope", "project")
+		if code == 0 || facts["reason"] != "health_check_failed" {
+			t.Fatalf("exit %d reason=%q, want nonzero/health_check_failed: %v",
+				code, facts["reason"], facts)
+		}
+		if _, err := os.Stat(filepath.Join(proj, ".claude", "settings.local.json")); err == nil {
+			b, _ := os.ReadFile(filepath.Join(proj, ".claude", "settings.local.json"))
+			t.Errorf("routing was written with nothing answering — a routed project with no proxy is "+
+				"the hang state this ordering exists to prevent:\n%s", b)
+		}
+	})
+}
+
+// TestRouteIsIdempotent. The install skill may be re-run, and on a hosted agent a re-run IS the
+// repair path after an earlier attempt stopped partway. A second run must be a success that changes
+// nothing, not a conflict against itself.
+func TestRouteIsIdempotent(t *testing.T) {
+	home, state, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	port := freePort(t)
+	writePluginOptions(t, home, map[string]any{"port": port})
+	env := routeEnv(t, home, state, fakeProxyDir(t, port, true))
+	t.Cleanup(func() {
+		if b, e := os.ReadFile(filepath.Join(state, "context-guru", "proxy-"+port+".pid")); e == nil {
+			exec.Command("kill", strings.TrimSpace(string(b))).Run() //nolint:errcheck
+		}
+	})
+	if facts, code := runRoute(t, proj, env, "--scope", "project"); code != 0 {
+		t.Fatalf("first run: exit %d %v", code, facts)
+	}
+	facts, code := runRoute(t, proj, env, "--scope", "project")
+	if code != 0 || facts["result"] != "routed" {
+		t.Fatalf("second run: exit %d result=%q, want 0/routed: %v", code, facts["result"], facts)
+	}
+	if facts["settings_result"] != "unchanged" && facts["settings_result"] != "completed" {
+		t.Errorf("settings_result=%q on a re-run; want unchanged or completed rather than a conflict "+
+			"against our own key", facts["settings_result"])
+	}
+	// A re-run must also be distinguishable from a first install, or it gets narrated as one.
+	if plan, _ := runRoute(t, proj, env, "--plan", "--scope", "project"); plan["already_routed"] != "true" {
+		t.Errorf("already_routed=%q after installing; the model cannot tell a repair from a fresh "+
+			"install and will describe the wrong thing", plan["already_routed"])
+	}
+}
+
+// TestInstallSkillDelegatesRatherThanReimplementing. The point of the orchestrator is that the
+// ordering and the option resolution stop being prose. If the skill still spells out the individual
+// commands, both copies exist and the one a model follows is whichever it read last.
+func TestInstallSkillDelegatesRatherThanReimplementing(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("skills", "install", "SKILL.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(b)
+	if !strings.Contains(body, "--route --plan") {
+		t.Error("the install skill never renders the plan, so the model is back to asking its " +
+			"question with placeholders instead of the user's real file and endpoint")
+	}
+	// The `!` block is what makes the plan un-mistypable: it runs at render, so no model chose it.
+	if !strings.Contains(body, "!`") {
+		t.Error("the plan is not rendered through a `!` block, so the model must decide to run it " +
+			"and can reword it — the failure mode the orchestrator exists to remove")
+	}
+	for _, banned := range []string{`settings.py" add`, `start-proxy.sh" --unrouted`} {
+		if strings.Contains(body, banned) {
+			t.Errorf("the install skill still spells out %q. The ordering between the individual "+
+				"scripts is load-bearing and getting it wrong once killed the installing session; "+
+				"two copies of it means a model can follow the wrong one.", banned)
+		}
+	}
+	// Cut from 423 lines to roughly a third. Not a style preference: 39 of those lines were some
+	// form of "do not improvise this", which is what prose has to do when it carries a mechanism.
+	if n := strings.Count(body, "\n"); n > 200 {
+		t.Errorf("the install skill is %d lines; it delegates the mechanism now, so it should be "+
+			"well under 200", n)
+	}
+}
+
+// TestRoutePlanAlwaysExitsZero is the regression test for the defect that a real sandboxed session
+// found and no unit test could have.
+//
+// The install skill runs `--route --plan` from a `!` block, which pre-executes at render. The first
+// version of this script exited 2 when a base URL was already set — the commonest state of a hosted
+// machine, and precisely the case the plan exists to describe. Invoked for real, the whole skill then
+// produced NO OUTPUT AT ALL: the model never saw the plan, never asked its question, and the run
+// looked successful because nothing had been written.
+//
+// So the rule is flat, and it is cheaper to assert than to reason about: a plan REPORTS. Every
+// condition it can discover is a fact on stdout with exit 0. Only a command that actually declines
+// to act — the writing path — exits non-zero.
+func TestRoutePlanAlwaysExitsZero(t *testing.T) {
+	home, state, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	base := routeEnv(t, home, state, "")
+	withTheirs := append(routeEnv(t, home, state, ""),
+		"ANTHROPIC_BASE_URL=https://gateway.corp.example/v1")
+
+	for _, tc := range []struct {
+		name string
+		env  []string
+		args []string
+	}{
+		{"clean project", base, []string{"--plan", "--scope", "project"}},
+		{"a base URL already set", withTheirs, []string{"--plan", "--scope", "project"}},
+		{"machine-wide without the flag", base, []string{"--plan", "--scope", "user"}},
+		{"attach with no base url", base, []string{"--plan", "--mode", "attach"}},
+		{"attach with a malformed base url", base,
+			[]string{"--plan", "--mode", "attach", "--base-url", "127.0.0.1/anthropic"}},
+		{"a base url in local mode", base,
+			[]string{"--plan", "--scope", "project", "--base-url", "https://gw/anthropic"}},
+		{"team scope", base, []string{"--plan", "--scope", "team"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			facts, code := runRoute(t, proj, tc.env, tc.args...)
+			if code != 0 {
+				t.Errorf("exit %d, want 0. A `!` block that exits non-zero can take the whole skill "+
+					"invocation with it, and then the model sees nothing at all: %v", code, facts)
+			}
+			// Exit 0 is not enough on its own — it must also SAY something the caller can branch on,
+			// or a silent success is just a different way of proving nothing.
+			switch facts["result"] {
+			case "planned", "needs_decision":
+			default:
+				t.Errorf("result=%q; a plan must report either `planned` or `needs_decision`",
+					facts["result"])
+			}
+		})
+	}
+}
+
+// TestInstallSkillDoesNotGrantItselfTheGatedCommand.
+//
+// Measured in a real sandboxed session: with `allowed-tools: Bash(.../install.sh)` in the skill's
+// frontmatter, the command that starts a traffic-intercepting proxy and repoints
+// ANTHROPIC_BASE_URL ran with NO prompt at all. The `!` block needs no such grant — it pre-executes
+// at render — so the only thing that line can grant is the one step whose gate this design calls a
+// feature.
+//
+// A plugin declaring the permission the classifier exists to ask about is the plugin answering a
+// question that belongs to its user. That is worth a test rather than a comment, because adding an
+// allowed-tools line is an obvious "fix" for anyone who finds the prompt annoying.
+func TestInstallSkillDoesNotGrantItselfTheGatedCommand(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("skills", "install", "SKILL.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(b)
+	front, _, ok := strings.Cut(strings.TrimPrefix(body, "---\n"), "\n---")
+	if !ok {
+		t.Fatal("no frontmatter in skills/install/SKILL.md")
+	}
+	for _, line := range strings.Split(front, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "allowed-tools:") {
+			t.Errorf("the install skill declares %q. That pre-approves the one command that redirects "+
+				"the user's model traffic, which was measured to run with no prompt at all. The `!` "+
+				"block does not need it.", strings.TrimSpace(line))
+		}
+	}
+	// And the reason has to stay written down, or the line comes back.
+	if !strings.Contains(body, "allowed-tools") {
+		t.Error("no note explaining why there is no allowed-tools; without it the next person to " +
+			"find the prompt annoying will simply add one")
 	}
 }
