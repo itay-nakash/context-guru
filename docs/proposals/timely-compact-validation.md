@@ -220,6 +220,7 @@ measurement nobody else can re-run is an assertion:
 | **A** `a-firing-rate.sh` | **shipped** defaults, no injected idle | how often do both gates open on traffic nobody arranged? |
 | **B** `b-cold-events.sh` | forced, then **three** cold events in one span | does the cold credit *accumulate* per prevented rewrite? |
 | **C** `c-warm-only.sh` | forced, then **warm turns only** | is a warm turn's credit priced at the cache-**read** rate? |
+| **D** `d-early-compacting-client.sh` | shipped trigger, client's own threshold lowered | does the gate fire against a client that compacts **early** — the case `C` exists for? |
 
 ```bash
 export CG_SCEN_UPSTREAM="https://your-gateway.example.com"   # the plain provider gateway
@@ -442,6 +443,33 @@ It also queries the panel a second time at `?span=0.002`, so the same rows produ
 episode. An arm that only ever reports an open one cannot check the settled total, which is the
 figure a reader actually trusts.
 
+### Arm D — the case the `C` denominator exists for
+
+`Trigger.Fires` measures the fill fraction against `C` rather than the model window. The entire value
+of that is a client that compacts **early**: against the window, such a client resets the transcript
+before billed input ever reaches `frac × window`, so the component **never fires**, silently, looking
+exactly like a gate that is working.
+
+**On stock Claude Code no live run can distinguish the two denominators**, because `C = 0.996 × W` on
+haiku. Arm B is therefore the regression check — it fires reliably, so a change in its behaviour is a
+regression — and arm D tries to create the divergence by lowering the client's own auto-compact
+threshold.
+
+**The outcome is informative either way, which is why the arm is worth keeping:**
+
+- If the setting takes effect, the run reports where the client really compacts. With `C` coming from
+  a static per-model table the gate should **not** fire there — a table cannot know a tenant's
+  configured threshold — and that is the concrete argument for learning `C` per deployment
+  ([#239](https://github.com/rossoctl/context-guru/issues/239)) rather than shipping one.
+- If the setting does nothing, the early-compacting client is **not reachable by configuration** from
+  here, and the Go-level test (`TestTheFillFractionIsAFractionOfTheCompactionPointNotTheWindow`) is
+  the honest limit of what can be shown. The arm says so rather than implying a live demonstration
+  exists.
+
+The arm also reports `agent` and `max_tokens` per run, because those are the two client facts that
+*are* on every request: `W − max_tokens` reproduces the client's own displayed threshold (168,000 on
+haiku), which is what makes the table's numbers explicable rather than asserted.
+
 ### Reading a run
 
 Each arm prints every request row as the provider billed it — `billed`, `read`, `write`, the cache
@@ -564,6 +592,7 @@ A rig that fails silently certifies nothing, and each of these looked like "the 
 | If you change… | Re-run |
 |---|---|
 | the gate (`trigger.go`, `cachephase.go`) | level 1, then arm A — the firing rate is the only thing that says whether a gate change matters |
+| the fill **denominator** (`C`, `internal/compactionpoint`) | level 1, then arm **B** as a regression (it fires reliably, so a behaviour change there is a regression) and arm **D** for the early-client case. On stock haiku `C = 0.996 × W`, so no live run distinguishes the denominators — only arm D can, and only if the client's threshold is configurable |
 | the accounting (`compactepisode.go`) | level 2, then arms B **and** C — B checks the write-rate bucket, C the read-rate one, and a rate error shows in only one |
 | the async path | level 3 including `-race`, then arm B (its t0+1 carries the deferred summarizer cost) |
 | the client ceiling table | arm A on that model — it is the arm that measures the ceiling |
