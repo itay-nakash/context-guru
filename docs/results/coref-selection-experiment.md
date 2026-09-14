@@ -270,6 +270,29 @@ operational damage rate.
   deterministic slice of Tier-2 turns out to be nearly empty, so closing this bias properly needs a
   judge, which reintroduces the noise that ruled out UltraHorizon
   ([measurement-limits §6](measurement-limits.md)). The bound is tighter, not removed.
+- **A class of candidate that the ground truth cannot score at all, in either direction.** The
+  classifier calls an output `opaque` when `novel == 0` — it introduced no `distinctive()` token that
+  was not already in the prefix, a sibling output, or the common set. A reference is detected as
+  `novel ∩ ref_tokens[j]`, so an empty `novel` intersects nothing and the candidate is recorded "never
+  referenced" **by construction**, whatever the agent actually did with it. This is not a bias to be
+  bracketed like the two above; it is zero sensitivity on a subset. Quantified on iteration 027's
+  LOCA corpus: `opaque` is **30% of candidates and 46% of token mass**, with a referenced rate of
+  exactly **0.0%** against 10.0% for `unreferenced`, 50.0% for `closed` and 76.0% for `open`. The
+  class merges three unlike populations — records whose values are human-readable (a 119,846-token
+  spreadsheet dump yields five distinctive tokens, all schema keys), re-sends whose identifiers were
+  all already in `prior`, and boilerplate-dominated outputs. Consequences for the numbers on this
+  page: any arm's false-drop is measured only on the scoreable subset, and any arm that cuts `opaque`
+  more than another is flattered by exactly that much. The deterministic arms never cut it — `Opaque`
+  is never-cut by design — so the comparison here is not distorted by it; a model arm's is. See
+  [iteration 027 §7](../experiments/loca/iter027/results.md).
+- **The proxy is blind to positional and non-identifier reuse even on the scoreable subset.** Both
+  sides of `novel ∩ ref_tokens[j]` pass through `distinctive()`, which by design rejects short
+  lowercase words and numbers under five digits. So "the address in row 1" shares no token with the
+  output it refers to, and an agent may copy `123 Main St` verbatim into an email it sends without
+  producing a match. An attempt to quantify this by matching literal values instead reproduced the
+  precision failure `distinctive()`'s own docstring records — scoring `2025`, `spreadsheetId` and
+  `valueRanges` as reuse, and returning 74% hit on `opaque` against 68% on `unreferenced`, i.e. no
+  signal. Widening the token rule without the novelty subtraction measures ubiquity, not reference.
 - **One firing point** (`F` = 60% of model turns). A real pass fires at a threshold crossing, at
   varying depth with varying future remaining.
 - **An asymmetry that flatters the deterministic arms:** `min_later_turns` is a hard structural guard
