@@ -110,16 +110,50 @@ type Verdict struct {
 // cost and NEVER mentions recoverability — even though, on this path, the drop genuinely is
 // recoverable through the marker and the stash. That asymmetry is intentional: the operator gets the
 // safety net, the model is not told about it. Every softening of this text measured WORSE.
+//
+// TWO EDITS FROM ITERATION 027, and what they were answering. The adjudication dump showed 46 verdicts
+// across 10 asks: 45 keeps, 1 drop. 28 of those keeps cited criterion (b), 17 cited (a), and 12 of 45
+// rested on a quote that is not in the transcript.
+//
+//  1. THE RAW-FORM TEST MOVED INTO THE CRITERION. (b) reads "an instruction that is NOT YET COMPLETE",
+//     which is true for the whole duration of any unfinished task -- so as written it licenses keeping
+//     anything topically related to the task. The narrowing idea was already in this text ("no
+//     outstanding obligation needs it in raw form") but sat in a later sentence qualifying only the
+//     "captured elsewhere" case. It is now the question itself.
+//
+//     APPLIED TO (a) AS WELL, and that is not incidental: the dump shows the SAME output cited under
+//     (b) on one turn and (a) on the next as later_turns grew. Narrow one clause and the answers
+//     migrate to the other, which would produce no measurable change and read as "the prompt is not the
+//     problem". The clauses have to move together.
+//
+//  2. THE QUOTE IS DECLARED CHECKED. It always was checked -- Judge verifies it against the flattened
+//     transcript and sets QuoteFabricated -- but the model was never told, and 27% of keeps carried a
+//     quote that could not be found. Stating the verification removes the incentive to reconstruct one
+//     from memory. Note what this deliberately does NOT do: a fabricated quote still leaves the verdict
+//     alone, because every failure path here resolves toward keep and making fabrication cause a
+//     REMOVAL would invert that asymmetry in the one direction that loses task quality silently.
+//
+// A THIRD EDIT WAS DRAFTED AND NOT APPLIED. "keep everything is a valid and often correct answer"
+// below reads as encouragement and is the line most directly implicated in a 98% keep rate -- but it is
+// also the text whose cost-honest framing is worth ~26 points of live-kept, and this file's own history
+// says every softening measured worse. Changing it is a measurement, not an edit — the instrument is the
+// offline selection scorer (8,105 decisions, $0 to re-score), because live-kept is what the clause
+// trades against and no reward run at this budget can resolve it. Tracked in #242; do not quietly
+// reword it here.
 const adjudicationContract = `Some of the tool outputs in the conversation above may no longer be needed. Decide,
 for EACH output listed below, whether you still need it.
 
-CRITERION. An output is SPENT only if it is needed for NONE of the following:
+CRITERION. An output is SPENT only if NONE of the following would require you to RE-READ ITS
+CONTENTS. Being about the task is not enough -- the question is whether you need these bytes again:
   (a) the step you are on right now;
-  (b) any instruction the user has given that is NOT YET COMPLETE;
-  (c) any step you have EXPLICITLY STATED you will take and have not yet taken.
-Only obligations WRITTEN IN THE CONVERSATION count -- do not invent hypothetical future needs. An
-output whose information has already been captured elsewhere (a filed total, a recorded conclusion)
-AND which no outstanding obligation needs in raw form is spent.
+  (b) an instruction the user has given that is NOT YET COMPLETE;
+  (c) a step you have EXPLICITLY STATED you will take and have not yet taken.
+Only obligations WRITTEN IN THE CONVERSATION count -- do not invent hypothetical future needs.
+
+THE TEST, per output: could you carry out that obligation from what you have ALREADY concluded or
+written down, without looking at this output again? If yes, it is spent -- even though the task is
+unfinished, and even though the output is about the task. An unfinished task does not by itself make
+every output it touched still needed.
 
 WHAT A WRONG REMOVAL ACTUALLY COSTS. If something you still need is removed, you will usually NOT
 notice the gap and will not ask for the content back. You will answer from worse information and get
@@ -133,7 +167,10 @@ look load-bearing, keep them all -- "keep everything" is a valid and often corre
 FOR EACH OUTPUT, ANSWER THE CRITERION FIRST, THEN DECIDE:
   "needed_by" -- which of (a)/(b)/(c) still needs this output, or "none" if it is spent.
   "quote"     -- when needed_by is a/b/c, the text from the conversation that creates that
-                 obligation, copied VERBATIM. Leave empty only when needed_by is "none".
+                 obligation, copied VERBATIM. Your quote is checked against the conversation
+                 character for character. Do not paraphrase or reconstruct it: if you cannot find
+                 the exact text, you have not identified a written obligation.
+                 Leave empty only when needed_by is "none".
   "verdict"   -- keep (still needed, or you are unsure -- this is the default) or drop (its
                  information is spent; a short descriptor of its shape will remain in its place).
                  A verdict of "drop" REQUIRES needed_by "none": if any obligation still needs the

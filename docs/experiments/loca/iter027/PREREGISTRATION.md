@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| binary | `cg-i027-proxy-v03`, SHA-256 (first 32) `607ef085d0151c4048f6460345429070` — v01 ran the first mechanism probe, v02 added the summarize decline labels, v03 adds the adjudication dump (`CG_SWEEP_ASK_DUMP`, off unless a directory is named) |
+| binary | `cg-i027-proxy-v04`, SHA-256 (first 32) `6a09c9e993a31e9387c2a330945fd234` — see [Amendments](#amendments) for what each build changed and why |
 | arms | `cfg-iter027-{A-baseline,B-merged}.yaml` |
 | B differs by | **five lines** — `evidence`, `econ_trigger`, `reward_premium: 20`, `min_pressure: 0.20`, `min_inventory: 3` |
 | pipeline | **`housellm` + `summarize`** — `collapse` removed from both arms, see [The pipeline is now the one being claimed](#the-pipeline-is-now-the-one-being-claimed) |
@@ -129,6 +129,32 @@ silent decline paths in `summarize.go` now raise `summary_below_trigger`, `summa
 **The risk, stated plainly:** an uncapped oversized output causing an upstream 400. Measured as absent on
 this band and this task set — and that is **not** a claim about a 128k band or a different task set. If
 step 2 moves off this configuration, check `capfail` before assuming it still holds.
+
+### The adjudicator, after three probes measured what it actually does
+
+**Amended before any endpoint was read.** The adjudication dump (`CG_SWEEP_ASK_DUMP`) recorded **46
+verdicts across 10 asks: 45 keeps, 1 drop — a 2% drop rate.** The gate fired ten times; the judgement
+was the blocker, and three separate causes were visible:
+
+| observation | change |
+|---|---|
+| 3 of 46 candidates had `later_turns == 0` — the model had taken no turn since receiving them — carrying **22% of offered token mass** | `min_later_turns: 3`. "Still needed" is the only honest answer about an output the model has not yet acted on, so the verdict carries no information and the ask is paid for anyway. This floor was **off** in the first three probes; I set the request-level `min_pressure` and missed that the per-candidate floor was the one this needed. |
+| **7 of 10 asks** were the same five candidates at the same 41,453 tokens, kept every time — ~70% of the pass's adjudication spend | `keep_recheck_turns: 4`. Drops are frozen and replayed; keeps were forgotten. Expiry is in **turns**, and it must exist: a permanently cached keep makes a candidate judged needed once unreachable for the session. |
+| 28 keeps cited criterion (b) "instruction not yet complete" — true for the whole duration of any unfinished task — and 17 cited (a), the **same output** switching from (b) to (a) between turns | two edits to `adjudicationContract`: the raw-form test moved **into** the criterion and applied to all three clauses, and the quote declared checked. |
+| **12 of 45 keeps (27%)** rested on a quote not present in the transcript | the second edit above. The check always ran (`Judge` sets `QuoteFabricated`); the model was never told. |
+
+**A third prompt edit was drafted and deliberately not applied.** The clause *"keep everything is a valid
+and often correct answer"* is the line most directly implicated in a 2% drop rate — and also the text
+whose cost-honest framing is worth ~26 points of live-kept, where this file's own history records that
+every softening measured worse. It is a measurement, not an edit, and the instrument is the offline
+selection scorer rather than a reward run. Tracked in
+[#242](https://github.com/rossoctl/context-guru/issues/242).
+
+**What this means for reading the run.** The treatment in arm B is no longer the one iterations 023–026
+ran: its adjudication prompt and two of its floors have changed. That is deliberate — a run whose
+adjudicator keeps 98% of what it sees measures nothing about the mechanism — but it means B−A here is
+not comparable with iteration 024's B−A term by term, and the reward result is being re-asked rather
+than replicated.
 
 ### In the rig
 
@@ -260,3 +286,20 @@ Written before the data exists.
 - **The harm-gate threshold is still unsettled** and deliberately deferred: it affects how this run is
   read, not how it is executed. At 15 clusters the Clopper-Pearson upper bound is 21.8% with zero
   worsened tasks, so a 25% veto cannot be cleared by any single-seed result.
+
+
+## Amendments
+
+Every change below was made **before any endpoint was read**, on mechanism data from probes that cost
+$14.40 in total. They are listed so the run's inputs are recoverable rather than implied by a hash.
+
+| build | SHA-256 (first 32) | what changed | what prompted it |
+|---|---|---|---|
+| v01 | `a3c0e725248e6fab19356d61aec0f57e` | the premium, the horizon credit, the model-info fixes | iterations 008–024 never ran at their declared band |
+| v02 | `827876e9e0893db05f6b4abebe073de6` | six `summarize` decline labels | a session sat above its own trigger for six turns with nothing recording why |
+| v03 | `607ef085d0151c4048f6460345429070` | the adjudication dump | `sweep_kept: 32` was the entire record of a judgement |
+| v04 | `6a09c9e993a31e9387c2a330945fd234` | keep-cache, `min_later_turns`, two prompt edits | the dump: 45 keeps of 46, 7 of 10 asks repeated, 27% fabricated quotes |
+
+Config amendments: `collapse` removed from both arms; probe fixtures re-chosen on **mean request size**
+after the first pair proved to sit below the floor being tested; `min_later_turns: 3` and
+`keep_recheck_turns: 4` added to arm B.
