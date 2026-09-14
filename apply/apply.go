@@ -469,7 +469,9 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 	cacheAware := resolveCacheAware(o.CacheMode, provider, body)
 	nowMs := o.nowMs()
 	coldCache := false
-	idleMs := int64(0)
+	// -1, not 0: unknown and "zero idle" are different facts, and the compaction gate PERMITS the
+	// first while it must refuse the second. See components.Ctx.IdleMs.
+	idleMs := int64(-1)
 	// ttlMs is the cache lifetime the cold decision below derives, carried onto the Ctx so a
 	// component can act BEFORE expiry rather than only after it. 0 when the cache-aware path did not
 	// run, which reads as "unknown" to every consumer.
@@ -549,7 +551,14 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 			// re-deriving it there would be a second read of one fact — which is how the cold
 			// decision and the dashboard came to disagree once already (see ttlTier).
 			ttlMs = ttl.Milliseconds()
-			if prevAt > 0 && nowMs > prevAt {
+			// nowMs == prevAt is a REAL zero, not a missing measurement: two turns of one session
+			// arriving in the same millisecond, which concurrent sub-requests produce routinely.
+			// It used to fall through to the unknown value and classify the warmest possible
+			// request as "cannot tell" — see components.Ctx.IdleMs.
+			//
+			// nowMs < prevAt stays unknown. A backwards clock cannot be turned into an idle time,
+			// and inventing 0 there would claim warmth we have not measured.
+			if prevAt > 0 && nowMs >= prevAt {
 				idleMs = nowMs - prevAt
 			}
 		} else {

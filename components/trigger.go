@@ -97,6 +97,31 @@ func (t Trigger) PreExpiry() time.Duration {
 // An unrecognised value permits, rather than silently disabling the component. Constructors
 // validate the string and refuse a bad one at config time, which is where a typo belongs.
 func (t Trigger) CacheAllows(c *Ctx, p CachePhase) bool {
+	// UNKNOWN IS ONLY SAFE WHEN THERE IS PROVABLY NO LIVE PREFIX, and the justification above used
+	// to assert that Unknown implied exactly that. It does not: a request can carry
+	// MaxCachedIdx >= 0 with no readable TTL, and then Unknown means "there is a cached prefix and
+	// we cannot say how much life is left in it" — the one state where compacting is most
+	// expensive and this gate was most permissive.
+	//
+	// A REVIEW OBSERVED THE GATE OPENING OVER A LIVE 8-MESSAGE PREFIX on 13 of 26 turns, reached by
+	// ordinary concurrency rather than by any exotic deployment. That particular route (two turns
+	// in the same millisecond reading as zero-idle-therefore-unknown) is now fixed at its root in
+	// apply, but two others remain reachable — apply's legacy no-Tracker path, which every library
+	// consumer of BodyFull/BodyOpts takes, and `cache_mode: on` against a provider whose TTL this
+	// repo does not derive. Both leave MaxCachedIdx set and CacheTTLMs at zero.
+	//
+	// AND ONE FALSE POSITIVE POISONS THE WHOLE SESSION, which is why this belongs here rather than
+	// at the splice. Once a checkpoint exists the replay runs before and independently of this gate
+	// (deliberately — a gated turn must still replay, or it reverts to the full transcript at the
+	// worst moment), so a single wrongly-permitted turn commissions a summary against a live prefix
+	// and then rewrites the forwarded prefix for the rest of the session, warm turns included.
+	//
+	// Scoped to a caller that asked for a cache state at all: `""` and `any` are the callers that
+	// never wanted this gate, and declining there would disable components that do not consult it.
+	if p == CachePhaseUnknown && c != nil && c.CacheAware && c.MaxCachedIdx >= 0 &&
+		t.CacheState != "" && t.CacheState != CacheStateAny {
+		return false
+	}
 	switch t.CacheState {
 	case CacheStatePreExpiry:
 		return p == CachePhasePreExpiry || p == CachePhaseUnknown
@@ -124,9 +149,24 @@ func (t Trigger) CacheAllows(c *Ctx, p CachePhase) bool {
 // lifetime has run out. Unknown is NOT cold here — a component that cannot tell must fall through
 // to the Unknown branch, which the caller permits for its own documented reasons, rather than
 // borrow a verdict it has not earned.
+//
+// AND THE TEST IS CertainlyColdByClock, NOT `remaining <= 0`, which is the threshold CachePhase uses
+// for the opposite question. A compactor needs the entry to be certainly GONE; the sweep needs it to
+// still EXIST, and the safe error runs the other way for each. Requiring only `remaining <= 0` here
+// made this gate willing to permit a rewrite for a full minute during which apply still called the
+// same entry warm — see CertainlyColdByClock for why the two thresholds differ on purpose, and for
+// the dead zone between them where compaction declines.
+//
+// THE KEEP-ALIVE FALSE POSITIVE IS NOT FULLY ANSWERED HERE, and the paragraph above should not be
+// read as claiming otherwise. IdleMs derives from the same prevAt that keepalive.go never updates,
+// so on a kept-alive session with a real gap past the TTL this function returns true and permits
+// compacting a live prefix — the very thing it was written to prevent, on exactly the sessions
+// someone is paying pings to protect. It cannot be fixed by adjusting the arithmetic, because the
+// input it trusts is stale for those sessions: either keepalive.go updates the tracker, or the cold
+// signal must not derive from prevAt at all. Tracked as its own issue.
 func coldByArithmetic(c *Ctx) bool {
 	remaining, ok := c.CacheRemaining()
-	return ok && remaining <= 0
+	return ok && CertainlyColdByClock(remaining)
 }
 
 // FracResolvable reports whether the configured fractions can be resolved against a window worth

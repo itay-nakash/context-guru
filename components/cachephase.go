@@ -27,11 +27,24 @@ import "time"
 // WHAT CALLERS DO WITH Unknown IS THEIR POLICY, NOT THIS FUNCTION'S, and the two shipped
 // callers answer it oppositely on purpose. extract_llm_sweep must not fire on Unknown: it would
 // invalidate live prefixes on exactly the deployments whose TTL could not be read. A size-gated
-// compactor must fire on Unknown: CacheTTLMs and IdleMs are also zero whenever the cache-aware
-// path is off entirely (a non-Anthropic-family provider with no cache_control breakpoint,
-// `cache_mode: off`, a bypassed turn, a session's first turn), and on those deployments
-// MaxCachedIdx stays -1 so every offloader is already permitted to rewrite deep history —
-// declining there would protect nothing and disable the component. See Trigger.CacheAllows.
+// compactor must fire on Unknown, because Unknown is not rare or exotic: CacheTTLMs is zero
+// whenever the cache-aware path is off entirely (a non-Anthropic-family provider with no
+// cache_control breakpoint, `cache_mode: off`, a bypassed turn), and declining there would
+// disable the component on those deployments.
+//
+// UNKNOWN DOES NOT IMPLY THERE IS NO LIVE PREFIX, and this comment used to claim it did — that
+// "on those deployments MaxCachedIdx stays -1 so every offloader is already permitted to rewrite
+// deep history". The implication is false, and a live run reached the gap: a request can carry
+// MaxCachedIdx >= 0 with no readable TTL, in which case there IS a cached prefix and Unknown means
+// only that we cannot say how much life is left in it. Two reachable shapes —
+//
+//   - apply's legacy no-Tracker path (every library consumer of BodyFull/BodyOpts) sets
+//     MaxCachedIdx from the store and never sets CacheTTLMs at all;
+//   - `cache_mode: on` against a provider whose TTL this repo does not derive.
+//
+// A third, the same-millisecond concurrent turn, was the one observed live; that one is now fixed
+// at its root by making IdleMs distinguish zero from unknown. The remaining two are answered by
+// Trigger.CacheAllows, which refuses Unknown when MaxCachedIdx says a prefix exists.
 type CachePhase int
 
 const (
@@ -69,7 +82,10 @@ func (p CachePhase) String() string {
 // fields, and anything else that wants it (a dashboard row, a keep-alive deadline) must read it
 // here rather than re-derive a TTL of its own.
 func (c *Ctx) CacheRemaining() (time.Duration, bool) {
-	if c == nil || c.CacheTTLMs <= 0 || c.IdleMs <= 0 {
+	// IdleMs < 0 is unknown; IdleMs == 0 is a positive claim of zero idle, and the entry then has
+	// its whole TTL left. Treating zero as unknown reported "cannot tell" for the WARMEST possible
+	// request, and the compaction gate permits Unknown — see Ctx.IdleMs.
+	if c == nil || c.CacheTTLMs <= 0 || c.IdleMs < 0 {
 		return 0, false
 	}
 	return time.Duration(c.CacheTTLMs-c.IdleMs) * time.Millisecond, true
@@ -78,10 +94,15 @@ func (c *Ctx) CacheRemaining() (time.Duration, bool) {
 // CachePhase classifies this request against preExpiry, the width of the window before the
 // entry's believed expiry that the caller considers cheap to invalidate.
 //
-// ColdCache is checked FIRST and is not merely redundant against `remaining <= 0`: it is apply's
-// own verdict, computed with its clock-skew margin over the same timestamps, and one cheap
-// agreement check costs nothing next to a wrongly invalidated prefix. A turn apply has called
-// cold is Cold here even if the arithmetic below would have said otherwise.
+// ColdCache is checked FIRST: it is apply's own verdict over the same timestamps, and a turn apply
+// has called cold is Cold here even if the arithmetic below would have said otherwise.
+//
+// It is NOT a safety check, and an earlier version of this comment implied it was ("one cheap
+// agreement check costs nothing next to a wrongly invalidated prefix"). Checking ColdCache first can
+// only make this classifier MORE willing to say cold, never less, so it cannot protect a live
+// prefix. The reachable disagreement was the opposite one — the arithmetic calling an entry cold
+// while apply called it warm — and that is answered by CertainlyColdByClock's margin, not by this
+// line.
 func (c *Ctx) CachePhase(preExpiry time.Duration) CachePhase {
 	if c == nil {
 		return CachePhaseUnknown
@@ -101,3 +122,44 @@ func (c *Ctx) CachePhase(preExpiry time.Duration) CachePhase {
 	}
 	return CachePhaseWarm
 }
+
+// ColdMargin is the clock-skew allowance required PAST the believed expiry before this package will
+// make the positive claim that an entry is GONE. It mirrors apply.coldMargin, which applies the same
+// allowance to the same two timestamps when it computes Ctx.ColdCache.
+//
+// Duplicated as a constant rather than exported from apply because components must not import apply —
+// apply imports components. The number is small, documented on both sides, and it exists for the same
+// reason in both places: the gap between when a request was recorded here and when the provider last
+// touched the entry, plus skew between this box's clock and the provider's.
+const ColdMargin = time.Minute
+
+// CertainlyColdByClock is the STRICT cold test: the entry's lifetime has run out by more than the
+// clock-skew allowance, so rewriting its prefix destroys nothing.
+//
+// # Why this is not the same test as CachePhase == CachePhaseCold, deliberately
+//
+// The two readers of "is the cache cold" in this package answer DIFFERENT QUESTIONS, and the safe
+// error runs in opposite directions for each. Collapsing them into one threshold makes one of the
+// two callers less safe, which a test caught:
+//
+//   - extract_llm_sweep needs an entry that STILL EXISTS, because its prefix ask reads one. If it is
+//     wrong about the entry being alive, the ask pays fresh for the whole transcript. So the safe
+//     error is to assume the entry is already gone, and CachePhase calls nominal expiry Cold — which
+//     makes the sweep stand down at exactly the right moment.
+//   - summarize's gate needs an entry that is CERTAINLY GONE, because it rewrites deep history. If it
+//     is wrong about the entry being dead, it invalidates a live prefix and pays a cache-write of the
+//     whole suffix at 1.25x fresh. So the safe error is the opposite: assume the entry may still be
+//     alive, and require the skew allowance before claiming otherwise.
+//
+// A REVIEW FOUND THE COMPACTION SIDE MISSING THIS. Trigger.coldByArithmetic required only
+// `remaining <= 0` — the sweep's threshold — so for a full minute of every session's expiry it said
+// cold and permitted a rewrite while apply still called the same entry warm and the rest of the
+// pipeline treated its prefix as live. That converts the case summarize's design calls "strictly
+// better, unconditionally" into the harmful one, on a window that recurs in every long session.
+//
+// The gap between the two thresholds is therefore a deliberate DEAD ZONE for compaction: an entry at
+// or just past nominal expiry is neither PreExpiry (CachePhase calls it Cold) nor certainly cold
+// (this returns false), so `cache_state: cold` and `pre_expiry_or_cold` both decline. That is the
+// correct outcome for the one honest description of that window — we cannot tell whether this entry
+// is alive or dead, so we must not rewrite it.
+func CertainlyColdByClock(remaining time.Duration) bool { return remaining <= -ColdMargin }

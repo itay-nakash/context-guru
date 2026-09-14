@@ -355,10 +355,22 @@ type Ctx struct {
 	// one invoice is not a rounding difference; it is a component and a dashboard disagreeing
 	// about whether a configuration pays.
 	RatesFor func(model string) TokenRates
-	// IdleMs is how long this session was idle before this request, in milliseconds; 0 when
-	// there is no previous turn on record. Carried alongside ColdCache so a component can
-	// demand MORE idle time than the provider TTL implies, and so the figure can be
-	// reported rather than re-derived.
+	// IdleMs is how long this session was idle before this request, in milliseconds. Carried
+	// alongside ColdCache so a component can demand MORE idle time than the provider TTL implies,
+	// and so the figure can be reported rather than re-derived.
+	//
+	// NEGATIVE MEANS UNKNOWN — there is no previous turn on record, or the clock went backwards.
+	// ZERO MEANS ZERO IDLE, which is a positive fact about the warmest possible cache.
+	//
+	// The distinction is load-bearing and it was missing. IdleMs used to be 0 for both, so
+	// CacheRemaining reported "cannot tell" for a request that arrived in the same millisecond as
+	// the previous one — and CachePhase turned that into Unknown, which the compaction gate
+	// PERMITS. A live run reached it with nothing exotic: four concurrent requests on one session,
+	// which any agent issuing parallel sub-requests does routinely, produced 13 of 26 turns
+	// classified Unknown over an 8-message live cached prefix. A turn with genuinely zero idle is
+	// the warmest cache there can be and must classify as Warm, not as "no information".
+	//
+	// Writers must therefore initialise this to -1, not 0, when they have no previous timestamp.
 	IdleMs int64
 	// MaxCachedIdx is the highest req.Input index considered already committed to the
 	// provider cache (the messages present on the previous turn of this session).
