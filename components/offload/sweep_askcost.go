@@ -53,11 +53,44 @@ import (
 // predecessor's rate; `estFromMeasurement` in cg.sweep.econ is what makes that visible rather than
 // assumed.
 type askLedger struct {
-	mu       sync.Mutex
-	asks     int
-	costUSD  float64
+	mu      sync.Mutex
+	asks    int
+	costUSD float64
+	// Pooled mass, kept alongside the per-bucket mass rather than derived from it: the pooled figure is
+	// what a bucket with no history of its own shrinks toward, so it has to exist before any bucket does.
 	offered  int
 	approved int
+	// APPROVAL IS A CURVE IN INVENTORY SIZE, NOT A SCALAR (issue #230), and keeping it as a scalar is
+	// what shut the component down on a measured probe. The component's own evidence: shown one output,
+	// 6% live-kept on haiku and 14% on sonnet; shown ~15, 58%; batch 3-6 dropped a genuinely-spent
+	// output 2 times in 4; batch 10 dropped it 4 in 4. A ratio pooled over asks is dominated by whatever
+	// regime the gate happened to admit -- and the gate admits THIN asks, because `have` is remaining
+	// window room and shrinks as pressure rises. So the estimate was measured at three candidates and
+	// then applied to twelve, which declined every rich ask and denied the ledger the only evidence that
+	// would have revised it.
+	//
+	// Three buckets, not a fitted curve: with this much data a fit would be noise wearing a shape. The
+	// splits are the inflection the measurements above report.
+	buckets map[int]*askBucket
+}
+
+// askBucket is one inventory-size regime's mass. Split out so a rich ask is priced by rich-ask history.
+type askBucket struct {
+	offered  int
+	approved int
+}
+
+// approvalBucket maps an inventory size onto its regime. Below 7 is where a drop is documented to be a
+// guess; 10 and above is where judgement was measured sound; between them is the transition.
+func approvalBucket(inventory int) int {
+	switch {
+	case inventory < 7:
+		return 0
+	case inventory < 10:
+		return 1
+	default:
+		return 2
+	}
 }
 
 // record books one completed adjudication: what it cost, the candidate mass it was shown, and the mass
@@ -67,7 +100,7 @@ type askLedger struct {
 // this builds has to map "mass I am about to offer" onto "mass I will actually stop sending", so every
 // later stage that shrinks the outcome — selectAffordableDrops' pruning, tryMark's refusals, the
 // marker's own tokens — belongs inside the measured fraction rather than outside it.
-func (l *askLedger) record(costUSD float64, offered, approved int) {
+func (l *askLedger) record(costUSD float64, offered, approved, inventory int) {
 	if l == nil || offered <= 0 {
 		return
 	}
@@ -77,6 +110,16 @@ func (l *askLedger) record(costUSD float64, offered, approved int) {
 	l.costUSD += costUSD
 	l.offered += offered
 	l.approved += approved
+	if l.buckets == nil {
+		l.buckets = map[int]*askBucket{}
+	}
+	b := l.buckets[approvalBucket(inventory)]
+	if b == nil {
+		b = &askBucket{}
+		l.buckets[approvalBucket(inventory)] = b
+	}
+	b.offered += offered
+	b.approved += approved
 }
 
 // estimate reports what the NEXT ask should be assumed to cost, and what fraction of the mass offered
@@ -84,30 +127,60 @@ func (l *askLedger) record(costUSD float64, offered, approved int) {
 // component's own asks or from the priors.
 //
 // `prior` supplies the cost until enough asks have completed to average — see askCostPrior.
-func (l *askLedger) estimate(prior float64) (costUSD, approval float64, measured bool) {
+func (l *askLedger) estimate(prior float64, inventory int) (costUSD, approval float64, measured bool) {
 	if l == nil {
-		return prior, 1, false
+		return prior, approvalPrior, false
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.asks < minAskSamples {
-		// The prior on APPROVAL is 1.0, i.e. exactly what the gate assumed before this file existed.
-		// Deliberate: the opening asks are the measurement, and starting pessimistic would decline the
-		// very calls that produce the data. Bounded by minAskSamples, so it is a warm-up and not a
-		// policy.
-		return prior, 1, false
+	// COST AND APPROVAL NO LONGER SHARE ONE SWITCH, and they never should have. The cost is an AVERAGE
+	// over asks, so it genuinely needs a few asks before it beats the prior — minAskSamples is the right
+	// instrument for it. The approval is a MASS RATIO, whose precision scales with offered mass rather
+	// than with how many calls produced it, and gating it on an ask count is what produced a 20x cliff:
+	// on a measured probe the third ask completed, the switch flipped, and a pooled ratio of 0.0124
+	// declined every one of the next 48 evaluations.
+	costUSD, measured = prior, false
+	if l.asks >= minAskSamples {
+		costUSD, measured = l.costUSD/float64(l.asks), true
 	}
-	costUSD = l.costUSD / float64(l.asks)
-	approval = float64(l.approved) / float64(l.offered)
-	// FLOORED, and this is a ratchet guard rather than a fudge. A measured approval of exactly zero
-	// would drive the expected saving to zero, decline every subsequent ask, and thereby destroy the
-	// only source of new evidence — the component would disable itself permanently on the strength of
-	// however few asks happened to come back empty, with no path back. The floor keeps a large enough
-	// inventory able to clear the bar, which is what lets the estimate be revised.
-	if approval < approvalFloor {
-		approval = approvalFloor
+	return costUSD, l.approvalLocked(inventory), measured
+}
+
+// approvalLocked is the estimate itself. Caller holds the lock.
+//
+//	approval = (approved + k*prior) / (offered + k)
+//
+// MASS-WEIGHTED SHRINKAGE, and each property answers a measured failure:
+//
+//   - k is in TOKENS OF OFFERED MASS, not asks. Three 2k-token asks were three units of evidence to the
+//     old estimator and are 6k units to this one, which is the right unit for a mass ratio. It is also
+//     what makes the estimate move continuously instead of switching.
+//   - the bucket shrinks toward the POOLED estimate once any mass has been seen anywhere, so a regime
+//     with no history of its own inherits the component's overall experience rather than fixed optimism.
+//     That is issue #230 as arithmetic: a twelve-candidate ask is not priced by three-candidate history.
+//   - the FLOOR STAYS. Shrinkage does not subsume it, which a simulation over 384 decision points showed
+//     directly: at k=300k the unfloored form converged to 0.033, below the floor, and made 11 fewer asks
+//     than the floored one at 128k. The floor is an optimistic bias that keeps the component asking, and
+//     that is worth keeping for the reason its original note gives — a zero estimate destroys the only
+//     source of evidence that could revise it.
+func (l *askLedger) approvalLocked(inventory int) float64 {
+	prior := approvalPrior
+	if l.offered > 0 {
+		prior = (float64(l.approved) + approvalShrinkTokens*approvalPrior) /
+			(float64(l.offered) + approvalShrinkTokens)
 	}
-	return costUSD, approval, true
+	var off, app int
+	if b := l.buckets[approvalBucket(inventory)]; b != nil {
+		off, app = b.offered, b.approved
+	}
+	v := (float64(app) + approvalShrinkTokens*prior) / (float64(off) + approvalShrinkTokens)
+	if v < approvalFloor {
+		v = approvalFloor
+	}
+	if v > 1 {
+		v = 1
+	}
+	return v
 }
 
 const (
@@ -117,8 +190,30 @@ const (
 	// 5291 tokens, a sequence whose first three entries average to something usable and whose first
 	// one does not.
 	minAskSamples = 3
-	// approvalFloor is the lowest approval rate the estimator will report. See estimate's ratchet note.
+	// approvalFloor is the lowest approval rate the estimator will report. See approvalLocked's note on
+	// why shrinkage does not replace it.
 	approvalFloor = 0.05
+	// approvalShrinkTokens is the shrinkage pseudo-count, in tokens of offered mass: the estimate sits at
+	// the prior until this much mass has been offered, and leaves it continuously thereafter.
+	//
+	// ONE MILLION, chosen from a simulation over 384 decision points that ran the ledger sequentially and
+	// compared estimators against an identical, swept outcome model. The ordering was stable in all six
+	// cells (three outcome models x two windows): k=1M floored bucketed beat k=300k, which beat the
+	// unfloored form, which beat a pooled form, which beat the shipped pooled ratio. At 64k under the
+	// pessimistic outcome model it made 132 asks against the shipped 36 and removed 68,955 tokens against
+	// 7,329 — 9.4x.
+	//
+	// WHAT THE VALUE MEANS IN PRACTICE, because it is large and should not be mistaken for a small
+	// correction: the ledger belongs to a component instance and outlives any one session, so a million
+	// tokens of offered mass is hours of traffic rather than one task. Within a single short session the
+	// discount therefore barely engages — which is deliberate, and is the asymmetry argument: one ask
+	// measured $0.036-$0.049 on the probe, while a removal that never happened costs reward. Erring
+	// toward asking is the cheap direction.
+	approvalShrinkTokens = 1_000_000.0
+	// approvalPrior is what the estimate reports before any mass has been offered — 1.0, i.e. what the
+	// gate assumed before this file existed. The opening asks ARE the measurement, and starting
+	// pessimistic declines the very calls that would produce the data.
+	approvalPrior = 1.0
 	// askReplyTokens is the completion budget one adjudication is assumed to spend. The reply is a vote
 	// list bounded by maxAskItems, so it is small and nearly constant — unlike the prompt, which grows
 	// with the transcript.

@@ -11,7 +11,7 @@
 #
 #   reward_premium: 20     a removed token is worth 20x the cache read it saves (was: unpriced, i.e. 1)
 #   min_pressure:  0.20    was 0.70, which blocked 127 of iteration 024's 203 firings on its own
-#   min_inventory:    3    was 7; iteration 024's firings commonly carried three candidates
+#   min_inventory:   10    the measured inflection; iteration 024 already ran at 9.6 offered per ask
 #   + in the BINARY        the turn horizon now credits the removal it is pricing (issue #232)
 #
 # THE LAST ONE IS NOT OPTIONAL AND NOT SEPARABLE. The horizon was measured on the request as it ARRIVED,
@@ -103,14 +103,30 @@ components:
     # turns x (1/p - 1), so 0.70 caps it at 0.43 x turns. Iteration 026's admitted requests carried 3-7
     # assistant turns, giving haveTurns 0-3 against needs in the tens.
     min_pressure: 0.20
-    # LOWERED FROM 7 TO 3. The 7 was set on my reasoning that a high pressure floor would only admit
-    # large requests and therefore large inventories. Iteration 024's actual firings say otherwise: they
-    # commonly carried THREE candidates, and a floor of 7 blocks a further 50 of its 203 firings after
-    # the pressure floor has taken 127. The batch-size evidence that argues for a high floor is about
-    # judgement QUALITY (about 94% kept when shown one output, 58% dropped at ~15), and it is real -- but
-    # a floor is not how to get large batches, it is how to decline. Read sweep_inventory_below_min
-    # against sweep_offered.
-    min_inventory: 3
+    # RAISED TO 10, and the 3 that stood here rested on a claim its own source refutes.
+    #
+    # WHAT I WROTE BEFORE: "iteration 024's actual firings commonly carried THREE candidates", so a floor
+    # of 7 would block 50 of its 203 firings and a floor is "how to decline, not how to get large
+    # batches". The second half is still true. The first half is wrong, and iteration 024's own pooled
+    # counters say so: sweep_offered 6,034 and sweep_over_ask_cap 3,682 across ~626 asks is 15.5 ELIGIBLE
+    # candidates per ask, capped by maxAskItems to a mean of 9.6 OFFERED. Iteration 024 -- the only run in
+    # this line that produced reward -- was already operating at the inflection, not at three.
+    #
+    # WHY THE INFLECTION IS THE RIGHT PLACE TO STAND, from extract_sweep.go's own measurements: shown one
+    # output, 6% live-kept on haiku and 14% on sonnet, both inside the drop-everything null model's error
+    # bar; shown ~15, 58% live-kept at the LOWEST cost per output; batch 3-6 dropped a genuinely-spent
+    # output 2 times in 4; batch 10 dropped it 4 in 4 and cleared 100% of genuinely-spent candidates. A
+    # drop from a three-candidate ask is a guess, and the probe measured what that buys: three asks of
+    # three candidates each dropped only 135, 170 and 162 tokens while keeping every 16k candidate, so
+    # 326 tokens net against 37,060 examined -- 1.2%. An ask that removes 1% of what it is shown does not
+    # repay itself at any premium.
+    #
+    # WHAT THIS COSTS, deliberately: roughly half the opportunities. Measured on the decision-point
+    # corpus, 44% of points carry >=10 candidates overall and 50% in the 32-64k band. That is the
+    # intended trade -- declining an ask whose judgement the measurements call a guess is strictly better
+    # than paying for it, because a wrong keep costs one turn's tokens and a wrong drop costs content the
+    # agent still needs. Read sweep_inventory_below_min against sweep_offered to see the half declined.
+    min_inventory: 10
     # THE PER-CANDIDATE OPPORTUNITY FLOOR, which iteration 027's first three probes left OFF. It is the
     # one this failure needed and I set the request-level floor instead: measured on the probe, 3 of 46
     # offered candidates had later_turns == 0 -- the model had taken no turn since receiving them -- and

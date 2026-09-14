@@ -120,9 +120,9 @@ func TestApprovalDiscountScalesTheRequirement(t *testing.T) {
 func TestApprovalFloorPreventsPermanentSelfDisable(t *testing.T) {
 	l := &askLedger{}
 	for i := 0; i < minAskSamples+2; i++ {
-		l.record(0.05, 10_000, 0) // asked, paid, removed nothing
+		l.record(0.05, 10_000, 0, 10) // asked, paid, removed nothing
 	}
-	cost, approval, measured := l.estimate(0)
+	cost, approval, measured := l.estimate(0, 10)
 	if !measured {
 		t.Fatalf("%d asks recorded and the ledger still reports the prior", minAskSamples+2)
 	}
@@ -130,11 +130,101 @@ func TestApprovalFloorPreventsPermanentSelfDisable(t *testing.T) {
 		t.Fatalf("approval %v: a zero estimate declines every future ask and can never be revised",
 			approval)
 	}
-	if approval != approvalFloor {
-		t.Errorf("approval = %v, want the floor %v", approval, approvalFloor)
+	// THE ASSERTION THAT USED TO STAND HERE was `approval == approvalFloor`, and it encoded the
+	// mechanism rather than the invariant. Five asks are 50,000 tokens of offered mass, which under
+	// mass-weighted shrinkage is not evidence that the rate is near zero — it is barely evidence at all,
+	// and reporting the floor there is exactly the 20x cliff that shut the component down on a measured
+	// probe. The INVARIANT this test exists for is unchanged and is asserted above: the estimate never
+	// reaches zero, so there is always a path back. The floor's own coverage moves to the case where the
+	// floor is what actually binds, below.
+	if approval < approvalFloor {
+		t.Errorf("approval = %v is below the floor %v", approval, approvalFloor)
+	}
+	if approval > 1 {
+		t.Errorf("approval = %v exceeds 1; the estimate is a fraction of offered mass", approval)
 	}
 	if cost <= 0 {
 		t.Errorf("cost = %v after recording $0.05 asks", cost)
+	}
+}
+
+// THE FLOOR STILL HAS TO BIND, and shrinkage does not replace it. Simulation over 384 decision points:
+// the unfloored form converged to 0.033 and made 11 fewer asks than the floored one at 128k. So with
+// enough mass to overwhelm the shrinkage, a genuinely near-zero rate must be reported AS the floor and
+// not below it.
+func TestTheFloorBindsOnceThereIsRealEvidenceOfANearZeroRate(t *testing.T) {
+	l := &askLedger{}
+	// Twenty times the shrinkage pseudo-count, all of it returning nothing: the prior cannot survive
+	// this much contrary mass, and what is left must be the floor rather than something smaller.
+	for i := 0; i < 20; i++ {
+		l.record(0.05, int(approvalShrinkTokens), 0, 10)
+	}
+	_, approval, _ := l.estimate(0, 10)
+	if approval != approvalFloor {
+		t.Errorf("approval = %v after %.0f tokens offered with zero returned; want exactly the floor %v",
+			approval, 20*approvalShrinkTokens, approvalFloor)
+	}
+}
+
+// NO CLIFF. The failure this replaced was discontinuous: the third ask completed, the estimate switched
+// from 1.0 to a pooled 0.0124, and 48 of the next evaluations declined. The estimate must move by a
+// little on a little evidence, whatever the ask count does.
+func TestApprovalDoesNotJumpWhenTheAskCountCrossesTheWarmUp(t *testing.T) {
+	l := &askLedger{}
+	var prev float64 = approvalPrior
+	for i := 1; i <= minAskSamples+3; i++ {
+		l.record(0.04, 12_000, 0, 10)
+		_, approval, _ := l.estimate(0, 10)
+		if drop := prev - approval; drop > 0.05 {
+			t.Errorf("ask %d: approval fell %.4f (%.4f -> %.4f) in one step; a step this size across "+
+				"the warm-up boundary is the cliff this estimator exists to remove", i, drop, prev, approval)
+		}
+		prev = approval
+	}
+}
+
+// A REGIME NEVER SAMPLED MUST INHERIT WHAT THE COMPONENT HAS LEARNED, not the fixed optimism. This is
+// the half of the bucketing that a rich-vs-thin comparison cannot see: with bucket 2 empty, shrinking it
+// toward approvalPrior instead of toward the pooled rate would make every FIRST ask in a new regime
+// price itself at 1.0 — cheap to authorise, and a fresh source of the same over-optimism the warm-up
+// prior already provides once.
+func TestAnUnsampledInventoryRegimeInheritsThePooledRate(t *testing.T) {
+	l := &askLedger{}
+	// Twenty pseudo-counts of thin-ask history at a genuinely poor rate, and NOTHING in the rich bucket.
+	for i := 0; i < 40; i++ {
+		l.record(0.04, 500_000, 5_000, 3)
+	}
+	if b := l.buckets[approvalBucket(12)]; b != nil {
+		t.Fatalf("fixture is wrong: the rich bucket already has history (%+v)", b)
+	}
+	_, rich, _ := l.estimate(0, 12)
+	if rich > 0.2 {
+		t.Errorf("an unsampled rich bucket reports %.4f; with %.0f tokens of pooled evidence at ~1%% it "+
+			"must inherit that experience rather than restart at the prior %v",
+			rich, 20*approvalShrinkTokens, approvalPrior)
+	}
+	if rich < approvalFloor {
+		t.Errorf("rich = %.4f is below the floor %v", rich, approvalFloor)
+	}
+}
+
+// ISSUE #230 AS A TEST: a rich ask must not be priced by thin-ask history. Without bucketing the two
+// estimates below are the same number, which is what made a twelve-candidate opportunity inherit a
+// three-candidate refusal rate.
+func TestARichAskIsNotPricedByThinAskHistory(t *testing.T) {
+	l := &askLedger{}
+	// A long history of THIN asks that returned almost nothing, and enough mass for it to count.
+	for i := 0; i < 40; i++ {
+		l.record(0.04, 500_000, 5_000, 3)
+	}
+	// And one rich ask that returned most of what it was shown.
+	l.record(0.04, 500_000, 400_000, 12)
+
+	_, thin, _ := l.estimate(0, 3)
+	_, rich, _ := l.estimate(0, 12)
+	if rich <= thin {
+		t.Errorf("rich-inventory approval %.4f is not above thin-inventory %.4f; the estimate is still "+
+			"a single scalar and a rich ask inherits the thin regime's refusal rate", rich, thin)
 	}
 }
 
@@ -143,26 +233,49 @@ func TestApprovalFloorPreventsPermanentSelfDisable(t *testing.T) {
 func TestAskLedgerLearnsCostAndApprovalAfterWarmUp(t *testing.T) {
 	l := &askLedger{}
 	const prior = 0.123
-	if cost, approval, measured := l.estimate(prior); measured || cost != prior || approval != 1 {
+	if cost, approval, measured := l.estimate(prior, 10); measured || cost != prior || approval != 1 {
 		t.Fatalf("a fresh ledger must report the prior and say so: cost=%v approval=%v measured=%v",
 			cost, approval, measured)
 	}
-	l.record(0.04, 1_000, 250)
-	if _, _, measured := l.estimate(prior); measured {
+	l.record(0.04, 1_000, 250, 10)
+	if _, _, measured := l.estimate(prior, 10); measured {
 		t.Errorf("one ask is not a rate: the ledger trusted itself after a single sample")
 	}
 	for i := 0; i < minAskSamples; i++ {
-		l.record(0.04, 1_000, 250)
+		l.record(0.04, 1_000, 250, 10)
 	}
-	cost, approval, measured := l.estimate(prior)
+	cost, _, measured := l.estimate(prior, 10)
 	if !measured {
 		t.Fatalf("still on the prior after %d asks", minAskSamples+1)
 	}
 	if cost < 0.039 || cost > 0.041 {
 		t.Errorf("cost = %v, want ~0.04 (mean of identical asks)", cost)
 	}
-	if approval < 0.24 || approval > 0.26 {
-		t.Errorf("approval = %v, want ~0.25 (250 of 1,000 offered)", approval)
+	// APPROVAL IS NO LONGER ASSERTED HERE, and that is the deliberate half of this change. Four asks are
+	// 4,000 tokens of offered mass; the assertion that used to stand here wanted ~0.25 from them, which
+	// is precisely the "a rate from almost no mass" reading that produced the cliff. Cost still learns on
+	// an ask count because it is an average over asks. Approval learns on mass, and is asserted below.
+}
+
+// The other half: approval DOES converge, on enough mass to earn it.
+func TestApprovalConvergesOnMassNotOnAskCount(t *testing.T) {
+	l := &askLedger{}
+	// Twenty times the pseudo-count at a true rate of 25%.
+	for i := 0; i < 20; i++ {
+		l.record(0.04, int(approvalShrinkTokens), int(0.25*approvalShrinkTokens), 10)
+	}
+	_, approval, _ := l.estimate(0.1, 10)
+	// Shrinkage still pulls upward at 20x, so the estimate approaches 0.25 from above rather than
+	// landing on it: (0.25k*20 + k*prior)/(20k + k) with prior itself shrunk. Asserted as a band, and
+	// the band is what makes this a convergence test rather than a restatement of the formula.
+	if approval < 0.25 || approval > 0.34 {
+		t.Errorf("approval = %v after %.0f tokens at a true 25%%; want to be approaching 0.25 from above",
+			approval, 20*approvalShrinkTokens)
+	}
+	// And it must be well below the prior, or it has not learned anything.
+	if approval > 0.5 {
+		t.Errorf("approval = %v is still near the prior %v after twenty pseudo-counts of contrary "+
+			"evidence", approval, approvalPrior)
 	}
 }
 
@@ -171,9 +284,9 @@ func TestAskLedgerLearnsCostAndApprovalAfterWarmUp(t *testing.T) {
 func TestAskLedgerIgnoresAnAskThatOfferedNothing(t *testing.T) {
 	l := &askLedger{}
 	for i := 0; i < minAskSamples+1; i++ {
-		l.record(0.04, 0, 0)
+		l.record(0.04, 0, 0, 10)
 	}
-	if _, _, measured := l.estimate(0.5); measured {
+	if _, _, measured := l.estimate(0.5, 10); measured {
 		t.Error("empty asks were counted as samples, so the ledger now reports a rate over no mass")
 	}
 }

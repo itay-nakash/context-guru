@@ -455,7 +455,8 @@ func (e *ExtractSweep) econPays(req *bschemas.BifrostChatRequest, c *components.
 	saved, shallowest := candMass(cands)
 	d := econDecision{offered: saved, approval: 1}
 	if !e.ignoreAskCost {
-		d.askUSD, d.approval, d.measured = e.asks.estimate(askCostPrior(req, c))
+		// Bucketed by the inventory this decision is about, so the estimate describes THIS regime.
+		d.askUSD, d.approval, d.measured = e.asks.estimate(askCostPrior(req, c), len(cands))
 	}
 	e.priceBatch(req, saved, shallowest, &d, c)
 	// Stashed for the ask dump, which is written inside adjudicate and cannot see this decision.
@@ -1057,7 +1058,7 @@ func (e *ExtractSweep) Offload(req *bschemas.BifrostChatRequest, rep *components
 		if offered == 0 {
 			offered, _ = candMass(cands)
 		}
-		e.asks.record(call.rec.CostUSD, offered, applied)
+		e.asks.record(call.rec.CostUSD, offered, applied, len(cands))
 		if call.rec.Component != "" {
 			rep.Calls = append(rep.Calls, call.rec)
 		}
