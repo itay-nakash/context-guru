@@ -81,8 +81,17 @@ type compactRow struct {
 	CacheRead int64
 	// CGLLMCostUSD is context-guru's own model spend on this request — the summarizer's call.
 	CGLLMCostUSD float64
-	// SavedUSD is summarize's share of this request's baseline delta, priced at write time.
-	// Zero on a turn where summarize did nothing.
+	// SavedGross is summarize's own token count of what it removed on this turn — including on a
+	// replay, where the same span is removed again. It is the credit's QUANTITY; the RATE comes from
+	// this row's cache verdict. See creditTurn for why the stored saved_usd is not the credit.
+	//
+	// Measured on our tokenizer's ruler (message text only), so it under-states the provider's count
+	// of the same content by ~12% at the transcript sizes compaction happens at — issue #240.
+	// Conservative for a savings figure, and stated in the panel's assumptions.
+	SavedGross int64
+	// SavedUSD is summarize's share of this request's baseline delta, priced at write time. Read
+	// ONLY to detect that summarize did something priceable on this turn, never as a credit — see
+	// creditTurn.
 	SavedUSD float64
 	// Events is summarize's Report.Events for this request, as stored JSON. It says whether this
 	// turn PAID for a summary or replayed one, which is what identifies an episode's t0.
@@ -225,18 +234,21 @@ type CompactionCoverage struct {
 // CompactionAssumptions is the server stating its own arithmetic, so the page prints it rather
 // than restating it in a template nothing tests — the rule the KV-cache page already keeps.
 type CompactionAssumptions struct {
-	SpanFrac        float64 `json:"span_frac"`
-	FillFrac        float64 `json:"fill_frac"`
-	SpanMeasure     string  `json:"span_measure"`
-	CreditSource    string  `json:"credit_source"`
-	ColdLabel       string  `json:"cold_label"`
-	ReadLabel       string  `json:"read_label"`
-	DebitBound      string  `json:"debit_bound"`
-	VoidRule        string  `json:"void_rule"`
-	WindowRule      string  `json:"window_rule"`
-	KnownOmission   string  `json:"known_omission"`
-	OpenRule        string  `json:"open_rule"`
-	SpanMeasureNote string  `json:"span_measure_note"`
+	SpanFrac     float64 `json:"span_frac"`
+	FillFrac     float64 `json:"fill_frac"`
+	SpanMeasure  string  `json:"span_measure"`
+	CreditSource string  `json:"credit_source"`
+	// CreditQuantityNote names the known error in the credit's QUANTITY, which is a different thing
+	// from its rate: the tokens are counted on our own ruler. See issue #240.
+	CreditQuantityNote string `json:"credit_quantity_note"`
+	ColdLabel          string `json:"cold_label"`
+	ReadLabel          string `json:"read_label"`
+	DebitBound         string `json:"debit_bound"`
+	VoidRule           string `json:"void_rule"`
+	WindowRule         string `json:"window_rule"`
+	KnownOmission      string `json:"known_omission"`
+	OpenRule           string `json:"open_rule"`
+	SpanMeasureNote    string `json:"span_measure_note"`
 }
 
 // CompactionEpisodes is the whole view.
@@ -409,14 +421,16 @@ func conversationEpisodes(conv []compactRow, w int, p kvcache.Pricing, spanFrac 
 	var cur *CompactionEpisode
 	var prevTokensBefore int64
 	for _, r := range conv {
-		// credited guards the one row that can belong to two episodes: the turn that closes a
-		// span AND itself produces a fresh summary. Its SAVING was earned inside the span that
-		// is closing and is credited there; its COSTS (the new summary's own call, and the cache
-		// write that rewrite caused) belong to the span it opens. Crediting it twice would make
-		// the sum of episodes exceed the money that existed, which is the one direction a
-		// savings figure must never go.
-		credited := false
-
+		// ONE ROW CAN BELONG TO TWO EPISODES: the turn that closes a span AND itself commissions
+		// the next summary. Its SAVING was earned inside the span that is closing and is credited
+		// there; its COSTS — the new summary's own call, and the cache write that rewrite caused —
+		// are the next span's investment and belong to the span it OPENS.
+		//
+		// This used to be carried in a `credited` flag that stated the rule and was then discarded
+		// as `_ = credited`, so such a row was debited in BOTH episodes and the sum of episodes
+		// exceeded the money that existed — the one direction a savings figure must never go. A
+		// review found it. The rule is now structural (`closing && opensNew` below) rather than
+		// held in a variable, so it cannot be declared and then forgotten a second time.
 		if cur != nil {
 			// A DROP in our own message-token count means the client compacted its own
 			// transcript. Scale-free (one measure against itself), which is why this is the
@@ -432,26 +446,7 @@ func conversationEpisodes(conv []compactRow, w int, p kvcache.Pricing, spanFrac 
 		if cur != nil {
 			cur.Turns++
 			cur.EndTS, cur.EndBilled = r.TS, r.Billed
-			creditTurn(cur, r)
-			credited = true
-			// A roll-forward inside the span is not a new episode — it is this episode still
-			// being maintained, and its cost belongs to the span it happened in.
-			if isFreshSummary(r) != "" {
-				cur.SummarizerCostUSD += r.CGLLMCostUSD
-				cur.InvalidationDebitUSD += causedWriteUSD(r, p)
-			} else if r.MissReason == CachePrefixChange {
-				// A prefix_change turn inside a span we opened is a cache write charged because
-				// the prompt no longer matched what was cached — and inside a summarized span the
-				// thing that changes the prompt is US. It is already excluded from the credit for
-				// that reason (see creditTurn); excluding it from the DEBIT as well would be
-				// having it both ways, counting neither our damage nor its cost.
-				//
-				// Observed for real: a turn whose summarizer call hung held the request past its
-				// own cache lifetime, so the entry expired in our hands and the full prefix was
-				// re-written — and it was recorded as prefix_change, because idle is measured at
-				// arrival while the expiry happened inside the pipeline.
-				cur.InvalidationDebitUSD += writeUSD(r.CacheWrite, r.CacheWrite1h, p)
-			}
+			creditTurn(cur, r, p)
 			// CUMULATIVE NEW CONTENT, which is neither of the two obvious axes.
 			//
 			// Per-turn SIZE does not work: compaction reduces what a turn sends, so `r.Billed`
@@ -476,8 +471,19 @@ func conversationEpisodes(conv []compactRow, w int, p kvcache.Pricing, spanFrac 
 			//     existed. Counting it would call the whole transcript "new" every time an entry
 			//     expired, which is exactly the over-count that made a cold t0 close its own span.
 			//   - cache_read is the re-sent prefix and is never new.
+			//
+			// Computed BEFORE the costs are attributed, because which episode owns this row's
+			// costs depends on whether the span ends here.
 			cur.NewContentBilled += newContentBilled(r)
-			if cur.NewContentBilled >= span {
+			closing := cur.NewContentBilled >= span
+			// opensNew: this row commissions a summary, so a new episode begins on it. Together
+			// with `closing` it identifies the one row that belongs to two episodes, whose costs
+			// are charged to the span it OPENS and not to the one it closes.
+			opensNew := isFreshSummary(r) != ""
+			if !(closing && opensNew) {
+				chargeRowCosts(cur, r, p, opensNew)
+			}
+			if closing {
 				cur.State = EpisodeClosed
 				finishEpisode(cur, p)
 				out = append(out, *cur)
@@ -499,7 +505,7 @@ func conversationEpisodes(conv []compactRow, w int, p kvcache.Pricing, spanFrac 
 					InvalidationDebitUSD: causedWriteUSD(r, p),
 					SummarizerCostUSD:    r.CGLLMCostUSD,
 				}
-				// NO CREDIT ON THE COMPACTION TURN, and `credited` is now irrelevant to that.
+				// NO CREDIT ON THE COMPACTION TURN.
 				//
 				// At t0 nothing has been saved — we have only SPENT: a model call, and a cache
 				// write for the new smaller prefix. The saving arrives on later turns, as reads
@@ -507,7 +513,6 @@ func conversationEpisodes(conv []compactRow, w int, p kvcache.Pricing, spanFrac 
 				// 1.25xF. Crediting t0 front-loaded a saving at the cache-CREATION rate for work
 				// that had not yet paid off, which is the one direction a savings figure must
 				// never lean.
-				_ = credited
 			}
 		}
 		prevTokensBefore = r.TokensBefore
@@ -520,23 +525,133 @@ func conversationEpisodes(conv []compactRow, w int, p kvcache.Pricing, spanFrac 
 	return out
 }
 
-// creditTurn adds one turn's summarize saving to the bucket its cache verdict names.
+// chargeRowCosts charges one row's DEBITS to the episode whose investment they are.
 //
-// prefix_change is deliberately absent from all three buckets. That verdict means the entry
-// missed because the prompt had CHANGED — which on a summarized session is frequently our own
-// doing — so counting it as a saving would credit this component for the misses it caused.
-func creditTurn(e *CompactionEpisode, r compactRow) {
-	if r.SavedUSD == 0 {
+// # Our own model spend is charged on EVERY turn in the span, not only on a summarizing one
+//
+// On the async path the summarizer's cost does not land on the turn that commissioned it. The
+// detached goroutine finishes after t0's row has already been written, so its usage is attributed
+// one turn late (cheapmodel.ReplayUsage + store.UsagePrefix, commit f61e8c0). t0+1 carries
+// EventAwaitedCheckpoint, which isFreshSummary classifies as a REPLAY — so gating the charge on
+// isFreshSummary wrote the cost to the database and then skipped reading it back.
+//
+// The repo had already said this twice: in f61e8c0's own message ("The episode panel charges that
+// spend as a debit, so a missing cost inflates the reported net") and in proxy/cgllm_test.go ("TWO
+// REQUESTS, and the cost lands on the SECOND"). The proxy side was fixed; this side was never
+// updated to follow, and A REVIEW MEASURED THE CONSEQUENCE — the summarizer's $0.0727 missing from
+// a reported net, in the direction this file repeatedly insists a savings figure must never lean.
+//
+// Charging every turn slightly over-attributes: cg_llm_cost_usd is the whole request's context-guru
+// model spend, so another component's extraction call inside the span is charged here too. That is
+// the conservative direction, and it is the only rule that cannot silently MISS our call — the
+// alternative is to key on where the deferred usage was attributed, which is not a fact the row
+// carries.
+//
+// # The cache write
+//
+// opensNew says this row commissioned a summary, so the write it caused is ours to answer for — but
+// only where the entry was still live, which is causedWriteUSD's rule.
+func chargeRowCosts(e *CompactionEpisode, r compactRow, p kvcache.Pricing, opensNew bool) {
+	e.SummarizerCostUSD += r.CGLLMCostUSD
+	switch {
+	case opensNew:
+		e.InvalidationDebitUSD += causedWriteUSD(r, p)
+	case r.MissReason == CachePrefixChange:
+		// A prefix_change turn inside a span we opened is a cache write charged because the prompt
+		// no longer matched what was cached — and inside a summarized span the thing that changes
+		// the prompt is US. It is already excluded from the credit for that reason (see creditTurn);
+		// excluding it from the DEBIT as well would be having it both ways, counting neither our
+		// damage nor its cost.
+		//
+		// Observed for real: a turn whose summarizer call hung held the request past its own cache
+		// lifetime, so the entry expired in our hands and the full prefix was re-written — and it
+		// was recorded as prefix_change, because idle is measured at arrival while the expiry
+		// happened inside the pipeline.
+		e.InvalidationDebitUSD += writeUSD(r.CacheWrite, r.CacheWrite1h, p)
+	}
+}
+
+// creditTurn adds one turn's summarize saving to the bucket its cache verdict names, PRICED HERE
+// rather than inherited from request_components.saved_usd.
+//
+// # Why this does not use saved_usd, though an earlier version did
+//
+// saved_usd is Event.baselineDeltaUSD: `unique × cacheWriteRate + (gross − unique) × repeatRate`.
+// The repeat term is right. The UNIQUE term has no meaning inside an episode, and pricing it at the
+// cache-creation rate on a turn whose cache HIT overstated that turn by the full write:read ratio —
+// 12.5x on the Anthropic family.
+//
+// NOTHING SUMMARIZE REMOVES INSIDE A SPAN IS NEW CONTENT. That is what makes it summarizable: the
+// span it drops is transcript the provider has already been sent, at least once, on an earlier turn.
+// So the counterfactual for a removed span is never "this content enters the prompt for the first
+// time" — it is "this content is re-sent, and billed at whatever rate this turn paid for its
+// prefix". `unique` is a dedup of STASH keys, and it answers a different question.
+//
+// A LIVE REVIEW RUN CAUGHT THIS, and it had inverted the panel's sign. On the async path the stash
+// is written by the background goroutine, which has no Report — so the checkpoint key first reaches
+// rep.CacheKeys on the turn that REPLAYS it, one turn after the summary was commissioned.
+// Recorder.MarkUnique sees a key it has never seen, returns the whole removal as unique, and the row
+// lands with saved_usd priced at the cache-creation rate. That turn is a cache HIT, and unlike t0 it
+// IS credited. So going async moved the write-rate term off the uncredited compaction turn and onto
+// a credited warm one: a measured episode that LOST $0.0397 was published as +$0.376, and the
+// write-rate term was $0.358 of that gap — larger than the missing summarizer debit by ~5x.
+//
+// The bucket labels and the arithmetic now agree, which they did not before: a figure sitting in
+// ReadCreditUSD — the bucket documented as "billed at the cache-read rate" — had been priced at the
+// cache-WRITE rate.
+//
+// # The rate each verdict earns
+//
+//   - ttl_expiry: the entry had lapsed, so an uncompacted prefix would have been RE-CREATED. The
+//     cache-creation rate, and this is the one bucket where the write rate belongs. Its 1h-tier
+//     subset is split the same way the debit's is, assuming the counterfactual write would have used
+//     the tier this turn's actual write did — the only tier evidence the row carries.
+//   - hit: the entry was live, so the removed span would have been served from it. The cache-READ
+//     rate.
+//   - cold_start / unknown: reported apart and never blended into either, at the read rate, which is
+//     the conservative choice for a bucket no total picks up.
+//
+// prefix_change is deliberately absent from all three buckets. That verdict means the entry missed
+// because the prompt had CHANGED — which on a summarized session is frequently our own doing — so
+// counting it as a saving would credit this component for the misses it caused.
+//
+// # The quantity, and its known error
+//
+// saved_gross is summarize's own tokenizer over message text, which under-states the provider's
+// count of the same removed content by ~12.4% at the sizes compaction happens at (issue #240). That
+// under-reports this component, which is the safe direction, and the panel says so.
+func creditTurn(e *CompactionEpisode, r compactRow, p kvcache.Pricing) {
+	// saved_usd is read for exactly one thing: it is non-zero iff summarize removed something on
+	// this turn that the savings pipeline was willing to price. Cheaper than re-deriving that
+	// condition, and it keeps this bucket's population identical to the one the Components tab
+	// reports for the same component.
+	if r.SavedUSD == 0 || r.SavedGross <= 0 || !p.Known {
 		return
 	}
 	switch r.MissReason {
 	case CacheTTLExpiry:
-		e.ColdCreditUSD += r.SavedUSD
+		// The counterfactual write is the whole removed span, at the tier this turn wrote at.
+		e.ColdCreditUSD += writeUSD(r.SavedGross, scaledWrite1h(r), p)
 	case CacheHit:
-		e.ReadCreditUSD += r.SavedUSD
+		e.ReadCreditUSD += float64(r.SavedGross) * p.CacheRead
 	case CacheColdStart, CacheUnknown, "":
-		e.OtherCreditUSD += r.SavedUSD
+		e.OtherCreditUSD += float64(r.SavedGross) * p.CacheRead
 	}
+}
+
+// scaledWrite1h is how much of a counterfactual write of SavedGross tokens would have been billed at
+// the 1-hour tier, assuming the removed span would have used the same tier mix this turn's own write
+// did. All of it, none of it, or a proportional share — there is no per-span tier on the row, and
+// the alternative is to assume the cheaper 5m tier for everything, which would understate the one
+// bucket that carries the headline.
+func scaledWrite1h(r compactRow) int64 {
+	if r.CacheWrite1h <= 0 || r.CacheWrite <= 0 {
+		return 0
+	}
+	if r.CacheWrite1h >= r.CacheWrite {
+		return r.SavedGross
+	}
+	return r.SavedGross * r.CacheWrite1h / r.CacheWrite
 }
 
 // finishEpisode computes the net once the credits and debits are all in.
@@ -735,9 +850,15 @@ func compactAssumptions(spanFrac, fillFrac float64) CompactionAssumptions {
 		SpanFrac:    spanFrac,
 		FillFrac:    fillFrac,
 		SpanMeasure: "provider-billed NEW content (fresh input, plus the newly-written tail on turns whose cache hit), in the units the context window is stated in",
-		CreditSource: "request_components.saved_usd for the summarize component, priced at write time " +
-			"(Event.baselineDeltaUSD: unique removals at the cache-creation rate, re-sent " +
-			"removals at the rate that turn's cache actually paid)",
+		CreditSource: "the tokens summarize removed on each turn (request_components.saved_gross), " +
+			"priced at the rate THAT turn's cache verdict earns: the cache-creation rate where the " +
+			"entry had lapsed, the cache-read rate where it hit. Nothing removed inside a span is " +
+			"new content, so the stored saved_usd — which prices first-time removals at the " +
+			"creation rate — is deliberately not used as the credit",
+		CreditQuantityNote: "the removed-token count is our own tokenizer over message text, which " +
+			"under-states the provider's count of the same content by roughly 12% at the transcript " +
+			"sizes compaction happens at (issue #240). This panel therefore under-reports rather " +
+			"than over-reports",
 		ColdLabel:       "turns whose cache_miss_reason is ttl_expiry — the entry had lapsed, so an uncompacted prefix would have been re-written in full",
 		ReadLabel:       "turns whose cache_miss_reason is hit — the re-sent remainder, billed at the cache-read rate",
 		SpanMeasureNote: "the span closes on cumulative NEW content since t0 — fresh input plus the newly-written tail on turns whose cache hit. It excludes the re-sent prefix (a cache read) and the re-creation of an expired one (a cache write on a miss), because counting either makes one turn exceed the whole span",
@@ -762,7 +883,8 @@ func compactAssumptions(spanFrac, fillFrac float64) CompactionAssumptions {
 const compactEpisodeSelect = `SELECT r.tenant_id, r.session_id, r.model, r.ts, r.tokens_before,
 		r.fresh_input + r.cache_read + r.cache_write AS billed,
 		r.cache_miss_reason, r.cache_write, r.cache_write_1h, r.cache_read, r.cg_llm_cost_usd,
-		COALESCE(c.saved_usd, 0), COALESCE(c.events, ''), COALESCE(c.acted, 0)
+		COALESCE(c.saved_gross, 0), COALESCE(c.saved_usd, 0), COALESCE(c.events, ''),
+		COALESCE(c.acted, 0)
 	FROM requests r
 	LEFT JOIN request_components c ON c.request_id = r.id AND c.component = 'summarize'
 	WHERE %s
@@ -783,7 +905,7 @@ func (d *DB) compactEpisodeDataset(f Filter) ([]compactRow, error) {
 		var acted int
 		if err := rows.Scan(&r.Tenant, &r.Session, &r.Model, &r.TS, &r.TokensBefore,
 			&r.Billed, &r.MissReason, &r.CacheWrite, &r.CacheWrite1h, &r.CacheRead,
-			&r.CGLLMCostUSD, &r.SavedUSD, &r.Events, &acted); err != nil {
+			&r.CGLLMCostUSD, &r.SavedGross, &r.SavedUSD, &r.Events, &acted); err != nil {
 			return nil, err
 		}
 		r.Acted = acted != 0
