@@ -71,6 +71,14 @@ messages, and Anthropic accepts it — an alternation rule would reject correct 
 legality on the wire (`role:"tool"` never reaching Anthropic) is a property of the *bytes*, not
 of the normalized list, so it is asserted on the raw body instead (`apply/toolrole_wire_test.go`).
 
+> **Testing this component.** The gate is timing-dependent and three of its defects were only
+> reachable on live traffic, so the scenarios that matter are written down rather than rediscovered:
+> `docs/proposals/timely-compact-validation.md` (in the repo, not on this site) carries
+> the full matrix — the Go-level cases and what each protects, the three live `claude -p` arms in
+> `scripts/scenarios/`, the six rig traps that each produced a *silently empty* run, and a table of
+> which levels to re-run for a given change. Read it before changing the trigger or the episode
+> accounting.
+
 ## Configuration
 
 | Key | Default | Meaning |
@@ -89,7 +97,7 @@ of the normalized list, so it is asserted on the raw body instead (`apply/toolro
 | `model.auth` | `x-api-key` | Anthropic only: `x-api-key` \| `bearer`. |
 | `trigger.min_request_frac` | **0.9** | Summarize only once the session has been billed at least this fraction of the model's context window. Measured from the provider's own input count for the previous turn — see below. |
 | `trigger.cache_state` | **`pre_expiry_or_cold`** | Summarize only when the prompt cache is about to expire **or has already expired** — the two moments when the cache write it costs was going to be paid anyway. `any` removes the constraint. See below. |
-| `trigger.pre_expiry_seconds` | 60 | How wide "about to expire" is. Unmeasured either way. |
+| `trigger.pre_expiry_seconds` | 60 | How wide "about to expire" is. Must stay below the shortest prompt-cache lifetime (300s) or every warm turn counts as pre-expiry; refused at config time above that. |
 | `trigger` (rest) | — | `min_request_tokens`, `min_messages`, `min_output_tokens`, `min_output_frac`, `huge_output_frac`. |
 | `summary_wait_seconds` | 120 | The summary is produced **off the hot path**; a turn that arrives while one is still running waits this long for it. When the wait expires the turn proceeds regardless. See below. |
 | `marker_mode` | `full` | `full` (stash + resolvable marker) / `summary` / `off`. |

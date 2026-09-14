@@ -553,14 +553,28 @@ func TestTheServerStatesTheFractionsItActuallyUsed(t *testing.T) {
 	if out.Coverage.FillFrac != 0.5 {
 		t.Errorf("coverage fill_frac = %v, want 0.5", out.Coverage.FillFrac)
 	}
-	// A zero falls back to the shipped default rather than producing a degenerate span.
+	// A ZERO SPAN MEANS "DERIVED PER MODEL", not "fall back to a shipped constant". The span's far end
+	// is the client's compaction ceiling and that is a per-model fact, so the top-level SpanFrac is the
+	// explicit `?span=` OVERRIDE and the spans actually used are one per model in ClientCeilings. A
+	// single top-level number would be an average of things that are not comparable.
 	def := walkCompactEpisodes(nil, exactWindow, testPrice, 0, 0, 0)
-	wantSpan, ok := spanFor(defaultFillFrac, defaultClientCeilingFrac)
-	if !ok {
-		t.Fatal("the shipped fill and ceiling must leave an attributable span")
+	if def.Assumptions.SpanFrac != 0 {
+		t.Errorf("span_frac = %v with no override; it must report 0 to mean DERIVED, or a reader takes "+
+			"it for the span every model was measured against", def.Assumptions.SpanFrac)
 	}
-	if def.Assumptions.SpanFrac != wantSpan || def.Assumptions.FillFrac != defaultFillFrac {
-		t.Errorf("assumptions with zero fractions = %+v, want the shipped defaults", def.Assumptions)
+	if def.Assumptions.FillFrac != defaultFillFrac {
+		t.Errorf("fill_frac = %v, want the shipped %v", def.Assumptions.FillFrac, defaultFillFrac)
+	}
+	// The shipped fill and the shipped ceiling must leave an attributable span, or the component
+	// could never be credited for anything on a default deployment.
+	if wantSpan, ok := spanFor(defaultFillFrac, defaultClientCeiling); !ok {
+		t.Error("the shipped fill and default ceiling leave no attributable span")
+	} else if math.Abs(wantSpan-0.10) > 1e-9 {
+		t.Errorf("the shipped pair derives a span of %v, want 0.10", wantSpan)
+	}
+	if def.Assumptions.SpanRule == "" {
+		t.Error("the assumptions must state WHY the span is the width it is; a derived number the " +
+			"page cannot explain is one the reader has to take on trust")
 	}
 	if def.Assumptions.KnownOmission == "" {
 		t.Error("the assumptions must name what this measurement leaves out; an omission the " +
@@ -1083,13 +1097,14 @@ func TestATriggerAboveTheClientCeilingIsReportedNotSilentlyRescaled(t *testing.T
 		t.Errorf("a trigger above the client's ceiling must produce no episodes, got %d",
 			len(out.Episodes))
 	}
-	if !out.Coverage.NoAttributableSpan {
-		t.Error("no_attributable_span must be set, or the panel reports an empty dataset where the " +
-			"truth is that this configuration cannot help at all")
+	if out.Coverage.NoAttributableSpan != 1 {
+		t.Errorf("no_attributable_span = %d, want 1: the panel must report that this configuration "+
+			"cannot help at all, not an empty dataset", out.Coverage.NoAttributableSpan)
 	}
-	if out.Assumptions.ClientCeilingFrac != 0.835 {
-		t.Errorf("client_ceiling_frac = %v, want the 0.835 it was given — the page prints this, so a "+
-			"value the measurement did not use would be a lie", out.Assumptions.ClientCeilingFrac)
+	// And the excluded conversation contributes no ceiling entry, because it was never measured
+	// against one — an entry there would claim the panel had used a span it refused to derive.
+	if len(out.Assumptions.ClientCeilings) != 0 {
+		t.Errorf("client_ceilings = %+v, want none: nothing was measured", out.Assumptions.ClientCeilings)
 	}
 }
 
@@ -1097,10 +1112,83 @@ func TestATriggerAboveTheClientCeilingIsReportedNotSilentlyRescaled(t *testing.T
 // measurement did not use.
 func TestTheDerivedSpanReachesTheServedAssumptions(t *testing.T) {
 	out := walkCompactEpisodes([]compactRow{row(1, 1_000, fresh)}, exactWindow, testPrice, 0, 0.50, 1.00)
-	if got := out.Assumptions.SpanFrac; math.Abs(got-0.50) > 1e-9 {
-		t.Errorf("span_frac = %v for a 0.50 fill against a 1.00 ceiling, want 0.50", got)
+	if len(out.Assumptions.ClientCeilings) != 1 {
+		t.Fatalf("want one ceiling entry, got %+v", out.Assumptions.ClientCeilings)
 	}
-	if got := out.Assumptions.ClientCeilingFrac; math.Abs(got-1.00) > 1e-9 {
-		t.Errorf("client_ceiling_frac = %v, want 1.00", got)
+	c := out.Assumptions.ClientCeilings[0]
+	if math.Abs(c.SpanFrac-0.50) > 1e-9 {
+		t.Errorf("span_frac = %v for a 0.50 fill against a 1.00 ceiling, want 0.50", c.SpanFrac)
+	}
+	if math.Abs(c.Frac-1.00) > 1e-9 {
+		t.Errorf("ceiling frac = %v, want the 1.00 it was given", c.Frac)
+	}
+}
+
+// THE CEILING IS RESOLVED PER MODEL, and a query spanning two models must not average them.
+//
+// It is a fact about the CLIENT's behaviour on a given model: Claude Code compacts a haiku session at
+// a measured 0.996 of a 200,000 window, and an unlisted model has no entry at all. One number for the
+// whole query would be an average of things that are not comparable, and it would hide which
+// published figures rest on a measurement.
+func TestTheCeilingIsResolvedPerModelAndCarriesItsProvenance(t *testing.T) {
+	haiku := row(1, 1_000, fresh)
+	haiku.Model = "claude-haiku-4-5"
+	other := row(2, 1_000, fresh)
+	other.Model, other.Session = "some-unlisted-model", "s2"
+
+	out := walkCompactEpisodes([]compactRow{haiku, other},
+		func(string) (int, bool) { return 200_000, true }, testPrice, 0, 0.90, 0)
+	if len(out.Assumptions.ClientCeilings) != 2 {
+		t.Fatalf("want one entry per model, got %+v", out.Assumptions.ClientCeilings)
+	}
+	byModel := map[string]ClientCeilingUsed{}
+	for _, c := range out.Assumptions.ClientCeilings {
+		byModel[c.Model] = c
+	}
+	h := byModel["claude-haiku-4-5"]
+	if h.Provenance != string(ceilingMeasured) {
+		t.Errorf("haiku ceiling provenance = %q, want %q — it was observed on a real client run",
+			h.Provenance, ceilingMeasured)
+	}
+	if math.Abs(h.Frac-0.996) > 1e-9 {
+		t.Errorf("haiku ceiling = %v, want the measured 0.996 in BILLED tokens (not the ~0.835 the "+
+			"client's own indicator shows for the same turn)", h.Frac)
+	}
+	u := byModel["some-unlisted-model"]
+	if u.Provenance != string(ceilingDefault) {
+		t.Errorf("unlisted model provenance = %q, want %q", u.Provenance, ceilingDefault)
+	}
+	if u.Frac != defaultClientCeiling {
+		t.Errorf("unlisted model ceiling = %v, want the fallback %v", u.Frac, defaultClientCeiling)
+	}
+	// Every entry says WHY, or the provenance is a label with nothing behind it.
+	for _, c := range out.Assumptions.ClientCeilings {
+		if c.Note == "" {
+			t.Errorf("%s carries no note; a provenance label with no reasoning cannot be audited", c.Model)
+		}
+	}
+}
+
+// The per-model table itself, including the routed forms a gateway produces.
+func TestClientCeilingTableMatchesRoutedModelIDs(t *testing.T) {
+	for _, tc := range []struct {
+		id   string
+		frac float64
+		prov ceilingProvenance
+	}{
+		{"claude-haiku-4-5", 0.996, ceilingMeasured},
+		{"aws/claude-haiku-4-5", 0.996, ceilingMeasured},
+		{"claude-opus-5", 1.00, ceilingAssumed},
+		{"aws/claude-opus-5[1m]", 1.00, ceilingAssumed},
+		{"claude-sonnet-5", 1.00, ceilingAssumed},
+		{"gpt-5", defaultClientCeiling, ceilingDefault},
+	} {
+		t.Run(tc.id, func(t *testing.T) {
+			got := clientCeilingFor(tc.id)
+			if math.Abs(got.Frac-tc.frac) > 1e-9 || got.Prov != tc.prov {
+				t.Errorf("clientCeilingFor(%q) = %v/%s, want %v/%s",
+					tc.id, got.Frac, got.Prov, tc.frac, tc.prov)
+			}
+		})
 	}
 }

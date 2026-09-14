@@ -213,11 +213,13 @@ type CompactionEpisodeGroup struct {
 // decides whether the trigger is worth its default is how many qualifying conversations produced
 // NO episode at all, and what the cold rewrites cost them.
 type CompactionCoverage struct {
-	// NoAttributableSpan is set when the fill threshold sits at or above the client's own compaction
-	// ceiling: the client compacts before we would ever fire, so there is no window in which anything
-	// is attributable to us and this component cannot help on this deployment. A configuration to
-	// change, not an empty dataset — which is why it is a flag rather than a zero count.
-	NoAttributableSpan bool `json:"no_attributable_span"`
+	// NoAttributableSpan counts conversations excluded because the fill threshold sits at or above
+	// the CLIENT's compaction ceiling for that model: the client compacts before we would ever fire,
+	// so there is no window in which anything is attributable to us and this component cannot help
+	// there. A configuration to change, not an empty dataset — and a COUNT rather than a flag,
+	// because the ceiling is per model and a query can span one model where this holds and another
+	// where it does not.
+	NoAttributableSpan int `json:"no_attributable_span"`
 	// FillFrac is the threshold a conversation had to reach to qualify, as a fraction of its
 	// window, measured in billed input. Reported because it is a parameter, not a law.
 	FillFrac float64 `json:"fill_frac"`
@@ -240,6 +242,10 @@ type CompactionCoverage struct {
 // CompactionAssumptions is the server stating its own arithmetic, so the page prints it rather
 // than restating it in a template nothing tests — the rule the KV-cache page already keeps.
 type CompactionAssumptions struct {
+	// SpanFrac is the explicit `?span=` override, or 0 meaning the span was DERIVED per model from
+	// that model's client ceiling. The spans actually used are in ClientCeilings, one per model,
+	// because the ceiling is a per-model fact and one number here would average things that are not
+	// comparable.
 	SpanFrac     float64 `json:"span_frac"`
 	FillFrac     float64 `json:"fill_frac"`
 	SpanMeasure  string  `json:"span_measure"`
@@ -258,10 +264,11 @@ type CompactionAssumptions struct {
 	// SpanRule says WHY the span is the width it is: it is an attribution boundary derived from the
 	// fill threshold, not a tuning knob. See spanFor.
 	SpanRule string `json:"span_rule"`
-	// ClientCeilingFrac is where the CLIENT is assumed to compact its own transcript, as a fraction of
-	// the window in provider-billed tokens. It is the far end of the span and it belongs to the client,
-	// not to the model — see spanFor.
-	ClientCeilingFrac float64 `json:"client_ceiling_frac"`
+	// ClientCeilings is one entry per model this query actually measured, because the ceiling is a
+	// fact about the CLIENT's behaviour on that model and a single number would be an average of
+	// things that are not comparable. Each carries its provenance, so a reader can tell which
+	// published figures rest on a measurement and which on an assumption.
+	ClientCeilings []ClientCeilingUsed `json:"client_ceilings"`
 }
 
 // CompactionEpisodes is the whole view.
@@ -381,16 +388,17 @@ func walkCompactEpisodes(rows []compactRow, window windowFn, price priceFn,
 	if fillFrac <= 0 {
 		fillFrac = defaultFillFrac
 	}
-	if ceilingFrac <= 0 {
-		ceilingFrac = defaultClientCeilingFrac
-	}
-	spanOK := true
-	if spanFrac <= 0 {
-		spanFrac, spanOK = spanFor(fillFrac, ceilingFrac)
-	}
+	// THE CEILING IS PER MODEL, so it is resolved per conversation below rather than once here — it
+	// is a fact about the CLIENT's behaviour on a given model, and a query spanning haiku and opus
+	// must not average the two. `ceilingFrac > 0` is the explicit `?ceiling=` override, which applies
+	// to every conversation because an operator using it is investigating one deployment.
+	explicitCeiling := ceilingFrac > 0
+	// Likewise the span: derived per conversation from that conversation's own ceiling. A non-zero
+	// spanFrac here is the explicit `?span=` override.
+	explicitSpan := spanFrac > 0
 	out := &CompactionEpisodes{
 		Coverage:    CompactionCoverage{FillFrac: fillFrac},
-		Assumptions: compactAssumptions(spanFrac, fillFrac, ceilingFrac),
+		Assumptions: compactAssumptions(spanFrac, fillFrac),
 		Scanned:     int64(len(rows)),
 	}
 	groups := map[string]*CompactionEpisodeGroup{}
@@ -401,15 +409,6 @@ func walkCompactEpisodes(rows []compactRow, window windowFn, price priceFn,
 			groups[p] = g
 		}
 		return g
-	}
-
-	// THE TRIGGER IS AT OR ABOVE THE CLIENT'S OWN CEILING, so the client compacts before we would
-	// ever fire and nothing is attributable to us on this deployment. Reported as its own condition
-	// rather than as an empty result, because "no episodes" and "no episodes are POSSIBLE here" are
-	// different facts and only the second one names a configuration to change.
-	if !spanOK {
-		out.Coverage.NoAttributableSpan = true
-		return out
 	}
 
 	for _, conv := range groupConversations(rows) {
@@ -427,7 +426,29 @@ func walkCompactEpisodes(rows []compactRow, window windowFn, price priceFn,
 			continue
 		}
 		p := price(conv[0].Model)
-		eps := conversationEpisodes(conv, w, p, spanFrac)
+
+		// This conversation's own span, from this MODEL's client ceiling.
+		ceil := clientCeilingFor(conv[0].Model)
+		if explicitCeiling {
+			ceil = clientCeiling{Frac: ceilingFrac, Prov: ceilingAssumed,
+				Note: "supplied explicitly on the request"}
+		}
+		convSpan := spanFrac
+		if !explicitSpan {
+			var ok bool
+			convSpan, ok = spanFor(fillFrac, ceil.Frac)
+			if !ok {
+				// THE TRIGGER IS AT OR ABOVE THIS CLIENT'S CEILING for this model, so the client
+				// compacts before we would ever fire and nothing about this conversation is
+				// attributable to us. Counted as its own condition rather than folded into an empty
+				// result: "no episodes" and "no episodes are POSSIBLE on this model" are different
+				// facts, and only the second one names a configuration to change.
+				out.Coverage.NoAttributableSpan++
+				continue
+			}
+		}
+		out.Assumptions.noteCeiling(conv[0].Model, ceil, convSpan)
+		eps := conversationEpisodes(conv, w, p, convSpan)
 
 		// Coverage is about the conversation, not the episodes: did it get big enough to be
 		// this trigger's business, and did anything happen when it did?
@@ -943,12 +964,39 @@ func spanTS(first, last int64, conv []compactRow) (int64, int64) {
 	return first, last
 }
 
-func compactAssumptions(spanFrac, fillFrac, ceilingFrac float64) CompactionAssumptions {
+// ClientCeilingUsed is the ceiling one model's conversations were measured against.
+type ClientCeilingUsed struct {
+	Model string `json:"model"`
+	// Frac is the fraction of the context window, in PROVIDER-BILLED input, at which the client is
+	// taken to compact its own transcript. Not the figure the client's own indicator displays.
+	Frac float64 `json:"frac"`
+	// SpanFrac is what that ceiling produced for this model: `frac - fill_frac`.
+	SpanFrac float64 `json:"span_frac"`
+	// Provenance is "measured", "assumed" or "default". A measured ceiling came from watching a real
+	// client compact, in billed tokens; the other two did not, and an assumed ceiling that is too high
+	// makes the span too wide and OVER-reports.
+	Provenance string `json:"provenance"`
+	// Note is why this value, in enough detail to tell whether it still holds.
+	Note string `json:"note"`
+}
+
+// noteCeiling records the ceiling one model was measured against, once per model.
+func (a *CompactionAssumptions) noteCeiling(model string, c clientCeiling, span float64) {
+	for _, e := range a.ClientCeilings {
+		if e.Model == model {
+			return
+		}
+	}
+	a.ClientCeilings = append(a.ClientCeilings, ClientCeilingUsed{
+		Model: model, Frac: c.Frac, SpanFrac: span, Provenance: string(c.Prov), Note: c.Note,
+	})
+}
+
+func compactAssumptions(spanFrac, fillFrac float64) CompactionAssumptions {
 	return CompactionAssumptions{
-		SpanFrac:          spanFrac,
-		FillFrac:          fillFrac,
-		ClientCeilingFrac: ceilingFrac,
-		SpanMeasure:       "provider-billed NEW content (fresh input, plus the newly-written tail on turns whose cache hit), in the units the context window is stated in",
+		SpanFrac:    spanFrac,
+		FillFrac:    fillFrac,
+		SpanMeasure: "provider-billed NEW content (fresh input, plus the newly-written tail on turns whose cache hit), in the units the context window is stated in",
 		CreditSource: "the tokens summarize removed on each turn (request_components.saved_gross), " +
 			"priced at the rate THAT turn's cache verdict earns: the cache-creation rate where the " +
 			"entry had lapsed, the cache-read rate where it hit. Nothing removed inside a span is " +

@@ -116,6 +116,17 @@ const LiteLLMPricesURL = "https://raw.githubusercontent.com/BerriAI/litellm/main
 // Stripped from BOTH return values, and only when the suffix closes at the very end: `[` inside a
 // key would be part of the name rather than a variant marker, and a half-open bracket is a
 // malformed id this must not silently rewrite.
+// NormalizeID is normalize's exported half: the full normalized id, for a caller outside this
+// package that needs to match a model against a table of its own and must not re-implement the
+// prefix and variant-suffix rules. dash's per-model client-ceiling table is the caller.
+//
+// One implementation, because two would drift: this package already learned that the hard way when
+// the bracketed `[1m]` suffix went unstripped and every lookup for such an id silently missed.
+func NormalizeID(model string) string {
+	full, _ := normalize(model)
+	return full
+}
+
 func normalize(model string) (full, tail string) {
 	full = stripVariant(strings.ToLower(strings.TrimSpace(model)))
 	tail = full
@@ -371,32 +382,78 @@ type staticEntry struct {
 }
 
 // DefaultStatic covers the common families with conservative windows.
+//
+// THE 1M CLAUDE FAMILIES ARE LISTED EXPLICITLY, and they had to be. The table used to carry
+// `{"claude-sonnet-5", 1000000}, {"claude-opus-4", 200000}, {"claude", 200000}` — so every Opus 4.6
+// and newer, Fable 5.1, Sonnet 4.6 and Opus 5 fell through to the 200,000 catch-all against a
+// published 1,000,000. Five times low, with ok=true, so no caller ever saw "unknown"; they saw a
+// confident wrong number. That is issue #233, and its live consumer was ExtractLLM.inputLimit, which
+// reads this table directly when `model.model` is pinned in config: a 5x-low budget means large tool
+// outputs are judged not to fit and are silently skipped, on exactly the long-context models the
+// component exists for.
+//
+// The windows here follow what LiteLLM publishes, which is also the resolver that answers ahead of
+// this table whenever the map is reachable. This is the floor for when it is not.
+//
+// IT IS STILL NEVER EXACT — see WindowExact. A caller deciding "is this transcript 90% full" must
+// refuse a figure from this table however right it looks, because being right about today's model
+// list is not the same as being authoritative about tomorrow's.
 func DefaultStatic() Static {
 	return Static{table: []staticEntry{
-		{"claude-sonnet-5", 1000000}, {"claude-opus-4", 200000}, {"claude", 200000},
+		// The 1M Claude families, most specific first for readability — though the lookup no longer
+		// depends on order, see Window.
+		{"claude-opus-5", 1000000},
+		{"claude-sonnet-5", 1000000},
+		{"claude-fable-5", 1000000},
+		{"claude-opus-4-8", 1000000},
+		{"claude-opus-4-7", 1000000},
+		{"claude-opus-4-6", 1000000},
+		{"claude-sonnet-4-6", 1000000},
+		// 200K Claude families. haiku-4-5 is stated rather than left to the catch-all so that the
+		// test which pins every shipped id has something to point at, and so a future haiku with a
+		// different window fails that test instead of inheriting this one.
+		{"claude-haiku-4-5", 200000},
+		{"claude-opus-4", 200000},
+		{"claude-sonnet-4", 200000},
+		{"claude", 200000},
 		{"gpt-5", 400000}, {"gpt-4o", 128000}, {"gpt-4", 128000}, {"o1", 200000}, {"o3", 200000},
 		{"gemini-2", 1000000}, {"gemini", 1000000}, {"llama", 128000}, {"mistral", 32000},
 	}}
 }
 
-// WindowExact: NEVER exact. Every answer here is a substring match against a deliberately tiny
-// table ending in a `{"claude", 200000}` catch-all, so a model with no entry of its own gets its
-// family's floor rather than its own window — measured 5x low for the whole Opus family, which
-// LiteLLM publishes at 1,000,000. A floor is what this table is for; a fill percentage is not
-// something it can answer.
+// WindowExact: NEVER exact, and adding correct entries for today's models does not change that.
+// Every answer here is a substring match against a deliberately tiny table ending in a
+// `{"claude", 200000}` catch-all, so a model with no entry of its own still gets its family's floor
+// rather than its own window. A floor is what this table is for; a fill percentage is not something
+// it can answer, and the difference between "right about the models I listed" and "authoritative"
+// is exactly what exact=false encodes.
 func (s Static) WindowExact(ctx context.Context, model string) (int, bool, bool) {
 	w, ok := s.Window(ctx, model)
 	return w, false, ok
 }
 
+// Window resolves by LONGEST matching substring, not by first match.
+//
+// It used to be first-match-wins with a comment asking the reader to keep the table "most-specific
+// first". That made correctness depend on nobody ever appending in the wrong place — and a table
+// whose invariant is a comment is a table that gets appended to in the wrong place. Adding
+// `{"claude-opus-5", 1000000}` after the `{"claude", 200000}` catch-all would have been a one-line
+// change that silently did nothing.
+//
+// Longest-match makes the order cosmetic: `claude-opus-4-8` beats `claude-opus-4` beats `claude`
+// because it is longer, wherever each sits in the slice.
 func (s Static) Window(_ context.Context, model string) (int, bool) {
 	m := strings.ToLower(model)
-	for _, e := range s.table { // first match wins; order most-specific first
-		if strings.Contains(m, e.substr) {
-			return e.window, true
+	best, longest := 0, 0
+	for _, e := range s.table {
+		if len(e.substr) > longest && strings.Contains(m, e.substr) {
+			best, longest = e.window, len(e.substr)
 		}
 	}
-	return 0, false
+	if longest == 0 {
+		return 0, false
+	}
+	return best, true
 }
 
 // Chain tries each resolver in order; the first ok wins.

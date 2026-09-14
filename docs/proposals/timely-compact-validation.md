@@ -390,3 +390,97 @@ repeat phases B-D on a session that genuinely reached 900k — same script, ~$25
 
 **That 0.9 and 60s are the right numbers.** Neither is measured. This validates the mechanism
 against its specification, not the specification against reality.
+
+---
+
+# The complete test matrix for this feature
+
+**Read this before reviewing or changing the pre-expiry summary gate.** Every scenario below found at
+least one real defect, and several found one that a careful reading of the code had already missed.
+They are listed with what each one proves, so a maintainer can tell which are load-bearing for a
+change they are making rather than re-running everything.
+
+## Level 1 — Go tests, the gate itself (`components/`)
+
+Run: `go test ./components/... ./apply/...`
+
+| Scenario | File | What it protects |
+|---|---|---|
+| Every cache phase from a `(TTL, idle)` pair | `cachephase_test.go` | the classification, including **zero idle is Warm, not Unknown** — reading it as Unknown let the gate open over a live prefix on 13 of 26 turns of a real run |
+| A backwards clock stays Unknown | `cachephase_test.go` | never invent warmth from a clock that went backwards |
+| Unknown **with a live prefix** is refused | `cachephase_test.go` | the B1 blocker. Every pre-existing guard set `MaxCachedIdx: -1`, the one value that makes Unknown safe, which is why none caught it |
+| Unknown with **no** prefix is still permitted | `cachephase_test.go` | the guard must not disable the component on non-cache-aware deployments — the failure the guard could easily have traded for |
+| The compaction **dead zone** at nominal expiry | `cachephase_test.go` | the sweep needs a LIVE entry, the compactor a DEAD one, so the two cold tests differ on purpose. Collapsing them into one threshold is a real temptation and a test catches it |
+| `pre_expiry_seconds` validated against the TTL | `trigger_test.go` | a 600s window on a 300s TTL makes every warm turn PreExpiry → compaction every turn. Asserted by first *demonstrating* the misclassification |
+| `cache_state` typo refused | `trigger_test.go` | a typo must not read as `any` |
+| The two size thresholds are **ANDed**, not `max()`ed | `trigger_test.go` | a semantic change nothing asserted. No shipped config sets both, which is exactly when a test is worth writing |
+
+## Level 2 — Go tests, the accounting (`dash/`)
+
+Run: `go test ./dash/...` (~70s; it is the slowest package)
+
+| Scenario | What it protects |
+|---|---|
+| The span closes at exactly the boundary and not before | the axis, including that **cumulative new content** is the axis and neither per-turn size nor cumulative spend works |
+| A **guessed** window produces no episode, and is counted | `modelinfo.Exact`'s rule: a 5x-low window makes every figure 5x wrong, so exclude rather than estimate |
+| A client compaction mid-span **voids** the episode | the client did the thing we were getting ahead of, so the remainder is not comparable |
+| An open span is reported but **not totalled** | and its net is rendered — the false-green defect was that `open_net_usd` was computed and displayed nowhere |
+| Credit split by cache verdict, **each bucket pinning its RATE** | the dominant defect: a credit on a turn whose cache HIT priced at the cache-WRITE rate, 12.5x too high. Two assertions exist only to *reject* the old arithmetic |
+| The debit comes from the write, not the label | a partial hit reads as `hit`, so a label-derived debit is silently zero where we rewrote a live prefix |
+| t0 is **debit-only** | crediting the compaction turn front-loads a saving that has not happened |
+| A roll-forward inside a span charges that span | not a new episode |
+| The turn that closes one span and opens another | charged **once**, to the span it OPENS. The old fixture used `miss(CacheTTLExpiry)` so the debit was 0 and hid the double charge — the fixture is part of the defect |
+| An unpriced model publishes **no** dollars | including `summarizer_cost_usd`, the one field independent of the model's rates. The fixture needs a `cgCost` or the assertion is vacuous |
+| Two models in one session are two conversations | a cache entry does not transfer between models |
+| Recorded and inferred provenance kept apart | never summed |
+| The span **derives** from the client ceiling | and the ceiling is per model, carrying its provenance |
+| A trigger **above** the client's ceiling is reported | `no_attributable_span`, not an empty dataset. Establishes a precondition first, so the zero is about the ceiling and not the fixture |
+| The production-scale case | real live-run shapes, where the first replay turn's stored `saved_usd` is $0.14 against a correct ~$0.0105 |
+
+## Level 3 — Go tests, the async path (`components/offload/`, `proxy/`)
+
+| Scenario | What it protects |
+|---|---|
+| A forged marker in the summary is stripped | both spellings `expand` accepts, including the JSON-escaped one, plus `</summary>`. The wrapper's OWN marker must survive |
+| An ordinary summary is byte-identical | the sanitizer must not mangle prose containing `<` or `>` |
+| The async counters reach `/stats` | they had **no caller at all** for a whole review round while three comments claimed they did |
+| `-race` over the detached goroutine | it must hold no live `Ctx` |
+
+## Level 4 — live scenario arms (`scripts/scenarios/`)
+
+These need a real gateway and real money. **~1 hour wall clock, dominated by idle, and a few dollars.**
+See the arm descriptions above for what each proves and how to read the output.
+
+| Arm | Forces? | Proves |
+|---|---|---|
+| **A** `a-firing-rate.sh` | no | the firing rate, WHICH gate binds, the gap distribution, and the client's own compaction ceiling |
+| **B** `b-cold-events.sh` | yes | the cold credit accumulates per prevented rewrite, and cold events fit inside the shipped span |
+| **C** `c-warm-only.sh` | yes | a warm turn's credit is at the cache-READ rate, and equals `gross x rate` rather than the stored `saved_usd` |
+
+### The traps, all of which produced a SILENTLY EMPTY run
+
+A rig that fails silently certifies nothing, and each of these looked like "the feature does not work":
+
+1. **`PATH` replaced rather than prepended** drops `~/.local/bin`, so every turn exits 127 while the log shows only "no rows".
+2. **A gap of 310s** is past a 5-minute TTL and still inside `ColdMargin`, so the provider has already dropped the entry and the gate correctly refuses to say so. The gap must exceed **TTL + margin**.
+3. **Bridging turns that read files.** Two prompts that made the agent read large files wrote 20,095 tokens of new tail against a 20,000 span, closing it before the first idle gap — and produced a `$0.00` cold credit that was written up as a property of the design. Post-summary turns in a cold-event arm must add almost nothing.
+4. **Reading the provenance GROUP instead of the EPISODE.** Group credit fields accumulate over CLOSED episodes only; an open episode's figures are in `open_net_usd`. Reading the group printed `0.00000000` for every bucket on a perfectly healthy run.
+5. **Hand-checking a different population than the panel measured.** Summing `saved_gross` over every turn after t0 rather than over the turns inside the span disagreed by three whole cold events, and neither figure was wrong.
+6. **Claude Code's `settings.json` env OVERRIDES the process env.** `ANTHROPIC_BASE_URL=... claude` does nothing; the first attempt sent every request to the production Guru without a word. The endpoint must be written into a copied `settings.json`.
+
+### What a maintainer should re-run for a given change
+
+| If you change… | Re-run |
+|---|---|
+| the gate (`trigger.go`, `cachephase.go`) | level 1, then arm A — the firing rate is the only thing that says whether a gate change matters |
+| the accounting (`compactepisode.go`) | level 2, then arms B **and** C — B checks the write-rate bucket, C the read-rate one, and a rate error shows in only one |
+| the async path | level 3 including `-race`, then arm B (its t0+1 carries the deferred summarizer cost) |
+| the client ceiling table | arm A on that model — it is the arm that measures the ceiling |
+| anything touching `saved_usd` or `saved_gross` | arm C, which asserts the panel does **not** equal the stored `saved_usd` |
+
+## What no scenario here covers
+
+- **The production base rate** of a high-fill session going idle past the TTL. That is the number that decides whether the shipped default earns its place, and it is a query over stored data rather than an experiment. See "What this run does not prove".
+- **A measured client ceiling for sonnet-5 or opus-5.** Only haiku has one. Reaching a 1M client's ceiling costs a full 1M-window session per model.
+- **Behaviour at a real 1M fill.** The arms run on haiku's real 200,000 window; the arithmetic is exercised, the provider's behaviour near its actual limit is not.
+- **Any client other than Claude Code.** Every ceiling figure, and the whole attribution boundary, is a statement about one client.
