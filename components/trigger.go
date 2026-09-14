@@ -233,6 +233,23 @@ func frac(f float64, window int) int {
 // The fraction is skipped when PrevBilledInput is 0 rather than treated as a zero fill — see
 // FracResolvable, which is the conjunct a caller uses to tell "not full enough" from "cannot
 // tell", and which summarize counts separately.
+//
+// # AND THE DENOMINATOR IS C, NOT THE MODEL WINDOW
+//
+// "90% full" has to mean 90% of the way to the point where the conversation's own compaction
+// mechanism acts — Ctx.CompactionPoint — and not 90% of the model's window. That IS the argument for
+// this component: compacting just before the client would have acted captures the saving of a large
+// prefix going cold and costs no accuracy that was not already going to be lost, because a compaction
+// was going to happen there anyway. Against the window it is only correct when C equals the window.
+//
+// The direction of the error is what makes it worth fixing rather than noting. A client that compacts
+// EARLY — Claude Code with a lowered auto-compact threshold, or any agent that caps its own context —
+// resets the transcript before billed input ever reaches `frac x window`, so the component NEVER
+// FIRES on that deployment, silently, and looks exactly like a gate that is working. Measured on
+// haiku behind the current client C is 0.996 of the window, so the two denominators are nearly the
+// same there and this branch's own acceptance run was not affected; that is luck, not design.
+//
+// See Ctx.FillDenominator for the fallback, and internal/compactionpoint for the definition.
 func (t Trigger) Fires(req *schemas.BifrostChatRequest, c *Ctx) bool {
 	if t.MinMessages > 0 && len(req.Input) < t.MinMessages {
 		return false
@@ -240,11 +257,11 @@ func (t Trigger) Fires(req *schemas.BifrostChatRequest, c *Ctx) bool {
 	if t.MinRequestTokens > 0 && schema.MessagesTokens(req) < t.MinRequestTokens {
 		return false
 	}
-	window, billed := 0, 0
+	denom, billed := 0, 0
 	if c != nil {
-		window, billed = c.CtxWindow, c.PrevBilledInput
+		denom, billed = c.FillDenominator(), c.PrevBilledInput
 	}
-	if f := frac(t.MinRequestFrac, window); f > 0 && billed > 0 && billed < f {
+	if f := frac(t.MinRequestFrac, denom); f > 0 && billed > 0 && billed < f {
 		return false
 	}
 	return true

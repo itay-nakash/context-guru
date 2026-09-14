@@ -39,6 +39,12 @@ type Opts struct {
 	// "how full is the context" must not act on a guess; one setting a per-output floor may.
 	// See modelinfo.ExactResolver.
 	WindowExact bool
+	// CompactionPoint is C in provider-billed tokens: where the conversation's own compaction
+	// mechanism acts. 0 = unknown, and components fall back to Window. See
+	// internal/compactionpoint for the definition and why it is not the window.
+	CompactionPoint int
+	// CompactionPointSource is "measured" | "assumed" | "window_fallback".
+	CompactionPointSource string
 	// CacheMode is "auto" (default) | "on" | "off" — see resolveCacheAware.
 	CacheMode string
 	// Now is the clock, injected so idle-time reasoning is testable. Zero means time.Now().

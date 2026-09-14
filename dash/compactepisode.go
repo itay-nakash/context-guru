@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/rossoctl/context-guru/components/offload"
+	"github.com/rossoctl/context-guru/internal/compactionpoint"
 	"github.com/rossoctl/context-guru/internal/modelinfo"
 	"github.com/rossoctl/context-guru/kvcache"
 )
@@ -427,10 +428,10 @@ func walkCompactEpisodes(rows []compactRow, window windowFn, price priceFn,
 		}
 		p := price(conv[0].Model)
 
-		// This conversation's own span, from this MODEL's client ceiling.
-		ceil := clientCeilingFor(conv[0].Model)
+		// This conversation's own span, from this MODEL's compaction point.
+		ceil := compactionpoint.For(conv[0].Model)
 		if explicitCeiling {
-			ceil = clientCeiling{Frac: ceilingFrac, Prov: ceilingAssumed,
+			ceil = compactionpoint.Point{Frac: ceilingFrac, Source: compactionpoint.Assumed,
 				Note: "supplied explicitly on the request"}
 		}
 		convSpan := spanFrac
@@ -981,14 +982,14 @@ type ClientCeilingUsed struct {
 }
 
 // noteCeiling records the ceiling one model was measured against, once per model.
-func (a *CompactionAssumptions) noteCeiling(model string, c clientCeiling, span float64) {
+func (a *CompactionAssumptions) noteCeiling(model string, c compactionpoint.Point, span float64) {
 	for _, e := range a.ClientCeilings {
 		if e.Model == model {
 			return
 		}
 	}
 	a.ClientCeilings = append(a.ClientCeilings, ClientCeilingUsed{
-		Model: model, Frac: c.Frac, SpanFrac: span, Provenance: string(c.Prov), Note: c.Note,
+		Model: model, Frac: c.Frac, SpanFrac: span, Provenance: string(c.Source), Note: c.Note,
 	})
 }
 

@@ -226,3 +226,79 @@ func TestTheTwoSizeThresholdsAreAndedNotMaxed(t *testing.T) {
 		t.Error("a trigger with no fraction configured must not be constrained by one")
 	}
 }
+
+// THE FILL FRACTION IS A FRACTION OF C, NOT OF THE MODEL WINDOW, and this is the case that says why.
+//
+// "90% full" has to mean 90% of the way to the point where the conversation's OWN compaction
+// mechanism acts. That is the argument for the whole component: compacting just before the client
+// would have acted captures the saving of a large prefix going cold and costs no accuracy that was not
+// already going to be lost, because a compaction was going to happen there anyway.
+//
+// THE DIRECTION OF THE OLD ERROR IS WHAT MATTERS. A client that compacts EARLY resets the transcript
+// before billed input ever reaches `frac x window` — so against the window the component NEVER FIRES
+// on that deployment, silently, looking exactly like a gate that is working. Measured on haiku behind
+// the current Claude Code, C is 0.996 of the window, so the two denominators are nearly the same
+// there and this branch's acceptance runs were unaffected. That is luck, not design.
+func TestTheFillFractionIsAFractionOfTheCompactionPointNotTheWindow(t *testing.T) {
+	tr := Trigger{MinRequestFrac: 0.9}
+	req := &schemas.BifrostChatRequest{Input: []schemas.ChatMessage{mkMsg("hello")}}
+
+	// A client that caps its own context at 120,000 billed on a 200,000 model. Against the window the
+	// gate would want 180,000, which this conversation can never reach — the client resets first.
+	early := &Ctx{
+		CtxWindow: 200_000, CtxWindowExact: true,
+		CompactionPoint: 120_000, CompactionPointSource: "measured",
+		PrevBilledInput: 110_000, // 0.92 of C, and only 0.55 of the window
+	}
+	if !tr.Fires(req, early) {
+		t.Error("the conversation is 92% of the way to where the CLIENT will compact, which is the " +
+			"only moment this component can act usefully — but only 55% of the model window. " +
+			"Measuring the fraction against the window means never firing on this deployment")
+	}
+	// And it must still decline when the conversation is genuinely early against C.
+	tooEarly := &Ctx{
+		CtxWindow: 200_000, CtxWindowExact: true,
+		CompactionPoint: 120_000, CompactionPointSource: "measured",
+		PrevBilledInput: 60_000, // half of C
+	}
+	if tr.Fires(req, tooEarly) {
+		t.Error("half way to the client's compaction point is not 90% full; the gate must still decline")
+	}
+
+	// THE FALLBACK: with no compaction point known, the window is the denominator. That is correct
+	// where nothing compacts (a raw API client grows until the provider rejects it) and a guess where
+	// a client compacts unobserved — which is why the source is carried alongside.
+	noC := &Ctx{CtxWindow: 200_000, CtxWindowExact: true, PrevBilledInput: 185_000}
+	if !tr.Fires(req, noC) {
+		t.Error("with no compaction point known the window is the denominator, and 185,000 of " +
+			"200,000 is over 0.9")
+	}
+	if got := noC.FillDenominator(); got != 200_000 {
+		t.Errorf("FillDenominator = %d with no compaction point, want the window 200000", got)
+	}
+	if got := early.FillDenominator(); got != 120_000 {
+		t.Errorf("FillDenominator = %d, want the compaction point 120000 — it takes precedence over "+
+			"the window whenever it is known", got)
+	}
+}
+
+// A client that compacts LATE than our gate would not be helped by the old denominator either, and
+// this is the mirror case: C above the window is clamped by nothing here, so the gate simply asks for
+// more fill. It must not overflow into never-firing by arithmetic accident.
+func TestACompactionPointAtOrAboveTheWindowStillFires(t *testing.T) {
+	tr := Trigger{MinRequestFrac: 0.9}
+	req := &schemas.BifrostChatRequest{Input: []schemas.ChatMessage{mkMsg("hello")}}
+	// The shipped haiku figure: C is 0.996 of the window, so the gate wants 179,280.
+	c := &Ctx{
+		CtxWindow: 200_000, CtxWindowExact: true,
+		CompactionPoint: 199_200, CompactionPointSource: "measured",
+		PrevBilledInput: 180_000,
+	}
+	if !tr.Fires(req, c) {
+		t.Error("180,000 billed against a 199,200 compaction point is 0.904 — over the 0.9 gate")
+	}
+	c.PrevBilledInput = 170_000 // 0.853 of C
+	if tr.Fires(req, c) {
+		t.Error("170,000 of 199,200 is 0.853, under the gate")
+	}
+}

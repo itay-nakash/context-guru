@@ -32,6 +32,7 @@ import (
 	"github.com/rossoctl/context-guru/expand"
 	"github.com/rossoctl/context-guru/internal/adjudicate"
 	"github.com/rossoctl/context-guru/internal/cheapmodel"
+	"github.com/rossoctl/context-guru/internal/compactionpoint"
 	"github.com/rossoctl/context-guru/internal/logging"
 	"github.com/rossoctl/context-guru/internal/modelinfo"
 	"github.com/rossoctl/context-guru/metrics"
@@ -652,8 +653,12 @@ func (h *Handler) compact(w http.ResponseWriter, r *http.Request) {
 		Models:      models,
 		Window:      window,
 		WindowExact: windowExact,
-		CacheMode:   cacheMode,
-		Tracker:     h.tracker,
+		// C, resolved beside the window because the fill fraction belongs over it rather than over
+		// the window — see internal/compactionpoint.
+		CompactionPoint:       compactionpoint.For(gjson.GetBytes(body, "model").String()).Tokens(window),
+		CompactionPointSource: string(compactionpoint.For(gjson.GetBytes(body, "model").String()).Source),
+		CacheMode:             cacheMode,
+		Tracker:               h.tracker,
 	})
 	cp.noteCG(float64(time.Since(start).Microseconds()) / 1000.0)
 	cp.noteTrace(res.Trace)
@@ -1033,6 +1038,8 @@ func (h *Handler) chat(provider bschemas.ModelProvider, static upstream, pick fu
 		// Resolve the model's context window (dynamic, cached) so fraction-based
 		// triggers scale with the model; 0 when unknown (absolutes apply).
 		window, windowExact := h.resolveWindow(r.Context(), body)
+		// C beside the window, resolved once for both the enforced and the observed path.
+		cpoint := compactionpoint.For(gjson.GetBytes(body, "model").String())
 		bypassed := strings.EqualFold(r.Header.Get("x-context-guru-bypass"), "true")
 		// The agent's OWN compaction request rides the same route. Bypass it exactly as the
 		// header does — compacting it destroys content the summary is supposed to carry
@@ -1120,8 +1127,12 @@ func (h *Handler) chat(provider bschemas.ModelProvider, static upstream, pick fu
 				models:      models,
 				window:      window,
 				windowExact: windowExact,
-				rates:       h.selfRates(r.Context(), gjson.GetBytes(body, "model").String()),
-				tn:          tn,
+				// C, resolved once here so both the enforced and the observed path see the same
+				// figure — a second resolution is a second thing to keep in agreement.
+				compactionPoint:       cpoint.Tokens(window),
+				compactionPointSource: string(cpoint.Source),
+				rates:                 h.selfRates(r.Context(), gjson.GetBytes(body, "model").String()),
+				tn:                    tn,
 			})
 			addedMs := float64(added.Microseconds()) / 1000.0
 			cp.noteCG(addedMs)

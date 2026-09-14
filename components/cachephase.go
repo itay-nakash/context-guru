@@ -163,3 +163,33 @@ const ColdMargin = time.Minute
 // correct outcome for the one honest description of that window — we cannot tell whether this entry
 // is alive or dead, so we must not rewrite it.
 func CertainlyColdByClock(remaining time.Duration) bool { return remaining <= -ColdMargin }
+
+// FillDenominator is what a fill FRACTION is a fraction OF: C, the point at which the conversation's
+// own compaction mechanism acts, falling back to the model's context window when C is unknown.
+//
+// It exists as one function so that "90% full" cannot come to mean two different things in two
+// callers — the failure this repo has had with cache TTLs and with token rulers, twice each.
+//
+// THE FALLBACK IS THE WINDOW AND THAT IS CORRECT FOR TWO OF THE FOUR CASES: a deployment where
+// nothing compacts (a raw API client) genuinely has C == W, because the conversation grows until the
+// provider rejects it. It is a guess for the case where a client compacts and we have not observed it
+// — and those two are not currently distinguishable, which is why CompactionPointSource is carried
+// rather than the number alone.
+//
+// A GUESSED C IS STILL ACTED ON, deliberately, where a guessed WINDOW is not (see FracResolvable).
+// The asymmetry is about the direction of harm. A wrong window fires the gate at the wrong absolute
+// size against a live cache: five times too early on the Opus family, invalidating prefixes that had
+// most of their life left. A wrong C only moves the moment within the window — and the cache-state
+// conjunct still has to agree, so the turn is one where the write was due anyway. Too-high a C means
+// the component never fires (no harm, no benefit); too-low means it compacts a smaller prefix at a
+// moment that was already cheap. Refusing to act on an assumed C would disable the component on every
+// model whose client behaviour has not been measured, which today is all of them but haiku.
+func (c *Ctx) FillDenominator() int {
+	if c == nil {
+		return 0
+	}
+	if c.CompactionPoint > 0 {
+		return c.CompactionPoint
+	}
+	return c.CtxWindow
+}

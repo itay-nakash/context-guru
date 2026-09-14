@@ -372,6 +372,24 @@ type Ctx struct {
 	//
 	// Writers must therefore initialise this to -1, not 0, when they have no previous timestamp.
 	IdleMs int64
+	// CompactionPoint is C: the provider-billed input at which the CONVERSATION'S OWN compaction
+	// mechanism acts — the largest prompt that mechanism allows before it rewrites the transcript.
+	// 0 = unknown, and a caller must then fall back to CtxWindow.
+	//
+	// IT IS THE DENOMINATOR THE FILL FRACTION BELONGS OVER, not the model window, and that is the
+	// argument for this whole component: compacting just before the conversation's own mechanism
+	// would have acted captures the saving of a large prefix going cold and costs no accuracy that
+	// was not already going to be lost — because a compaction was going to happen there anyway.
+	// Comparing against the window is only correct when C equals the window.
+	//
+	// Measured in the same units as PrevBilledInput and CtxWindow: provider-billed input. Never the
+	// client's own token count, which for one real request read ~168,000 where the provider billed
+	// 199,184 — the same event in a different ruler. See internal/compactionpoint.
+	CompactionPoint int
+	// CompactionPointSource says where CompactionPoint came from: observed on real traffic, assumed
+	// from reported behaviour, or fallen back to the window. Carried so a decision made on a guess
+	// is distinguishable from one made on a measurement — the discipline CtxWindowExact keeps.
+	CompactionPointSource string
 	// MaxCachedIdx is the highest req.Input index considered already committed to the
 	// provider cache (the messages present on the previous turn of this session).
 	// -1 = unknown/first turn/cache off ⇒ no tail restriction. Only meaningful when

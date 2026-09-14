@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/rossoctl/context-guru/components/offload"
+	"github.com/rossoctl/context-guru/internal/compactionpoint"
 	"github.com/rossoctl/context-guru/kvcache"
 )
 
@@ -26,6 +27,10 @@ func guessedWindow(string) (int, bool) { return testWindow, false }
 
 // testPrice is a priced model with round rates, so an expected dollar figure in a test is
 // arithmetic a reader can do in their head.
+// defaultCeilingForTest is the compaction point an unlisted model gets: the whole window. Stated here
+// rather than imported, because a test asserting "the fallback is the window" should say the number.
+const defaultCeilingForTest = 1.00
+
 func testPrice(string) kvcache.Pricing {
 	return kvcache.Pricing{Model: "m", Known: true,
 		Input: 1e-6, CacheRead: 1e-7, Write5m: 1.25e-6, Write1h: 2e-6}
@@ -109,7 +114,7 @@ func cgCost(usd float64) func(*compactRow) {
 }
 
 func walk(rows []compactRow, w windowFn, p priceFn) *CompactionEpisodes {
-	return walkCompactEpisodes(rows, w, p, 0.10, 0.90, defaultClientCeilingFrac)
+	return walkCompactEpisodes(rows, w, p, 0.10, 0.90, defaultCeilingForTest)
 }
 
 // offUSD reports whether a dollar figure misses its target, with a tolerance.
@@ -504,7 +509,7 @@ func TestTheTurnThatClosesOneSpanAndOpensAnotherIsCreditedOnce(t *testing.T) {
 		// double-charge this test exists to catch was invisible — the review that found the bug
 		// found this fixture hiding it. A hit makes the write OURS and the debit non-zero.
 		row(2, testSpan+8_000, fresh, saved(500_000), miss(CacheHit), wrote(8_000), cgCost(0.03)),
-	}, exactWindow, testPrice, 0.10, 0.90, defaultClientCeilingFrac)
+	}, exactWindow, testPrice, 0.10, 0.90, defaultCeilingForTest)
 
 	if len(out.Episodes) != 2 {
 		t.Fatalf("want 2 episodes (one closed, one opened by the same turn), got %d: %+v",
@@ -546,7 +551,7 @@ func TestTheTurnThatClosesOneSpanAndOpensAnotherIsCreditedOnce(t *testing.T) {
 // The assumptions the server states must actually describe what it did. The KV-cache page's rule:
 // the arithmetic is served, not restated in a template nothing tests.
 func TestTheServerStatesTheFractionsItActuallyUsed(t *testing.T) {
-	out := walkCompactEpisodes(nil, exactWindow, testPrice, 0.25, 0.5, defaultClientCeilingFrac)
+	out := walkCompactEpisodes(nil, exactWindow, testPrice, 0.25, 0.5, defaultCeilingForTest)
 	if out.Assumptions.SpanFrac != 0.25 || out.Assumptions.FillFrac != 0.5 {
 		t.Errorf("assumptions = %+v, want the 0.25/0.5 actually used", out.Assumptions)
 	}
@@ -567,7 +572,7 @@ func TestTheServerStatesTheFractionsItActuallyUsed(t *testing.T) {
 	}
 	// The shipped fill and the shipped ceiling must leave an attributable span, or the component
 	// could never be credited for anything on a default deployment.
-	if wantSpan, ok := spanFor(defaultFillFrac, defaultClientCeiling); !ok {
+	if wantSpan, ok := spanFor(defaultFillFrac, defaultCeilingForTest); !ok {
 		t.Error("the shipped fill and default ceiling leave no attributable span")
 	} else if math.Abs(wantSpan-0.10) > 1e-9 {
 		t.Errorf("the shipped pair derives a span of %v, want 0.10", wantSpan)
@@ -983,7 +988,7 @@ func TestAtProductionScaleTheSpanSurvivesMoreThanOneTurn(t *testing.T) {
 			CacheWrite: 275, MissReason: CacheHit, TokensBefore: 122_562,
 			SavedGross: 105_469, SavedUSD: 0.01},
 	}
-	out := walkCompactEpisodes(rows, window, testPrice, 0.10, 0.50, defaultClientCeilingFrac)
+	out := walkCompactEpisodes(rows, window, testPrice, 0.10, 0.50, defaultCeilingForTest)
 	e := only(t, out)
 
 	// t0's 167,263-token write is a re-creation of an expired prefix, not new content, so it must
@@ -1146,20 +1151,20 @@ func TestTheCeilingIsResolvedPerModelAndCarriesItsProvenance(t *testing.T) {
 		byModel[c.Model] = c
 	}
 	h := byModel["claude-haiku-4-5"]
-	if h.Provenance != string(ceilingMeasured) {
+	if h.Provenance != string(compactionpoint.Measured) {
 		t.Errorf("haiku ceiling provenance = %q, want %q — it was observed on a real client run",
-			h.Provenance, ceilingMeasured)
+			h.Provenance, compactionpoint.Measured)
 	}
 	if math.Abs(h.Frac-0.996) > 1e-9 {
 		t.Errorf("haiku ceiling = %v, want the measured 0.996 in BILLED tokens (not the ~0.835 the "+
 			"client's own indicator shows for the same turn)", h.Frac)
 	}
 	u := byModel["some-unlisted-model"]
-	if u.Provenance != string(ceilingDefault) {
-		t.Errorf("unlisted model provenance = %q, want %q", u.Provenance, ceilingDefault)
+	if u.Provenance != string(compactionpoint.WindowFallback) {
+		t.Errorf("unlisted model provenance = %q, want %q", u.Provenance, compactionpoint.WindowFallback)
 	}
-	if u.Frac != defaultClientCeiling {
-		t.Errorf("unlisted model ceiling = %v, want the fallback %v", u.Frac, defaultClientCeiling)
+	if u.Frac != defaultCeilingForTest {
+		t.Errorf("unlisted model ceiling = %v, want the fallback %v", u.Frac, defaultCeilingForTest)
 	}
 	// Every entry says WHY, or the provenance is a label with nothing behind it.
 	for _, c := range out.Assumptions.ClientCeilings {
@@ -1174,20 +1179,20 @@ func TestClientCeilingTableMatchesRoutedModelIDs(t *testing.T) {
 	for _, tc := range []struct {
 		id   string
 		frac float64
-		prov ceilingProvenance
+		prov compactionpoint.Source
 	}{
-		{"claude-haiku-4-5", 0.996, ceilingMeasured},
-		{"aws/claude-haiku-4-5", 0.996, ceilingMeasured},
-		{"claude-opus-5", 1.00, ceilingAssumed},
-		{"aws/claude-opus-5[1m]", 1.00, ceilingAssumed},
-		{"claude-sonnet-5", 1.00, ceilingAssumed},
-		{"gpt-5", defaultClientCeiling, ceilingDefault},
+		{"claude-haiku-4-5", 0.996, compactionpoint.Measured},
+		{"aws/claude-haiku-4-5", 0.996, compactionpoint.Measured},
+		{"claude-opus-5", 1.00, compactionpoint.Assumed},
+		{"aws/claude-opus-5[1m]", 1.00, compactionpoint.Assumed},
+		{"claude-sonnet-5", 1.00, compactionpoint.Assumed},
+		{"gpt-5", defaultCeilingForTest, compactionpoint.WindowFallback},
 	} {
 		t.Run(tc.id, func(t *testing.T) {
-			got := clientCeilingFor(tc.id)
-			if math.Abs(got.Frac-tc.frac) > 1e-9 || got.Prov != tc.prov {
-				t.Errorf("clientCeilingFor(%q) = %v/%s, want %v/%s",
-					tc.id, got.Frac, got.Prov, tc.frac, tc.prov)
+			got := compactionpoint.For(tc.id)
+			if math.Abs(got.Frac-tc.frac) > 1e-9 || got.Source != tc.prov {
+				t.Errorf("compactionpoint.For(%q) = %v/%s, want %v/%s",
+					tc.id, got.Frac, got.Source, tc.frac, tc.prov)
 			}
 		})
 	}

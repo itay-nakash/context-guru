@@ -609,6 +609,10 @@ func BodyOpts(ctx context.Context, pipe *components.Pipeline, st store.Store, o 
 		Bypass:         bypass,
 		CtxWindow:      o.Window,
 		CtxWindowExact: o.WindowExact,
+		// C, the denominator the fill fraction actually belongs over — see
+		// components.Ctx.CompactionPoint.
+		CompactionPoint:       o.CompactionPoint,
+		CompactionPointSource: o.CompactionPointSource,
 		// Read under the SAME sessionID the host will write back under (Trace.Session), which
 		// is what keeps the fraction gate from reading a permanent zero. See
 		// RecordBilledInput.
