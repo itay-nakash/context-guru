@@ -89,16 +89,54 @@ type Pricer interface {
 // Overridable (air-gapped mirrors) via NewLiteLLM.
 const LiteLLMPricesURL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 
-// normalize lowercases a model id and strips a provider prefix so gateway route
-// names (aws/claude-sonnet-5, anthropic/…, bedrock/…, us.anthropic.…) match the
-// keys LiteLLM uses. Returns the full normalized id and its last path segment.
+// normalize lowercases a model id, strips a provider prefix, and strips a trailing bracketed
+// variant suffix, so gateway route names (aws/claude-sonnet-5, anthropic/…, bedrock/…,
+// us.anthropic.…, aws/claude-opus-5[1m]) match the keys LiteLLM uses. Returns the full normalized
+// id and its last path segment.
+//
+// THE BRACKETED SUFFIX IS THE CONTEXT-LENGTH VARIANT, and not stripping it made every lookup for
+// such an id miss the map entirely. The consequences ran in two directions, both bad:
+//
+//   - The chain fell through to DefaultStatic, whose answer is never exact. Trigger.FracResolvable
+//     requires CtxWindowExact, and summarize ships min_request_frac: 0.9 — so on any id carrying a
+//     suffix the fraction gate could never fire, silently, which looks exactly like a gate that is
+//     working.
+//   - DefaultStatic's substring table answered 200,000 for `claude-opus-5[1m]` against a real
+//     1,000,000. exact=false keeps the trigger from acting on that, but OutputFloor, IsHuge and
+//     extract_llm's fraction all read the non-exact Window(), where five times too low is only safe
+//     in one direction.
+//
+// Found by a review, which then corrected itself twice about the reach: the gateway on the box it
+// tested refuses these ids with a model-authorization error, and the client demonstrably works on
+// that key with the un-suffixed name, so what the request body actually carries in `model` — the
+// only field this reads — was never observed. So this is DEFENSIVE: the defect is real and the fix
+// is right, with no demonstrated production impact. An operator can also work around it with a
+// trailing `*` in a MODEL_PRICES entry.
+//
+// Stripped from BOTH return values, and only when the suffix closes at the very end: `[` inside a
+// key would be part of the name rather than a variant marker, and a half-open bracket is a
+// malformed id this must not silently rewrite.
 func normalize(model string) (full, tail string) {
-	full = strings.ToLower(strings.TrimSpace(model))
+	full = stripVariant(strings.ToLower(strings.TrimSpace(model)))
 	tail = full
 	if i := strings.LastIndexAny(tail, "/"); i >= 0 {
 		tail = tail[i+1:]
 	}
 	return full, tail
+}
+
+// stripVariant removes a single trailing "[...]" suffix, e.g. claude-opus-5[1m] -> claude-opus-5.
+// Leaves anything else untouched, including an id with no suffix, an unterminated bracket, and an
+// id that is nothing but a bracketed group.
+func stripVariant(id string) string {
+	if !strings.HasSuffix(id, "]") {
+		return id
+	}
+	i := strings.LastIndexByte(id, '[')
+	if i <= 0 { // no opener, or the whole id is the group — not a variant suffix
+		return id
+	}
+	return id[:i]
 }
 
 // LiteLLM fetches and caches the LiteLLM prices map, serving per-model windows.
