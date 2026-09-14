@@ -251,6 +251,30 @@ gate needs, so the two are compared rather than assumed.
 That is also why the forced arms use `min_request_frac: 0.5`. It is a test lever, not a
 recommendation, and arm A is the arm that measures why the lever is needed.
 
+### Why the span is 10%, and why it is derived rather than configured
+
+The span is `1 - fill_threshold` of the window, computed from the threshold rather than set beside it.
+It is an **attribution boundary**, not a tuning knob.
+
+We fire at the threshold. In the counterfactual world where we did *not* compact, that conversation
+keeps growing — and it does not grow forever, because the **client** compacts when it reaches its own
+ceiling. Past that point both worlds are running on a summarized transcript, and nothing further is
+attributable to us. So the span is exactly the distance from where we fired to where the client would
+have acted: at the shipped 0.9, that is 0.10.
+
+Deriving it matters for any other threshold. An operator who moves the trigger to 0.5 needs a 0.50
+span; a fixed 0.10 would stop crediting at 0.6 fill while the counterfactual client kept going to
+1.0, under-reporting the component by four fifths — silently, and in the direction that looks like
+the feature not working.
+
+Arm A is what makes 1.0 the right ceiling on this client: Claude Code let a haiku session reach
+**0.996** of the window before compacting. A client that capped lower would make this span too *wide*,
+crediting turns past the point its own compaction would have fired — which is [#239](https://github.com/rossoctl/context-guru/issues/239).
+
+The two axes line up, which is worth stating because it is not obvious: the fill is measured in
+provider-billed input (prefix plus new), the span in new content only. They agree because adding X
+tokens of new content raises billed input by X — the prefix is re-sent either way.
+
 ### Arm B — the cold credit has to accumulate
 
 `ColdCreditUSD` exists to measure one thing: an expiry that happens *after* a summary re-creates the
@@ -263,11 +287,23 @@ and checks the bucket holds three prevented rewrites. It prints the counterfactu
 full prefix (which t0 itself re-created, so it is measured rather than modelled), the compacted
 prefix each cold turn actually wrote, and the difference per event and over all three.
 
-**Three colds fit inside one span, and that is itself worth demonstrating.** The span axis is
-cumulative *new* content, and a cache write on a MISS is re-creation rather than new content, so a
-cold turn advances the span by only its few tokens of fresh input. Under the axis this PR replaced —
-cumulative spend — the first cold turn would have closed the span on its own, which is exactly how
-the headline bucket came to be structurally empty.
+**Three colds fit inside one span, and the reason is the point of the arm.** The span advances on
+cumulative *new content*; a cold event happens because of *elapsed time*. Those are independent, and
+they are anti-correlated in the helpful direction: **a session idle enough for its cache entry to
+lapse is by definition not accruing new content, so the span cannot be closing while a cold event
+becomes possible.** A session can go cold having added 2% of the window — and the next turn then pays
+a write that, uncompacted, would have covered 92% of it.
+
+Two things have to be right for that to hold, and one of them is the script's own prompts:
+
+- A cache write on a MISS is re-creation rather than new content, so a cold turn advances the span by
+  only its few tokens of fresh input. Under the axis this PR replaced — cumulative spend — the first
+  cold turn would have closed the span on its own.
+- The turns *between* t0 and the idle gaps must add almost nothing. The first version of this arm
+  asked them to read files; they wrote 20,095 tokens of new tail against a 20,000 span and the span
+  closed before any gap. That produced `cold_credit_usd = $0.00` and an incorrect conclusion — that a
+  cold event "essentially cannot fall inside a 10% span". It can, easily. The arm was measuring its
+  own prompts.
 
 ### Arm C — the rate on a warm turn
 
@@ -298,11 +334,23 @@ check.
 
 ## What this run does not prove
 
-**That the firing rate is acceptable.** Arm A measures it; nothing here decides whether the answer is
-good enough. If both gates are shown to be practically unreachable under the shipped defaults, that
-is an argument about the defaults — lower the fraction, widen `pre_expiry_seconds`, or accept the
-feature as a narrow safety net for the walk-away-and-return case and document it as one. It is not an
-argument that the mechanism is broken.
+**The base rate of the event this insures against.** Arm A measures the firing rate on a
+*continuously active* session and gets zero — but that is the one population where a cold event
+cannot occur, because an active agent keeps touching its own cache. So arm A bounds the wrong
+quantity, and reading it as "the feature does not fire" is a mistake.
+
+The structure is cheap insurance with a rare trigger and a large payout. Declining costs nothing: the
+component splices nothing and spends nothing on a turn it skips. Firing costs one summarizer call
+plus a cache write. Arm B measures the payout at roughly **$0.15 per prevented rewrite** of ~115,000
+tokens. So the question that decides whether the default earns its place is not "how often does it
+fire on a busy session" but **how many production conversations reach the fill threshold and then go
+idle past the TTL** — someone goes to lunch, a job pauses, a person switches tasks.
+
+That is a query over stored data, not an experiment: per conversation, did it reach the fill
+threshold, and did any later turn arrive after more than TTL + `ColdMargin` of idle? `dash/kvcache.go`
+already records the per-request idle gap, and the panel already has the field to report the answer —
+`coverage.no_episode_cold_usd` sizes exactly what the conversations we did *not* fire on paid to
+re-create expired prefixes. It needs production data, not new code.
 
 **A net over a settled span on natural traffic.** Arm B and arm C both force their conditions. A
 forced span that is cut short shows a loss almost by construction, because t0 pays the model call and

@@ -100,9 +100,15 @@ session are skipped turns.
 **Measured, on a real Claude Code session:** 0 of 53 turns fired under these defaults, with
 `cache_state_declined_warm` on 51 of them. The fill gate was not the obstacle — the session reached
 0.996 of the window and 12 turns were over the 0.9 threshold — the **idle time** was. `pre_expiry`
-needs roughly 240s of idle on a 5-minute entry, and the largest gap in that session was 44s. So the
-default is, in practice, gated on a user stepping away and coming back to a nearly-full context. See
-`docs/proposals/timely-compact-validation.md` for the arm that measures this and how to re-run it.
+needs roughly 240s of idle on a 5-minute entry, and the largest gap in that session was 44s.
+
+That is a measurement of a *continuously active* session, which is the one population where a cache
+entry cannot lapse. It is not evidence that the component does little: skipping costs nothing at all,
+and a turn that does fire prevents a full-prefix rewrite worth roughly **$0.15 per event** at haiku
+rates on a 175k prefix. What the default is really gated on is a session going idle past its TTL with
+a nearly-full context — someone stepping away, a job pausing — and how often that happens in
+production is a question about the traffic, not about the gate. See
+`docs/proposals/timely-compact-validation.md` for the arms that measure both and how to re-run them.
 
 (The agent's own compaction is a second route to the same skip — it shrinks the incoming request and
 can drop it back under `min_request_tokens` for several consecutive turns.)

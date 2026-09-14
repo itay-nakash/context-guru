@@ -1,6 +1,7 @@
 package dash
 
 import (
+	"math"
 	"testing"
 
 	"github.com/rossoctl/context-guru/components/offload"
@@ -554,7 +555,7 @@ func TestTheServerStatesTheFractionsItActuallyUsed(t *testing.T) {
 	}
 	// A zero falls back to the shipped default rather than producing a degenerate span.
 	def := walkCompactEpisodes(nil, exactWindow, testPrice, 0, 0)
-	if def.Assumptions.SpanFrac != defaultSpanFrac || def.Assumptions.FillFrac != defaultFillFrac {
+	if def.Assumptions.SpanFrac != spanFor(defaultFillFrac) || def.Assumptions.FillFrac != defaultFillFrac {
 		t.Errorf("assumptions with zero fractions = %+v, want the shipped defaults", def.Assumptions)
 	}
 	if def.Assumptions.KnownOmission == "" {
@@ -1012,5 +1013,45 @@ func TestAtProductionScaleTheSpanSurvivesMoreThanOneTurn(t *testing.T) {
 	if offUSD(g.OpenNetUSD, wantRead) {
 		t.Errorf("open net = %v, want %v: t0's write was due whatever we did (its entry had already "+
 			"lapsed), so nothing offsets the credit here", g.OpenNetUSD, wantRead)
+	}
+}
+
+// THE SPAN IS AN ATTRIBUTION BOUNDARY DERIVED FROM THE FILL THRESHOLD, not a free constant that
+// happens to be 0.10.
+//
+// We fire at the threshold. In the world where we did not compact, the conversation keeps growing
+// until the CLIENT compacts at its own ceiling — measured at 0.996 of the window on a real Claude
+// Code session (scripts/scenarios/a-firing-rate.sh). Past that point both worlds are running on a
+// summarized transcript and nothing further is attributable to us. So the span is exactly the
+// distance from where we fired to where the client would have acted.
+//
+// The consequence that makes deriving it worth doing: an operator who moves the trigger to 0.5 needs
+// a 0.50 span. A fixed 0.10 would stop crediting at 0.6 fill while the counterfactual client kept
+// going to 1.0, under-reporting the component by four fifths — silently, and in the direction that
+// looks like the feature not working.
+func TestTheSpanIsDerivedFromTheFillThreshold(t *testing.T) {
+	for _, tc := range []struct{ fill, want float64 }{
+		{0.90, 0.10}, // the shipped pair
+		{0.50, 0.50},
+		{0.75, 0.25},
+		{0.99, 0.01},
+	} {
+		if got := spanFor(tc.fill); math.Abs(got-tc.want) > 1e-9 {
+			t.Errorf("spanFor(%v) = %v, want %v — the span is the distance from our trigger to the "+
+				"client's own ceiling", tc.fill, got, tc.want)
+		}
+	}
+	// A threshold at or past the whole window leaves nothing attributable; fall back rather than
+	// emit a degenerate span that closes every episode on its own t0.
+	for _, bad := range []float64{1.0, 1.5} {
+		if got := spanFor(bad); got != 1-defaultFillFrac {
+			t.Errorf("spanFor(%v) = %v, want the shipped fallback %v", bad, got, 1-defaultFillFrac)
+		}
+	}
+	// And the walk really uses it: a 0.5 fill must produce a 0.5 span end to end, not a 0.1 one.
+	out := walkCompactEpisodes([]compactRow{row(1, 1_000, fresh)}, exactWindow, testPrice, 0, 0.50)
+	if got := out.Assumptions.SpanFrac; math.Abs(got-0.50) > 1e-9 {
+		t.Errorf("the walk reported span_frac = %v for a 0.50 fill; the derivation must reach the "+
+			"served assumptions, or the page prints a number the measurement did not use", got)
 	}
 }

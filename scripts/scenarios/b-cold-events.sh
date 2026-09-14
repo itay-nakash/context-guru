@@ -10,10 +10,22 @@
 # So: fire once, then force the cache cold three separate times inside the same 10% span, and check
 # the bucket is three prevented rewrites rather than one.
 #
-# WHY THREE COLDS FIT INSIDE ONE SPAN, which is itself a property worth demonstrating: the span axis
-# is cumulative NEW content, and cache_write on a MISS is re-creation rather than new content, so a
-# cold turn advances the span by only its few tokens of fresh input. If the axis had been cumulative
-# spend (the version this PR fixed), the first cold turn would have closed the span on its own.
+# WHY THREE COLDS FIT INSIDE ONE SPAN, which is the property this arm exists to demonstrate:
+#
+# The span advances on cumulative NEW content. A cold event happens because of ELAPSED TIME. Those are
+# independent, and they are anti-correlated in the helpful direction — a session idle enough for its
+# cache entry to lapse is BY DEFINITION not accruing new content, so the span cannot be closing while
+# a cold event becomes possible. A session can go cold having added 2% of the window.
+#
+# Two things had to be right for that to hold, and one of them is this script's own prompts:
+#
+#   - cache_write on a MISS is re-creation rather than new content, so a cold turn advances the span
+#     by only its few tokens of fresh input. Under the axis this PR replaced (cumulative SPEND) the
+#     first cold turn would have closed the span on its own.
+#   - the turns BETWEEN t0 and the idle gaps must add almost nothing. The first version of this arm
+#     asked them to read files, they wrote 20,095 tokens of new tail against a 20,000 span, and the
+#     span closed before any gap. That produced a $0.00 cold credit and an incorrect conclusion that
+#     a cold event "essentially cannot fall inside a 10% span".
 #
 # min_request_frac is 0.5, NOT the shipped 0.9, and Scenario A is the arm that measures why.
 set -u
@@ -54,17 +66,28 @@ scen_tail "$N" 3
 
 # --- FIRE: one gap past the TTL, with the transcript full. This turn commissions the summary.
 scen_sleep "$GAP" "past the TTL so the gate sees a cold cache; this turn fires"
-scen_turn "$N" f01 continue "In one sentence, what is the single most important invariant in a.go?"
+scen_turn "$N" f01 continue "Reply with exactly: ok"
 
-# --- The splice lands on the next turn (the summary is produced off the hot path).
-scen_turn "$N" s01 continue "In one sentence, name one risk in d.go."
+# --- The splice lands on the NEXT turn, because the summary is produced off the hot path.
+#
+# EVERY TURN FROM HERE ON MUST ADD ALMOST NO NEW CONTENT, and getting that wrong invalidated the
+# first version of this arm. These prompts used to be "name one risk in d.go" and "name one thing
+# c.go owns", which makes the agent READ those files: the two bridging turns wrote 3,809 and 16,278
+# tokens of new tail, 20,095 against a 20,000 span, and the span closed before the first idle gap.
+# The run then reported cold_credit_usd = $0.00 with three cold events sitting outside the episode,
+# which reads exactly like the credit being broken.
+#
+# The span advances on NEW CONTENT and a cold event needs ELAPSED TIME, so an arm testing cold events
+# must spend the former as slowly as possible. A trivial prompt adds a few tokens; a file read adds
+# sixteen thousand.
+scen_turn "$N" s01 continue "Reply with exactly: ok"
 echo "--- after the summary landed (billed should have COLLAPSED):"
 scen_tail "$N" 4
 
 # --- THREE COLD EVENTS, each inside the span. Each must re-create the COMPACTED prefix.
 for k in 1 2 3; do
   scen_sleep "$GAP" "cold event $k of 3, inside the span"
-  scen_turn "$N" "c0$k" continue "In one sentence, name one thing c.go owns."
+  scen_turn "$N" "c0$k" continue "Reply with exactly: ok"
 done
 
 echo
