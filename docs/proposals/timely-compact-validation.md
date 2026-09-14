@@ -251,6 +251,97 @@ gate needs, so the two are compared rather than assumed.
 That is also why the forced arms use `min_request_frac: 0.5`. It is a test lever, not a
 recommendation, and arm A is the arm that measures why the lever is needed.
 
+### The compaction point `C` — the definition everything else rests on
+
+> `C(deployment, client, model)` is the **provider-billed input** at which the conversation's own
+> compaction mechanism acts — the largest prompt that mechanism allows to be sent before it rewrites
+> the transcript.
+
+Two figures derive from it and nothing else should:
+
+| | |
+|---|---|
+| the **trigger** | `summarize` fires at `frac × C` (shipped `frac` = 0.9) |
+| the **span** | an episode covers `C − frac × C` = `(1 − frac) × C` |
+
+Both come from `C` rather than from the model window `W` because that *is* the argument for the
+feature: compacting just before the conversation's own mechanism would have acted captures the saving
+of a large prefix going cold, and **costs no accuracy that was not already going to be lost** — a
+compaction was going to happen there anyway. Firing against `W` is only correct when `C = W`.
+
+#### Which ruler, and why this definition never needs the client's own number
+
+`C` is in provider-billed input (`fresh_input + cache_read + cache_write`) — the ruler the gate
+compares, the ruler a context window is stated in, and the only one every party shares. The same
+request is counted three ways:
+
+| ruler | value | fraction |
+|---|---|---|
+| **provider-billed input** | 199,184 | **0.996** ← `C` is in this |
+| Claude Code's own count | ~167,000 | 0.835 ← never used here |
+| our message-text count (`tokens_before`) | 147,493 | 0.737 |
+
+A client thresholding at ~167,000 of *its* count and the provider billing 199,184 on that same
+request are **the same event**. So `C` is *defined* as an observation in billed tokens rather than as
+a translation of the client's threshold — which means the conversion factor between rulers never has
+to be known, and cannot be got wrong. Putting 0.835 in would be the units error `Trigger.Fires`
+shipped with, one level up.
+
+#### "Whenever the native compaction works" — four cases, because it genuinely differs
+
+| case | what compacts | how `C` is known |
+|---|---|---|
+| **1** | **the client** (Claude Code and similar) | **observed**: the billed input of a request the agent-compaction detector flagged |
+| **2** | **the provider, at our request** ([#241](https://github.com/rossoctl/context-guru/issues/241)) | **chosen** — the `trigger.input_tokens` we set. Exactly known |
+| **3** | **nothing** (raw API, `llm-d`, self-hosted) | `C = W`, the hard limit, and this is a **fact**. Also the deployment where this component matters most, since nothing else stands between the session and a 400 |
+| **4** | **unknown** — never observed, and case 1 vs case 3 indistinguishable | `C = W` as a **guess**. Must not report alike with case 3 |
+
+**Case 1 is measurable from columns already stored.** `proxy/agentcompaction.go` writes its verdict to
+`requests.bypassed`, so `C` is one column away. Verified on a real session: exactly **one of 53 rows**
+carried `bypassed=1`, and it billed **199,184** — the transcript at its largest. A `tokens_before` drop
+on the following turn is an independent second marker and agreed exactly.
+
+**Require both markers.** The phrase detector has a reachable false positive — the phrase is quoted
+verbatim in this repo's own `docs/how-to/agent-compaction.md`, so an agent that reads that page gets it
+into a `tool_result` — and a false `C` poisons the trigger for the whole model.
+
+#### What varies, which is why `C` cannot be a constant
+
+- **By model.** A client thresholding on a fraction of the window scales `C` with `W`: haiku 200K
+  against sonnet/opus 1M.
+- **By client, and by that client's configuration.** Claude Code's auto-compact threshold is
+  settable, so two tenants on the same model legitimately have different `C`. **This is the largest
+  source of variation and the one a shipped table cannot capture.**
+- **By client version.** The 0.996 measured here and a ~0.835 reported elsewhere may be exactly this.
+- **By provider, twice over:** it sets the hard limit for case 3, and whether case 2 exists at all.
+
+So `C` is properly per `(tenant, client, model)` and **learned**. The table in
+`dash/compactionpoint.go` is a fallback for a deployment with no observations yet, and
+[#239](https://github.com/rossoctl/context-guru/issues/239) is the issue for learning it.
+
+#### The statistic, once there are several observations
+
+A **low percentile** is conservative for *both* uses, which is what makes it principled rather than a
+taste:
+
+- the **trigger**: a lower `C` fires earlier, which still beats the client's mechanism. A `C` that is
+  too **high** is the dangerous one — the client resets before billed input ever reaches `frac × C`,
+  so the component **never fires at all** and looks broken.
+- the **span**: a lower `C` narrows the span, which under-reports.
+
+And note what an observation bounds: the client acts when it *exceeds* its threshold, so the flagged
+request is at or above it. An observed `C` is an **upper** bound on the threshold in billed terms, so
+taking a low percentile and then `frac × C` pulls safely under it twice.
+
+#### Where the code stands against this definition
+
+`spanFor` uses `C` (from the fallback table, per model, with provenance). **`Trigger.Fires` does
+not** — it still compares against `frac × W`. On haiku behind this Claude Code version that is nearly
+the same number, because `C = 0.996 W`; it is wrong on any deployment whose client compacts
+meaningfully earlier, and wrong in the direction where the component never fires. Retargeting the
+trigger is a behaviour change to the shipped gate and is called out as its own decision rather than
+carried quietly.
+
 ### Why the span is what it is: an attribution boundary whose far end belongs to the CLIENT
 
 The span is `client_ceiling - fill_threshold`, derived rather than configured beside them.
