@@ -209,12 +209,106 @@ About 250-350k input tokens across both sessions on a sonnet-class model, most o
 well under $1. Wall time ~15 minutes, dominated by two sleeps of 250s and 310s. The summarizer's
 own calls are on `CHEAP_MODEL` and are cents.
 
+## The scenario suite — `scripts/scenarios/`
+
+The single forced run above validates the mechanism against its specification. It cannot validate
+three things that turned out to matter, and each got its own arm. They are checked in, because a
+measurement nobody else can re-run is an assertion:
+
+| Arm | Config | What it answers |
+|---|---|---|
+| **A** `a-firing-rate.sh` | **shipped** defaults, no injected idle | how often do both gates open on traffic nobody arranged? |
+| **B** `b-cold-events.sh` | forced, then **three** cold events in one span | does the cold credit *accumulate* per prevented rewrite? |
+| **C** `c-warm-only.sh` | forced, then **warm turns only** | is a warm turn's credit priced at the cache-**read** rate? |
+
+```bash
+export CG_SCEN_UPSTREAM="https://your-gateway.example.com"   # the plain provider gateway
+export CG_SCEN_SRC=/path/to/a/frozen/checkout                # not a tree you are still editing
+tmux new -d -s scen 'scripts/scenarios/run-all.sh'           # ~1 hour, dominated by idle
+```
+
+Every arm builds its own proxy binary and runs it on its own port with its own dashboard database,
+and points a private `CLAUDE_CONFIG_DIR` at it. **The production Context Guru is never in the request
+path.** That matters more than it sounds: Claude Code's `settings.json` env *overrides* the process
+env, so `ANTHROPIC_BASE_URL=... claude` does nothing at all — the first attempt at this sent every
+request to the production Guru without a word. The endpoint has to be written into a copied
+`settings.json`, which `scen_home` does.
+
+### Arm A — the firing rate, and why 0.9 may be unreachable
+
+This is the arm with no forcing in it, and therefore the only one whose result does not depend on any
+of this feature's code being correct. It runs a real `claude -p` session on the **shipped**
+`min_request_frac: 0.9` and `cache_state: pre_expiry_or_cold`, with no injected gaps, and reports how
+many turns fired.
+
+It also records the number that decides whether 0.9 is reachable *at all* on this client: **where
+Claude Code runs its own compaction.** If the client caps its transcript below 0.9 of the model
+window, the shipped gate cannot fire on that model however long the session runs — the firing rate is
+zero for a structural reason rather than a statistical one, and no amount of additional traffic
+changes it. The arm prints the client's own ceiling as a fraction of the window beside the 0.900 the
+gate needs, so the two are compared rather than assumed.
+
+That is also why the forced arms use `min_request_frac: 0.5`. It is a test lever, not a
+recommendation, and arm A is the arm that measures why the lever is needed.
+
+### Arm B — the cold credit has to accumulate
+
+`ColdCreditUSD` exists to measure one thing: an expiry that happens *after* a summary re-creates the
+**compacted** prefix instead of the full one, so the difference is a rewrite that did not happen. A
+run with one such event cannot distinguish "the credit is computed" from "the credit accumulates per
+event", and it is the accumulation that makes the amortisation model true rather than anecdotal.
+
+So arm B fires once and then forces the cache cold **three separate times inside the same span**,
+and checks the bucket holds three prevented rewrites. It prints the counterfactual explicitly: the
+full prefix (which t0 itself re-created, so it is measured rather than modelled), the compacted
+prefix each cold turn actually wrote, and the difference per event and over all three.
+
+**Three colds fit inside one span, and that is itself worth demonstrating.** The span axis is
+cumulative *new* content, and a cache write on a MISS is re-creation rather than new content, so a
+cold turn advances the span by only its few tokens of fresh input. Under the axis this PR replaced —
+cumulative spend — the first cold turn would have closed the span on its own, which is exactly how
+the headline bucket came to be structurally empty.
+
+### Arm C — the rate on a warm turn
+
+The defect that inverted the panel's sign: a credit on a turn whose cache **hit** was priced at the
+cache-**write** rate, 12.5x too high. The mechanism is worth stating because it is not obvious and it
+was introduced by going async — the stash is written by the detached goroutine, which has no
+`Report`, so the checkpoint key first reaches `rep.CacheKeys` on the turn that *replays* it.
+`Recorder.MarkUnique` sees a key it has never seen, calls the whole removal new content, and the row
+lands priced at the creation rate. That turn is a cache hit, and unlike t0 it **is** credited.
+
+Arm C fires once and then takes only warm turns, so:
+
+- every credit must land in `read_credit_usd` at the cache-read rate,
+- `cold_credit_usd` must be exactly zero,
+- the figure must equal `sum(saved_gross) x read rate` and must **not** equal the sum of the stored
+  `saved_usd`. The arm prints both, so a regression reads as the panel agreeing with the wrong one.
+
+It also queries the panel a second time at `?span=0.002`, so the same rows produce a **closed**
+episode. An arm that only ever reports an open one cannot check the settled total, which is the
+figure a reader actually trusts.
+
+### Reading a run
+
+Each arm prints every request row as the provider billed it — `billed`, `read`, `write`, the cache
+verdict, our own removed-token count, the summarizer's cost and `cg_ms` — then the panel's JSON, then
+a hand-derivation from the raw rows to compare against it. The panel is never the source of its own
+check.
+
 ## What this run does not prove
 
-**The firing rate.** One forced episode says the mechanism works; it says nothing about how often
-the conditions co-occur on real traffic, which is the number that decides whether the default earns
-its place. That needs the query over historical `IdleMs` per conversation, and it is unaffected by
-this run.
+**That the firing rate is acceptable.** Arm A measures it; nothing here decides whether the answer is
+good enough. If both gates are shown to be practically unreachable under the shipped defaults, that
+is an argument about the defaults — lower the fraction, widen `pre_expiry_seconds`, or accept the
+feature as a narrow safety net for the walk-away-and-return case and document it as one. It is not an
+argument that the mechanism is broken.
+
+**A net over a settled span on natural traffic.** Arm B and arm C both force their conditions. A
+forced span that is cut short shows a loss almost by construction, because t0 pays the model call and
+the cache write up front while the credit accrues turn by turn afterwards — so a negative net on a
+truncated span is a statement about the span's length, not about the mechanism. Break-even is on the
+order of six warm turns after the summary.
 
 **Behaviour at a real 1M fill.** The pinned 30,000 window exercises the arithmetic, not the
 provider's behaviour near its actual limit. If you want that too, drop the `window:` override and

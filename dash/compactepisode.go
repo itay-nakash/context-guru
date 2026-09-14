@@ -2,6 +2,7 @@ package dash
 
 import (
 	"database/sql"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -992,7 +993,11 @@ func queryFrac(r *http.Request, key string, def float64) float64 {
 	// legitimate reason to ask for several windows' worth. The `fill` fraction is a fraction of one
 	// window and could not exceed 1, but one guard serves both and the looser bound cannot hurt
 	// fill (a fill above 1 simply qualifies nothing, which is visible rather than silent).
-	if err != nil || f <= 0 || f > 8 {
+	// NaN AND Inf ARE CHECKED FIRST, because a range guard cannot catch them: every comparison
+	// against NaN is false, so `f <= 0 || f > 8` passed `?span=NaN` straight through. The span then
+	// became NaN, which compares false against everything — so no episode ever closed and the panel
+	// reported an empty measurement rather than an error. A review found it.
+	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || f <= 0 || f > 8 {
 		return def
 	}
 	return f

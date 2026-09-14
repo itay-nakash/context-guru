@@ -3031,18 +3031,77 @@ async function loadCompactionEpisodes() {
           title: 'the summary\u2019s own model call (' + usd(g.summarizer_cost_usd) + ') plus the '
             + 'cache write our rewrite caused (' + usd(g.invalidation_debit_usd) + ', an upper bound)',
         }, usdOrNA(ourCost, priced, reason)),
-        el('td', { class: 'num ' + (g.net_usd >= 0 ? 'good-text' : 'bad-text') },
-          usdOrNA(g.net_usd, priced, reason))));
+        // NOT GREEN WHEN NOTHING HAS SETTLED. With no closed span the settled net is $0.00 by
+        // definition, and rendering that in good-text read as "this component broke even" on
+        // exactly the sessions where it has spent money and not yet recouped it — the position is
+        // in open_net_usd, which nothing rendered at all. A review found the false green.
+        g.closed
+          ? el('td', { class: 'num ' + (g.net_usd >= 0 ? 'good-text' : 'bad-text') },
+            usdOrNA(g.net_usd, priced, reason))
+          : el('td', {
+            class: 'num muted',
+            title: 'no span in this group has finished, so nothing has settled. The money already '
+              + 'committed is in the exposure line below the table.',
+          }, '\u2014')));
     }
+    renderEpisodeExposure($('#episodes-exposure'), groups);
     renderEpisodeCoverage(cov, out.coverage, out.assumptions);
     renderEpisodeAssumptions(asm, out.assumptions);
   } catch (err) {
     if (aborted(err)) return;
     cov.hidden = true;
     asm.hidden = true;
+    $('#episodes-exposure').hidden = true;
     tableMessage(body, EPISODE_COLS, 'Could not load compaction episodes',
       String(err.message || err), { error: true });
   }
+}
+
+/**
+ * renderEpisodeExposure reports money already COMMITTED whose payoff has not arrived.
+ *
+ * WITHOUT THIS THE PANEL IS FALSE-GREEN IN ITS NORMAL STATE. A summarized session adds new content
+ * slowly by construction — five turns after a summary on a live run had accrued 3,486 of a 20,000
+ * target — so "open" is where a healthy episode spends most of its life. The server computes
+ * open_net_usd, open_turns and voided_net_usd for exactly this reason, and nothing rendered any of
+ * them: the table showed a settled total of $0.00 in good-text green while the real position was
+ * negative. A review found it, and an earlier commit of mine had documented the state in prose
+ * rather than fixing it, which is the wrong end of the problem.
+ *
+ * Voided is reported apart and never blended: the client compacted its own transcript mid-span, so
+ * the remainder is not comparable to a world where we had not compacted. It is counted because
+ * dropping it would be survivorship, and separated because averaging it in would be a claim.
+ */
+function renderEpisodeExposure(node, groups) {
+  if (!node) return;
+  const open = groups.reduce((a, g) => a + (g.open || 0), 0);
+  const voided = groups.reduce((a, g) => a + (g.voided || 0), 0);
+  node.hidden = !(open || voided);
+  if (node.hidden) return;
+  clear(node);
+  // Only priced groups contribute a figure, for the same reason every cell above goes through
+  // usdOrNA: an unpriced model is not a free one.
+  const priced = groups.filter((g) => g.episodes > g.unpriced_episodes);
+  const openUSD = priced.reduce((a, g) => a + (g.open_net_usd || 0), 0);
+  const openTurns = priced.reduce((a, g) => a + (g.open_turns || 0), 0);
+  const voidUSD = priced.reduce((a, g) => a + (g.voided_net_usd || 0), 0);
+  const parts = [el('strong', {}, 'Not yet settled: ')];
+  if (open) {
+    parts.push(document.createTextNode(num(open) + ' span(s) still accruing over '
+      + num(openTurns) + ' turn(s), currently '));
+    parts.push(el('strong', { class: openUSD >= 0 ? 'good-text' : 'bad-text' }, usd(openUSD)));
+    parts.push(document.createTextNode('. That is money committed whose payoff is still arriving, '
+      + 'not a loss: the compaction turn pays a model call and a cache write up front while the '
+      + 'saving accrues turn by turn afterwards'));
+  }
+  if (voided) {
+    parts.push(document.createTextNode((open ? '. ' : '') + num(voided)
+      + ' span(s) voided by the client compacting its own transcript, carrying '));
+    parts.push(el('strong', { class: voidUSD >= 0 ? 'good-text' : 'bad-text' }, usd(voidUSD)));
+    parts.push(document.createTextNode(' — reported apart, never averaged in'));
+  }
+  parts.push(document.createTextNode('.'));
+  for (const x of parts) node.appendChild(x);
 }
 
 /**

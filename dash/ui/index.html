@@ -610,6 +610,10 @@
     </div>
     <!-- The coverage half. Without it this panel is survivorship: it would only ever report on
          sessions the trigger DID fire on, which is always a positive number. -->
+    <!-- The exposure line comes FIRST, above coverage: it is the sentence that stops a settled
+         total of $0.00 reading as "broke even" on a session that has spent money and not yet
+         recouped it. See renderEpisodeExposure. -->
+    <p class="hint" id="episodes-exposure" data-testid="episodes-exposure" hidden></p>
     <p class="hint" id="episodes-coverage" data-testid="episodes-coverage" hidden></p>
     <p class="hint" id="episodes-assumptions" data-testid="episodes-assumptions" hidden></p>
   </div>

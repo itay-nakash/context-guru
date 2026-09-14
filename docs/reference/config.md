@@ -92,10 +92,20 @@ is reachable at `ttl_seconds` too, so it is not new; a shorter payload horizon s
 to it.
 
 `summarize`'s trigger skip is **recurring**, not a one-off, and by default it is now the common case
-rather than the exception: `trigger.cache_state` defaults to `pre_expiry`, which is true for seconds
-at a time, so most turns of a long session are skipped turns. (The agent's own compaction is a second
-route to the same state — it shrinks the incoming request and can drop it back under
-`min_request_tokens` for several consecutive turns.)
+rather than the exception: `trigger.cache_state` defaults to `pre_expiry_or_cold`, so a turn fires only
+when the prompt cache is within a minute of expiring **or** has already expired past the clock-skew
+allowance. Neither is true of a turn that arrives seconds after the last one, so most turns of a long
+session are skipped turns.
+
+**Measured, on a real Claude Code session:** 0 of 53 turns fired under these defaults, with
+`cache_state_declined_warm` on 51 of them. The fill gate was not the obstacle — the session reached
+0.996 of the window and 12 turns were over the 0.9 threshold — the **idle time** was. `pre_expiry`
+needs roughly 240s of idle on a 5-minute entry, and the largest gap in that session was 44s. So the
+default is, in practice, gated on a user stepping away and coming back to a nearly-full context. See
+`docs/proposals/timely-compact-validation.md` for the arm that measures this and how to re-run it.
+
+(The agent's own compaction is a second route to the same skip — it shrinks the incoming request and
+can drop it back under `min_request_tokens` for several consecutive turns.)
 
 That is only safe because a skipped turn still **splices**. Once a checkpoint exists, every later turn
 re-emits the same summary bytes from it, with no model call, whichever gate declined and whether or

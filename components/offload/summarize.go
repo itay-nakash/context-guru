@@ -3,6 +3,7 @@ package offload
 import (
 	"context"
 	"encoding/json"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -764,7 +765,54 @@ func ensureSummaryTags(s string) string {
 // mode it carries the <<cg:HASH>> marker so the expand tool can recover the full
 // original trajectory; in summary mode a non-resolvable ⟪cg⟫ sentinel; in off
 // mode nothing (the summary text itself is the only trace).
+// sanitizeSummary is the one place the cheap model's raw reply is treated as UNTRUSTED before being
+// wrapped in authoritative instructions and spliced into the transcript.
+//
+// # What is and is not at risk here
+//
+// STRUCTURAL injection is already impossible and this does not attempt to re-close it: whatever comes
+// back becomes exactly one user-role text message, so the leaked-tool_use class from #103 cannot be
+// reproduced through this path. What remains is CONTENT-level steering — the reply is framed by "Use
+// this summary as the older context ... Continue the task accordingly", so text inside it inherits
+// that authority. And the span being summarized is agent-read material: a web page, a file, a
+// command's output. A prompt planted there reaches the summarizer, and whatever the summarizer echoes
+// reaches every later turn of the session, because the checkpoint is replayed verbatim.
+//
+// # What this does, and what it deliberately does not
+//
+// It strips OUR OWN CONTROL STRINGS. The wrapper appends its own expand marker, so a marker inside
+// the reply is never legitimate — and a forged one names a stash key the reply's author chose.
+// OwnsKey (proxy.go) already refuses a cross-tenant restore, so this is not a data-exfiltration path;
+// it is a way to make context_guru_expand resolve to something the model was not given, or to make a
+// summary look like it carries a restorable span when it does not. Same for a closing </summary>,
+// which the summarizer's own prompt uses as a delimiter.
+//
+// It does NOT try to detect instructions inside the reply. That is not decidable, and a filter that
+// half-works invites reliance on it. It also does not cap the length: summarize's own never-worse
+// guard already reverts a turn whose output grew, and a cap here would silently truncate a legitimate
+// long summary into a misleading one — a worse failure than the one it would prevent.
+//
+// Found by a review.
+func sanitizeSummary(summary string) string {
+	// Both marker spellings expand itself accepts, not just the plain one: expand.rawMarkerRe exists
+	// because a marker can arrive JSON-escaped, and a stripper handling only the unescaped form would
+	// be bypassed by exactly the encoding expand deliberately tolerates.
+	summary = summaryMarkerRe.ReplaceAllString(summary, "")
+	for _, bad := range []string{expand.SummaryMarker, "</summary>"} {
+		summary = strings.ReplaceAll(summary, bad, "")
+	}
+	return summary
+}
+
+// summaryMarkerRe matches both spellings of an expand marker — plain and JSON-escaped — mirroring
+// expand.rawMarkerRe. Kept here rather than exported from expand because this is a REMOVAL pattern
+// for untrusted text while expand's own regexes exist to RESOLVE markers we wrote; one identifier
+// for both jobs would let a future tightening of one silently change the other.
+var summaryMarkerRe = regexp.MustCompile(
+	`(?:<|(?i:\\u003c)){2}cg:([A-Za-z0-9_-]{1,64})(?:>|(?i:\\u003e)){2}`)
+
 func summaryWrapper(summary, key string, mode markerMode) string {
+	summary = sanitizeSummary(summary)
 	body := "=== History Summary ===\n" +
 		"The earlier trajectory is summarized below.\n\n" +
 		summary + "\n\n" +
