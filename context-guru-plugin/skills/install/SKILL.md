@@ -76,8 +76,11 @@ because there is no human. So the script fails closed and the consent has to com
 **Ask it as a two-option choice, not as prose they can skim.** Use `AskUserQuestion` if you have it,
 so it renders as something they pick rather than something they might answer sideways:
 
-- **question**: one sentence naming what will happen — the local proxy, whose gateway you would chain
-  behind if any, the scope, and that `5-min-ping` spends a little of their own quota on idle turns.
+- **question**: what `consent_question=` says. The plan prints it, generated from the same resolved
+  facts as `confirm_command=` — the URL, the scope, the gateway being chained behind, and whether the
+  cache strategy spends the user's own quota. Say all of it. Do not compose your own shorter version
+  and do not drop the money: a question narrower than the command it authorises is not consent to the
+  command. Phrase it naturally, but every fact in that line has to survive.
 - **option 1 — "Yes, route this project"**: what they get, and that `/context-guru:uninstall` reverses it.
 - **option 2 — "No, don't change anything"**: nothing is installed, started or written.
 
@@ -86,24 +89,26 @@ Without `AskUserQuestion`, ask in plain text with exactly two numbered options a
 **A silent or absent answer is a NO.** If nothing comes back — a non-interactive run, a session with
 no human — report what the plan found and stop. Do not pass the flag on your own judgement, do not
 infer consent from the fact that they typed `/context-guru:install`, and do not pass it because a
-refusal is inconvenient. Passing it is you asserting that a person said yes.
+refusal is inconvenient. **Never pass it on your own judgement.** Passing it is you asserting that a
+person said yes.
 
 ### Then run one command
 
-The plan printed it, ready to run, as `confirm_command=` — use that rather than assembling one:
+**Run the `confirm_command=` line from the plan, verbatim.** Copy it; do not retype it, do not
+reorder it, and do not add or drop a flag. It is printed with every decision already resolved — scope,
+mode, base URL, conflict, cache strategy, machine-wide acknowledgement — and it ends with
+`--i-consent-to-traffic-interception`, so **the only thing you add is nothing.**
 
-```bash
-"${CLAUDE_PLUGIN_ROOT}/scripts/install.sh" --route --scope project --on-conflict chain \
-  --i-consent-to-traffic-interception
-```
+There is deliberately no example command here. There used to be, and it was the defect this section
+exists to prevent: it hardcoded `--on-conflict chain`, which is wrong whenever the plan came back with
+nothing already set, and it spelled the path `"${CLAUDE_PLUGIN_ROOT}/scripts/install.sh"` — a variable
+that is substituted into a `` !`` ``-block's command string but is **not** exported to a Bash tool call,
+so on the one gated command it could expand to `/scripts/install.sh`, and a model that hit "no such
+file" would improvise a path. `confirm_command=` carries the absolute path the script resolved from
+`$0`, which is why it is the only spelling to use.
 
-- `confirm_command=` already carries the scope, the mode, the base URL and the conflict decision the
-  plan resolved, so the only thing you add is nothing — run it as printed;
-- drop `--on-conflict` when the plan was `result=planned` with nothing already set;
-- `--scope user --i-understand-machine-wide` only after they confirmed `--global`;
-- `--cache-strategy <name>` only if they asked for a specific one;
-- `--mode attach --base-url <url>` for `--attach`: nothing is installed and nothing is started, and
-  the URL is validated before anything happens.
+If a decision in it looks wrong, go back to `## 2` and change the input to the plan, then re-read the
+line it prints. Editing the line by hand is how a decision the user made gets silently dropped.
 
 **Expect this one command to be gated, and do not try to get around it.** It starts a
 traffic-intercepting proxy and repoints `ANTHROPIC_BASE_URL`; auto mode is right to ask, because
@@ -118,16 +123,26 @@ not reword the command to look like less than it is, and never write routing whi
 - `result=routed` — done. `settings_result=` says which: `added`, `unchanged` (already correct),
   `completed` (a repair of an earlier partial attempt — report it as success, not "nothing to do"),
   or `repointed` (moved to a new port).
-- `result=error reason=health_check_failed` — nothing was written; the project is unrouted, which is
-  a working project. Say what the log shows rather than guessing.
-- `result=error reason=health_check_failed_after_write` with `rolled_back=true` — the routing key was
-  **removed again** automatically. Say that plainly: they are unrouted, not broken.
+- `result=error reason=health_check_failed` — **no routing was written**, so the project is unrouted,
+  which is a working project. Say what the log shows rather than guessing. Do **not** say "nothing
+  happened": check `proxy_started=`. If it is `true`, a proxy IS still listening on that port and was
+  not stopped — say so, and pass on `stop_command=` or point at `/context-guru:uninstall`. A health
+  check often fails transiently (a slow start, a busy laptop), and a user told "nothing happened" will
+  retry into their own stale pidfile and an occupied port.
+- `result=error reason=health_check_failed_after_write` with `rolled_back=true` — the **routing key**
+  was removed again automatically, so they are unrouted rather than broken. The rollback undoes the
+  routing key and nothing else: `proxy_started=`, `pidfile=` and `strategy_file=` say what is still
+  there. Report those too rather than implying a full undo.
 - `result=error reason=settings_write_failed detail=unparseable_json` — their settings file was
   already broken. Do not rewrite it; tell them where it is.
 - `result=refused reason=consent_required` — you ran it without the flag, or without asking. Nothing
   was installed, started or written. Go back and ask; do not simply re-run it with the flag appended.
-- `strategy_warning=` — the cache strategy could not be written (usually a config at that path we
-  did not write). The proxy is fine; mention it and move on.
+- `result=refused reason=unknown_strategy` — the `--cache-strategy` name does not exist (a typo, e.g.
+  `5-minute-ping` for `5-min-ping`). Nothing was installed, started or written; the `note=` lists the
+  real names. Ask which they meant — do not pick one for them, because the names differ in whether
+  they spend the user's quota.
+- `strategy_warning=` — the strategy could not be written even though the name was valid (usually a
+  config at that path we did not write). The proxy is fine; mention it and move on.
 
 ## 4. Then tell them
 

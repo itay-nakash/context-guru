@@ -711,6 +711,12 @@ def cmd_show(args: argparse.Namespace) -> int:
         other_env_keys=len([k for k in (data.get("env") or {}) if k not in OURS]),
         top_level_keys=len(data),
         statusline=json.dumps(sl, sort_keys=True) if sl else "(unset)",
+        # Provenance, from the record rather than the URL's shape. install.sh decided "already
+        # routed" by matching `127.0.0.1:<port>` against the current value, which is the inference
+        # valid_base_url()'s own docstring forbids: two local proxies are indistinguishable by URL,
+        # so somebody else's proxy on our port read as ours and the conflict was never reported.
+        # `show` emitted nothing carrying this, so the caller had nothing better to use. Now it does.
+        ours=str(bool(current) and is_ours(data, current)).lower(),
     )
     return 0
 
@@ -1285,6 +1291,24 @@ def valid_base_url(url: str) -> str:
         host, _, port = hostport.partition(":")
     if not host:
         return "no_host"
+    # A host must look like a host. This was only checked for emptiness, and the consequence was not
+    # cosmetic: `http://x;touch /tmp/PWNED;cd /anthropic` was approved as `result=ok`, install.sh
+    # interpolated that approved string unquoted into the `confirm_command=` line that SKILL.md tells
+    # a model to run verbatim and that the suite runs through `bash -c`, and the injected command
+    # executed. Worse, it executed regardless of the consent answer, because it rides the string the
+    # *plan* prints — upstream of the gate in route_main.
+    #
+    # install.sh now also shell-quotes every value it interpolates, which closes the same hole from
+    # the other side. Both are deliberate: this one refuses a URL we would never want to write, and
+    # the quoting stops the next field added to that line from reopening the vector.
+    #
+    # Underscore is permitted though it is not strictly legal in a hostname, because internal
+    # gateways use it and a false refusal here blocks an install; it is shell-inert either way.
+    if host.startswith("["):
+        if not re.fullmatch(r"\[[0-9A-Fa-f:.]+\]", host):
+            return "bad_host"
+    elif not re.fullmatch(r"[A-Za-z0-9_]([A-Za-z0-9._-]*[A-Za-z0-9_])?", host):
+        return "bad_host"
     if port and not port.isdigit():
         return "bad_port"
     if port and not (0 < int(port) < 65536):
@@ -1313,7 +1337,10 @@ def cmd_check_url(args: argparse.Namespace) -> int:
 
 def cmd_strategy(args) -> int:
     if args.op == "list":
-        emit(result="ok", default=DEFAULT_STRATEGY)
+        # `names=` is the machine-readable list. The per-strategy keys below mangle `-` to `_` to be
+        # valid fact keys, so they cannot be parsed back into names — install.sh needs to validate a
+        # `--cache-strategy` value BEFORE it downloads a binary, and this is what it reads.
+        emit(result="ok", default=DEFAULT_STRATEGY, names=",".join(STRATEGIES))
         for name, spec in STRATEGIES.items():
             emit(**{f"strategy_{name.replace('-', '_')}": spec["desc"],
                     f"spends_{name.replace('-', '_')}": "true" if spec["spends"] else "false"})

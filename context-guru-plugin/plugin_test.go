@@ -5796,7 +5796,7 @@ func TestRouteConfirmCommandCarriesEveryDecision(t *testing.T) {
 	env := append(routeEnv(t, home, state, ""),
 		"ANTHROPIC_BASE_URL=https://gateway.corp.example/v1")
 	facts, code := runRoute(t, proj, env, "--plan", "--scope", "user",
-		"--i-understand-machine-wide", "--on-conflict", "chain")
+		"--i-understand-machine-wide", "--on-conflict", "chain", "--cache-strategy", "split")
 	if code != 0 {
 		t.Fatalf("exit %d: %v", code, facts)
 	}
@@ -5804,6 +5804,10 @@ func TestRouteConfirmCommandCarriesEveryDecision(t *testing.T) {
 		"--scope user",
 		"--on-conflict chain",
 		"--i-understand-machine-wide",
+		// The decision that spends the user's money was missing from both the command and this list,
+		// which is how the drop shipped past a suite that otherwise covers this area well. `split` is
+		// the value worth pinning: the regression is a user asking NOT to spend and being charged.
+		"--cache-strategy split",
 		"--i-consent-to-traffic-interception",
 	} {
 		if !strings.Contains(facts["confirm_command"], want) {
@@ -5839,5 +5843,365 @@ func TestInstallSkillAsksForConsentAsAChoice(t *testing.T) {
 	}
 	if !strings.Contains(lowered, "do not pass") {
 		t.Error("the skill never prohibits passing the consent flag on the model's own judgement")
+	}
+}
+
+// TestValidBaseURLRefusesAHostThatIsNotAHost. The host was checked for emptiness and nothing else,
+// which would be a modest gap if the approved string stayed data. It does not: install.sh interpolates
+// it into `confirm_command=`, SKILL.md tells the model to run that verbatim, and this suite runs it
+// through `bash -c`. So "is this a URL we will write" was also, in effect, "is this safe to put in a
+// command line", and it answered yes to `http://x;whoami/anthropic`.
+func TestValidBaseURLRefusesAHostThatIsNotAHost(t *testing.T) {
+	state, home := t.TempDir(), t.TempDir()
+	for _, bad := range []string{
+		"http://x;whoami/anthropic", // command separator
+		"http://$(id)/anthropic",    // command substitution
+		"http://`id`/anthropic",     // the older spelling of the same
+		"http://a b/anthropic",      // argument splitting
+		"http://x@y/anthropic",      // userinfo, i.e. a host that is not the host
+		"http://-/anthropic",        // reads as a flag once it reaches a command line
+		"http://x|y/anthropic",      // pipe
+		"http://x&y/anthropic",      // background/AND
+	} {
+		facts, code := settingsIn(t, state, home, "check-url", "--url", bad)
+		if code == 0 || facts["detail"] != "bad_host" {
+			t.Errorf("check-url %q -> exit %d detail=%q; want a bad_host refusal. This string reaches a "+
+				"shell command line the skill tells a model to run verbatim", bad, code, facts["detail"])
+		}
+	}
+
+	// The control half. A guard that refuses real gateways is a different defect, not a fix — and the
+	// underscore case is deliberate: it is not strictly legal in a hostname, internal gateways use it
+	// anyway, and it is shell-inert, so refusing it would block installs to buy nothing.
+	for _, good := range []string{
+		"http://127.0.0.1:8787/anthropic",
+		"https://gw.internal/anthropic",
+		"https://gw-1.corp_int.example:4000/anthropic",
+		"http://[::1]:8787/anthropic",
+	} {
+		facts, code := settingsIn(t, state, home, "check-url", "--url", good)
+		if code != 0 || facts["result"] != "ok" {
+			t.Errorf("check-url %q -> exit %d %v; refusing a legitimate endpoint is its own defect",
+				good, code, facts)
+		}
+	}
+}
+
+// TestRouteConfirmCommandCannotCarryShellSyntax is the second half of the same defect, and it is the
+// half that keeps working when the first is bypassed.
+//
+// The host character class cannot save this case: the URL below is a LEGITIMATE loopback URL by every
+// rule valid_base_url() enforces — real host, real port, path ending in `anthropic` — and it still
+// carries `;` in its PATH, which valid_base_url() does not police and should not have to. The only
+// thing standing between that and execution is that route_confirm_command quotes what it interpolates.
+//
+// Asserted on the marker file rather than the exit code on purpose: the install is expected to fail
+// (there is nothing at that URL). What must not happen is the payload running, and it ran BEFORE any
+// consent answer in the original, because it rides the string `--plan` prints.
+func TestRouteConfirmCommandCannotCarryShellSyntax(t *testing.T) {
+	home, state, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	marker := filepath.Join(t.TempDir(), "PWNED")
+	port := freePort(t)
+	writePluginOptions(t, home, map[string]any{"port": port})
+	env := routeEnv(t, home, state, "")
+
+	hostile := "http://127.0.0.1:" + port + "/;touch " + marker + ";/anthropic"
+
+	// It really is accepted by the validator — otherwise this test would be proving nothing about the
+	// quoting, which is the thing it exists to pin.
+	if facts, code := settingsIn(t, state, home, "check-url", "--url", hostile); code != 0 {
+		t.Skipf("check-url now refuses %q (%v); this case no longer isolates the quoting layer",
+			hostile, facts)
+	}
+
+	plan, code := runRoute(t, proj, env, "--plan", "--mode", "attach", "--base-url", hostile)
+	if code != 0 {
+		t.Fatalf("plan: exit %d %v", code, plan)
+	}
+	cmdline := plan["confirm_command"]
+	if cmdline == "" {
+		t.Fatal("no confirm_command to test")
+	}
+	cmd := exec.Command("bash", "-c", cmdline)
+	cmd.Dir = proj
+	cmd.Env = env
+	out, _ := cmd.CombinedOutput()
+	t.Logf("confirm_command run verbatim:\n%s\n%s", cmdline, out)
+
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatalf("the command printed by --plan executed an injected payload (%s exists). It fires "+
+			"whenever that string reaches a shell, which is upstream of the consent gate entirely",
+			marker)
+	}
+}
+
+// TestRouteDecidesProvenanceFromTheRecordNotTheURLShape. `route_inspect` answered "is this already
+// ours?" by matching `127.0.0.1:<port>` against the current value — the one inference
+// valid_base_url()'s own docstring forbids, because two local proxies are indistinguishable by URL.
+// The consequence was not cosmetic: somebody else's proxy on our port was reported as ours with
+// `existing_base_url=` emptied, so the single question this design says can never be defaulted was
+// never asked, and the skill narrated it as "a re-run or a repair".
+func TestRouteDecidesProvenanceFromTheRecordNotTheURLShape(t *testing.T) {
+	port := freePort(t)
+
+	t.Run("a foreign URL on our own port is a conflict", func(t *testing.T) {
+		home, state, proj := t.TempDir(), t.TempDir(), t.TempDir()
+		writePluginOptions(t, home, map[string]any{"port": port})
+		// No `$context-guru` record: this file was written by something else. Same URL we would use.
+		foreign := "http://127.0.0.1:" + port + "/anthropic"
+		if err := os.MkdirAll(filepath.Join(proj, ".claude"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeJSON(t, filepath.Join(proj, ".claude", "settings.local.json"),
+			map[string]any{"env": map[string]any{"ANTHROPIC_BASE_URL": foreign}})
+
+		facts, code := runRoute(t, proj, routeEnv(t, home, state, ""), "--plan", "--scope", "project")
+		if code != 0 {
+			t.Fatalf("plan: exit %d %v", code, facts)
+		}
+		if facts["already_routed"] == "true" {
+			t.Errorf("claimed somebody else's endpoint as ours. With port 4000 this is litellm's own "+
+				"default, so this is how an install would silently take over a working gateway: %v", facts)
+		}
+		if facts["existing_base_url"] == "" {
+			t.Errorf("existing_base_url was emptied, so the conflict is never reported and the one "+
+				"question that cannot be defaulted is never asked: %v", facts)
+		}
+	})
+
+	t.Run("a different port is not our port", func(t *testing.T) {
+		home, state, proj := t.TempDir(), t.TempDir(), t.TempDir()
+		writePluginOptions(t, home, map[string]any{"port": port})
+		// The old match was an unanchored substring, so 8787 matched an endpoint on 87870.
+		if err := os.MkdirAll(filepath.Join(proj, ".claude"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeJSON(t, filepath.Join(proj, ".claude", "settings.local.json"), map[string]any{
+			"env": map[string]any{"ANTHROPIC_BASE_URL": "http://127.0.0.1:" + port + "0/anthropic"},
+		})
+		facts, code := runRoute(t, proj, routeEnv(t, home, state, ""), "--plan", "--scope", "project")
+		if code != 0 {
+			t.Fatalf("plan: exit %d %v", code, facts)
+		}
+		if facts["already_routed"] == "true" {
+			t.Errorf("port %s0 was matched as port %s: %v", port, port, facts)
+		}
+	})
+
+	// The other direction, which is what makes the fix a fix rather than a refusal to answer: OUR OWN
+	// install must still be recognised, from the record this time, so a re-run is not narrated as fresh.
+	t.Run("our own install is still recognised", func(t *testing.T) {
+		home, state, proj := t.TempDir(), t.TempDir(), t.TempDir()
+		p := freePort(t)
+		writePluginOptions(t, home, map[string]any{"port": p})
+		env := routeEnv(t, home, state, fakeProxyDir(t, p, true))
+		t.Cleanup(func() { stopFakeProxy(t, state, p) })
+
+		if facts, code := runRoute(t, proj, env, consentOK()...); code != 0 {
+			t.Fatalf("first install: exit %d %v", code, facts)
+		}
+		facts, code := runRoute(t, proj, env, "--plan", "--scope", "project")
+		if code != 0 {
+			t.Fatalf("plan: exit %d %v", code, facts)
+		}
+		if facts["already_routed"] != "true" {
+			t.Errorf("our own routing was not recognised, so a re-run gets narrated as a fresh "+
+				"install: %v", facts)
+		}
+	})
+}
+
+// TestRouteRefusesAnUnknownStrategyBeforeTouchingAnything. `settings.py strategy set` refuses a typo
+// with exit 2, and install.sh turned that refusal into `strategy_warning=` with `|| true`. No config
+// file written means `split`, so `--cache-strategy 5-minute-ping` installed a DIFFERENT mechanism from
+// the one named and reported `result=routed`. That is the same shape as the unknown flag this script
+// already refuses: a dropped decision reporting success.
+func TestRouteRefusesAnUnknownStrategyBeforeTouchingAnything(t *testing.T) {
+	home, state, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	port := freePort(t)
+	writePluginOptions(t, home, map[string]any{"port": port})
+	env := routeEnv(t, home, state, fakeProxyDir(t, port, true))
+
+	facts, code := runRoute(t, proj, env, consentOK("--cache-strategy", "5-minute-ping")...)
+	if code != 2 || facts["reason"] != "unknown_strategy" {
+		t.Fatalf("exit %d reason=%q, want 2/unknown_strategy: %v", code, facts["reason"], facts)
+	}
+	// Before the binary, before the proxy, before the settings file.
+	for _, p := range []string{
+		filepath.Join(proj, ".claude", "settings.local.json"),
+		filepath.Join(state, "context-guru", "proxy-"+port+".pid"),
+	} {
+		if _, err := os.Stat(p); err == nil {
+			t.Errorf("refused the strategy name but created %s anyway", p)
+		}
+	}
+	// The names have to be in the refusal, or the model guesses — and the names differ in whether they
+	// spend the user's money, which is not a thing to guess at.
+	if !strings.Contains(facts["note"], "5-min-ping") {
+		t.Errorf("the refusal does not list the real strategy names: note=%q", facts["note"])
+	}
+}
+
+// TestRouteReportsAProxyItLeftRunning. "SETTINGS WERE NOT TOUCHED" is true, and "nothing happened" is
+// what a caller infers from it — the skill was instructing the model to say "nothing was written; the
+// project is unrouted, which is a working project", and the first clause was false. This matters most
+// when the health check fails TRANSIENTLY: the user is told nothing happened, and their retry meets a
+// stale pidfile on an occupied port.
+func TestRouteReportsAProxyItLeftRunning(t *testing.T) {
+	home, state, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	port := freePort(t)
+	writePluginOptions(t, home, map[string]any{"port": port})
+	// listen=false: it starts, it stays up, it never answers /healthz.
+	env := routeEnv(t, home, state, fakeProxyDir(t, port, false))
+	t.Cleanup(func() { stopFakeProxy(t, state, port) })
+
+	facts, code := runRoute(t, proj, env, consentOK()...)
+	if facts["reason"] != "health_check_failed" {
+		t.Fatalf("exit %d, want a failed health check: %v", code, facts)
+	}
+	pidfile := filepath.Join(state, "context-guru", "proxy-"+port+".pid")
+	b, err := os.ReadFile(pidfile)
+	if err != nil {
+		t.Skipf("no proxy was started, so there is no side effect to report: %v", err)
+	}
+	// Ground truth first: this test is only meaningful if something really is still running.
+	if err := exec.Command("kill", "-0", strings.TrimSpace(string(b))).Run(); err != nil {
+		t.Skipf("the fake proxy is not running, so there is nothing to report: %v", err)
+	}
+	if facts["proxy_started"] != "true" {
+		t.Errorf("a proxy IS running on port %s and the report does not say so. The caller is told "+
+			"only that settings were untouched, and will report that nothing happened: %v", port, facts)
+	}
+	if facts["pidfile"] == "" || facts["stop_command"] == "" {
+		t.Errorf("no pidfile= or stop_command=, so the user is left with a listener and no handle "+
+			"on it: %v", facts)
+	}
+}
+
+// TestRoutePlanCarriesTheConsentQuestionIncludingTheSpend.
+//
+// The gate guards the ACT and has to name the TERMS. `--i-consent-to-traffic-interception` is spelled
+// to gate "traffic gets intercepted", while what the user is asked also covers scope and which cache
+// strategy — and the default one spends their own quota while nobody is at the keyboard. A question
+// narrower than the command it authorises is not consent to that command, so the question is generated
+// from the same resolved facts as the command rather than from the skill's example paragraph.
+func TestRoutePlanCarriesTheConsentQuestionIncludingTheSpend(t *testing.T) {
+	home, state, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	writePluginOptions(t, home, map[string]any{"port": freePort(t)})
+	env := routeEnv(t, home, state, "")
+
+	facts, code := runRoute(t, proj, env, "--plan", "--scope", "project")
+	if code != 0 {
+		t.Fatalf("plan: exit %d %v", code, facts)
+	}
+	q := facts["consent_question"]
+	if q == "" {
+		t.Fatal("the plan prints no consent_question=, so the question a model asks is composed from " +
+			"prose and can drift from the command it authorises")
+	}
+	if !strings.Contains(q, "SPENDS") {
+		t.Errorf("the default strategy spends the user's own quota and the question does not say so. "+
+			"That is the half of the proposition a user would most want to have been asked: %q", q)
+	}
+
+	// And with a strategy that does not spend, it must not claim otherwise.
+	facts, code = runRoute(t, proj, env, "--plan", "--scope", "project", "--cache-strategy", "split")
+	if code != 0 {
+		t.Fatalf("plan: exit %d %v", code, facts)
+	}
+	if strings.Contains(facts["consent_question"], "SPENDS") {
+		t.Errorf("`split` spends nothing, so warning about spending is a false statement in the one "+
+			"sentence the user is asked to agree to: %q", facts["consent_question"])
+	}
+}
+
+// TestRouteHonoursTheStrategyThroughThePrintedCommand is the end-to-end of the money finding: not just
+// that the flag appears in `confirm_command=`, but that running that line actually leaves `split`
+// armed. The regression it guards is a user asking not to spend and being charged anyway.
+func TestRouteHonoursTheStrategyThroughThePrintedCommand(t *testing.T) {
+	home, state, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	port := freePort(t)
+	writePluginOptions(t, home, map[string]any{"port": port})
+	env := routeEnv(t, home, state, fakeProxyDir(t, port, true))
+	t.Cleanup(func() { stopFakeProxy(t, state, port) })
+
+	plan, code := runRoute(t, proj, env, "--plan", "--scope", "project", "--cache-strategy", "split")
+	if code != 0 {
+		t.Fatalf("plan: exit %d %v", code, plan)
+	}
+	cmd := exec.Command("bash", "-c", plan["confirm_command"])
+	cmd.Dir = proj
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	t.Logf("verbatim -> %v\n%s", err, out)
+	if !strings.Contains(string(out), "result=routed") {
+		t.Fatalf("the printed command did not complete the install:\n%s", out)
+	}
+	// `split` IS the absence of a keepalive config. Its presence means the spending strategy was armed.
+	if _, err := os.Stat(filepath.Join(state, "context-guru", "keepalive-"+port+".yaml")); err == nil {
+		t.Error("the user asked for `split` and a keepalive config was written anyway, so the install " +
+			"spends their quota while reporting success")
+	}
+}
+
+// stopFakeProxy kills whatever the run under test left listening. Pidfile-first and best-effort: a
+// `pkill` pattern is out of the question here, because these eval boxes are shared with another
+// engineer and with other sessions running as the same unix user.
+func stopFakeProxy(t *testing.T, state, port string) {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(state, "context-guru", "proxy-"+port+".pid"))
+	if err != nil {
+		return
+	}
+	if pid := strings.TrimSpace(string(b)); pid != "" {
+		exec.Command("kill", pid).Run() //nolint:errcheck
+	}
+}
+
+// TestInstallSkillRunsThePrintedCommandRatherThanAnExample. The step-2 block used to be a hand-written
+// command, and it contradicted the bullet directly under it telling the model to run `confirm_command=`
+// as printed. Two concrete defects in one block: it baked in `--on-conflict chain`, wrong whenever the
+// plan came back with nothing already set, and it spelled the path with `${CLAUDE_PLUGIN_ROOT}` — a
+// variable install.sh's own comment records as substituted into a `!`-block's command STRING but NOT
+// exported to a child process, so on the one gated command it can expand to `/scripts/install.sh`.
+func TestInstallSkillRunsThePrintedCommandRatherThanAnExample(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("skills", "install", "SKILL.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(b)
+	step, _, found := strings.Cut(body, "## 3. Read the result")
+	if !found {
+		t.Fatal("SKILL.md no longer has a `## 3. Read the result` section; this test reads the step " +
+			"above it and needs re-anchoring")
+	}
+	_, step, found = strings.Cut(step, "### Then run one command")
+	if !found {
+		t.Fatal("SKILL.md no longer has a `### Then run one command` section")
+	}
+	// The defect is a COPYABLE command, so that is what this looks for: a fenced block in this step
+	// spelling out an install.sh invocation. Prose may name `--on-conflict chain` and
+	// `${CLAUDE_PLUGIN_ROOT}` freely — the section explains why neither belongs in a command here, and
+	// an earlier version of this assertion failed on that explanation, which is a test measuring the
+	// wrong thing rather than a defect in the file.
+	for _, fence := range strings.Split(step, "```")[1:] {
+		if !strings.Contains(fence, "install.sh") {
+			continue
+		}
+		t.Errorf("this step shows a copyable install.sh command:\n%s\nA model copies the block, not "+
+			"the bullet beside it. Every hand-written spelling of this command has been wrong in the "+
+			"same two ways: a baked-in --on-conflict that is wrong whenever the plan found nothing "+
+			"already set, and ${CLAUDE_PLUGIN_ROOT}, which is not exported to a Bash tool call. "+
+			"confirm_command= carries the absolute path resolved from $0", fence)
+		break
+	}
+	if !strings.Contains(step, "verbatim") {
+		t.Error("the step no longer tells the model to run the printed line verbatim")
+	}
+	// And the ask has to be driven by the script's own resolved question, not a paragraph that can
+	// drift from what the command does.
+	if !strings.Contains(body, "consent_question") {
+		t.Error("the skill does not use consent_question=, so the question asked and the command " +
+			"authorised are composed independently and can disagree about the money")
 	}
 }

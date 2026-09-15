@@ -65,7 +65,7 @@ route_here() { CDPATH= cd -- "$(dirname -- "$0")" && pwd -P; }
 R_MODE=local R_SCOPE=project R_ONCONFLICT= R_BASEURL= R_HEALTHURL= R_NOHEALTH=0
 R_STRATEGY= R_UPSTREAM= R_USERSCOPE=0 R_PLAN=0 R_CONFIRM=0
 R_PORT= R_PRESET= R_IDLE= R_BIN= R_ONPATH= R_FILE= R_EXISTING= R_CHAINED=false
-R_ALREADY=false R_CONSENT=0
+R_ALREADY=false R_CONSENT=0 R_OURS= R_FROMENV=0
 
 route_die() { emit "result=error"; emit "reason=$1"; [ -n "${2:-}" ] && emit "detail=$2"; exit 3; }
 
@@ -129,6 +129,7 @@ route_inspect() {
   R_FILE=$(route_scope_file) || exit $?
   shown=$("$(route_here)/settings.py" show --file "$R_FILE" 2>/dev/null) || shown=""
   R_EXISTING=$(kv "$shown" base_url)
+  R_OURS=$(kv "$shown" ours)
   # `settings.py show` prints the SENTINEL `(unset)` rather than an empty value, and reading that
   # as a real base URL made every clean project look already-routed — so the install refused with
   # `base_url_already_set` and named `(unset)` as the conflicting endpoint. Caught by the first
@@ -138,12 +139,35 @@ route_inspect() {
   # The environment matters as much as the file: on a hosted or containerised agent the base URL is
   # often set in the process environment and no settings file mentions it at all, so `show` reports
   # exists=false while the session is already routed somewhere.
-  [ -z "$R_EXISTING" ] && R_EXISTING="${ANTHROPIC_BASE_URL:-}"
+  if [ -z "$R_EXISTING" ] && [ -n "${ANTHROPIC_BASE_URL:-}" ]; then
+    R_EXISTING="$ANTHROPIC_BASE_URL"
+    R_FROMENV=1
+  fi
   # Already ours is NOT a conflict — but it is not nothing either, and reporting it as an empty
   # existing_base_url would let a re-run be narrated as a fresh install. Say which it is.
-  case "$R_EXISTING" in
-    *"127.0.0.1:${R_PORT}"*) R_EXISTING=; R_ALREADY=true ;;
-  esac
+  #
+  # This asked the URL's SHAPE (`*127.0.0.1:$R_PORT*`), which is the inference valid_base_url()'s own
+  # docstring forbids twenty lines away in the sibling this calls: two local proxies are
+  # indistinguishable by URL. So somebody else's proxy on our port was reported as ours, with
+  # `existing_base_url=` emptied — the one question this design says can never be defaulted was never
+  # asked, and the skill narrated it as "a re-run or a repair". Port 4000 would have claimed litellm's
+  # own endpoint, the exact collision the docstring names.
+  #
+  # `show` now reports `ours=`, answered from the recorded installed_base_url. Prefer it whenever the
+  # value came from the FILE, which is the case the shape test got wrong.
+  if [ "$R_OURS" = true ]; then
+    R_EXISTING=; R_ALREADY=true
+  elif [ "$R_FROMENV" = 1 ]; then
+    # The value came from the ENVIRONMENT, so there is no record to consult and shape is the only
+    # signal there is. Kept, but anchored on `//host:port/` — the old unanchored match made port 8787
+    # claim an endpoint on 87870. Stated plainly as the residual inference: a foreign proxy on our
+    # port, injected through the environment rather than a file, still reads as ours here.
+    case "$R_EXISTING" in
+      *"//127.0.0.1:${R_PORT}/"*|*"//localhost:${R_PORT}/"*) R_EXISTING=; R_ALREADY=true ;;
+    esac
+  fi
+  # A value in the FILE that is not ours stays exactly where it is: a conflict, reported, and
+  # answerable only by a human. That is the case the shape match silently swallowed.
 }
 
 # The URL is DERIVED in local mode and never accepted as an argument, which is what makes the
@@ -172,13 +196,97 @@ route_health_ok() {
 # The exact command that would perform this install, decisions included. Printed by the plan and by
 # the consent refusal so nothing has to be reassembled by hand — the failure mode on 2026-09-14 was a
 # model re-typing a command and dropping part of it.
+# Quote a value so it cannot contribute SYNTAX to the line we print for someone to run. Values that
+# are already unambiguous pass through untouched, because the place this line is most likely to be
+# read is a permission prompt shown to a human, and `--scope 'project'` reads worse than `--scope
+# project` while being no safer.
+#
+# This is not hypothetical tidiness. `--base-url` was interpolated raw, valid_base_url() checked the
+# host only for emptiness, and the two together were an arbitrary-command hole: a `check-url`-approved
+# `http://x;touch /tmp/PWNED;cd /anthropic` produced a confirm_command whose payload EXECUTED when the
+# line was run the way SKILL.md and the suite both run it. It fired regardless of the consent answer,
+# because it rides the string the *plan* prints and the gate is downstream in route_main. The host
+# character class in settings.py closes today's vector; this closes the class, so the next value added
+# to this line cannot reopen it.
+shq() {
+  case "$1" in
+    ""|*[!A-Za-z0-9._:/=@,+-]*) printf "'%s'" "${1//\'/\'\\\'\'}" ;;
+    *)                          printf '%s' "$1" ;;
+  esac
+}
+
 route_confirm_command() {
-  local c="$(route_here)/install.sh --route --scope $R_SCOPE"
-  [ "$R_MODE" != local ] && c="$c --mode $R_MODE"
-  [ -n "$R_BASEURL" ] && c="$c --base-url $R_BASEURL"
-  [ -n "$R_ONCONFLICT" ] && c="$c --on-conflict $R_ONCONFLICT"
+  local c="$(shq "$(route_here)/install.sh") --route --scope $(shq "$R_SCOPE")"
+  [ "$R_MODE" != local ] && c="$c --mode $(shq "$R_MODE")"
+  [ -n "$R_BASEURL" ] && c="$c --base-url $(shq "$R_BASEURL")"
+  [ -n "$R_ONCONFLICT" ] && c="$c --on-conflict $(shq "$R_ONCONFLICT")"
+  # The strategy was missing, and it is the one decision that spends the user's money. Dropped from
+  # here, a user who asked for `split` ("install it, but do not spend my quota") ran the printed
+  # command, the strategy re-resolved to the `5-min-ping` default, and the install reported
+  # `result=routed` — success, while doing the opposite of what was asked. The consent artefact has
+  # to name the whole proposition the user was asked to agree to, not just the interception.
+  [ -n "$R_STRATEGY" ] && c="$c --cache-strategy $(shq "$R_STRATEGY")"
   [ "$R_USERSCOPE" = 1 ] && c="$c --i-understand-machine-wide"
   printf '%s --i-consent-to-traffic-interception\n' "$c"
+}
+
+# The proposition a human is asked to agree to, generated from the SAME resolved facts as the command
+# above rather than composed from the skill's example paragraph. Two things drifted apart before this
+# existed: the question mentioned the spending strategy and the gated command did not.
+route_consent_question() {
+  local q="route this project's model traffic through $(route_url)"
+  [ "$R_SCOPE" = user ] && q="route THIS MACHINE's model traffic (every project) through $(route_url)"
+  [ -n "$R_UPSTREAM" ] && q="$q, chained in front of $R_UPSTREAM"
+  if [ "$R_MODE" = attach ]; then
+    q="$q (attach mode: nothing is started, the URL is assumed to be already serving)"
+  fi
+  case "$R_STRATEGY" in
+    5-min-ping) q="$q, with cache strategy 5-min-ping, which SPENDS THE USER'S OWN QUOTA on idle \
+turns to hold the cache warm" ;;
+    *)          q="$q, with cache strategy $R_STRATEGY (no spend)" ;;
+  esac
+  printf '%s\n' "$q"
+}
+
+# start-proxy.sh derives this identically; only files that EXIST are reported, so if the two
+# derivations ever drift the symptom is a missing line rather than a wrong path.
+route_state_dir() {
+  printf '%s\n' "${CONTEXT_GURU_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/context-guru}"
+}
+
+# What steps 4b and 5 may have left behind, reported on every failure path.
+#
+# "SETTINGS WERE NOT TOUCHED" is true, and "nothing happened" is what a caller infers from it. A proxy
+# left listening on a port, with a pidfile, a dashboard DB and a strategy config, is not nothing — and
+# the skill was instructing the model to say "nothing was written; the project is unrouted, which is a
+# working project", whose first clause was false. It matters most when the health check fails
+# TRANSIENTLY (a slow start, a busy laptop): the user is told nothing happened, and their retry meets a
+# stale pidfile on an occupied port.
+#
+# This reports rather than cleans up. Stopping a proxy needs the pidfile-first, ownership-confirmed path
+# that /context-guru:uninstall already owns, and half of one here would be worse than an honest line.
+route_report_side_effects() {
+  local st pf sf pid
+  st=$(route_state_dir)
+  pf="$st/proxy-${R_PORT}.pid"
+  sf="$st/keepalive-${R_PORT}.yaml"
+  if [ -f "$pf" ]; then
+    emit "pidfile=$pf"
+    pid=$(cat "$pf" 2>/dev/null)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      emit "proxy_started=true"
+      emit "proxy_pid=$pid"
+      emit "stop_command=kill $pid"
+      emit "side_effect_note=A PROXY IS STILL RUNNING on port ${R_PORT} and was NOT stopped. Say so; \
+do not tell the user nothing happened. /context-guru:uninstall stops it, or run stop_command above."
+    else
+      emit "proxy_started=false"
+      emit "side_effect_note=a pidfile is present with nothing running behind it, so a retry meets a \
+stale pidfile on port ${R_PORT}."
+    fi
+  fi
+  [ -f "$sf" ] && emit "strategy_file=$sf"
+  return 0
 }
 
 route_report() {
@@ -197,11 +305,26 @@ route_report() {
   emit "upstream=$R_UPSTREAM"
   emit "permission_rule=$(route_permission_rule)"
   emit "consent_required=true"
+  emit "consent_question=$(route_consent_question)"
   emit "confirm_command=$(route_confirm_command)"
 }
 
 route_main() {
   route_resolve_options
+
+  # A typo'd strategy name used to reach step 4b, where `settings.py strategy set` correctly refused it
+  # with exit 2 — and `|| true` plus a catch-all `*)` turned that refusal into `strategy_warning=`.
+  # No config file written means `split`, so `--cache-strategy 5-minute-ping` installed a DIFFERENT
+  # mechanism from the one named and reported `result=routed`. That is the same shape as the unknown
+  # flag this script refuses eighty lines down: a dropped decision that reports success. Checked here,
+  # before a binary is downloaded, against the one machine-readable list of names.
+  local names
+  names=$("$(route_here)/settings.py" strategy list 2>/dev/null | sed -n 's/^names=//p')
+  case ",${names}," in
+    *",${R_STRATEGY},"*) : ;;
+    *) route_needs "unknown_strategy" "--cache-strategy $R_STRATEGY is not a strategy. Known: \
+${names:-unavailable}. Nothing was installed, started or written." ;;
+  esac
 
   if [ "$R_MODE" = attach ]; then
     [ -n "$R_BASEURL" ] || route_needs "attach_needs_base_url" \
@@ -294,9 +417,16 @@ handling auth), replace (theirs is recorded and uninstall puts it back), or abor
     emit "consent_required=true"
     emit "base_url=$(route_url)"
     emit "existing_base_url=$R_EXISTING"
-    emit "note=nothing was installed, started or written. This routes THIS SESSION's model \
-traffic through a local proxy. Ask the user in one question, with an explicit yes/no, and pass \
---i-consent-to-traffic-interception only if they say yes. Never pass it on your own judgement."
+    # The gate guards the ACT; it has to name the TERMS too. What the flag is spelled to gate is
+    # "traffic gets intercepted", while what the user is actually asked includes which scope and which
+    # cache strategy — and one of those strategies spends their own quota while nobody is at the
+    # keyboard. Ask a narrower question than the command performs and the consent artefact is
+    # under-specified relative to the consent. consent_question= is generated from the same resolved
+    # facts as confirm_command=, so the two cannot drift.
+    emit "consent_question=$(route_consent_question)"
+    emit "note=nothing was installed, started or written. Ask the user to agree to exactly what \
+consent_question= says, as a choice they pick, and pass --i-consent-to-traffic-interception only if \
+they say yes. A silent or absent answer is a NO. Never pass it on your own judgement."
     emit "confirm_command=$(route_confirm_command)"
     exit 2
   fi
@@ -327,7 +457,11 @@ traffic through a local proxy. Ask the user in one question, with an explicit ye
            --port "$R_PORT" --preset "$R_PRESET" 2>&1) || true
   case "$(kv "$sout" result)" in
     set|cleared|unchanged) : ;;
-    *) emit "strategy_warning=$(kv "$sout" reason)" ;;   # not fatal: a working proxy beats no proxy
+    # `not_ours` is genuinely non-fatal: a config we did not write is not a reason to refuse an
+    # install. An unknown NAME is different in kind — it means the caller asked for something that
+    # does not exist — and it is refused in route_main before the binary is touched, so it cannot
+    # reach here. Anything else keeps the fail-open behaviour, which is where it belongs.
+    *) emit "strategy_warning=$(kv "$sout" reason)" ;;
   esac
 
   # ---- step 5: start the proxy (local only), BEFORE writing any settings ----------------
@@ -348,6 +482,11 @@ traffic through a local proxy. Ask the user in one question, with an explicit ye
     emit "health_url=$(route_health_url)"
     emit "note=SETTINGS WERE NOT TOUCHED. An unrouted project with no proxy is a working project; \
 a routed one with no proxy is a broken one."
+    # ...but "settings were not touched" is not "nothing happened", and the caller will read it as
+    # the latter. Step 5 may have started a proxy and left a pidfile and a strategy config behind.
+    # That matters most when a health check fails TRANSIENTLY (a slow start, a busy laptop): the user
+    # is told nothing happened, and their retry meets a stale pidfile on an occupied port.
+    route_report_side_effects
     exit 3
   fi
 
@@ -364,7 +503,8 @@ a routed one with no proxy is a broken one."
     added|completed|unchanged|repointed) : ;;
     *) emit "result=error"; emit "reason=settings_write_failed"
        emit "detail=$(kv "$aout" reason)"; emit "exit=$acode"
-       emit "note=the proxy may be running; no routing was written."
+       emit "note=no routing was written."
+       route_report_side_effects        # "may be running" is knowable; say which.
        exit 3 ;;
   esac
 
@@ -377,6 +517,9 @@ a routed one with no proxy is a broken one."
     emit "result=error"; emit "reason=health_check_failed_after_write"
     emit "rolled_back=true"
     emit "note=the routing key was REMOVED again, so the project is unrouted rather than broken."
+    # The rollback undoes the ROUTING KEY and nothing else. Say so, rather than letting
+    # `rolled_back=true` be read as "everything was undone".
+    route_report_side_effects
     exit 3
   fi
 
