@@ -118,18 +118,26 @@ needed on a Pro/Max subscription** ([details](docs/how-to/install-plugin.md)):
 /context-guru:install
 ```
 
-**If it ever breaks and Claude cannot fix it:** `~/.local/state/context-guru/context-guru-reset`
-undoes the routing from a plain terminal — no working Claude session, no proxy, no network. Routing
-every request through a local proxy means a failure there fails every request, including the ones the
-uninstall skill would need, so the way out cannot itself be a skill.
-
 `/reload-plugins` is what makes the `/context-guru:*` skills exist in this session; without it the
 last line answers `Unknown command`. A new session does the same thing.
 
 That installs a statically-linked binary (no Go, no C compiler), routes **this project only** by
 default, starts the proxy on demand and lets it exit when idle. `/context-guru:uninstall` undoes it,
-restoring any base URL it replaced. The plugin installs with `--preset cache` — the prompt-cache
-split and nothing else. (The proxy's own default is `house`; `--preset` is how you change it.)
+restoring any base URL it replaced.
+
+**Two defaults worth knowing before you run it.** `--preset cache` is the pipeline: the prompt-cache
+split, nothing dropped from your requests. `cache_strategy` is separate and defaults to `5-min-ping`,
+which **spends a little of your own quota** on idle turns to hold the cache warm —
+`/context-guru:cache-strategy-picker` switches it to `split`, which spends nothing.
+
+**If sessions here run under auto mode or a restrictive permission policy, add the permission rule
+first** ([how](docs/how-to/install-plugin.md#recommended-first-grant-the-plugins-scripts-once)).
+Without it the install's opening command can be denied, and then the skill's instructions never reach
+the model at all — measured, not theoretical.
+
+**If it ever breaks and Claude cannot fix it:** `~/.local/state/context-guru/context-guru-reset` undoes
+the routing from a plain terminal — no working session, no proxy, no network. A dead proxy fails every
+request, including the ones an uninstall skill would need, so the way out cannot itself be a skill.
 
 Or by hand — a release binary is statically linked, **no Go and no C compiler needed** — or build
 from source:
