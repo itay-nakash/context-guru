@@ -699,6 +699,32 @@ type Snapshot struct {
 	SummarizeTimeouts      int64 `json:"summarize_timeouts"`
 	SummarizeErrors        int64 `json:"summarize_errors"`
 	SummarizeCallTimeoutMs int64 `json:"summarize_call_timeout_ms"`
+	// SummarizeAsync* are the health of the DETACHED summarizer path, and they exist because that
+	// path removed every other way to see it. When the call was inline, a slow or failing summarizer
+	// showed up as request latency, as a `reverted` component, and in that request's own row. Off
+	// the hot path it shows up nowhere: the request has already been answered, and no row carries
+	// the work until the session's next turn.
+	//
+	// The pair that matters is Started vs Committed. A growing gap means calls are being paid for
+	// and lost — the only signal that exists for it. Refused counts what the GLOBAL bound turned
+	// away (the deployment shedding compaction under load, distinct from the ordinary per-session
+	// single-flight refusal, which is a gate). Unresolved is how many are outstanding right now.
+	//
+	// WaitedMs and WaitTimeouts are the other half: whether the wait cap is set anywhere near
+	// right. A climbing timeout count means turns are paying the full cap and getting nothing,
+	// which is the case for lowering it or for looking at the summarizer.
+	SummarizeAsyncStarted    int64 `json:"summarize_async_started"`
+	SummarizeAsyncCommitted  int64 `json:"summarize_async_committed"`
+	SummarizeAsyncRefused    int64 `json:"summarize_async_refused"`
+	SummarizeAsyncUnresolved int64 `json:"summarize_async_unresolved"`
+	// SummarizeAsyncPanics counts recovered panics in the detached goroutine. Fail-open is right
+	// there — a panic in a detached goroutine would otherwise take the process down — but the
+	// recover() was silent, so a panicking summarizer showed up only as a growing started/committed
+	// gap and nothing named the cause.
+	SummarizeAsyncPanics      int64 `json:"summarize_async_panics"`
+	SummarizeAwaitedMs        int64 `json:"summarize_awaited_ms"`
+	SummarizeAwaitTimeouts    int64 `json:"summarize_await_timeouts"`
+	SummarizeAsyncConcurrency int64 `json:"summarize_async_concurrency"`
 	// AgentDiet* are the same three figures for the `agentdiet` baseline, which owns a
 	// third budget: its prompt is a window of b+1+a serialized steps, so it sits
 	// between extract_llm's single tool output and summarize's whole span. Reported

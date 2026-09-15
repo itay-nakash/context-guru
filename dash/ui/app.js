@@ -2967,6 +2967,216 @@ async function loadComponents() {
   }
 }
 
+// ── compaction episodes ────────────────────────────────────────────────
+const EPISODE_COLS = 11;
+
+/**
+ * Provenance is TWO CLAIMS, not one series, so each row says which it is in words rather than
+ * relying on the reader to know that "inferred" is weaker.
+ */
+const PROVENANCE_NOTE = {
+  recorded: 'the component recorded a fresh summary on this turn',
+  inferred: 'an older row that acted and carried no replay marker, so it must have paid — '
+    + 'deduced, not recorded, and never added to the recorded figures',
+};
+
+/**
+ * loadCompactionEpisodes renders what each summary earned.
+ *
+ * Every dollar goes through usdOrNA with the group's own priced flag, because an unpriced model
+ * is not a free one and a $0 here would be a claim about a mechanism we are asking the reader to
+ * trust. The coverage line is rendered even when it is unflattering — particularly then: a panel
+ * that only reports the sessions the trigger fired on is survivorship, and always positive.
+ */
+async function loadCompactionEpisodes() {
+  const body = clear($('#episodes-body'));
+  loadingRows(body, EPISODE_COLS);
+  const cov = $('#episodes-coverage');
+  const asm = $('#episodes-assumptions');
+  try {
+    const out = await api('components/compaction-episodes');
+    const groups = out.by_provenance || [];
+    clear(body);
+    if (!groups.length) {
+      tableMessage(body, EPISODE_COLS, 'No compaction episodes yet',
+        'An episode needs a summary followed by 10% more of the window being spent. Nothing in '
+        + 'this time range has both.');
+    }
+    for (const g of groups) {
+      const priced = g.episodes > g.unpriced_episodes;
+      const reason = 'every episode in this group ran on a model with no known rates';
+      const ourCost = g.invalidation_debit_usd + g.summarizer_cost_usd;
+      body.appendChild(el('tr', {},
+        el('td', {}, el('span', { class: 'pill', title: PROVENANCE_NOTE[g.provenance] || '' },
+          g.provenance)),
+        el('td', { class: 'num', text: num(g.episodes) }),
+        el('td', { class: 'num', text: num(g.closed) }),
+        // Open and voided are shown even at zero: they are the reasons a total is smaller than
+        // the episode count, and a blank cell would leave that unexplained.
+        el('td', {
+          class: 'num' + (g.open ? ' muted' : ''),
+          title: 'spans that have not finished inside this time range; counted, not totalled',
+        }, num(g.open)),
+        el('td', {
+          class: 'num' + (g.voided ? ' warn-text' : ''),
+          title: 'the client compacted its own transcript part-way through the span, so the rest '
+            + 'is not comparable; counted, not totalled',
+        }, num(g.voided)),
+        el('td', { class: 'num', text: num(g.turns) }),
+        el('td', { class: 'num' }, usdOrNA(g.cold_credit_usd, priced, reason)),
+        el('td', { class: 'num' }, usdOrNA(g.read_credit_usd, priced, reason)),
+        el('td', { class: 'num' }, usdOrNA(g.other_credit_usd, priced, reason)),
+        el('td', {
+          class: 'num',
+          title: 'the summary\u2019s own model call (' + usd(g.summarizer_cost_usd) + ') plus the '
+            + 'cache write our rewrite caused (' + usd(g.invalidation_debit_usd) + ', an upper bound)',
+        }, usdOrNA(ourCost, priced, reason)),
+        // NOT GREEN WHEN NOTHING HAS SETTLED. With no closed span the settled net is $0.00 by
+        // definition, and rendering that in good-text read as "this component broke even" on
+        // exactly the sessions where it has spent money and not yet recouped it — the position is
+        // in open_net_usd, which nothing rendered at all. A review found the false green.
+        g.closed
+          ? el('td', { class: 'num ' + (g.net_usd >= 0 ? 'good-text' : 'bad-text') },
+            usdOrNA(g.net_usd, priced, reason))
+          : el('td', {
+            class: 'num muted',
+            title: 'no span in this group has finished, so nothing has settled. The money already '
+              + 'committed is in the exposure line below the table.',
+          }, '\u2014')));
+    }
+    renderEpisodeExposure($('#episodes-exposure'), groups);
+    renderEpisodeCoverage(cov, out.coverage, out.assumptions);
+    renderEpisodeAssumptions(asm, out.assumptions);
+  } catch (err) {
+    if (aborted(err)) return;
+    cov.hidden = true;
+    asm.hidden = true;
+    $('#episodes-exposure').hidden = true;
+    tableMessage(body, EPISODE_COLS, 'Could not load compaction episodes',
+      String(err.message || err), { error: true });
+  }
+}
+
+/**
+ * renderEpisodeExposure reports money already COMMITTED whose payoff has not arrived.
+ *
+ * WITHOUT THIS THE PANEL IS FALSE-GREEN IN ITS NORMAL STATE. A summarized session adds new content
+ * slowly by construction — five turns after a summary on a live run had accrued 3,486 of a 20,000
+ * target — so "open" is where a healthy episode spends most of its life. The server computes
+ * open_net_usd, open_turns and voided_net_usd for exactly this reason, and nothing rendered any of
+ * them: the table showed a settled total of $0.00 in good-text green while the real position was
+ * negative. A review found it, and an earlier commit of mine had documented the state in prose
+ * rather than fixing it, which is the wrong end of the problem.
+ *
+ * Voided is reported apart and never blended: the client compacted its own transcript mid-span, so
+ * the remainder is not comparable to a world where we had not compacted. It is counted because
+ * dropping it would be survivorship, and separated because averaging it in would be a claim.
+ */
+function renderEpisodeExposure(node, groups) {
+  if (!node) return;
+  const open = groups.reduce((a, g) => a + (g.open || 0), 0);
+  const voided = groups.reduce((a, g) => a + (g.voided || 0), 0);
+  node.hidden = !(open || voided);
+  if (node.hidden) return;
+  clear(node);
+  // Only priced groups contribute a figure, for the same reason every cell above goes through
+  // usdOrNA: an unpriced model is not a free one.
+  const priced = groups.filter((g) => g.episodes > g.unpriced_episodes);
+  const openUSD = priced.reduce((a, g) => a + (g.open_net_usd || 0), 0);
+  const openTurns = priced.reduce((a, g) => a + (g.open_turns || 0), 0);
+  const voidUSD = priced.reduce((a, g) => a + (g.voided_net_usd || 0), 0);
+  const parts = [el('strong', {}, 'Not yet settled: ')];
+  if (open) {
+    parts.push(document.createTextNode(num(open) + ' span(s) still accruing over '
+      + num(openTurns) + ' turn(s), currently '));
+    parts.push(el('strong', { class: openUSD >= 0 ? 'good-text' : 'bad-text' }, usd(openUSD)));
+    parts.push(document.createTextNode('. That is money committed whose payoff is still arriving, '
+      + 'not a loss: the compaction turn pays a model call and a cache write up front while the '
+      + 'saving accrues turn by turn afterwards'));
+  }
+  if (voided) {
+    parts.push(document.createTextNode((open ? '. ' : '') + num(voided)
+      + ' span(s) voided by the client compacting its own transcript, carrying '));
+    parts.push(el('strong', { class: voidUSD >= 0 ? 'good-text' : 'bad-text' }, usd(voidUSD)));
+    parts.push(document.createTextNode(' — reported apart, never averaged in'));
+  }
+  parts.push(document.createTextNode('.'));
+  for (const x of parts) node.appendChild(x);
+}
+
+/**
+ * renderEpisodeCoverage is the half that can make the panel look bad, and it is not optional.
+ *
+ * "When we summarized, we saved money" is true by construction. The question that decides whether
+ * the trigger deserves its default is how many qualifying conversations it never fired on at all,
+ * and what the cold rewrites cost THEM.
+ */
+function renderEpisodeCoverage(node, c, a) {
+  if (!c || !c.conversations) {
+    // No qualifying conversation at all is itself worth saying: it means nothing in this range
+    // was ever big enough for the question to arise.
+    node.hidden = !(c && c.window_unknown);
+    if (!node.hidden) {
+      clear(node).appendChild(document.createTextNode(
+        num(c.window_unknown) + ' conversation(s) excluded because their model\u2019s context '
+        + 'window is not published — a span measured against a guessed window would be wrong by '
+        + 'whatever the guess is off by, so they are left out rather than estimated.'));
+    }
+    return;
+  }
+  const fill = pct((a && a.fill_frac ? a.fill_frac : c.fill_frac) * 100, 0);
+  const parts = [
+    el('strong', {}, 'Coverage: '),
+    document.createTextNode(num(c.with_episode) + ' of ' + num(c.conversations)
+      + ' conversations that reached ' + fill + ' of their context window produced a summary'),
+  ];
+  if (c.no_episode) {
+    parts.push(document.createTextNode('. The other ' + num(c.no_episode) + ' never did'));
+    if (c.no_episode_cold_usd) {
+      parts.push(document.createTextNode(', and paid '));
+      parts.push(el('strong', {}, usd(c.no_episode_cold_usd)));
+      parts.push(document.createTextNode(' re-creating expired cache entries — the size of the '
+        + 'opportunity there, not a saving anyone missed out on for certain'));
+    }
+  }
+  if (c.window_unknown) {
+    parts.push(document.createTextNode('. ' + num(c.window_unknown)
+      + ' more excluded: no published context window to measure against'));
+  }
+  if (c.unpriced) {
+    parts.push(document.createTextNode('. ' + num(c.unpriced) + ' on models with no known rates'));
+  }
+  parts.push(document.createTextNode('.'));
+  clear(node);
+  for (const p of parts) node.appendChild(p);
+  node.hidden = false;
+}
+
+/**
+ * renderEpisodeAssumptions prints the server's own statement of its arithmetic.
+ *
+ * The server sends it; the page does not compose it. That is the rule the KV-cache tab already
+ * keeps — a formula restated in a template is a formula nothing tests, and this one has three
+ * caveats a reader needs in order to size what they are looking at.
+ */
+function renderEpisodeAssumptions(node, a) {
+  if (!a) { node.hidden = true; return; }
+  clear(node).appendChild(el('details', {},
+    el('summary', {}, 'How this is measured'),
+    el('ul', {},
+      el('li', {}, 'Span: ' + pct(a.span_frac * 100, 0) + ' more of the window, measured in '
+        + a.span_measure),
+      el('li', {}, 'Credit: ' + a.credit_source),
+      el('li', {}, 'Cold: ' + a.cold_label),
+      el('li', {}, 'Reads: ' + a.read_label),
+      el('li', {}, 'Our cost: ' + a.debit_bound),
+      el('li', {}, 'Voided: ' + a.void_rule),
+      el('li', {}, 'Excluded: ' + a.window_rule),
+      el('li', {}, el('strong', {}, 'Not counted: '), a.known_omission))));
+  node.hidden = false;
+}
+
+
 // ── sessions ───────────────────────────────────────────────────────────────
 /**
  * wideScope is "this list can contain more than one account", which is a manager with no
@@ -4830,7 +5040,11 @@ async function checkCapture() {
 
 // ── views + filters ────────────────────────────────────────────────────────
 const loaders = {
-  overview: loadOverview, usage: loadUsage, components: loadComponents, sessions: loadSessions,
+  overview: loadOverview, usage: loadUsage,
+  // The Components tab has two independent reads: the per-component table and the
+  // compaction-episode panel. Awaited together so one failing does not blank the other.
+  components: async () => { await Promise.allSettled([loadComponents(), loadCompactionEpisodes()]); },
+  sessions: loadSessions,
   requests: loadRequests, benchmarks: loadBenchmarks, config: loadConfig,
   keepalive: loadKeepAlive,
 };
