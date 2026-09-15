@@ -172,6 +172,32 @@ type errNoPrefix struct{}
 
 func (errNoPrefix) Error() string { return "no stashed prefix for this session" }
 
+// MessagesModel is an OPTIONAL capability on a Model: a client that can send a full
+// message ARRAY rather than one flattened prompt string. Components detect it by type
+// assertion and must degrade gracefully when a client does not implement it.
+//
+// IT EXISTS FOR CACHE-REUSE COMPACTION, and the reason is arithmetic. A summarizer that
+// builds a fresh prompt ("summarize this trajectory: {text}") shares no prefix with the
+// conversation it is summarizing, so the call pays full prefill on every token — measured
+// at ~57k prompt tokens per call on a 50-task SWE-bench arm. A summarizer that sends the
+// conversation ITSELF plus a short trailing instruction reuses the prefix the agent's own
+// turn just cached, and pays prefill only on the appended suffix.
+//
+// That is the shape Anthropic's own caching guidance prescribes for exactly this case:
+// "Fork operations must reuse the parent's exact prefix. Side computations (summarization,
+// compaction, sub-agents) often spin up a separate API call. If the fork rebuilds system /
+// tools / model with any difference, it misses the parent's cache entirely."
+//
+// system is the parent request's system prompt, passed verbatim so the fork's prefix can
+// match the parent's. "" means send no system block — which is what a component on
+// Anthropic-shaped traffic must do, because the top-level `system` field is not part of
+// the messages array and the pipeline never sees it (see Ctx: there is no System field to
+// read). On that path the shared prefix therefore starts after the system block, and the
+// saving is correspondingly smaller. Measure it; do not assume it.
+type MessagesModel interface {
+	CompleteMessages(ctx context.Context, system string, msgs []schemas.ChatMessage) (string, error)
+}
+
 // ModelSpec carries the LLM clients a NeedsModel component may use, resolved per
 // request by the host adapter. Incoming is the proxied request's own model +
 // credentials (nil when unavailable, e.g. the AuthBridge host); Static is a

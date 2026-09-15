@@ -1989,6 +1989,13 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
 	snap.AgentDietTimeouts = offload.AgentDietTimeouts()
 	snap.AgentDietErrors = offload.AgentDietErrors()
 	snap.AgentDietCallTimeoutMs = offload.AgentDietCallTimeout().Milliseconds()
+	// cache_aware_summarizer's budget, plus the decline counter that distinguishes "this arm ran"
+	// from "this arm was a no-op indistinguishable from off".
+	snap.CacheAwareSummarizerCalls = offload.CacheAwareSummarizerCalls()
+	snap.CacheAwareSummarizerTimeouts = offload.CacheAwareSummarizerTimeouts()
+	snap.CacheAwareSummarizerErrors = offload.CacheAwareSummarizerErrors()
+	snap.CacheAwareSummarizerDeclined = offload.CacheAwareSummarizerDeclined()
+	snap.CacheAwareSummarizerCallTimeoutMs = offload.CacheAwareSummarizerCallTimeout().Milliseconds()
 	// Freeze-replay health, same layering: the counters live with the code that owns
 	// them (offload for the replay path, the store for dropped/repaired decisions).
 	// Reversibility's two failure causes, split because they need opposite responses and one of

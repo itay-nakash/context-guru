@@ -30,6 +30,13 @@ var statsGoldenTopLevel = []string{
 	// its own arm: folded into llm_*, an agentdiet arm whose every reflection call
 	// expired would report llm_timeouts 0 and read as having nothing to reduce.
 	"agentdiet_call_timeout_ms",
+	// cache_aware_summarizer. `declined` matters most to a reader of this contract: a declining
+	// arm is byte-identical to `off` on every other field here.
+	"cache_aware_summarizer_calls",
+	"cache_aware_summarizer_timeouts",
+	"cache_aware_summarizer_errors",
+	"cache_aware_summarizer_declined",
+	"cache_aware_summarizer_call_timeout_ms",
 	"agentdiet_errors",
 	"agentdiet_timeouts",
 	"attempted_tokens",

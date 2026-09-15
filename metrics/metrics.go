@@ -733,6 +733,22 @@ type Snapshot struct {
 	AgentDietTimeouts      int64 `json:"agentdiet_timeouts"`
 	AgentDietErrors        int64 `json:"agentdiet_errors"`
 	AgentDietCallTimeoutMs int64 `json:"agentdiet_call_timeout_ms"`
+	// CacheAwareSummarizer* are cache_aware_summarizer's. That method's whole claim is WHERE the
+	// summarization request is built — the conversation plus an appended instruction, so the
+	// backend recognises a prefix it already has — which makes its cost profile different in
+	// kind from the summarizers it is compared against. Folding it into theirs would report the
+	// baseline's numbers for the treatment.
+	//
+	// ⭐ CacheAwareSummarizerDeclined IS THE LOAD-BEARING ONE. The component refuses to run when
+	// no components.MessagesModel is available, because the alternative — flattening the
+	// conversation into one prompt string — is precisely the prefix-destroying shape it exists to
+	// avoid. A declining arm therefore compacts NOTHING and is byte-identical to `off` on every
+	// other field in this struct. Non-zero means that arm measured nothing.
+	CacheAwareSummarizerCalls         int64 `json:"cache_aware_summarizer_calls"`
+	CacheAwareSummarizerTimeouts      int64 `json:"cache_aware_summarizer_timeouts"`
+	CacheAwareSummarizerErrors        int64 `json:"cache_aware_summarizer_errors"`
+	CacheAwareSummarizerDeclined      int64 `json:"cache_aware_summarizer_declined"`
+	CacheAwareSummarizerCallTimeoutMs int64 `json:"cache_aware_summarizer_call_timeout_ms"`
 	// Extract is extract_llm's own economics (#28 part F), including NET savings after
 	// its LLM cost — the honest headline for the one component that spends to save.
 	// Purely ADDITIVE: no field above was renamed or removed, so deploy/harbor/*.py
