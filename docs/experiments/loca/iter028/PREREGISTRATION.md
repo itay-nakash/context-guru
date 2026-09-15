@@ -1,8 +1,8 @@
 # LOCA — iteration 028 (preregistration)
 
-**The question, in one sentence.** Does reward track how MUCH the sweep removes, or how WELL it
-chooses — because iteration 027 measured a selector no better than dropping everything, and
-iteration 024 won reward with one just like it.
+**The question, in one sentence.** Does iteration 024's reward result reproduce at a band that is
+actually 64k, with a gate that is honestly priced — because iteration 027 measured the same selector as
+no better than dropping everything, and iteration 024 won reward with it anyway.
 
 Written before the run. Predictions, margin and stopping rule are fixed here; anything decided after
 the numbers exist is recorded as an amendment with its date.
@@ -20,7 +20,7 @@ Two facts from iteration 027 that are only compatible under a specific hypothesi
 A selector that removes wrongly should not win reward. It can only have done so if **removal volume,
 not selection quality, is what buys reward** — plausible because every removal is reversible through
 `expand`, so a wrong drop usually costs a round-trip rather than the task. The counter-evidence is in
-iteration 024's own ledger: **`expand_unresolved_missing` = 175 in arm B against 0 in arm A** — content
+iteration 024's own ledger: **`expand_unresolved_missing` = 175 in ITS arm B against 0 in its arm A** — content
 the agent asked for and did not get back.
 
 Offline scoring cannot separate these. It ranks selectors against a proxy for reuse; it has no access
@@ -52,96 +52,152 @@ their declared band without anyone noticing, and iteration 026 spent a full run 
 2. A probe pass shows `sweep_offered` > 0 and at least **five** asks across the pass.
 3. `sweep_inventory_below_min` and `sweep_offered` both reported, so the half declined by the floor is
    visible rather than inferred.
-4. On the probe, arm B's `sweep_index_disagreed` (new counter, §3) is **> 0** — the arms must actually
-   differ on live traffic, or the run measures two identical things.
+4. On the probe, the BASELINE arm reports `acted = 0` and arm A reports at least five asks. The arms must
+   actually differ on live traffic, or the run measures two identical things — which is what iteration
+   026 spent a full run discovering.
 
-## 3. Arms
+## 3. Arms — two, paired within one pass
 
-All arms share: pipeline = `housellm` + `summarize`, **no `collapse`**; band 64k; `evidence: true`;
-`econ_trigger: true`; `reward_premium: 20`; `min_pressure: 0.20`; `min_inventory: 10`;
-`min_later_turns: 3`; `keep_recheck_turns: 4`; the mass-shrunk bucketed approval estimator.
+Arms B and C from an earlier draft of this file are **deferred**, at the operator's direction: nothing
+is worth comparing until the fixed configuration is shown to beat doing nothing.
 
-| arm | selection | expected on iteration 027's offline numbers |
-|---|---|---|
-| **A — volume** | the model's verdict alone, today's drop path | 85.4% of tokens, false-drop 36.8%, live-kept 16.1% |
-| **B — agreement** | drop only where the index says `unreferenced` **and** the model says drop | 58.0% of tokens, false-drop 8.0%, live-kept 88.7% |
-| **C — free** | `coref` alone: deterministic index, **no asks at all** | 70.6% of tokens, false-drop 10.7%, live-kept 76.8% |
+Both arms share: pipeline = `housellm` + `summarize`, **no `collapse`**; band **64k**;
+`min_inventory: 10`; `min_later_turns: 3`; `keep_recheck_turns: 4`; the same 15 environments and the
+same 5 seeds iteration 024 used.
 
-Arm C is the benchmark that matters. If neither LLM arm beats a component that costs nothing, the
-component's case is closed regardless of how A and B compare.
+| arm | sweep block |
+|---|---|
+| **baseline** | `min_tokens: 100`, `min_inventory: 10` — **`econ_trigger` absent**, so the component cannot act |
+| **A** | the same, plus `evidence: true`, `econ_trigger: true`, `reward_premium: 20`, `min_pressure: 0.20`, the horizon credit and the mass-shrunk bucketed estimator |
 
-**Arm B is NOT the refuted pre-filter, and the distinction is load-bearing.** `extract_sweep.go`
-records why: that design offered the model only what the index had already judged spent, so its
-inventory was starved and the comparison it is good at was destroyed (`4ca1f13`). Arm B offers the
-**full** inventory — the model sees and ranks everything, which is the condition its judgement needs —
-and the index acts only as a **veto on the drop**. Index proposes and model disposes is the refuted
-shape; here the model proposes and the index vetoes.
+**Why a baseline arm exists at all, when iteration 024 already has one.** It does not: iteration 024 ran
+at a window that silently resolved to **1,000,000**, and this runs at 64k. That is established from its
+own transcripts rather than inferred — **19% of its decision points carried prefixes already over 64,000
+tokens, to a maximum of 507,263**, which cannot happen against a 64k window. Reading a 64k arm against
+iteration 024's stored numbers would confound the band with the change under test, which is the exact
+defect that invalidated iterations 008–024. Same seeds control instance variance; they do not rescue a
+different independent variable.
 
-**What arm B cannot do, stated so it is not read as a defect later.** `opaque` candidates are never
-`unreferenced`, so arm B can never remove them: **46% of token mass is out of its reach by
-construction**. Arm A can and does. If A wins, part of the win may come from mass B is structurally
-forbidden to touch, and that is a real confound between "volume" and "reach", not a clean contrast.
+**The baseline's zero is measured, not assumed.** With `econ_trigger` absent only the pre-expiry trigger
+can fire, and iteration 024's arm A recorded `not_in_pre_expiry_window` on **378 of 378** requests —
+eight parallel workers never leave an idle gap for a cache entry to approach expiry.
 
-### Code required before the run
+### What has to exist before the run
 
-- A config key on `extract_llm_sweep` gating the drop on index agreement (arm B), with the index verdict
-  read from the record the evidence line already computes — not recomputed.
-- A counter, `sweep_index_disagreed`, incremented when the model says drop and the index does not.
-  Without it a null result cannot be told from an arm that never diverged, which is the failure
-  iteration 026 spent a run on.
+**No new code.** Every term arm A needs already ships: the mass-shrunk bucketed approval estimator, the
+horizon credit, `reward_premium`, `min_pressure`, `min_inventory`, `min_later_turns` and
+`keep_recheck_turns`. That is a reason to prefer this design over the three-arm one, whose agreement-gate
+arm needed a new config key and a new counter.
 
-## 4. Endpoints, margin and predictions — fixed now
+What is needed is **one config file** — the baseline, identical to arm A's with `evidence` and
+`econ_trigger` removed — and the per-pass readout that the stopping rule in §4 consumes.
 
-**Primary:** task accuracy, arm vs arm. **Two-sided**, and the margin is declared here because
-iteration 007's failure was declaring it afterwards.
+## 4. Endpoints, margin, power and the stopping rule — all fixed now
 
-- **Margin: 8 percentage points of accuracy.** A difference smaller than that is reported as "not
-  separated at this n", never as equivalence.
-- **Secondary, in this order:** cost per task; steps per task; cost per step; `expand_unresolved_missing`;
-  `summarize acted` (which is a real deferral signal for the first time now that `collapse` is gone).
-- **`expand_unresolved_missing` is a first-class endpoint, not a footnote.** It is the direct measure of
-  irreversible loss, and it is the quantity that decides whether iteration 024's reward was bought with
-  it. An arm that wins accuracy while raising it has not demonstrated a shippable mechanism.
+**Primary:** task accuracy over all 15 environments, arm vs arm, **two-sided**. Margin declared here
+because iteration 007's failure was declaring it afterwards.
 
-**Power, honestly.** 15 tasks × 5 seeds = 75 runs per arm, but the seeds are 5 draws of the **same 15
-tasks**, so observations are clustered and effective n is nearer 15 than 75. At that n only large
-effects resolve: iteration 008's own figures put the detectable harm bound at ~10% for n=30 and ~6% for
-n=45. **8 points is therefore near the edge of what this design can see**, and a null is the most
-likely single outcome. Reported as such rather than dressed up.
+- **Margin: 11 accuracy points**, which is what this design can actually resolve (below).
+- **Secondary, declared NOW so it is not a post-hoc subgroup:** the same difference over the **12
+  environments that are not degenerate**. Across 18 valid iteration-024 passes, `CanvasArrangeExamS2LEnv`,
+  `CanvasListTestS2LEnv` and `WoocommerceNewWelcomeS2LEnv` were solved **0 times**; they contribute
+  nothing to any arm difference and only dilute it.
+- **Then, in order:** `expand_unresolved_missing`; cost per task; steps per task; cost per step;
+  `summarize acted` (a real deferral signal for the first time now that `collapse` is gone).
+- **`expand_unresolved_missing` is a first-class endpoint.** It is the direct measure of irreversible
+  loss and the quantity that decides whether iteration 024's reward was bought with it — 175 in its arm
+  B against 0 in arm A. An arm that wins accuracy while raising it has not demonstrated anything
+  shippable.
+
+### Power, measured from iteration 024's own passes
+
+Pass-to-pass variability, each pass being 15 tasks, over 19 recorded passes (the one pass that scored
+0.000 excluded as a wholesale failure):
+
+| endpoint | mean | SD | SD/mean |
+|---|---|---|---|
+| accuracy | 0.520 | **0.087** | 16.8% |
+| steps | 24.3 | 5.74 | 23.6% |
+| cost | $40.89 | $17.02 | 41.6% |
+
+Minimum detectable difference, two arms, k passes each, p<0.05 two-sided:
+
+| endpoint | k=3 | k=5 | k=8 | iteration 024's effect |
+|---|---|---|---|---|
+| **accuracy (pts)** | 14 | **11** | 9 | **~13** |
+| steps | 9.2 | 7.1 | 5.6 | ~4.7 |
+| cost ($) | 27 | 21 | 17 | ~8.9 |
+
+**So k=5 is the minimum that can see the effect being chased, and k=3 cannot** — it needs 14 points
+where ~13 are expected, which makes "directional but not significant" the *expected* result of a
+three-seed run rather than bad luck. **Accuracy is also the best-powered endpoint of the three**: steps
+and cost have higher relative variance and neither resolves iteration 024's effect even at k=8.
+
+Two structural facts about the noise, both measured: between-seed SD is only **0.048** while within-seed
+SD is **0.091**, so instance identity is the small part and pairing arms on a seed buys little; and one
+task is **6.7 accuracy points**, so a single-seed difference can only take values in multiples of 6.7 —
+there is no observable "+5 points".
+
+### The stopping rule
+
+Read out after **every seed**, on the **cumulative** mean difference (arm A − baseline), not on the
+seed in isolation.
+
+- **Stop for futility if the running mean is below −6.7 points** — one whole task, which is also the
+  granularity of the measurement.
+- **The rule is futility-only.** It may end the run; it may **not** declare a win. The confirmatory
+  two-sided test happens at k=5. Stopping early for lack of benefit does not inflate type-I error;
+  looking, continuing because it looked good, then testing at 0.05, does.
+
+Simulated 200,000 times at the measured one-seed difference SE of 12.3 points:
+
+| threshold | abandons a true +13.3 | stops early if truly 0 | stops early if truly −13.3 |
+|---|---|---|---|
+| 0.0 | 11.6% | 69.0% | 99.6% |
+| **−6.7** | **3.2%** | 33.1% | **93.3%** |
+| −13.3 | 0.8% | 11.3% | 67.9% |
+
+At −6.7 a genuinely harmful arm stops at seed **1.6** on average, saving ~3.4 of 5 passes — roughly
+**$140**.
+
+**A pass that fails is not a futility signal and must not enter the running mean.** One of iteration
+024's 19 passes scored 0.000. Re-run, do not pool, if a pass scores 0.000 accuracy, or if arm A produces
+fewer than 5 asks (§2's pre-flight applies per pass, not only at the start).
 
 ### Pre-registered reading
 
 | outcome | conclusion | next |
 |---|---|---|
-| **A > C** beyond the margin, `expand_unresolved_missing` flat | volume buys reward and selection quality is a red herring; the offline scorer has been measuring the wrong thing | ship the sweep; retire the index-vs-model framing |
-| **A > C** but `expand_unresolved_missing` rises | the win is bought with irreversible loss; iteration 024's 175 is the same effect | not shippable as is; the reversibility invariant comes first |
-| **B > C** beyond the margin | selection quality is what pays, and the LLM's value is as a **veto** on a deterministic proposer | pursue agreement-gating; drop arm A's design |
-| **B ≈ A ≈ C** within the margin | the LLM adds nothing reward can see at this n, and C costs nothing | close the LLM sweep for selection; the index is the selector |
-| **C > A and C > B** | the asks are net harmful, not merely unprofitable | close it, and record that offline triage was right |
-| the run fires < 5 asks/pass | the pre-flight gate failed and nothing is concluded | fix firing before spending again |
+| **A > baseline** beyond 11 points, `expand_unresolved_missing` flat | iteration 024's result reproduces at a correctly denominated band, and volume buys reward despite a selector no better than the null | then, and only then, arms B and C to ask whether selection quality adds anything |
+| **A > baseline** but `expand_unresolved_missing` rises | the win is bought with irreversible loss, and iteration 024's 175 was the same effect | not shippable; the reversibility invariant comes first |
+| **within 11 points**, running mean positive | not separated at this n. NOT equivalence | the effect, if any, is below what 15 environments can resolve; more seeds do not fix a 15-environment ceiling |
+| **futility rule fires** (running mean < −6.7) | the fixed configuration is not better and may be worse | stop; ~$140 of the budget is unspent |
+| fewer than 5 asks in a pass | the pass is invalid, not informative | re-run that pass; do not pool it |
 
-## 5. Cost, and why the figure is a range
+## 5. Cost
 
-Derived rather than asserted, because four cost estimates in iteration 027 were wrong by 2–3x.
+Derived from measured per-pass cost, because five estimates in iteration 027 were wrong by 2–3x.
 
-- Agent traffic: LOCA's **measured $1.13/run** (iteration 024) × 75 runs ≈ **$85/arm**.
-- Ask spend for an LLM arm: iteration 024 spent **$20.26** on 626 asks over 75 runs ≈ **$0.27/run**, so
-  ≈ **$20/arm**. Arm C spends **$0**.
-- Bottom-up total for three arms ≈ **$190**.
-- But the plan file's own estimate for a *two*-arm 32k reward run was **$340**, i.e. ~$170/arm — twice
-  the bottom-up figure.
+`results.json` records **$40.89 per pass** of 15 tasks (mean over 19 passes, SD $17.02). Two arms x 5
+seeds = 10 passes ≈ **$409**, plus arm A's ask spend — iteration 024 spent $20.26 across 5 seeds ≈ **$20**.
 
-**Budget $200–$400 and treat the lower end as optimistic.** Two mitigations, both to be decided before
-launch and recorded here: drop to 3 seeds (~40% less, and the seeds are the correlated dimension, so
-little power is lost), or drop arm A and test only agreement-gating against free — which halves the
-LLM spend but forfeits the volume-versus-quality contrast that is the entire question.
+**Budget ≈ $430**, less whatever the futility rule saves (~$140 in expectation on a harmful arm).
+
+An earlier draft of this file said ~$190, from the iteration 024 page's "LOCA's measured $1.13/run" x 75
+runs. That does not reconcile with $40.89 per 15-task pass ($2.73/task), and which quantity the $1.13
+refers to is unresolved. The measured per-pass figure is used here and the discrepancy is flagged rather
+than settled quietly.
 
 ## 6. What this cannot settle
 
 - **Nothing about the 46% of mass that is `opaque`.** No offline instrument can score it (iteration 027
-  §7) and arm B cannot touch it. A separate paired run whose only difference is whether opaque
-  candidates may be dropped is the only way, and it is not this one.
+  §7), and this run does not separate it either: arm A may drop there, so any win is partly a win on mass
+  nothing can audit. A paired run whose only difference is whether opaque candidates may be dropped is
+  the only way to isolate it, and it is not this one.
 - **Whether the reuse proxy's blindness matters.** The offline expectations in §3 are floors, and the
   proxy cannot see positional or non-identifier reuse at all.
-- **Generalisation past LOCA.** One benchmark, 15 tasks. SWE-bench is deliberately out of scope until a
-  configuration beats arm C here.
+- **Generalisation past LOCA.** One benchmark, and really 12 non-degenerate environments. SWE-bench is
+  deliberately out of scope until a configuration beats the baseline here.
+- **Whether selection quality matters at all.** That was the three-arm question and it is deferred: this
+  run asks only whether the fixed configuration beats doing nothing. If it does, the agreement-gated arm
+  becomes worth its own iteration; if it does not, that question is moot.
