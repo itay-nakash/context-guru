@@ -221,6 +221,26 @@ shq() {
   esac
 }
 
+# Every flag that takes a value goes through this. `${2:?...}` wrote BASH's diagnostic to stderr and
+# exited 1 - no `result=`, nothing on stdout - which is the third recorded instance of this design's
+# oldest defect shape: `--plan` exiting 2 with no output, `--scope bogus` swallowed by a command
+# substitution, and this. Closed as a class rather than one flag at a time. Its message was also the
+# wrong artefact even when someone saw stderr: `line 623: 2: --scope needs a value` leads with bash's
+# parameter name and a line number, so it reads as an internal error rather than a fact about input.
+#
+# NOT written as `R_SCOPE=$(need --scope "$2")`, which is the shape that looks natural and reproduces
+# the bug being fixed: inside `$(...)` the emitted lines are captured into the variable and `exit` ends
+# only the subshell, so the script would carry on with the refusal text as the flag's value. This
+# validates in the CALLING shell and the branch assigns separately.
+route_need_value() {   # route_need_value <flag> <value-or-empty>
+  [ "$#" -ge 2 ] && [ -n "$2" ] && return 0
+  emit "result=error"; emit "reason=missing_value"; emit "flag=$1"
+  emit "note=$1 takes a value; refused rather than defaulted. A re-typed command is usually cut at \
+the END, so a dropped value is at least as likely as a dropped flag - and a dropped flag already \
+reports unknown_flag here."
+  exit 2
+}
+
 route_confirm_command() {
   local c="$(shq "$(route_here)/install.sh") --route --scope $(shq "$R_SCOPE")"
   [ "$R_MODE" != local ] && c="$c --mode $(shq "$R_MODE")"
@@ -242,7 +262,16 @@ route_confirm_command() {
 route_consent_question() {
   local q="route this project's model traffic through $(route_url)"
   [ "$R_SCOPE" = user ] && q="route THIS MACHINE's model traffic (every project) through $(route_url)"
-  [ -n "$R_UPSTREAM" ] && q="$q, chained in front of $R_UPSTREAM"
+  # What happens to an endpoint they already have is the whole of the question on the conflict path,
+  # and this named it only via R_UPSTREAM - which the `chain` branch populates, and that branch has by
+  # definition NOT run on the path that asks. So the generated question described a local proxy and
+  # never mentioned the corporate gateway it was about to displace, while SKILL.md says of this line
+  # "say all of it, do not compose your own shorter version". Both answers now have a clause.
+  if [ -n "$R_UPSTREAM" ]; then
+    q="$q, keeping $R_UPSTREAM as the upstream so it still handles auth"
+  elif [ "$R_ONCONFLICT" = replace ] && [ -n "$R_EXISTING" ]; then
+    q="$q, REPLACING $R_EXISTING (recorded, and /context-guru:uninstall puts it back)"
+  fi
   if [ "$R_MODE" = attach ]; then
     q="$q (attach mode: nothing is started, the URL is assumed to be already serving)"
   fi
@@ -329,7 +358,12 @@ route_report() {
   emit "upstream=$R_UPSTREAM"
   emit "permission_rule=$(route_permission_rule)"
   emit "consent_required=true"
-  emit "consent_question=$(route_consent_question)"
+  if [ "${1:-}" = per_conflict_answer ]; then
+    emit "consent_question_chain=$(R_ONCONFLICT=chain R_UPSTREAM="$R_EXISTING" route_consent_question)"
+    emit "consent_question_replace=$(R_ONCONFLICT=replace route_consent_question)"
+  else
+    emit "consent_question=$(route_consent_question)"
+  fi
   # On the ONE path that asks a question, the answer is not in R_ONCONFLICT yet - so a single
   # confirm_command would be printed WITHOUT --on-conflict, and running it verbatim just re-hits the
   # same refusal. SKILL.md says the line carries every decision and that the caller adds nothing;
@@ -338,11 +372,15 @@ route_report() {
   #
   # So the script prints one runnable command PER ANSWER and the model picks, never composes.
   if [ "${1:-}" = per_conflict_answer ]; then
+    # Paired one-to-one, and generated together, so the question a user answers and the command that
+    # answer runs cannot describe different things. `chain` and `replace` are genuinely different
+    # propositions and that difference IS what the user is being asked to decide.
     emit "confirm_command_chain=$(R_ONCONFLICT=chain route_confirm_command)"
     emit "confirm_command_replace=$(R_ONCONFLICT=replace route_confirm_command)"
-    emit "confirm_command=(none yet: the conflict decision is unanswered. Use the \
-confirm_command_chain= or confirm_command_replace= line above, exactly as printed. For abort, run \
-nothing at all.)"
+    # No `confirm_command=` and no `consent_question=` on this path, deliberately. Both keys mean one
+    # thing everywhere else in this script - a line that RUNS, and the whole proposition - and
+    # assigning either an explanatory sentence would be the value most likely to be re-read as if it
+    # were the real thing. Absence is unambiguous; the paired keys are self-describing.
   else
     emit "confirm_command=$(route_confirm_command)"
   fi
@@ -432,6 +470,8 @@ or abort"
 handling auth), replace (theirs is recorded and uninstall puts it back), or abort"
     # Runnable, for the same reason as the plan path: a refusal that names a flag but not a command
     # invites the caller to assemble one.
+    emit "consent_question_chain=$(R_ONCONFLICT=chain R_UPSTREAM="$R_EXISTING" route_consent_question)"
+    emit "consent_question_replace=$(R_ONCONFLICT=replace route_consent_question)"
     emit "confirm_command_chain=$(R_ONCONFLICT=chain route_confirm_command)"
     emit "confirm_command_replace=$(R_ONCONFLICT=replace route_confirm_command)"
     exit 2
@@ -619,13 +659,13 @@ if [ "${1:-}" = --route ]; then
     case "$1" in
       --plan)     R_PLAN=1 ;;
       --confirm)  R_CONFIRM=1 ;;
-      --mode)     R_MODE="${2:?--mode needs a value}"; shift ;;
-      --scope)    R_SCOPE="${2:?--scope needs a value}"; shift ;;
-      --on-conflict) R_ONCONFLICT="${2:?--on-conflict needs a value}"; shift ;;
-      --cache-strategy) R_STRATEGY="${2:?--cache-strategy needs a value}"; shift ;;
-      --base-url) R_BASEURL="${2:?--base-url needs a value}"; shift ;;
-      --health-url) R_HEALTHURL="${2:?--health-url needs a value}"; shift ;;
-      --upstream) R_UPSTREAM="${2:?--upstream needs a value}"; shift ;;
+      --mode)     route_need_value --mode "${2:-}";     R_MODE="$2"; shift ;;
+      --scope)    route_need_value --scope "${2:-}";    R_SCOPE="$2"; shift ;;
+      --on-conflict) route_need_value --on-conflict "${2:-}"; R_ONCONFLICT="$2"; shift ;;
+      --cache-strategy) route_need_value --cache-strategy "${2:-}"; R_STRATEGY="$2"; shift ;;
+      --base-url) route_need_value --base-url "${2:-}"; R_BASEURL="$2"; shift ;;
+      --health-url) route_need_value --health-url "${2:-}"; R_HEALTHURL="$2"; shift ;;
+      --upstream) route_need_value --upstream "${2:-}"; R_UPSTREAM="$2"; shift ;;
       --no-health-check) R_NOHEALTH=1 ;;
       --i-understand-machine-wide) R_USERSCOPE=1 ;;
       --i-consent-to-traffic-interception) R_CONSENT=1 ;;

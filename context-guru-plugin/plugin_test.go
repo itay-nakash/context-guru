@@ -6741,3 +6741,122 @@ func TestStrategySetSplitNeedsNoPreset(t *testing.T) {
 		t.Errorf("the empty-preset guard was lost where it matters: exit %d %v", code, facts)
 	}
 }
+
+// TestConflictPlanAsksAboutTheEndpointItWouldDisplace.
+//
+// `consent_question=` named an existing endpoint only through R_UPSTREAM, which the `chain` branch
+// populates — and that branch has by definition not run on the path that ASKS about the conflict. So on
+// the one path where what happens to the user's gateway *is* the question, the generated question
+// described a local proxy and never mentioned the gateway, while SKILL.md says of that line "say all of
+// it, do not compose your own shorter version".
+//
+// This is the round-2 finding (the gate protects the act, not the terms) surviving on the single path
+// where the terms are the whole question — and untested for the same reason the --force bug was:
+// TestRoutePlanCarriesTheConsentQuestionIncludingTheSpend runs with no ANTHROPIC_BASE_URL, so it never
+// reaches this branch.
+//
+// Questions are now paired one-to-one with the commands that perform them, so the thing a user answers
+// and the thing that answer runs are generated together and cannot describe different states.
+func TestConflictPlanAsksAboutTheEndpointItWouldDisplace(t *testing.T) {
+	home, state, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	port := freePort(t)
+	writePluginOptions(t, home, map[string]any{"port": port})
+	const gateway = "https://gw.corp.example/v1"
+	env := withEnv(routeEnv(t, home, state, ""), "ANTHROPIC_BASE_URL", gateway)
+
+	facts, code := runRoute(t, proj, env, "--plan", "--scope", "project")
+	if code != 0 || facts["reason"] != "base_url_already_set" {
+		t.Fatalf("expected the conflict question: exit %d %v", code, facts)
+	}
+
+	chain, replace := facts["consent_question_chain"], facts["consent_question_replace"]
+	for name, q := range map[string]string{"chain": chain, "replace": replace} {
+		if q == "" {
+			t.Fatalf("consent_question_%s= is missing, so a model asking per SKILL.md has no generated "+
+				"question for the answer it is asking about: %v", name, facts)
+		}
+		if !strings.Contains(q, gateway) {
+			t.Errorf("consent_question_%s does not name the endpoint being displaced, which is the "+
+				"whole of what the user is deciding: %q", name, q)
+		}
+		// The money clause from round 2 has to survive into both, or the paired questions reintroduce
+		// the very gap they were split to close.
+		if !strings.Contains(q, "SPENDS") {
+			t.Errorf("consent_question_%s lost the spend warning: %q", name, q)
+		}
+	}
+	// The two answers are different propositions, and the difference is the decision.
+	if !strings.Contains(chain, "upstream") {
+		t.Errorf("the chain question does not say the gateway is KEPT: %q", chain)
+	}
+	if !strings.Contains(replace, "REPLACING") {
+		t.Errorf("the replace question does not say the gateway is replaced: %q", replace)
+	}
+
+	// One state, one shape: neither bare key appears here, because neither could be complete and both
+	// mean something exact everywhere else in this script.
+	for _, k := range []string{"consent_question", "confirm_command"} {
+		if v, ok := facts[k]; ok {
+			t.Errorf("%s=%q is printed on the path where the answer is what is being asked for. A key "+
+				"whose contract is 'the whole proposition' / 'a line that runs' should be absent rather "+
+				"than hold a placeholder, which is the value most likely to be re-read as the real thing",
+				k, v)
+		}
+	}
+
+	// And the control, because the risk in this fix is losing the single keys where they are correct.
+	clean := t.TempDir()
+	facts, code = runRoute(t, clean, routeEnv(t, home, t.TempDir(), ""), "--plan", "--scope", "project")
+	if code != 0 {
+		t.Fatalf("plan with no conflict: exit %d %v", code, facts)
+	}
+	if facts["consent_question"] == "" || facts["confirm_command"] == "" {
+		t.Errorf("with nothing to ask about, the single keys must still be present and complete: %v",
+			facts)
+	}
+}
+
+// TestMissingFlagValueRefusesOnStdout. Every value-taking flag used `${2:?...}`, which writes BASH's
+// diagnostic to stderr and exits 1 — no `result=`, nothing on stdout. That is the third recorded
+// instance of one shape in this design: `--plan` exiting 2 with no output, `--scope bogus` swallowed by
+// a command substitution, and this. Closed as a class rather than one flag at a time, which is why this
+// test is a table over every flag rather than an assertion about one.
+//
+// Reachability is honest rather than dramatic: the skill's `!` block passes fixed arguments and a
+// printed `confirm_command_*` always carries its values. What makes it matter is that a re-typed or
+// truncated command is usually cut at the END — so a dropped VALUE is at least as likely as a dropped
+// flag, and a dropped flag already reports `unknown_flag` on stdout.
+func TestMissingFlagValueRefusesOnStdout(t *testing.T) {
+	home, proj := t.TempDir(), t.TempDir()
+	env := routeEnv(t, home, t.TempDir(), "")
+
+	for _, flag := range []string{
+		"--scope", "--mode", "--on-conflict", "--base-url",
+		"--cache-strategy", "--upstream", "--health-url",
+	} {
+		t.Run(flag, func(t *testing.T) {
+			facts, code := runRoute(t, proj, env, "--plan", flag)
+			if code == 0 {
+				t.Fatalf("%s with no value was accepted: %v", flag, facts)
+			}
+			// The point of the finding: something has to arrive on STDOUT as key=value.
+			if len(facts) == 0 {
+				t.Fatalf("%s exited %d with nothing on stdout. A caller keying on `result=` sees an "+
+					"empty response and no reason, which is this design's oldest defect shape", flag, code)
+			}
+			if facts["reason"] != "missing_value" {
+				t.Errorf("reason=%q, want missing_value: %v", facts["reason"], facts)
+			}
+			if facts["flag"] != flag {
+				t.Errorf("flag=%q, want %q — the refusal has to name which one: %v",
+					facts["flag"], flag, facts)
+			}
+		})
+	}
+
+	// Control: the flags still take values.
+	facts, code := runRoute(t, proj, env, "--plan", "--scope", "project", "--cache-strategy", "split")
+	if code != 0 || facts["result"] != "planned" {
+		t.Errorf("a flag WITH a value must still be accepted: exit %d %v", code, facts)
+	}
+}

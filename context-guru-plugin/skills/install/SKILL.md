@@ -58,12 +58,10 @@ to act on, not a failure to report as one.
   integrity check in the path and the binary is about to carry all of their LLM traffic. Never set
   `CONTEXT_GURU_INSECURE=1` on their behalf.
 
-**One question, one sentence, covering everything that needs their agreement** — the scope, what to
-do about an existing base URL, and what the cache strategy spends. Not one interview per parameter:
-
-> You're already pointed at `<existing_base_url>`. I'd put context-guru in front of it so that
-> gateway keeps handling your login, routing this project only, with keep-alive on as `5-min-ping`
-> (a little of your own quota on idle turns, to hold the cache warm). OK?
+**One question, covering everything that needs their agreement — and you do not write it.** The
+script generates it from the resolved facts and prints it (`consent_question*=`, below). A worked
+example used to sit here, and it was the hazard this design removes: a hand-written sentence beside a
+generated one is two sources for one question, and the hand-written one drifts.
 
 ### Get an explicit yes, as a choice they pick
 
@@ -76,29 +74,33 @@ because there is no human. So the script fails closed and the consent has to com
 **Ask it as a two-option choice, not as prose they can skim.** Use `AskUserQuestion` if you have it,
 so it renders as something they pick rather than something they might answer sideways:
 
-- **question**: what `consent_question=` says. The plan prints it, generated from the same resolved
-  facts as `confirm_command=` — the URL, the scope, the gateway being chained behind, and whether the
-  cache strategy spends the user's own quota. Say all of it. Do not compose your own shorter version
-  and do not drop the money: a question narrower than the command it authorises is not consent to the
-  command. Phrase it naturally, but every fact in that line has to survive.
+- **question**: what the `consent_question*=` line says, generated from the same resolved facts as the
+  command it authorises. Say all of it — phrase it naturally, but every fact has to survive, and do not
+  drop the money: a question narrower than the command it authorises is not consent to that command.
 - **option 1 — "Yes, route this project"**: what they get, and that `/context-guru:uninstall` reverses it.
 - **option 2 — "No, don't change anything"**: nothing is installed, started or written.
 
 Without `AskUserQuestion`, ask in plain text with exactly two numbered options and stop for an answer.
 
 **A silent or absent answer is a NO.** If nothing comes back — a non-interactive run, a session with
-no human — report what the plan found and stop. Do not pass the flag on your own judgement, do not
-infer consent from the fact that they typed `/context-guru:install`, and do not pass it because a
-refusal is inconvenient. **Never pass it on your own judgement.** Passing it is you asserting that a
-person said yes.
+no human — report what the plan found and stop. Do not infer consent from the fact that they typed
+`/context-guru:install`, and do not pass it because a refusal is inconvenient. **Never pass it on your
+own judgement.** Passing it is you asserting that a person said yes.
 
 ### Then run one command
 
 **When the plan came back `needs_decision reason=base_url_already_set`**, there is no single
 `confirm_command=` — the answer is the thing being asked for. The plan prints one runnable line per
-answer instead: `confirm_command_chain=` and `confirm_command_replace=`. Ask the user, then run the
-line matching their answer, verbatim. For *abort*, run nothing. Do **not** add `--on-conflict` to any
-other line yourself; if neither line is present, re-run `--plan` rather than composing a command.
+answer instead, **paired**: `consent_question_chain=` with `confirm_command_chain=`, and
+`consent_question_replace=` with `confirm_command_replace=`. Ask using the two `consent_question_*`
+lines as the two options — they name the endpoint the user already has and say what becomes of it,
+which is the whole of what they are deciding — then run the `confirm_command_*` line matching their
+answer, verbatim. For *abort*, run nothing.
+
+There is deliberately **no** `consent_question=` or `confirm_command=` on that path: the answer is the
+thing being asked for, so neither could be complete, and both those keys mean something exact
+everywhere else. Do not add `--on-conflict` to any other line yourself; if the paired lines are
+missing, re-run `--plan` rather than composing a command.
 
 **Otherwise, run the `confirm_command=` line from the plan, verbatim.** Copy it; do not retype it, do not
 reorder it, and do not add or drop a flag. It is printed with every decision already resolved — scope,
