@@ -3567,6 +3567,18 @@ func TestStartProxyReportsThePresetActuallyInEffect(t *testing.T) {
 			wantNotIn: []string{"cache strategy split", "preset " + optionPreset},
 		},
 		{
+			// A file we do NOT own whose first line happens to carry `strategy=`. The name read ran the
+			// `sed` on line 1 of whatever was at that path, with no ownership test — so a foreign config
+			// was announced as `cache strategy <theirs>` in the startup note while `strategy show` called
+			// the same file `(foreign)`. The stated point of recording the name in the file is that the
+			// two readers cannot disagree, so this is the row that holds them to it.
+			name:      "a foreign config's strategy= is not adopted as ours",
+			writeCfg:  true,
+			cfg:       "# rolled by hand strategy=evil\npreset: house\ncache:\n  keepalive: true\n",
+			wantIn:    []string{"cache strategy unnamed"},
+			wantNotIn: []string{"cache strategy evil", "strategy evil"},
+		},
+		{
 			// A config we own but that predates named strategies, or one we do not own at all: report
 			// it as unnamed rather than guessing. Naming the DEFAULT here would be the worst answer —
 			// it would tell the user 5-min-ping is armed when the file might say anything.
@@ -6203,5 +6215,108 @@ func TestInstallSkillRunsThePrintedCommandRatherThanAnExample(t *testing.T) {
 	if !strings.Contains(body, "consent_question") {
 		t.Error("the skill does not use consent_question=, so the question asked and the command " +
 			"authorised are composed independently and can disagree about the money")
+	}
+}
+
+// TestStrategySetSplitAnswersTheOperationTheCallerAsked. `split` is implemented as a REMOVAL, because
+// --config replaces --preset rather than layering, so the absence of a file is the only way to express
+// "the preset and nothing else". That is the right mechanism and it leaked into the report: a caller
+// that asked to `set` was answered `cleared`, so success had three words and every future caller
+// inherited the obligation to know that. install.sh's `set|cleared|unchanged` case was the tell.
+func TestStrategySetSplitAnswersTheOperationTheCallerAsked(t *testing.T) {
+	state, home := t.TempDir(), t.TempDir()
+	const port = "9391"
+
+	if facts, code := settingsIn(t, state, home, "strategy", "set", "--name", "5-min-ping",
+		"--port", port, "--preset", "cache"); code != 0 || facts["result"] != "set" {
+		t.Fatalf("arming a real strategy: exit %d %v", code, facts)
+	}
+
+	facts, code := settingsIn(t, state, home, "strategy", "set", "--name", "split",
+		"--port", port, "--preset", "cache")
+	if code != 0 || facts["result"] != "set" {
+		t.Errorf("`strategy set --name split` -> exit %d result=%q; a caller that asked to set is "+
+			"answered with the word for what it asked: %v", code, facts["result"], facts)
+	}
+	if facts["strategy"] != "split" {
+		t.Errorf("strategy=%q, want split: %v", facts["strategy"], facts)
+	}
+	// The path deliberately does not exist now, so naming it would be a confidently wrong detail.
+	if facts["file"] != "(none)" {
+		t.Errorf("file=%q; `split` IS the absence of a config, so the report should not name a path "+
+			"that does not exist: %v", facts["file"], facts)
+	}
+	// Idempotent, and still a `set`.
+	if facts, code := settingsIn(t, state, home, "strategy", "set", "--name", "split",
+		"--port", port, "--preset", "cache"); code != 0 || facts["result"] != "set" {
+		t.Errorf("re-setting split: exit %d %v", code, facts)
+	}
+
+	// And `clear`, invoked as itself, keeps its own vocabulary — the fix must not have flattened the
+	// distinction, only stopped one op borrowing the other's word.
+	if facts, code := settingsIn(t, state, home, "strategy", "set", "--name", "5-min-ping",
+		"--port", port, "--preset", "cache"); code != 0 {
+		t.Fatalf("re-arming: exit %d %v", code, facts)
+	}
+	if facts, code := settingsIn(t, state, home, "strategy", "clear", "--port", port); code != 0 ||
+		facts["result"] != "cleared" {
+		t.Errorf("`strategy clear` -> exit %d result=%q, want cleared: %v", code, facts["result"], facts)
+	}
+	if facts, code := settingsIn(t, state, home, "strategy", "clear", "--port", port); code != 0 ||
+		facts["result"] != "unchanged" {
+		t.Errorf("`strategy clear` with nothing there -> exit %d result=%q, want unchanged: %v",
+			code, facts["result"], facts)
+	}
+}
+
+// TestOneHourHeadDisclosesItsSizeGateEverywhereItIsDescribed.
+//
+// `1-hour-head` ships `head_ttl_min_tokens: 50000`, and that number is the difference between the
+// strategy doing something and doing nothing. It was disclosed in none of the three places a user
+// reads before choosing it.
+//
+// What makes it more than an omission: the evidence all three places cite is config/config.go's live
+// measurement — GRANTED on Haiku 4.5 at 36,251 of 36,574 tokens written, downgraded on Sonnet 5 at
+// 48,212. BOTH of those prefixes are BELOW the 50,000 gate the strategy ships with. So a user who arms
+// this on the one model where the tier was granted, and checks a request the size of the one that was
+// measured, sees no 1h label — and the advice to "verify with Usage.CacheWrite1h" reads zero for a
+// second, undisclosed reason. The threshold is defensible (it is what makes the strategy pay at all);
+// advertising a measurement while hiding the gate that measurement would not have passed is not.
+func TestOneHourHeadDisclosesItsSizeGateEverywhereItIsDescribed(t *testing.T) {
+	// The gate as actually shipped. If this changes, every description below has to change with it,
+	// which is the coupling this test exists to enforce.
+	gate, err := os.ReadFile(filepath.Join("scripts", "settings.py"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(gate), `head_ttl_min_tokens": 50000`) {
+		t.Skip("the 1-hour-head size gate is no longer 50000; re-anchor this test on the new value")
+	}
+
+	for _, f := range []struct{ what, path string }{
+		{"the strategy's own description, printed by `strategy list`",
+			filepath.Join("scripts", "settings.py")},
+		{"plugin.json, where the option is actually chosen",
+			filepath.Join(".claude-plugin", "plugin.json")},
+		{"the picker skill, which is what a user reads to decide",
+			filepath.Join("skills", "cache-strategy-picker", "SKILL.md")},
+	} {
+		b, err := os.ReadFile(f.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := string(b)
+		// Only the text that talks about this strategy matters, but every one of these files mentions it
+		// exactly once in prose, so a whole-file check is honest and stays readable.
+		if !strings.Contains(body, "1-hour-head") && !strings.Contains(body, "1-hour tier") {
+			t.Errorf("%s (%s) does not describe 1-hour-head at all", f.what, f.path)
+			continue
+		}
+		if !strings.Contains(body, "50k") && !strings.Contains(body, "50,000") &&
+			!strings.Contains(body, "50000") {
+			t.Errorf("%s (%s) describes 1-hour-head without stating the >=50k-token gate. Below that "+
+				"the strategy does nothing at all, and both measurements this file cites as evidence "+
+				"(36,574 and 48,212 tokens) are on the inactive side of it", f.what, f.path)
+		}
 	}
 }

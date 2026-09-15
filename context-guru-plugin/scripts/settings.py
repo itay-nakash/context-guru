@@ -1196,10 +1196,19 @@ STRATEGIES: dict[str, dict] = {
     "1-hour-head": {
         "cache": {"head_ttl_1h": True, "head_ttl_min_tokens": 50000},
         "spends": False,
-        "desc": "split + asks for the 1-hour tier on the tools/system breakpoints. No pings. "
-                "Measured GRANTED on Haiku 4.5 and SILENTLY DOWNGRADED on Sonnet 5 (zero 1h "
-                "writes in 19,805 production requests), so on Opus/Sonnet the honest projection "
-                "is $0 - verify with Usage.CacheWrite1h before believing otherwise.",
+        # The >=50k gate is disclosed HERE, in plugin.json and in the picker's table, because it is
+        # the difference between this strategy doing something and doing nothing - and because both
+        # measurements quoted as its evidence are BELOW it (36,574 on Haiku, 48,212 on Sonnet). A
+        # strategy that advertises a measurement has to state the threshold that measurement would
+        # not have passed, or "verify with Usage.CacheWrite1h" reads zero for an undisclosed second
+        # reason and the user concludes the tier was refused.
+        "desc": "split + asks for the 1-hour tier on the tools/system breakpoints, and ONLY on "
+                "requests with a >=50k-token prefix (below that it does nothing at all; the "
+                "size gate is what makes it pay, +$48.81 against -$18.34 applied blanket). No "
+                "pings. Measured GRANTED on Haiku 4.5 and SILENTLY DOWNGRADED on Sonnet 5 (zero "
+                "1h writes in 19,805 production requests), so on Opus/Sonnet the honest projection "
+                "is $0 - verify with Usage.CacheWrite1h before believing otherwise, and note both "
+                "of those measurements were on prefixes UNDER the 50k gate this ships with.",
     },
 }
 
@@ -1370,8 +1379,18 @@ def cmd_strategy(args) -> int:
         return 0
 
     if args.op == "clear":
+        # `set --name split` reaches here by recursion, because split IS the absence of a config. The
+        # caller still asked to SET something, and answering a `set` with `cleared` made success have
+        # three words - install.sh's `set|cleared|unchanged` case was the tell, and every future caller
+        # would have inherited the obligation to know that. So the OP the caller invoked decides the
+        # word, and the mechanism stays a removal.
+        as_set = getattr(args, "as_set", False)
+        done, nothing_to_do = ("set", "set") if as_set else ("cleared", "unchanged")
+        # `file=` would name a path that deliberately does not exist, which is the sort of confidently
+        # wrong detail this script is careful about elsewhere.
+        where = "(none)" if as_set else path
         if not os.path.exists(path):
-            emit(result="unchanged", strategy="split", file=path, port=port,
+            emit(result=nothing_to_do, strategy="split", file=where, port=port,
                  note="nothing to remove")
             return 0
         text = ""
@@ -1384,7 +1403,7 @@ def cmd_strategy(args) -> int:
                  note="this config was not written by context-guru; remove it by hand")
             return 2
         os.unlink(path)
-        emit(result="cleared", strategy="split", file=path, port=port,
+        emit(result=done, strategy="split", file=where, port=port,
              note="takes effect the next time the proxy starts, not now")
         return 0
 
@@ -1404,8 +1423,9 @@ def cmd_strategy(args) -> int:
         return 2
 
     if name == "split":
-        # Expressed as a removal, per the STRATEGIES comment.
-        return cmd_strategy(argparse.Namespace(op="clear", port=port))
+        # Expressed as a removal, per the STRATEGIES comment - but reported as a `set`, because that is
+        # the operation the caller asked for. See the clear branch.
+        return cmd_strategy(argparse.Namespace(op="clear", port=port, as_set=True))
 
     if os.path.exists(path):
         try:

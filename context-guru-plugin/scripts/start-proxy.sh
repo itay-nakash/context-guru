@@ -307,7 +307,18 @@ if [ -f "$KEEPALIVE_CFG" ]; then
   CONFIG_ARGS=(--config "$KEEPALIVE_CFG")
   # Same fail-open discipline as the preset read below: an unreadable or marker-less file must
   # still start the proxy, and must report what is KNOWN rather than something confident and wrong.
-  cfg_strategy=$(sed -n '1s/.*strategy=\([A-Za-z0-9._-]*\).*/\1/p' "$KEEPALIVE_CFG" 2>/dev/null)
+  # The name is trusted only on a file whose first line carries OUR marker. Read without that check,
+  # any foreign config with `strategy=` on line 1 was reported as `cache strategy <theirs>` in the
+  # startup note while `strategy show` called the same file `(foreign)` - and the stated point of
+  # recording the name in the file is that the two readers cannot disagree. Same marker test as
+  # settings.py's _strategy_is_ours(): the prefix, and `written by` on that line.
+  cfg_first=$(sed -n '1p' "$KEEPALIVE_CFG" 2>/dev/null)
+  case "$cfg_first" in
+    "# context-guru:"*"written by"*)
+      cfg_strategy=$(printf '%s\n' "$cfg_first" \
+        | sed -n 's/.*strategy=\([A-Za-z0-9._-]*\).*/\1/p') ;;
+    *) cfg_strategy= ;;
+  esac
   if [ -n "$cfg_strategy" ]; then
     STRATEGY_NOTE="$cfg_strategy"
   else
