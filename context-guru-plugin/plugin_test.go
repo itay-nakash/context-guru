@@ -6494,3 +6494,105 @@ func TestConsentQuestionReadsWhetherAStrategySpendsFromTheStrategyList(t *testin
 		})
 	}
 }
+
+// TestRouteChainOverwritesAConflictFoundInTheFile is the shape no test covered, and the reason the
+// defect it guards shipped through three review rounds.
+//
+// `--force` was added for `replace` only. But BOTH decisions overwrite the routing key — that is what
+// routing through a proxy means; `chain` differs only in additionally recording the old value as the
+// upstream. So `chain` — the answer the design calls usually right, and the reason the plan asks its one
+// question at all — died at step 7 whenever the existing endpoint was in a settings FILE:
+// `result=error reason=settings_write_failed` with an empty `detail=`, for a user who had just answered
+// the only question they were asked.
+//
+// Every other chain test supplies the conflict through `ANTHROPIC_BASE_URL`, where there is nothing in
+// the file to overwrite, and that path genuinely worked. A file-sourced conflict is what a PREVIOUS
+// context-guru install or a checked-in team settings file leaves behind, which is not an exotic state.
+func TestRouteChainOverwritesAConflictFoundInTheFile(t *testing.T) {
+	home, state, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	port := freePort(t)
+	writePluginOptions(t, home, map[string]any{"port": port})
+	env := routeEnv(t, home, state, fakeProxyDir(t, port, true)) // routeEnv strips ANTHROPIC_BASE_URL
+	t.Cleanup(func() { stopFakeProxy(t, state, port) })
+
+	const gateway = "https://gw.corp.example/v1"
+	settings := filepath.Join(proj, ".claude", "settings.local.json")
+	if err := os.MkdirAll(filepath.Dir(settings), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeJSON(t, settings, map[string]any{"env": map[string]any{"ANTHROPIC_BASE_URL": gateway}})
+
+	facts, code := runRoute(t, proj, env, consentOK("--on-conflict", "chain")...)
+	if code != 0 || facts["result"] != "routed" {
+		t.Fatalf("chain with a file-sourced conflict: exit %d result=%q detail=%q — the user answered "+
+			"the one question the plan asks and the install refused: %v",
+			code, facts["result"], facts["detail"], facts)
+	}
+	if facts["upstream"] != gateway {
+		t.Errorf("upstream=%q, want the gateway we chained behind: %v", facts["upstream"], facts)
+	}
+
+	// The record is what makes overwriting their key safe rather than a bypass, so it is asserted
+	// directly rather than trusted: uninstall reads `previous_base_url` to put the gateway back.
+	got := readJSON(t, settings)
+	envBlock, _ := got["env"].(map[string]any)
+	meta, _ := got["$context-guru"].(map[string]any)
+	if envBlock["ANTHROPIC_UPSTREAM"] != gateway {
+		t.Errorf("ANTHROPIC_UPSTREAM=%v, want %q — without it the proxy has nothing to forward to and "+
+			"the user's auth breaks", envBlock["ANTHROPIC_UPSTREAM"], gateway)
+	}
+	if meta["previous_base_url"] != gateway {
+		t.Fatalf("previous_base_url=%v, want %q. This is the record uninstall restores from; without "+
+			"it, --force here WOULD be a one-way door", meta["previous_base_url"], gateway)
+	}
+
+	// And the round trip, because the record only matters if it is actually honoured.
+	if facts, code := settingsIn(t, state, home, "remove", "--file", settings); code != 0 {
+		t.Fatalf("remove: exit %d %v", code, facts)
+	}
+	after := readJSON(t, settings)
+	afterEnv, _ := after["env"].(map[string]any)
+	if afterEnv["ANTHROPIC_BASE_URL"] != gateway {
+		t.Errorf("after uninstall ANTHROPIC_BASE_URL=%v, want their gateway %q restored",
+			afterEnv["ANTHROPIC_BASE_URL"], gateway)
+	}
+}
+
+// TestAConflictRefusalNamesItsReason. install.sh reports `detail=$(kv "$aout" reason)` on a failed
+// write, and this script's conflict paths emitted `existing=`/`proposed=` but no `reason=` — so the one
+// line that would explain a refusal came back EMPTY, and a refusal was indistinguishable from a crash.
+//
+// Fixed in the emit rather than in the reader: every caller keys on `reason=`, so a refusal that does
+// not carry one is the defect, and naming it once fixes it for all of them.
+func TestAConflictRefusalNamesItsReason(t *testing.T) {
+	state, home := t.TempDir(), t.TempDir()
+
+	t.Run("add, base URL already set", func(t *testing.T) {
+		f := filepath.Join(t.TempDir(), "settings.json")
+		writeJSON(t, f, map[string]any{
+			"env": map[string]any{"ANTHROPIC_BASE_URL": "https://gw.corp.example/v1"}})
+		facts, code := settingsIn(t, state, home, "add", "--file", f,
+			"--url", "http://127.0.0.1:8787/anthropic")
+		if code != 2 || facts["result"] != "conflict" {
+			t.Fatalf("exit %d result=%q, want a conflict: %v", code, facts["result"], facts)
+		}
+		if facts["reason"] != "base_url_already_set" {
+			t.Errorf("reason=%q; install.sh reports this as `detail=`, so an empty one leaves the "+
+				"failure unexplained on the line meant to explain it: %v", facts["reason"], facts)
+		}
+	})
+
+	t.Run("remove, a URL we did not install", func(t *testing.T) {
+		f := filepath.Join(t.TempDir(), "settings.json")
+		writeJSON(t, f, map[string]any{
+			"env": map[string]any{"ANTHROPIC_BASE_URL": "https://someone.else/v1"}})
+		facts, code := settingsIn(t, state, home, "remove", "--file", f,
+			"--url", "http://127.0.0.1:8787/anthropic")
+		if code != 2 || facts["result"] != "conflict" {
+			t.Fatalf("exit %d result=%q, want a conflict: %v", code, facts["result"], facts)
+		}
+		if facts["reason"] == "" {
+			t.Errorf("no reason= on the remove mismatch either: %v", facts)
+		}
+	})
+}

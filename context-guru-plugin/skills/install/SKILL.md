@@ -135,6 +135,11 @@ not reword the command to look like less than it is, and never write routing whi
   there. Report those too rather than implying a full undo.
 - `result=error reason=settings_write_failed detail=unparseable_json` — their settings file was
   already broken. Do not rewrite it; tell them where it is.
+- `result=error reason=settings_write_failed detail=base_url_already_set` — a **refusal**, not a broken
+  file: something was already at that key and the run did not carry a decision authorising a replace.
+  It should not be reachable once `--on-conflict` is passed, so treat it as a bug worth reporting
+  rather than something to retry with a flag you chose yourself. Check `proxy_started=` — the proxy
+  starts before this step, so one may be running.
 - `result=refused reason=consent_required` — you ran it without the flag, or without asking. Nothing
   was installed, started or written. Go back and ask; do not simply re-run it with the flag appended.
 - `result=refused reason=unknown_strategy` — the `--cache-strategy` name does not exist (a typo, e.g.

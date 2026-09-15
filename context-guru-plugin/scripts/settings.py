@@ -851,7 +851,8 @@ def cmd_add(args: argparse.Namespace) -> int:
     if sl_command:
         existing_sl = data.get(STATUSLINE_KEY)
         if existing_sl is not None and not is_ours_statusline(data, existing_sl) and not args.force:
-            emit(result="conflict", file=args.file, existing=json.dumps(existing_sl, sort_keys=True),
+            emit(result="conflict", reason="statusline_already_set", file=args.file,
+                 existing=json.dumps(existing_sl, sort_keys=True),
                  proposed=sl_command, conflict_on="statusline",
                  note="a statusLine is already configured in this file; ask before replacing it, "
                       "then re-run with --force")
@@ -926,7 +927,13 @@ def cmd_add(args: argparse.Namespace) -> int:
         # env block — what is left is a base URL the USER set, which may be their company
         # gateway or a benchmark endpoint, and taking it over would break their setup while
         # looking like it worked.
-        emit(result="conflict", file=args.file, existing=current, proposed=args.url,
+        # `reason=` is emitted because callers read it. install.sh's step 7 reports
+        # `detail=$(kv "$aout" reason)`, and this path emitted `existing=`/`proposed=` but no reason -
+        # so the one line that would have explained a refusal came back EMPTY. Fixed here rather than
+        # in the reader: every caller of this script keys on `reason=`, so a refusal that does not
+        # carry one is the defect, and naming it once fixes it for all of them.
+        emit(result="conflict", reason="base_url_already_set", file=args.file, existing=current,
+             proposed=args.url,
              note="ANTHROPIC_BASE_URL is already set here; ask before replacing it, "
                   "then re-run with --force")
         return 2
@@ -1033,7 +1040,8 @@ def cmd_remove(args: argparse.Namespace) -> int:
     if current != args.url and not is_ours(data, current):
         # Refuse to remove a base URL that is not ours: the user may have pointed this at
         # something else since, and uninstall must not take that with it.
-        emit(result="conflict", file=args.file, existing=current, expected=args.url,
+        emit(result="conflict", reason="not_the_url_we_installed", file=args.file, existing=current,
+             expected=args.url,
              note="this base URL is not the one context-guru installed; left untouched")
         return 2
     saved = backup(args.file)

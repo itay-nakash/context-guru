@@ -538,7 +538,20 @@ a routed one with no proxy is a broken one."
   [ -n "$R_UPSTREAM" ] && add+=(--upstream "$R_UPSTREAM")
   [ -n "$R_BIN" ] && add+=(--bin "$R_BIN")
   [ "$R_SCOPE" = user ] && add+=(--user-scope)
-  [ "$R_ONCONFLICT" = replace ] && add+=(--force)
+  # BOTH decisions overwrite the routing key - that is what routing through a proxy means. `chain`
+  # differs from `replace` only in ADDITIONALLY recording the old value as the upstream, which the
+  # --upstream line above already does. With --force added for `replace` alone, the answer this design
+  # calls usually right - and the plan's one question exists to ask - died at this step whenever the
+  # existing endpoint was in a settings FILE: settings.py refused, correctly by its own rules, and the
+  # user who answered the one question they were asked got `result=error` for it.
+  #
+  # Every chain test supplied the conflict through $ANTHROPIC_BASE_URL, where there is nothing in the
+  # file to overwrite, which is why this was not caught. The file-sourced conflict is the shape a
+  # PREVIOUS context-guru install or a checked-in team settings file leaves behind.
+  #
+  # --force is not a bypass here: `add` records `previous_base_url`, so /context-guru:uninstall puts
+  # their gateway back. That record is what makes overwriting safe, and there is a test for it.
+  case "$R_ONCONFLICT" in replace|chain) add+=(--force) ;; esac
   aout=$("${add[@]}" 2>&1) || acode=$?
   local ares; ares=$(kv "$aout" result)
   case "$ares" in
