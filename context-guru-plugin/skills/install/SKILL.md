@@ -65,12 +65,40 @@ do about an existing base URL, and what the cache strategy spends. Not one inter
 > gateway keeps handling your login, routing this project only, with keep-alive on as `5-min-ping`
 > (a little of your own quota on idle turns, to hold the cache warm). OK?
 
-Then run **one** command, carrying their answer as arguments:
+### Get an explicit yes, as a choice they pick
+
+**`--route` refuses to do anything without `--i-consent-to-traffic-interception`.** That is
+deliberate and it is not a formality: everything the command does either intercepts their model
+traffic or points it somewhere new, and the approval prompt cannot be relied on to ask about that —
+it is probabilistic, a skill can declare it away, and in an unattended session there is no prompt
+because there is no human. So the script fails closed and the consent has to come from a person.
+
+**Ask it as a two-option choice, not as prose they can skim.** Use `AskUserQuestion` if you have it,
+so it renders as something they pick rather than something they might answer sideways:
+
+- **question**: one sentence naming what will happen — the local proxy, whose gateway you would chain
+  behind if any, the scope, and that `5-min-ping` spends a little of their own quota on idle turns.
+- **option 1 — "Yes, route this project"**: what they get, and that `/context-guru:uninstall` reverses it.
+- **option 2 — "No, don't change anything"**: nothing is installed, started or written.
+
+Without `AskUserQuestion`, ask in plain text with exactly two numbered options and stop for an answer.
+
+**A silent or absent answer is a NO.** If nothing comes back — a non-interactive run, a session with
+no human — report what the plan found and stop. Do not pass the flag on your own judgement, do not
+infer consent from the fact that they typed `/context-guru:install`, and do not pass it because a
+refusal is inconvenient. Passing it is you asserting that a person said yes.
+
+### Then run one command
+
+The plan printed it, ready to run, as `confirm_command=` — use that rather than assembling one:
 
 ```bash
-"${CLAUDE_PLUGIN_ROOT}/scripts/install.sh" --route --scope project --on-conflict chain
+"${CLAUDE_PLUGIN_ROOT}/scripts/install.sh" --route --scope project --on-conflict chain \
+  --i-consent-to-traffic-interception
 ```
 
+- `confirm_command=` already carries the scope, the mode, the base URL and the conflict decision the
+  plan resolved, so the only thing you add is nothing — run it as printed;
 - drop `--on-conflict` when the plan was `result=planned` with nothing already set;
 - `--scope user --i-understand-machine-wide` only after they confirmed `--global`;
 - `--cache-strategy <name>` only if they asked for a specific one;
@@ -96,6 +124,8 @@ not reword the command to look like less than it is, and never write routing whi
   **removed again** automatically. Say that plainly: they are unrouted, not broken.
 - `result=error reason=settings_write_failed detail=unparseable_json` — their settings file was
   already broken. Do not rewrite it; tell them where it is.
+- `result=refused reason=consent_required` — you ran it without the flag, or without asking. Nothing
+  was installed, started or written. Go back and ask; do not simply re-run it with the flag appended.
 - `strategy_warning=` — the cache strategy could not be written (usually a config at that path we
   did not write). The proxy is fine; mention it and move on.
 
@@ -134,4 +164,7 @@ not reword the command to look like less than it is, and never write routing whi
   variable is what would take them off subscription billing.
 - Do not prefix the command with environment variables. Permission rules match by command PREFIX, so
   `FOO=1 .../install.sh` is a command nobody can approve. Every option is a flag for that reason.
+- **Do not pass `--i-consent-to-traffic-interception` unless a person answered yes to a question you
+  asked.** It is not a flag that makes a refusal go away; it is you telling the script, on their
+  behalf, that they agreed to have their model traffic intercepted.
 - Do not claim it works because a command exited 0. `result=routed` is the claim.

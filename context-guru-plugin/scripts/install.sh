@@ -65,7 +65,7 @@ route_here() { CDPATH= cd -- "$(dirname -- "$0")" && pwd -P; }
 R_MODE=local R_SCOPE=project R_ONCONFLICT= R_BASEURL= R_HEALTHURL= R_NOHEALTH=0
 R_STRATEGY= R_UPSTREAM= R_USERSCOPE=0 R_PLAN=0 R_CONFIRM=0
 R_PORT= R_PRESET= R_IDLE= R_BIN= R_ONPATH= R_FILE= R_EXISTING= R_CHAINED=false
-R_ALREADY=false
+R_ALREADY=false R_CONSENT=0
 
 route_die() { emit "result=error"; emit "reason=$1"; [ -n "${2:-}" ] && emit "detail=$2"; exit 3; }
 
@@ -169,6 +169,18 @@ route_health_ok() {
   curl -fsS --max-time 5 "$(route_health_url)" >/dev/null 2>&1
 }
 
+# The exact command that would perform this install, decisions included. Printed by the plan and by
+# the consent refusal so nothing has to be reassembled by hand — the failure mode on 2026-09-14 was a
+# model re-typing a command and dropping part of it.
+route_confirm_command() {
+  local c="$(route_here)/install.sh --route --scope $R_SCOPE"
+  [ "$R_MODE" != local ] && c="$c --mode $R_MODE"
+  [ -n "$R_BASEURL" ] && c="$c --base-url $R_BASEURL"
+  [ -n "$R_ONCONFLICT" ] && c="$c --on-conflict $R_ONCONFLICT"
+  [ "$R_USERSCOPE" = 1 ] && c="$c --i-understand-machine-wide"
+  printf '%s --i-consent-to-traffic-interception\n' "$c"
+}
+
 route_report() {
   emit "mode=$R_MODE"
   emit "scope=$R_SCOPE"
@@ -184,6 +196,8 @@ route_report() {
   emit "chained=$R_CHAINED"
   emit "upstream=$R_UPSTREAM"
   emit "permission_rule=$(route_permission_rule)"
+  emit "consent_required=true"
+  emit "confirm_command=$(route_confirm_command)"
 }
 
 route_main() {
@@ -255,6 +269,36 @@ handling auth), replace (theirs is recorded and uninstall puts it back), or abor
     route_report
     emit "note=nothing was written, nothing started. Re-run without --plan to perform this."
     exit 0
+  fi
+
+  # ---- CONSENT GATE ---------------------------------------------------------------------
+  #
+  # Refuses to act at all without an explicit token. Everything below this line either intercepts the
+  # user's model traffic or points it somewhere new, and three measurements say the approval prompt
+  # cannot be relied on to ask about that:
+  #
+  #   * the auto-mode classifier is itself a model, so it is probabilistic — the same command string
+  #     was denied in one trial and allowed in two others;
+  #   * a skill can declare the prompt away. With `allowed-tools: Bash(.../install.sh)` in its
+  #     frontmatter, this exact command ran with NO prompt at all;
+  #   * in a non-interactive session there is no prompt, because there is no human to ask — and the
+  #     measured result was a complete, unattended install of a traffic interceptor.
+  #
+  # The third is what this gate is really for: an unattended run now FAILS CLOSED instead of quietly
+  # succeeding. What it cannot do is prove a human said yes — a caller can pass the flag unprompted.
+  # It converts "we hope a prompt fires" into "this refuses without a token that only exists because
+  # someone asked", which is a deterministic precondition and an auditable one, not a guarantee.
+  if [ "$R_CONSENT" != 1 ]; then
+    emit "result=refused"
+    emit "reason=consent_required"
+    emit "consent_required=true"
+    emit "base_url=$(route_url)"
+    emit "existing_base_url=$R_EXISTING"
+    emit "note=nothing was installed, started or written. This routes THIS SESSION's model \
+traffic through a local proxy. Ask the user in one question, with an explicit yes/no, and pass \
+--i-consent-to-traffic-interception only if they say yes. Never pass it on your own judgement."
+    emit "confirm_command=$(route_confirm_command)"
+    exit 2
   fi
 
   # ---- step 1: the binary (local only) --------------------------------------------------
@@ -361,6 +405,7 @@ if [ "${1:-}" = --route ]; then
       --upstream) R_UPSTREAM="${2:?--upstream needs a value}"; shift ;;
       --no-health-check) R_NOHEALTH=1 ;;
       --i-understand-machine-wide) R_USERSCOPE=1 ;;
+      --i-consent-to-traffic-interception) R_CONSENT=1 ;;
       *) emit "result=error"; emit "reason=unknown_flag"; emit "flag=$1"
          emit "note=refused rather than ignored: a dropped flag writes the wrong file and reports success"
          exit 2 ;;

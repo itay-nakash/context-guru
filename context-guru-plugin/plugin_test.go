@@ -5234,6 +5234,14 @@ func writePluginOptions(t *testing.T, home string, opts map[string]any) {
 	})
 }
 
+// consentOK returns the arguments a WRITING-path test needs: the scope plus the explicit consent
+// flag. Spelled out in a helper so it is obvious that these tests stand in for a user who answered
+// yes, rather than quietly routing around the gate - and so that the gate's own test,
+// TestRouteRefusesWithoutExplicitConsent, is the only place the flag is absent on purpose.
+func consentOK(extra ...string) []string {
+	return append([]string{"--scope", "project", "--i-consent-to-traffic-interception"}, extra...)
+}
+
 // TestRoutePlanWritesNothing. --plan is the command that runs before the user has agreed to
 // anything — it is what a `!` block in the skill executes at render time, unprompted. If it can
 // create a settings file, a state directory or a strategy config, then rendering the skill is
@@ -5492,7 +5500,7 @@ func TestRouteWritesRoutingOnlyAfterSomethingAnswers(t *testing.T) {
 		port := freePort(t)
 		writePluginOptions(t, home, map[string]any{"port": port})
 		env := routeEnv(t, home, state, fakeProxyDir(t, port, true))
-		facts, code := runRoute(t, proj, env, "--scope", "project")
+		facts, code := runRoute(t, proj, env, consentOK()...)
 		t.Cleanup(func() {
 			if b, e := os.ReadFile(filepath.Join(state, "context-guru", "proxy-"+port+".pid")); e == nil {
 				exec.Command("kill", strings.TrimSpace(string(b))).Run() //nolint:errcheck
@@ -5525,7 +5533,7 @@ func TestRouteWritesRoutingOnlyAfterSomethingAnswers(t *testing.T) {
 		port := freePort(t)
 		writePluginOptions(t, home, map[string]any{"port": port})
 		env := routeEnv(t, home, state, fakeProxyDir(t, port, false))
-		facts, code := runRoute(t, proj, env, "--scope", "project")
+		facts, code := runRoute(t, proj, env, consentOK()...)
 		if code == 0 || facts["reason"] != "health_check_failed" {
 			t.Fatalf("exit %d reason=%q, want nonzero/health_check_failed: %v",
 				code, facts["reason"], facts)
@@ -5551,10 +5559,10 @@ func TestRouteIsIdempotent(t *testing.T) {
 			exec.Command("kill", strings.TrimSpace(string(b))).Run() //nolint:errcheck
 		}
 	})
-	if facts, code := runRoute(t, proj, env, "--scope", "project"); code != 0 {
+	if facts, code := runRoute(t, proj, env, consentOK()...); code != 0 {
 		t.Fatalf("first run: exit %d %v", code, facts)
 	}
-	facts, code := runRoute(t, proj, env, "--scope", "project")
+	facts, code := runRoute(t, proj, env, consentOK()...)
 	if code != 0 || facts["result"] != "routed" {
 		t.Fatalf("second run: exit %d result=%q, want 0/routed: %v", code, facts["result"], facts)
 	}
@@ -5685,5 +5693,151 @@ func TestInstallSkillDoesNotGrantItselfTheGatedCommand(t *testing.T) {
 	if !strings.Contains(body, "allowed-tools") {
 		t.Error("no note explaining why there is no allowed-tools; without it the next person to " +
 			"find the prompt annoying will simply add one")
+	}
+}
+
+// TestRouteRefusesWithoutExplicitConsent is the gate the owner chose over relying on the approval
+// prompt, and the three measurements behind that choice are worth keeping next to the test:
+//
+//   - the auto-mode classifier is itself a model, so it is probabilistic. The same command string was
+//     denied in one trial and allowed in two others (see #248's retracted finding 3).
+//   - a skill can declare the prompt away. With `allowed-tools: Bash(.../install.sh)` in its
+//     frontmatter, this exact command ran with NO prompt at all.
+//   - in a non-interactive session there is no prompt, because there is no human to ask — and the
+//     measured result was a complete, unattended install of a traffic interceptor.
+//
+// The third is what this gate is really for: an unattended run now FAILS CLOSED. What the gate cannot
+// do is prove a human said yes, since a caller can pass the flag unprompted. It converts "we hope a
+// prompt fires" into a deterministic precondition, which is a different and better kind of guarantee
+// than none.
+func TestRouteRefusesWithoutExplicitConsent(t *testing.T) {
+	for _, mode := range []string{"local", "attach"} {
+		t.Run(mode, func(t *testing.T) {
+			home, state, proj := t.TempDir(), t.TempDir(), t.TempDir()
+			port := freePort(t)
+			writePluginOptions(t, home, map[string]any{"port": port})
+			env := routeEnv(t, home, state, fakeProxyDir(t, port, true))
+			args := []string{"--scope", "project"}
+			if mode == "attach" {
+				// attach starts nothing, but it still repoints the session's traffic, so it needs the
+				// same consent. A gate that only covered the mode that runs a binary would be guarding
+				// the wrong thing.
+				args = append(args, "--mode", "attach",
+					"--base-url", "http://127.0.0.1:"+port+"/anthropic")
+			}
+			facts, code := runRoute(t, proj, env, args...)
+			if code != 2 || facts["reason"] != "consent_required" {
+				t.Fatalf("exit %d reason=%q, want 2/consent_required: %v", code, facts["reason"], facts)
+			}
+			// Nothing at all may have happened. Not a settings file, not a proxy, not a strategy.
+			for _, p := range []string{
+				filepath.Join(proj, ".claude", "settings.local.json"),
+				filepath.Join(state, "context-guru", "proxy-"+port+".pid"),
+				filepath.Join(state, "context-guru", "keepalive-"+port+".yaml"),
+			} {
+				if _, err := os.Stat(p); err == nil {
+					t.Errorf("refused for want of consent but created %s anyway", p)
+				}
+			}
+			// The refusal has to hand back a runnable command, or a model reassembles one by hand —
+			// which is exactly how a scheme-less URL got composed on 2026-09-14.
+			if !strings.Contains(facts["confirm_command"], "--i-consent-to-traffic-interception") {
+				t.Errorf("confirm_command=%q does not carry the consent flag", facts["confirm_command"])
+			}
+		})
+	}
+}
+
+// TestRouteProceedsWithConsentAndThePrintedCommandWorksVerbatim. A refusal that hands back a command
+// which does not actually work is worse than no suggestion at all: it invites the caller to improvise
+// a fix. So run the printed command exactly as printed, through a shell, and require it to install.
+func TestRouteProceedsWithConsentAndThePrintedCommandWorksVerbatim(t *testing.T) {
+	home, state, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	port := freePort(t)
+	writePluginOptions(t, home, map[string]any{"port": port})
+	env := routeEnv(t, home, state, fakeProxyDir(t, port, true))
+	t.Cleanup(func() {
+		if b, e := os.ReadFile(filepath.Join(state, "context-guru", "proxy-"+port+".pid")); e == nil {
+			exec.Command("kill", strings.TrimSpace(string(b))).Run() //nolint:errcheck
+		}
+	})
+
+	plan, code := runRoute(t, proj, env, "--plan", "--scope", "project")
+	if code != 0 {
+		t.Fatalf("plan: exit %d %v", code, plan)
+	}
+	if plan["consent_required"] != "true" {
+		t.Errorf("the plan does not advertise consent_required, so the model has no reason to ask "+
+			"before running the command: %v", plan)
+	}
+	cmdline := plan["confirm_command"]
+	if cmdline == "" {
+		t.Fatal("the plan printed no confirm_command")
+	}
+
+	cmd := exec.Command("bash", "-c", cmdline)
+	cmd.Dir = proj
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	t.Logf("verbatim confirm_command -> %v\n%s", err, out)
+	if !strings.Contains(string(out), "result=routed") {
+		t.Errorf("the command the plan printed did not complete the install when run verbatim:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(proj, ".claude", "settings.local.json")); err != nil {
+		t.Errorf("no routing written by the printed command: %v", err)
+	}
+}
+
+// TestRouteConfirmCommandCarriesEveryDecision. The point of printing it is that the caller appends
+// nothing. If the decisions the plan resolved are missing from it, a model has to reassemble the
+// command — the failure that produced a scheme-less URL on a colleague's machine.
+func TestRouteConfirmCommandCarriesEveryDecision(t *testing.T) {
+	home, state, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	env := append(routeEnv(t, home, state, ""),
+		"ANTHROPIC_BASE_URL=https://gateway.corp.example/v1")
+	facts, code := runRoute(t, proj, env, "--plan", "--scope", "user",
+		"--i-understand-machine-wide", "--on-conflict", "chain")
+	if code != 0 {
+		t.Fatalf("exit %d: %v", code, facts)
+	}
+	for _, want := range []string{
+		"--scope user",
+		"--on-conflict chain",
+		"--i-understand-machine-wide",
+		"--i-consent-to-traffic-interception",
+	} {
+		if !strings.Contains(facts["confirm_command"], want) {
+			t.Errorf("confirm_command is missing %q, so the caller must add it by hand:\n%s",
+				want, facts["confirm_command"])
+		}
+	}
+}
+
+// TestInstallSkillAsksForConsentAsAChoice. The gate is only half the mechanism; the other half is
+// that a human is actually asked. A skill that mentions the flag without saying how to obtain a yes
+// invites a model to append it to make a refusal go away — which is the one thing it must not be.
+func TestInstallSkillAsksForConsentAsAChoice(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("skills", "install", "SKILL.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(b)
+	if !strings.Contains(body, "--i-consent-to-traffic-interception") {
+		t.Fatal("the install skill never mentions the consent flag, so the install cannot complete")
+	}
+	// A pickable choice, not prose to skim.
+	if !strings.Contains(body, "AskUserQuestion") {
+		t.Error("the skill does not tell the model to ask with AskUserQuestion; a two-option choice " +
+			"is much harder to answer sideways than a sentence ending in a question mark")
+	}
+	// And the absence of an answer must be a refusal, or an unattended run proceeds by default —
+	// the exact behaviour this gate was added to stop.
+	lowered := strings.ToLower(body)
+	if !strings.Contains(lowered, "a silent or absent answer is a no") {
+		t.Error("the skill does not say that a silent or absent answer means NO. Without that, a " +
+			"non-interactive session has no instruction against passing the flag unasked")
+	}
+	if !strings.Contains(lowered, "do not pass") {
+		t.Error("the skill never prohibits passing the consent flag on the model's own judgement")
 	}
 }
