@@ -65,7 +65,7 @@ route_here() { CDPATH= cd -- "$(dirname -- "$0")" && pwd -P; }
 R_MODE=local R_SCOPE=project R_ONCONFLICT= R_BASEURL= R_HEALTHURL= R_NOHEALTH=0
 R_STRATEGY= R_UPSTREAM= R_USERSCOPE=0 R_PLAN=0 R_CONFIRM=0
 R_PORT= R_PRESET= R_IDLE= R_BIN= R_ONPATH= R_FILE= R_EXISTING= R_CHAINED=false
-R_ALREADY=false R_CONSENT=0 R_OURS= R_FROMENV=0
+R_ALREADY=false R_CONSENT=0 R_OURS= R_FROMENV=0 R_SPENDS= R_PIDFILE= R_PROXYLOG=
 
 route_die() { emit "result=error"; emit "reason=$1"; [ -n "${2:-}" ] && emit "detail=$2"; exit 3; }
 
@@ -240,16 +240,30 @@ route_consent_question() {
   if [ "$R_MODE" = attach ]; then
     q="$q (attach mode: nothing is started, the URL is assumed to be already serving)"
   fi
-  case "$R_STRATEGY" in
-    5-min-ping) q="$q, with cache strategy 5-min-ping, which SPENDS THE USER'S OWN QUOTA on idle \
+  # Read from `strategy list`, never restated here. Hardcoding the names was correct for all three
+  # that exist, and the catch-all asserted "(no spend)" about every name it had not been told about -
+  # so a fourth strategy that spends, or 1-hour-head gaining a ping, would make this state something
+  # false in the one sentence a human is asked to agree to. consent_question= and confirm_command=
+  # could no longer disagree with each other; this is consent_question= disagreeing with STRATEGIES.
+  #
+  # An unknown spend status reads as SPENDING, not as free: the sentence a user consents to is the
+  # wrong place to resolve an uncertainty in their favour.
+  case "$R_SPENDS" in
+    true)  q="$q, with cache strategy $R_STRATEGY, which SPENDS THE USER'S OWN QUOTA on idle \
 turns to hold the cache warm" ;;
-    *)          q="$q, with cache strategy $R_STRATEGY (no spend)" ;;
+    false) q="$q, with cache strategy $R_STRATEGY (no spend)" ;;
+    *)     q="$q, with cache strategy $R_STRATEGY (SPEND STATUS UNKNOWN - treat it as spending \
+until Usage says otherwise)" ;;
   esac
   printf '%s\n' "$q"
 }
 
-# start-proxy.sh derives this identically; only files that EXIST are reported, so if the two
-# derivations ever drift the symptom is a missing line rather than a wrong path.
+# This mirrors settings.py's state_dir(), which is what writes the strategy config - NOT
+# start-proxy.sh's, which has a `|| STATE=$TMPDIR` fallback this deliberately does not copy. Each path
+# is now derived from whatever writes it: the strategy file from here, and the pidfile from the line
+# start-proxy.sh prints under --emit-facts. Copying one writer's expression to find another writer's
+# file is what drifted, and predicting that the symptom would be "a missing line rather than a wrong
+# path" was correct and no comfort at all - the missing line was the whole function.
 route_state_dir() {
   printf '%s\n' "${CONTEXT_GURU_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/context-guru}"
 }
@@ -268,8 +282,12 @@ route_state_dir() {
 route_report_side_effects() {
   local st pf sf pid
   st=$(route_state_dir)
-  pf="$st/proxy-${R_PORT}.pid"
+  # Straight from the script that wrote it. Falls back to the derived path only when step 5 never ran
+  # (attach mode, or a failure before it), where there is no proxy of ours to report anyway.
+  pf="$R_PIDFILE"
+  [ -n "$pf" ] || pf="$st/proxy-${R_PORT}.pid"
   sf="$st/keepalive-${R_PORT}.yaml"
+  [ -n "$R_PROXYLOG" ] && emit "proxy_log=$R_PROXYLOG"
   if [ -f "$pf" ]; then
     emit "pidfile=$pf"
     pid=$(cat "$pf" 2>/dev/null)
@@ -318,13 +336,30 @@ route_main() {
   # mechanism from the one named and reported `result=routed`. That is the same shape as the unknown
   # flag this script refuses eighty lines down: a dropped decision that reports success. Checked here,
   # before a binary is downloaded, against the one machine-readable list of names.
-  local names
-  names=$("$(route_here)/settings.py" strategy list 2>/dev/null | sed -n 's/^names=//p')
+  local slist names
+  slist=$("$(route_here)/settings.py" strategy list 2>/dev/null) || slist=""
+  names=$(printf '%s\n' "$slist" | sed -n 's/^names=//p')
+  # An empty list is NOT an unknown name, and conflating them made the script state a false thing
+  # about the caller's input: with settings.py unavailable, `--cache-strategy 5-min-ping` - the
+  # default, and obviously a strategy - was refused as "is not a strategy. Known: unavailable", with
+  # the one fault the user could act on buried as a word inside a sentence about a typo. The skill's
+  # next move is to ask which name they meant, about a name that was right. `${names:-unavailable}`
+  # showed the empty case was anticipated; it just routed into the wrong reason.
+  if [ -z "$names" ]; then
+    route_needs "strategy_list_unavailable" "could not read the strategy list, so --cache-strategy \
+$R_STRATEGY was not checked and cache_strategy= in this report may be wrong too. This is a broken \
+plugin install rather than a bad argument: check python3 and $(route_here)/settings.py. Nothing was \
+installed, started or written."
+  fi
   case ",${names}," in
     *",${R_STRATEGY},"*) : ;;
     *) route_needs "unknown_strategy" "--cache-strategy $R_STRATEGY is not a strategy. Known: \
-${names:-unavailable}. Nothing was installed, started or written." ;;
+${names}. Nothing was installed, started or written." ;;
   esac
+  # Whether this strategy spends the user's own money is half of what its NAME means, and STRATEGIES
+  # is where that is decided - so it is read from the same output as the names rather than restated
+  # here. Fact keys mangle `-` to `_`.
+  R_SPENDS=$(printf '%s\n' "$slist" | sed -n "s/^spends_${R_STRATEGY//-/_}=//p")
 
   if [ "$R_MODE" = attach ]; then
     [ -n "$R_BASEURL" ] || route_needs "attach_needs_base_url" \
@@ -469,11 +504,18 @@ they say yes. A silent or absent answer is a NO. Never pass it on your own judge
   # first once killed the installing session: its next API call went to a dead port and died with
   # Connection refused, never reaching the step that starts the proxy.
   if [ "$R_MODE" = local ]; then
-    local sp=("$(route_here)/start-proxy.sh" --unrouted --port "$R_PORT"
+    local sp=("$(route_here)/start-proxy.sh" --emit-facts --unrouted --port "$R_PORT"
               --preset "$R_PRESET" --idle-exit "$R_IDLE")
     [ -n "$R_UPSTREAM" ] && sp+=(--upstream "$R_UPSTREAM")
     [ -n "$R_BIN" ] && sp+=(--bin "$R_BIN")
-    "${sp[@]}" || true
+    # Captured so the pidfile path comes from the script that WROTE it (see --emit-facts there), then
+    # re-printed so the user still sees its notes. The two fact lines are stripped from the re-print
+    # so route_report_side_effects stays the single emitter of them.
+    local spout
+    spout=$("${sp[@]}" 2>&1) || true
+    printf '%s\n' "$spout" | sed '/^pidfile=/d; /^log=/d'
+    R_PIDFILE=$(kv "$spout" pidfile)
+    R_PROXYLOG=$(kv "$spout" log)
   fi
 
   # ---- step 6: prove something answers, BEFORE routing to it ----------------------------

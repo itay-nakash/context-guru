@@ -6320,3 +6320,177 @@ func TestOneHourHeadDisclosesItsSizeGateEverywhereItIsDescribed(t *testing.T) {
 		}
 	}
 }
+
+// withEnv replaces a variable in a prepared environment rather than appending a second copy of it:
+// duplicate keys in an exec environment are resolved by the child's libc, not by us, so appending is
+// not a reliable way to override one.
+func withEnv(env []string, key, val string) []string {
+	out := make([]string, 0, len(env)+1)
+	for _, kv := range env {
+		if !strings.HasPrefix(kv, key+"=") {
+			out = append(out, kv)
+		}
+	}
+	return append(out, key+"="+val)
+}
+
+// TestRouteReportsAProxyLeftInTheTMPDIRFallback.
+//
+// start-proxy.sh derives its state dir and then, if it cannot create it, falls back:
+//
+//	STATE="${CONTEXT_GURU_STATE:-...}"
+//	mkdir -p "$STATE" 2>/dev/null || STATE="${TMPDIR:-/tmp}"
+//
+// install.sh re-derived the first line and not the second, so on a machine whose state dir cannot be
+// created it looked for the pidfile in the state dir while the proxy's pidfile was in $TMPDIR — and the
+// honest "a proxy is still running" report printed NOTHING. The defect that report exists to fix,
+// intact in the fallback path.
+//
+// Not a corner: the fallback fires only when the machine is already broken, which is when a health
+// check is likeliest to fail and an accurate side-effect report matters most.
+//
+// The fix is that the script which WRITES the pidfile prints the path it used (`--emit-facts`) and this
+// one reads it, so there is no second derivation left to drift.
+func TestRouteReportsAProxyLeftInTheTMPDIRFallback(t *testing.T) {
+	home, proj := t.TempDir(), t.TempDir()
+	tmp := t.TempDir()
+	port := freePort(t)
+	writePluginOptions(t, home, map[string]any{"port": port})
+
+	// A state dir that cannot be created: a path underneath a regular file.
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(blocker, []byte("not a directory\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	unmakeable := filepath.Join(blocker, "state")
+
+	// listen=false: it starts and stays up, but never answers /healthz.
+	env := routeEnv(t, home, unmakeable, fakeProxyDir(t, port, false))
+	env = withEnv(env, "TMPDIR", tmp)
+	t.Cleanup(func() { stopFakeProxy2(t, filepath.Join(tmp, "proxy-"+port+".pid")) })
+
+	facts, code := runRoute(t, proj, env, consentOK()...)
+	if facts["reason"] != "health_check_failed" {
+		t.Fatalf("exit %d, want a failed health check: %v", code, facts)
+	}
+
+	// Ground truth: is a proxy really running, and is its pidfile really in TMPDIR? Without this the
+	// assertions below could pass vacuously on a run where nothing started at all.
+	pidfile := filepath.Join(tmp, "proxy-"+port+".pid")
+	b, err := os.ReadFile(pidfile)
+	if err != nil {
+		t.Skipf("no pidfile in the TMPDIR fallback, so there is no drift to test here: %v", err)
+	}
+	if err := exec.Command("kill", "-0", strings.TrimSpace(string(b))).Run(); err != nil {
+		t.Skipf("the fake proxy is not running: %v", err)
+	}
+
+	if facts["proxy_started"] != "true" {
+		t.Errorf("a proxy IS running with its pidfile at %s and the report does not mention it. This "+
+			"is the same defect the side-effect report fixed, reachable through the fallback: %v",
+			pidfile, facts)
+	}
+	if facts["pidfile"] != pidfile {
+		t.Errorf("pidfile=%q, want %q — the path has to come from the script that wrote it, not from "+
+			"a second copy of its derivation", facts["pidfile"], pidfile)
+	}
+}
+
+// stopFakeProxy2 kills a proxy by an explicit pidfile path. Pidfile-first and best-effort; never a
+// pkill pattern, because these boxes are shared with another engineer as the same unix user.
+func stopFakeProxy2(t *testing.T, pidfile string) {
+	t.Helper()
+	b, err := os.ReadFile(pidfile)
+	if err != nil {
+		return
+	}
+	if pid := strings.TrimSpace(string(b)); pid != "" {
+		exec.Command("kill", pid).Run() //nolint:errcheck
+	}
+}
+
+// TestRouteDistinguishesAnUnreadableStrategyListFromABadName. An empty strategy list is not an unknown
+// name, and conflating them made the script state a false thing about the caller's input: with
+// settings.py unavailable, `--cache-strategy 5-min-ping` — the default, and obviously a strategy — came
+// back as "is not a strategy. Known: unavailable", burying the one fault the user could act on inside a
+// sentence about a typo. The skill's next move is to ask which name they meant, about a correct name.
+func TestRouteDistinguishesAnUnreadableStrategyListFromABadName(t *testing.T) {
+	requireTool(t, "bash")
+	home, proj := t.TempDir(), t.TempDir()
+	writePluginOptions(t, home, map[string]any{"port": freePort(t)})
+
+	// A scripts directory where settings.py cannot run. install.sh self-locates from $0, so copying it
+	// beside a broken sibling is enough — no need to break the real one.
+	broken := t.TempDir()
+	for _, name := range []string{"install.sh", "start-proxy.sh"} {
+		b, err := os.ReadFile(filepath.Join(scriptsDir(t), name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(broken, name), b, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(broken, "settings.py"),
+		[]byte("#!/bin/sh\nexit 127\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command("bash", filepath.Join(broken, "install.sh"), "--route", "--plan",
+		"--cache-strategy", "5-min-ping")
+	cmd.Dir = proj
+	cmd.Env = routeEnv(t, home, t.TempDir(), "")
+	out, _ := cmd.CombinedOutput()
+	t.Logf("install.sh with an unusable settings.py:\n%s", out)
+	body := string(out)
+
+	if strings.Contains(body, "is not a strategy") {
+		t.Errorf("`5-min-ping` is the default strategy and was reported as not being one, because the "+
+			"LIST could not be read. A false statement about the caller's input:\n%s", body)
+	}
+	if !strings.Contains(body, "strategy_list_unavailable") {
+		t.Errorf("the real fault is not named as the reason, so the user cannot act on it:\n%s", body)
+	}
+}
+
+// TestConsentQuestionReadsWhetherAStrategySpendsFromTheStrategyList.
+//
+// `route_consent_question` hardcoded which name spends. That was correct for all three strategies that
+// exist, and its catch-all asserted "(no spend)" about every name it had not been told about — so a
+// fourth strategy that spends, or `1-hour-head` gaining a ping, would make it state something false in
+// the one sentence a human is asked to agree to.
+//
+// The expectation here is derived from `settings.py strategy list` rather than written out, so this test
+// cannot go stale the way the function did: add a spending strategy and it checks the new one too.
+func TestConsentQuestionReadsWhetherAStrategySpendsFromTheStrategyList(t *testing.T) {
+	home, state, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	writePluginOptions(t, home, map[string]any{"port": freePort(t)})
+	env := routeEnv(t, home, state, "")
+
+	list, code := settingsIn(t, state, home, "strategy", "list")
+	if code != 0 || list["names"] == "" {
+		t.Fatalf("could not read the strategy list this test derives its expectations from: %v", list)
+	}
+
+	for _, name := range strings.Split(list["names"], ",") {
+		t.Run(name, func(t *testing.T) {
+			spends := list["spends_"+strings.ReplaceAll(name, "-", "_")]
+			if spends == "" {
+				t.Fatalf("strategy list reports no spends_ fact for %q, so the consent question has "+
+					"nothing to read: %v", name, list)
+			}
+			facts, code := runRoute(t, proj, env, "--plan", "--scope", "project",
+				"--cache-strategy", name)
+			if code != 0 {
+				t.Fatalf("plan: exit %d %v", code, facts)
+			}
+			q := facts["consent_question"]
+			warns := strings.Contains(q, "SPENDS")
+			if warns != (spends == "true") {
+				t.Errorf("strategy list says spends=%s for %q, and the consent question %s warn about "+
+					"spending. The sentence a user agrees to has to agree with STRATEGIES:\n  %s",
+					spends, name, map[bool]string{true: "does", false: "does not"}[warns], q)
+			}
+		})
+	}
+}
