@@ -21,7 +21,12 @@ set -uo pipefail
 H="$HOME/cg-loca"
 BIN="${CG_I028_BIN:-$HOME/cg-bin/cg-i028-proxy}"
 PORT="${CG_I028_PORT:-6872}"
-EXPECT="${CG_I028_SHA:-}"          # 32 hex chars; refuse to run without it
+# PINNED HERE, not left to the environment, so the preregistration is auditable in the repo rather than
+# in someone's shell history. Built from the tree at commit a9b8586 with
+# `CGO_ENABLED=1 go build -o ~/cg-bin/cg-i028-proxy ./cmd/context-guru-proxy` on 2026-09-15.
+# DO NOT EDIT once a pass has completed: passes already run used this binary, and changing the pin to
+# match a rebuild is the same as comparing two different programs while every counter still looks healthy.
+EXPECT="${CG_I028_SHA:-b9a69b15e8644bb479bead7e537cf7bf}"
 BAND=64
 STEP="${1:-readout}"
 
