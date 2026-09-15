@@ -252,6 +252,19 @@ route_confirm_command() {
   # `result=routed` — success, while doing the opposite of what was asked. The consent artefact has
   # to name the whole proposition the user was asked to agree to, not just the interception.
   [ -n "$R_STRATEGY" ] && c="$c --cache-strategy $(shq "$R_STRATEGY")"
+  # --upstream, --health-url and --no-health-check were missing, and this is the same defect as the
+  # --cache-strategy drop: a decision that travels in argv, absent from the printed line, silently
+  # re-resolved to something else by the run that performs it. --upstream is the consequential one,
+  # because it decides what gets WRITTEN: with `--upstream <gateway>` on the plan and a conflicting
+  # existing endpoint, the printed command dropped it and the confirm run fell back to the endpoint
+  # being displaced - so the file ended up naming an upstream the caller never asked for.
+  #
+  # Found by running the check the reviewer prescribed for a different finding: compare the consent
+  # question against ANTHROPIC_UPSTREAM in the file the install writes. The question was right and the
+  # file was wrong, which is the opposite of the defect being looked for.
+  [ -n "$R_UPSTREAM" ] && c="$c --upstream $(shq "$R_UPSTREAM")"
+  [ -n "$R_HEALTHURL" ] && c="$c --health-url $(shq "$R_HEALTHURL")"
+  [ "$R_NOHEALTH" = 1 ] && c="$c --no-health-check"
   [ "$R_USERSCOPE" = 1 ] && c="$c --i-understand-machine-wide"
   printf '%s --i-consent-to-traffic-interception\n' "$c"
 }
@@ -259,18 +272,42 @@ route_confirm_command() {
 # The proposition a human is asked to agree to, generated from the SAME resolved facts as the command
 # above rather than composed from the skill's example paragraph. Two things drifted apart before this
 # existed: the question mentioned the spending strategy and the gated command did not.
+# The upstream route_main will ACTUALLY write: an explicit --upstream (or option_upstream) wins, and
+# `chain` otherwise falls back to the endpoint being displaced. One encoding, because there were two -
+# route_main defaulted only when R_UPSTREAM was empty while the question generator overrode it
+# unconditionally. With a configured upstream those disagreed: the chain question named the DISPLACED
+# endpoint as the one being kept and never named the gateway that actually ends up behind the proxy,
+# and the replace question lost its REPLACING clause entirely because a non-empty R_UPSTREAM made that
+# branch unreachable.
+#
+# Same shape as the --force gap and the state-dir drift: one rule, two encodings, and the copy drifts.
+route_effective_upstream() {
+  if [ -n "$R_UPSTREAM" ]; then printf '%s\n' "$R_UPSTREAM"
+  elif [ "$R_ONCONFLICT" = chain ]; then printf '%s\n' "$R_EXISTING"
+  fi
+}
+
 route_consent_question() {
   local q="route this project's model traffic through $(route_url)"
   [ "$R_SCOPE" = user ] && q="route THIS MACHINE's model traffic (every project) through $(route_url)"
-  # What happens to an endpoint they already have is the whole of the question on the conflict path,
-  # and this named it only via R_UPSTREAM - which the `chain` branch populates, and that branch has by
-  # definition NOT run on the path that asks. So the generated question described a local proxy and
-  # never mentioned the corporate gateway it was about to displace, while SKILL.md says of this line
-  # "say all of it, do not compose your own shorter version". Both answers now have a clause.
-  if [ -n "$R_UPSTREAM" ]; then
-    q="$q, keeping $R_UPSTREAM as the upstream so it still handles auth"
-  elif [ "$R_ONCONFLICT" = replace ] && [ -n "$R_EXISTING" ]; then
-    q="$q, REPLACING $R_EXISTING (recorded, and /context-guru:uninstall puts it back)"
+  # Two clauses, deliberately independent, because they answer different questions: what becomes of
+  # the endpoint the user already has, and which gateway ends up behind the proxy. Chaining them with
+  # elif made a configured --upstream suppress the REPLACING sentence altogether - the endpoint was
+  # still being displaced, and the question stopped saying so.
+  local up; up=$(route_effective_upstream)
+  if [ -n "$R_EXISTING" ]; then
+    if [ "$up" = "$R_EXISTING" ]; then
+      q="$q, keeping $R_EXISTING as the upstream so it still handles auth"
+    else
+      # Includes `chain` WITH an explicit --upstream: the proxy forwards to that instead, so their
+      # endpoint is displaced rather than kept, however the conflict decision was spelled.
+      q="$q, REPLACING $R_EXISTING (recorded, and /context-guru:uninstall puts it back)"
+    fi
+  fi
+  # Named whenever it is not the endpoint just described as kept, so the sentence always says where
+  # traffic actually goes next.
+  if [ -n "$up" ] && [ "$up" != "$R_EXISTING" ]; then
+    q="$q, forwarding on to $up as the upstream so it handles auth"
   fi
   if [ "$R_MODE" = attach ]; then
     q="$q (attach mode: nothing is started, the URL is assumed to be already serving)"
@@ -359,7 +396,9 @@ route_report() {
   emit "permission_rule=$(route_permission_rule)"
   emit "consent_required=true"
   if [ "${1:-}" = per_conflict_answer ]; then
-    emit "consent_question_chain=$(R_ONCONFLICT=chain R_UPSTREAM="$R_EXISTING" route_consent_question)"
+    # No R_UPSTREAM override: route_consent_question derives it the way route_main does. Overriding it
+    # here was the second encoding that drifted.
+    emit "consent_question_chain=$(R_ONCONFLICT=chain route_consent_question)"
     emit "consent_question_replace=$(R_ONCONFLICT=replace route_consent_question)"
   else
     emit "consent_question=$(route_consent_question)"
@@ -470,7 +509,7 @@ or abort"
 handling auth), replace (theirs is recorded and uninstall puts it back), or abort"
     # Runnable, for the same reason as the plan path: a refusal that names a flag but not a command
     # invites the caller to assemble one.
-    emit "consent_question_chain=$(R_ONCONFLICT=chain R_UPSTREAM="$R_EXISTING" route_consent_question)"
+    emit "consent_question_chain=$(R_ONCONFLICT=chain route_consent_question)"
     emit "consent_question_replace=$(R_ONCONFLICT=replace route_consent_question)"
     emit "confirm_command_chain=$(R_ONCONFLICT=chain route_confirm_command)"
     emit "confirm_command_replace=$(R_ONCONFLICT=replace route_confirm_command)"
@@ -482,7 +521,7 @@ handling auth), replace (theirs is recorded and uninstall puts it back), or abor
   fi
   if [ -n "$R_EXISTING" ] && [ "$R_ONCONFLICT" = chain ]; then
     R_CHAINED=true
-    [ -z "$R_UPSTREAM" ] && R_UPSTREAM="$R_EXISTING"
+    R_UPSTREAM=$(route_effective_upstream)   # the one encoding; see that function
   fi
 
   if [ "$R_PLAN" = 1 ]; then

@@ -5808,7 +5808,9 @@ func TestRouteConfirmCommandCarriesEveryDecision(t *testing.T) {
 	env := append(routeEnv(t, home, state, ""),
 		"ANTHROPIC_BASE_URL=https://gateway.corp.example/v1")
 	facts, code := runRoute(t, proj, env, "--plan", "--scope", "user",
-		"--i-understand-machine-wide", "--on-conflict", "chain", "--cache-strategy", "split")
+		"--i-understand-machine-wide", "--on-conflict", "chain", "--cache-strategy", "split",
+		"--upstream", "https://gw.example/v1", "--health-url", "http://127.0.0.1:9/healthz",
+		"--no-health-check")
 	if code != 0 {
 		t.Fatalf("exit %d: %v", code, facts)
 	}
@@ -5816,6 +5818,13 @@ func TestRouteConfirmCommandCarriesEveryDecision(t *testing.T) {
 		"--scope user",
 		"--on-conflict chain",
 		"--i-understand-machine-wide",
+		// Three more that travelled in argv and were missing from the printed line. --upstream is the
+		// consequential one: it decides what gets WRITTEN, so dropping it made the install record an
+		// upstream the caller never asked for. The other two decide how the install VERIFIES itself,
+		// and a dropped verification decision is the quieter half of the same defect.
+		"--upstream https://gw.example/v1",
+		"--health-url http://127.0.0.1:9/healthz",
+		"--no-health-check",
 		// The decision that spends the user's money was missing from both the command and this list,
 		// which is how the drop shipped past a suite that otherwise covers this area well. `split` is
 		// the value worth pinning: the regression is a user asking NOT to spend and being charged.
@@ -6859,4 +6868,117 @@ func TestMissingFlagValueRefusesOnStdout(t *testing.T) {
 	if code != 0 || facts["result"] != "planned" {
 		t.Errorf("a flag WITH a value must still be accepted: exit %d %v", code, facts)
 	}
+}
+
+// TestConsentQuestionAgreesWithTheUpstreamThatGetsWritten covers two defects that were only visible
+// together, and only by comparing the question against the file the install writes.
+//
+//  1. One rule, two encodings. `route_main` DEFAULTED R_UPSTREAM to the displaced endpoint only when it
+//     was empty; the question generator OVERRODE it unconditionally. With a configured upstream those
+//     disagreed: the chain question named the endpoint being displaced as the one being kept, never
+//     named the gateway that actually ends up behind the proxy, and the replace question lost its
+//     REPLACING clause entirely because a non-empty R_UPSTREAM made that branch unreachable.
+//
+//  2. `confirm_command` dropped `--upstream`. Same shape as the `--cache-strategy` drop: a decision
+//     travelling in argv, absent from the printed line, silently re-resolved by the run that performs
+//     it — so the file named an upstream the caller never asked for. Found by running the check
+//     prescribed for (1); the question was right by then and the FILE was wrong, which is the opposite
+//     of the defect being looked for.
+//
+// The assertion is therefore against the settings file rather than against a string: the question has
+// to describe what actually happens, and only the file knows that.
+func TestConsentQuestionAgreesWithTheUpstreamThatGetsWritten(t *testing.T) {
+	const gateway = "https://gw.corp.example/v1"    // what the user already has
+	const configured = "https://real.up.example/v1" // an explicitly configured upstream
+
+	t.Run("a configured upstream alongside a conflicting endpoint", func(t *testing.T) {
+		home, state, proj := t.TempDir(), t.TempDir(), t.TempDir()
+		port := freePort(t)
+		writePluginOptions(t, home, map[string]any{"port": port})
+		env := withEnv(routeEnv(t, home, state, fakeProxyDir(t, port, true)),
+			"ANTHROPIC_BASE_URL", gateway)
+		t.Cleanup(func() { stopFakeProxy(t, state, port) })
+
+		plan, code := runRoute(t, proj, env, "--plan", "--scope", "project", "--upstream", configured)
+		if code != 0 || plan["reason"] != "base_url_already_set" {
+			t.Fatalf("expected the conflict question: exit %d %v", code, plan)
+		}
+
+		chain, replace := plan["consent_question_chain"], plan["consent_question_replace"]
+		if strings.Contains(chain, "keeping "+gateway) {
+			t.Errorf("the chain question calls the DISPLACED endpoint the one being kept. With an "+
+				"explicit --upstream the proxy forwards there instead, so their endpoint is replaced "+
+				"however the conflict decision was spelled:\n  %s", chain)
+		}
+		if !strings.Contains(chain, configured) {
+			t.Errorf("the chain question never names the gateway that ends up behind the proxy:\n  %s",
+				chain)
+		}
+		if !strings.Contains(replace, "REPLACING "+gateway) {
+			t.Errorf("the replace question lost its REPLACING clause — a non-empty upstream made that "+
+				"branch unreachable, so it stopped saying the endpoint is displaced:\n  %s", replace)
+		}
+		// Splitting one question into two is an easy way to lose what round 2 added.
+		for name, q := range map[string]string{"chain": chain, "replace": replace} {
+			if !strings.Contains(q, "SPENDS") {
+				t.Errorf("consent_question_%s lost the spend warning: %q", name, q)
+			}
+		}
+
+		// The check that matters, and the one that found the second defect: run the printed line and
+		// compare the question against what was actually written.
+		cmd := exec.Command("bash", "-c", plan["confirm_command_chain"])
+		cmd.Dir = proj
+		cmd.Env = env
+		out, err := cmd.CombinedOutput()
+		t.Logf("confirm_command_chain -> %v\n%s", err, out)
+
+		got := readJSON(t, filepath.Join(proj, ".claude", "settings.local.json"))
+		envBlock, _ := got["env"].(map[string]any)
+		written, _ := envBlock["ANTHROPIC_UPSTREAM"].(string)
+		if written != configured {
+			t.Fatalf("ANTHROPIC_UPSTREAM=%q, want the %q that was asked for. The printed command "+
+				"dropped --upstream, so the run that performed the install re-resolved it to the "+
+				"endpoint being displaced", written, configured)
+		}
+		if !strings.Contains(chain, written) {
+			t.Errorf("the question and the file disagree: file says %q, question says:\n  %s",
+				written, chain)
+		}
+	})
+
+	// Control: the common case must be unchanged — chain with nothing configured really does keep
+	// their gateway, and the question should say so rather than claim a replacement.
+	t.Run("chain with no configured upstream still keeps their gateway", func(t *testing.T) {
+		home, state, proj := t.TempDir(), t.TempDir(), t.TempDir()
+		port := freePort(t)
+		writePluginOptions(t, home, map[string]any{"port": port})
+		env := withEnv(routeEnv(t, home, state, fakeProxyDir(t, port, true)),
+			"ANTHROPIC_BASE_URL", gateway)
+		t.Cleanup(func() { stopFakeProxy(t, state, port) })
+
+		plan, code := runRoute(t, proj, env, "--plan", "--scope", "project")
+		if code != 0 {
+			t.Fatalf("plan: exit %d %v", code, plan)
+		}
+		chain := plan["consent_question_chain"]
+		if !strings.Contains(chain, "keeping "+gateway) {
+			t.Errorf("the ordinary chain case should say their gateway is kept:\n  %s", chain)
+		}
+		if strings.Contains(chain, "REPLACING") {
+			t.Errorf("chain with nothing configured keeps their endpoint; saying REPLACING would be "+
+				"the same defect in the other direction:\n  %s", chain)
+		}
+		cmd := exec.Command("bash", "-c", plan["confirm_command_chain"])
+		cmd.Dir, cmd.Env = proj, env
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("confirm: %v\n%s", err, out)
+		}
+		got := readJSON(t, filepath.Join(proj, ".claude", "settings.local.json"))
+		envBlock, _ := got["env"].(map[string]any)
+		if envBlock["ANTHROPIC_UPSTREAM"] != gateway {
+			t.Errorf("ANTHROPIC_UPSTREAM=%v, want %q: the question and the file must agree here too",
+				envBlock["ANTHROPIC_UPSTREAM"], gateway)
+		}
+	})
 }
