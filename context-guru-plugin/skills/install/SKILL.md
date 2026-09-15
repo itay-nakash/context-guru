@@ -94,7 +94,13 @@ person said yes.
 
 ### Then run one command
 
-**Run the `confirm_command=` line from the plan, verbatim.** Copy it; do not retype it, do not
+**When the plan came back `needs_decision reason=base_url_already_set`**, there is no single
+`confirm_command=` — the answer is the thing being asked for. The plan prints one runnable line per
+answer instead: `confirm_command_chain=` and `confirm_command_replace=`. Ask the user, then run the
+line matching their answer, verbatim. For *abort*, run nothing. Do **not** add `--on-conflict` to any
+other line yourself; if neither line is present, re-run `--plan` rather than composing a command.
+
+**Otherwise, run the `confirm_command=` line from the plan, verbatim.** Copy it; do not retype it, do not
 reorder it, and do not add or drop a flag. It is printed with every decision already resolved — scope,
 mode, base URL, conflict, cache strategy, machine-wide acknowledgement — and it ends with
 `--i-consent-to-traffic-interception`, so **the only thing you add is nothing.**

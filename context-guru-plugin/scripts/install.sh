@@ -101,7 +101,12 @@ route_scope_file() {
     project) printf '%s\n' "$PWD/.claude/settings.local.json" ;;
     team)    printf '%s\n' "$PWD/.claude/settings.json" ;;
     user)    printf '%s\n' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json" ;;
-    *)       route_refuse "unknown_scope" "--scope must be project, team or user" ;;
+    # Returns non-zero WITHOUT emitting. It used to call route_refuse here, and this function is
+    # invoked as `R_FILE=$(route_scope_file)` - so every line route_refuse printed was captured into
+    # the command substitution, assigned to R_FILE and thrown away. `--scope bogus` produced NO OUTPUT
+    # AT ALL and exit 2, which is the exact defect this design was built to remove, reproduced for a
+    # different flag. The caller emits, outside the substitution, where output survives.
+    *)       return 2 ;;
   esac
 }
 
@@ -126,7 +131,8 @@ route_resolve_options() {
 
 route_inspect() {
   local shown
-  R_FILE=$(route_scope_file) || exit $?
+  R_FILE=$(route_scope_file) \
+    || route_refuse "unknown_scope" "--scope must be project, team or user; got '$R_SCOPE'"
   shown=$("$(route_here)/settings.py" show --file "$R_FILE" 2>/dev/null) || shown=""
   R_EXISTING=$(kv "$shown" base_url)
   R_OURS=$(kv "$shown" ours)
@@ -324,7 +330,22 @@ route_report() {
   emit "permission_rule=$(route_permission_rule)"
   emit "consent_required=true"
   emit "consent_question=$(route_consent_question)"
-  emit "confirm_command=$(route_confirm_command)"
+  # On the ONE path that asks a question, the answer is not in R_ONCONFLICT yet - so a single
+  # confirm_command would be printed WITHOUT --on-conflict, and running it verbatim just re-hits the
+  # same refusal. SKILL.md says the line carries every decision and that the caller adds nothing;
+  # that was false here, and the way out for a model would have been to compose the flag itself,
+  # which is the model-composed-syntax risk this whole design exists to remove.
+  #
+  # So the script prints one runnable command PER ANSWER and the model picks, never composes.
+  if [ "${1:-}" = per_conflict_answer ]; then
+    emit "confirm_command_chain=$(R_ONCONFLICT=chain route_confirm_command)"
+    emit "confirm_command_replace=$(R_ONCONFLICT=replace route_confirm_command)"
+    emit "confirm_command=(none yet: the conflict decision is unanswered. Use the \
+confirm_command_chain= or confirm_command_replace= line above, exactly as printed. For abort, run \
+nothing at all.)"
+  else
+    emit "confirm_command=$(route_confirm_command)"
+  fi
 }
 
 route_main() {
@@ -402,13 +423,17 @@ do with context-guru. Confirm with the user, then add --i-understand-machine-wid
       emit "note=ask the user, then re-run with --on-conflict chain (usually right: our proxy sits \
 in front and theirs keeps handling auth), replace (theirs is recorded and uninstall puts it back), \
 or abort"
-      route_report
+      route_report per_conflict_answer
       exit 0
     fi
     emit "result=refused"; emit "reason=base_url_already_set"
     emit "existing_base_url=$R_EXISTING"
     emit "note=pass --on-conflict chain (usually right: our proxy sits in front and theirs keeps \
 handling auth), replace (theirs is recorded and uninstall puts it back), or abort"
+    # Runnable, for the same reason as the plan path: a refusal that names a flag but not a command
+    # invites the caller to assemble one.
+    emit "confirm_command_chain=$(R_ONCONFLICT=chain route_confirm_command)"
+    emit "confirm_command_replace=$(R_ONCONFLICT=replace route_confirm_command)"
     exit 2
   fi
   if [ -n "$R_EXISTING" ] && [ "$R_ONCONFLICT" = abort ]; then
@@ -615,6 +640,16 @@ if [ "${1:-}" = --route ]; then
   esac
   case "$R_ONCONFLICT" in ""|chain|replace|abort) : ;; *)
     emit "result=error"; emit "reason=unknown_on_conflict"; emit "value=$R_ONCONFLICT"; exit 2 ;;
+  esac
+  # --scope belongs here with the other two. Without it, a bad value fell through to
+  # route_scope_file, whose refusal was swallowed by a command substitution - and `--scope global`
+  # is a plausible mistake, because the user-facing flag this skill documents is `--global` while the
+  # value this script accepts is `user`. Validated at parse time, so it fails before anything runs and
+  # says which values exist.
+  case "$R_SCOPE" in project|team|user) : ;; *)
+    emit "result=error"; emit "reason=unknown_scope"; emit "value=$R_SCOPE"
+    emit "note=--scope takes project, team or user. The user-facing --global maps to --scope user."
+    exit 2 ;;
   esac
   route_main
   exit 0

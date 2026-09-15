@@ -1401,11 +1401,20 @@ def cmd_strategy(args) -> int:
             emit(result=nothing_to_do, strategy="split", file=where, port=port,
                  note="nothing to remove")
             return 0
-        text = ""
+        # An unreadable file is NOT a file we may delete. This swallowed the OSError, left `text`
+        # empty, and `text and not _strategy_is_ours(text)` is then false - so the ownership check was
+        # skipped entirely and execution fell through to os.unlink(), reporting `result=cleared` for a
+        # file we never verified we wrote. A permission-restricted foreign config is exactly what that
+        # produces, and exactly the case the check exists for. `set` already handles the same
+        # situation as `unreadable`; this now matches it rather than contradicting the invariant this
+        # module advertises and tests for.
         try:
             text = open(path, encoding="utf-8").read()
-        except OSError:
-            pass
+        except OSError as exc:
+            emit(result="error", reason="unreadable", file=path, detail=f"{exc}",
+                 note="a config exists at this path and cannot be read, so ownership cannot be "
+                      "checked; refusing to delete it. Remove it by hand if it is yours.")
+            return 3
         if text and not _strategy_is_ours(text):
             emit(result="conflict", reason="not_ours", file=path,
                  note="this config was not written by context-guru; remove it by hand")
@@ -1421,6 +1430,16 @@ def cmd_strategy(args) -> int:
         emit(result="error", reason="unknown_strategy", requested=name,
              known=",".join(STRATEGIES))
         return 2
+    # `split` writes NO FILE, so it reaches `clear` and never touches the preset - checking the preset
+    # first refused `strategy set --name split` (with no --preset, which the parser does not require)
+    # as `empty_preset`, whose note about silently disabling compaction describes a file that would
+    # never be written. It also regressed the old keep-alive-off path, which was `rm -f "$CFG"` and
+    # required no preset at all. Ordered before the guard for that reason.
+    if name == "split":
+        # Expressed as a removal, per the STRATEGIES comment - but reported as a `set`, because that is
+        # the operation the caller asked for. See the clear branch.
+        return cmd_strategy(argparse.Namespace(op="clear", port=port, as_set=True))
+
     # An unresolved preset is NOT a harmless default: written empty, the proxy loads a config with
     # no pipeline and reports success, so compaction is off while a strategy keeps running. The old
     # keepalive skill guarded this in shell; it is enforced here so every caller inherits it.
@@ -1429,11 +1448,6 @@ def cmd_strategy(args) -> int:
              note="pass --preset (option_preset= from `settings.py config`, else the plugin.json "
                   "default `cache`); an empty preset silently disables compaction")
         return 2
-
-    if name == "split":
-        # Expressed as a removal, per the STRATEGIES comment - but reported as a `set`, because that is
-        # the operation the caller asked for. See the clear branch.
-        return cmd_strategy(argparse.Namespace(op="clear", port=port, as_set=True))
 
     if os.path.exists(path):
         try:

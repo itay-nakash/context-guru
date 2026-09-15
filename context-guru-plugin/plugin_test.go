@@ -6596,3 +6596,148 @@ func TestAConflictRefusalNamesItsReason(t *testing.T) {
 		}
 	})
 }
+
+// TestRouteRefusesAnUnknownScopeOutLoud. `route_scope_file` called `route_refuse` — which emits and
+// exits — from inside `R_FILE=$(route_scope_file)`. Command substitution captured every line it
+// printed, assigned them to R_FILE and threw them away, so `--scope bogus` produced NO OUTPUT AT ALL
+// and exit 2.
+//
+// That is the same defect class as this design's first recorded one: a non-zero exit with nothing on
+// stdout leaves the model with nothing to act on, and it happens inside the `!` block that renders the
+// skill. `--mode` and `--on-conflict` were validated at parse time and did print; `--scope` was not,
+// and it is the likelier mistake of the three — the flag this skill documents to users is `--global`
+// while the value this script accepts is `user`.
+func TestRouteRefusesAnUnknownScopeOutLoud(t *testing.T) {
+	home, proj := t.TempDir(), t.TempDir()
+	facts, code := runRoute(t, proj, routeEnv(t, home, t.TempDir(), ""), "--plan", "--scope", "global")
+	if code == 0 {
+		t.Fatalf("an unknown scope was accepted: %v", facts)
+	}
+	if len(facts) == 0 {
+		t.Fatal("exited non-zero with NO facts at all. A model gets an empty result and no reason, " +
+			"which is the failure this script's plan contract exists to prevent")
+	}
+	if facts["reason"] != "unknown_scope" {
+		t.Errorf("reason=%q, want unknown_scope: %v", facts["reason"], facts)
+	}
+	// The mistake this catches is `--global` -> `--scope global`, so the refusal should say what the
+	// real value is rather than only that this one is wrong.
+	if !strings.Contains(facts["note"], "user") {
+		t.Errorf("the refusal does not point at the accepted value, so a model has to guess "+
+			"again: note=%q", facts["note"])
+	}
+}
+
+// TestConflictPlanPrintsARunnableCommandPerAnswer.
+//
+// The conflict branch is the ONE place this design asks a question, and it printed a
+// `confirm_command=` that could not perform any of the answers: `R_ONCONFLICT` is empty precisely
+// because that is what is being asked, and `route_confirm_command` only appends `--on-conflict` when it
+// is set. So SKILL.md's "it carries every decision, the only thing you add is nothing" was false on
+// exactly the path where a decision was outstanding, and running the printed line verbatim re-hit the
+// same refusal. The way out for a model would have been to compose the flag itself — the
+// model-composed-syntax risk this whole design exists to remove.
+//
+// So the script prints one runnable line per answer and the model picks.
+func TestConflictPlanPrintsARunnableCommandPerAnswer(t *testing.T) {
+	home, state, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	port := freePort(t)
+	writePluginOptions(t, home, map[string]any{"port": port})
+	const gateway = "https://gateway.corp.example/v1"
+	env := withEnv(routeEnv(t, home, state, fakeProxyDir(t, port, true)),
+		"ANTHROPIC_BASE_URL", gateway)
+	t.Cleanup(func() { stopFakeProxy(t, state, port) })
+
+	plan, code := runRoute(t, proj, env, "--plan", "--scope", "project")
+	if code != 0 || plan["reason"] != "base_url_already_set" {
+		t.Fatalf("expected the conflict question: exit %d %v", code, plan)
+	}
+	for _, k := range []string{"confirm_command_chain", "confirm_command_replace"} {
+		if plan[k] == "" {
+			t.Fatalf("%s= is missing, so the only way to act on the answer is to compose the flag: %v",
+				k, plan)
+		}
+	}
+	if !strings.Contains(plan["confirm_command_chain"], "--on-conflict chain") {
+		t.Errorf("confirm_command_chain does not carry the decision: %s", plan["confirm_command_chain"])
+	}
+
+	// The property that matters: the printed line, run exactly as printed, performs the answer.
+	cmd := exec.Command("bash", "-c", plan["confirm_command_chain"])
+	cmd.Dir = proj
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	t.Logf("confirm_command_chain run verbatim -> %v\n%s", err, out)
+	if !strings.Contains(string(out), "result=routed") {
+		t.Fatalf("the chain line did not complete the install when run verbatim:\n%s", out)
+	}
+	if !strings.Contains(string(out), "upstream="+gateway) {
+		t.Errorf("chain ran but did not keep their gateway as upstream:\n%s", out)
+	}
+}
+
+// TestStrategyClearRefusesToDeleteAFileItCannotRead. `clear` swallowed the OSError from reading the
+// config, which left `text` empty — and `text and not _strategy_is_ours(text)` is then false, so the
+// ownership check was skipped and execution fell through to os.unlink(), reporting `result=cleared` for
+// a file it never verified it wrote. A permission-restricted foreign config is exactly what produces
+// that, and exactly the case the ownership check exists for, so the invariant this module advertises
+// (and TestStrategyNeverTouchesAFileItDidNotWrite asserts) was false in the one case that matters most.
+func TestStrategyClearRefusesToDeleteAFileItCannotRead(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: mode 000 is still readable, so this test cannot create the condition " +
+			"it asserts on and would pass without testing anything")
+	}
+	state, home := t.TempDir(), t.TempDir()
+	cfg := strategyCfg(state)
+	if err := os.MkdirAll(filepath.Dir(cfg), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfg, []byte("# not ours at all\npreset: whatever\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(cfg, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(cfg, 0o644) }) //nolint:errcheck
+
+	facts, code := settingsIn(t, state, home, "strategy", "clear", "--port", keepalivePort)
+	if _, err := os.Stat(cfg); err != nil {
+		t.Fatalf("a config that could not be read, and therefore could not be shown to be ours, was "+
+			"DELETED: %v (facts %v)", err, facts)
+	}
+	if code == 0 {
+		t.Errorf("reported success for a file it did not touch and could not verify: %v", facts)
+	}
+	if facts["reason"] != "unreadable" {
+		t.Errorf("reason=%q, want unreadable — `set` already names this situation that way, and the "+
+			"two ops disagreeing about it is what let this through: %v", facts["reason"], facts)
+	}
+}
+
+// TestStrategySetSplitNeedsNoPreset. The empty-preset guard ran before the `split` short-circuit, so
+// `strategy set --name split` — with no `--preset`, which the parser does not require — was refused as
+// `empty_preset`, whose note warns about silently disabling compaction in a file that would never be
+// written. `split` IS the absence of a config: it recurses into `clear` and never reads the preset. It
+// also regressed the old keep-alive-off path, which was `rm -f "$CFG"` and needed no preset at all.
+func TestStrategySetSplitNeedsNoPreset(t *testing.T) {
+	state, home := t.TempDir(), t.TempDir()
+	facts, code := settingsIn(t, state, home, "strategy", "set", "--name", "split",
+		"--port", keepalivePort)
+	if code != 0 {
+		t.Fatalf("`strategy set --name split` needs no preset and was refused: exit %d %v", code, facts)
+	}
+	if facts["reason"] == "empty_preset" {
+		t.Errorf("still refused for an empty preset on the one strategy that writes no file: %v", facts)
+	}
+	if facts["result"] != "set" || facts["strategy"] != "split" {
+		t.Errorf("result=%q strategy=%q, want set/split: %v", facts["result"], facts["strategy"], facts)
+	}
+
+	// The control, because the guard is right where it applies: a strategy that DOES write a file must
+	// still refuse an empty preset, or compaction is silently off while pings keep being paid for.
+	facts, code = settingsIn(t, state, home, "strategy", "set", "--name", "5-min-ping",
+		"--port", keepalivePort, "--preset", "")
+	if code == 0 || facts["reason"] != "empty_preset" {
+		t.Errorf("the empty-preset guard was lost where it matters: exit %d %v", code, facts)
+	}
+}
