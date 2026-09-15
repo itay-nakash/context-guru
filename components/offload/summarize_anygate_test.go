@@ -31,13 +31,7 @@ func TestCacheStateAnyFiresOnALiveCacheAndTheDefaultDoesNot(t *testing.T) {
 	msgs := sumTranscript(6)
 	const window = 1_000_000
 
-	// The fill gate has to be opened by the PROVIDER's figure rather than ours, or a fired turn
-	// would not show that the cache state was what differed. Same two-rulers precondition as the
-	// frac test in summarize_cachegate_test.go.
-	if tokens := schema.MessagesTokens(&bschemas.BifrostChatRequest{Input: msgs}); float64(tokens) >= 0.9*window {
-		t.Fatalf("fixture counts %d message-text tokens, which already clears the 0.9 floor; this "+
-			"test can no longer show that the billed figure is what opened the fill gate", tokens)
-	}
+	assertBilledFigureOpenedTheFill(t, msgs, window)
 
 	for _, tc := range []struct {
 		name       string
@@ -63,6 +57,7 @@ func TestCacheStateAnyFiresOnALiveCacheAndTheDefaultDoesNot(t *testing.T) {
 			s.modelClient = model
 
 			ctx := sumCtx(store.NewMemory(store.Options{MaxEntries: 400}), "warm", window, true, 950_000)
+			ctx.Session = "warm-" + tc.name // see anyGateTrigger's note on the single-flight registry
 			// Assert the fixture really is warm. If sumCtx's TTL arithmetic or DefaultPreExpiry
 			// moved so that 270s of remaining life read as pre-expiry, the default would fire too
 			// and this test would report an agreement it never demonstrated.
@@ -106,13 +101,18 @@ func TestCacheStateAnyStillFiresWhenAnUnknownPhaseHidesALivePrefix(t *testing.T)
 	msgs := sumTranscript(6)
 	const window = 1_000_000
 
+	// Not inherited from the test above even though both use sumTranscript(6): this test's own
+	// declining row asserts a SPECIFIC gate, which is only meaningful if the fill conjunct is open.
+	assertBilledFigureOpenedTheFill(t, msgs, window)
+
 	for _, tc := range []struct {
 		name       string
 		cacheState string
 		wantFires  bool
+		wantGate   string
 	}{
-		{"any fires despite the live-prefix guard", "any", true},
-		{"the shipped default is declined by it", "", false},
+		{"any fires despite the live-prefix guard", "any", true, ""},
+		{"the shipped default is declined by it", "", false, "cache_state_declined_unknown"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := newCacheGatedSummarizeWithFrac(t, anyGateTrigger(tc.cacheState))
@@ -121,6 +121,7 @@ func TestCacheStateAnyStillFiresWhenAnUnknownPhaseHidesALivePrefix(t *testing.T)
 
 			// An unknown phase — no readable TTL — over a prefix that provably exists.
 			ctx := sumCtx(store.NewMemory(store.Options{MaxEntries: 400}), "unknown", window, true, 950_000)
+			ctx.Session = "unknown-" + tc.name // see anyGateTrigger's note on the single-flight registry
 			ctx.CacheAware, ctx.MaxCachedIdx = true, 8
 			if phase := ctx.CachePhase(components.DefaultPreExpiry); phase != components.CachePhaseUnknown {
 				t.Fatalf("precondition: fixture phase is %s, want Unknown", phase)
@@ -137,13 +138,46 @@ func TestCacheStateAnyStillFiresWhenAnUnknownPhaseHidesALivePrefix(t *testing.T)
 					"where the phase is unreadable and a prefix is known to be live",
 					fired, tc.wantFires, rep.Gates)
 			}
+			// NAMING THE GATE IS WHAT MAKES THE DECLINING ROW MEAN ANYTHING. Asserting only that
+			// the default did not fire would pass on any decline at all — window_not_exact,
+			// below_request_trigger, a gate nobody has written yet — while this test's whole
+			// purpose is that the LIVE-PREFIX GUARD is what declined it. A negative half that
+			// cannot fail for the thing it names reads as coverage without being any.
+			if tc.wantGate != "" && rep.Gates[tc.wantGate] == 0 {
+				t.Errorf("gate %q not filed; gates: %v. The default declined for some other "+
+					"reason, so this subtest is not exercising the unknown-phase guard",
+					tc.wantGate, rep.Gates)
+			}
 		})
+	}
+}
+
+// assertBilledFigureOpenedTheFill pins that the fill conjunct is open because of the PROVIDER's
+// figure rather than our own count of the transcript.
+//
+// Both tests need it, and for the same reason: the fill gate is the half the two configurations
+// SHARE, so if it were closed — or if it were opened by MessagesTokens, which runs a median 3.38x
+// below billed input — then neither a fired turn nor a named gate would be attributable to
+// cache_state, and both tests would be measuring the wrong conjunct.
+func assertBilledFigureOpenedTheFill(t *testing.T, msgs []bschemas.ChatMessage, window int) {
+	t.Helper()
+	tokens := schema.MessagesTokens(&bschemas.BifrostChatRequest{Input: msgs})
+	if float64(tokens) >= summarizeDefaultRequestFrac*float64(window) {
+		t.Fatalf("fixture counts %d message-text tokens, which already clears the %.0f floor; these "+
+			"tests can no longer show that the billed figure is what opened the fill gate",
+			tokens, summarizeDefaultRequestFrac*float64(window))
 	}
 }
 
 // anyGateTrigger writes the trigger block for one of the two shipped configurations, omitting
 // cache_state entirely for the default so the constructor supplies it. min_request_frac is left out
 // of both, because the two configurations must differ in exactly one key.
+//
+// EACH SUBTEST ALSO GETS ITS OWN SESSION ID, which sumCtx does not give it. The async summarizer
+// keys in-flight calls on the session in a package-global single-flight registry, so subtests
+// sharing sumCtx's "s" are only safe while they run sequentially — a later t.Parallel() here would
+// have one subtest's commissioned call satisfy another's wait, and the firing counts would silently
+// stop belonging to the turns that produced them.
 func anyGateTrigger(cacheState string) string {
 	trigger := "trigger:\n  min_messages: 2\n"
 	if cacheState != "" {
