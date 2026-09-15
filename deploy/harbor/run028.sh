@@ -73,9 +73,21 @@ if arm=="A" and e.get("sweep_adjudicated",0)<5:
 PY
 }
 
+# RESUMABILITY CUTS BOTH WAYS. Skipping a tag whose stats exist is what lets an interrupted run continue
+# without repeating a paid pass -- and it is also how a pass that must be REDONE gets silently skipped.
+# Measured: the first pre-flight attempt died on a rotated gateway credential (HTTP 401 on every request),
+# left a stats file behind, and the retry would have reported "SKIP" and moved on with a pass that
+# adjudicated nothing. Move the artifact aside rather than deleting it -- `mv st-i022-<tag>.json{,.bad}` --
+# so the reason it was rejected stays on disk next to the run it belongs to.
 run_pass() {
   local tag="$1" cfg="$2" arm="$3" taskcfg="$4"
-  if [ -f "$H/st-i022-$tag.json" ]; then echo "SKIP $tag (already done)"; return 0; fi
+  if [ -f "$H/st-i022-$tag.json" ]; then
+    echo "SKIP $tag (stats already on disk)."
+    echo "  If that pass was INVALID -- wrong window, baseline acted, <5 verdicts, accuracy 0.000, or an"
+    echo "  auth failure -- move it aside first or this run silently reuses it:"
+    echo "    mv $H/st-i022-$tag.json $H/st-i022-$tag.json.bad"
+    return 0
+  fi
   echo "===== $tag  arm=$arm ====="; date -u
   check_binary
   bash "$H/stage022.sh" "$tag" "$BIN" "$H/$cfg" "$PORT" "$taskcfg" "$BAND" || die "$tag failed to run"
