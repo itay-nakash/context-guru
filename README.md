@@ -115,25 +115,27 @@ needed on a Pro/Max subscription** ([details](docs/how-to/install-plugin.md)):
 /plugin marketplace add rossoctl/context-guru
 /plugin install context-guru@context-guru
 /reload-plugins
+/permissions        # allow  Bash(<your home>/.claude/plugins/cache/context-guru/**)
 /context-guru:install
 ```
 
 `/reload-plugins` is what makes the `/context-guru:*` skills exist in this session; without it the
-last line answers `Unknown command`. A new session does the same thing.
+last line answers `Unknown command`. A new session does the same thing. The `/permissions` rule needs
+the **absolute** path — `~` is not expanded in permission rules — and is not optional in practice:
+without it the install's first command can be denied, and the skill's instructions then never reach
+the model at all
+([why](docs/how-to/install-plugin.md#recommended-first-grant-the-plugins-scripts-once)).
 
 That installs a statically-linked binary (no Go, no C compiler), routes **this project only** by
 default, starts the proxy on demand and lets it exit when idle. `/context-guru:uninstall` undoes it,
 restoring any base URL it replaced.
 
-**Two defaults worth knowing before you run it.** `--preset cache` is the pipeline: the prompt-cache
-split, nothing dropped from your requests. `cache_strategy` is separate and defaults to `5-min-ping`,
-which **spends a little of your own quota** on idle turns to hold the cache warm —
-`/context-guru:cache-strategy-picker` switches it to `split`, which spends nothing.
-
-**If sessions here run under auto mode or a restrictive permission policy, add the permission rule
-first** ([how](docs/how-to/install-plugin.md#recommended-first-grant-the-plugins-scripts-once)).
-Without it the install's opening command can be denied, and then the skill's instructions never reach
-the model at all — measured, not theoretical.
+**Keep-alive is on by default**, as `cache_strategy=5-min-ping`: a ping just under the provider's
+5-minute cache TTL, so the prompt cache is still warm when you come back to an idle session. It
+**spends a little of your own quota** while nobody is at the keyboard — that is the mechanism, not a
+side effect. `/context-guru:cache-strategy-picker` names the alternatives and what each costs.
+Separately, `--preset cache` is the compaction pipeline: prompt-cache handling only, nothing dropped
+from your requests.
 
 **If it ever breaks and Claude cannot fix it:** `~/.local/state/context-guru/context-guru-reset` undoes
 the routing from a plain terminal — no working session, no proxy, no network. A dead proxy fails every

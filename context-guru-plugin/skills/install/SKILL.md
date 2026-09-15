@@ -32,9 +32,10 @@ a numbered paragraph somebody can read differently.
 - `/context-guru:uninstall` reverses it. If routing itself breaks, no skill can run — so the install
   drops a plain-sh escape hatch outside the plugin, and step 4 tells them where.
 
-If `cache_strategy=5-min-ping` (the default), one more clause: it spends a little of their own quota
-on idle turns to hold the cache warm, and `/context-guru:cache-strategy-picker` switches it to
-`split`.
+If `cache_strategy=5-min-ping` (the default), one more clause: keep-alive is on, so it spends a little
+of their own quota on idle turns to hold the cache warm, and `/context-guru:cache-strategy-picker`
+names the alternatives and what each costs. Do not recommend one — they differ in what they spend, and
+that is the user's call.
 
 Fuller detail is in `docs/how-to/install-plugin.md`. Point at it; do not recite it.
 

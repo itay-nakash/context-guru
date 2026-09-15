@@ -118,7 +118,7 @@ and which decides *which sessions go through the proxy* ([table below](#which-fi
 They are independent: a local-scope plugin still routes only the repo you run the install skill in,
 and a user-scope plugin does not route anything until you ask it to.
 
-### `/plugin configure` — four options, all with working defaults
+### `/plugin configure` — five options, all with working defaults
 
 You can open it, press **Save configuration**, and change nothing. Only one of these usually needs
 setting, and only in one situation.
@@ -126,7 +126,8 @@ setting, and only in one situation.
 | Option | Default | Change it when |
 |---|---|---|
 | **Proxy port** | `8787` | something already holds 8787. Deliberately not 4000, which collides with litellm |
-| **Preset** | `cache` | you want more than the prompt-cache split. `cache` drops no content, adds no tools and makes no model calls |
+| **Preset** | `cache` | you want more than prompt-cache handling. `cache` drops no content and adds no tools. It makes no model calls *itself* — whether anything is spent is decided by the cache strategy below, not here |
+| **Cache strategy** | `5-min-ping` | you do not want keep-alive: this default holds the cache warm across idle gaps by pinging just under the provider's 5-minute TTL, and that **spends a little of your own quota** while nobody is at the keyboard. `/context-guru:cache-strategy-picker` names each strategy and what it costs |
 | **Idle exit** | `24h` | rarely. The floor is `max(2 × store.ttl_seconds, 1h)`; below it the proxy refuses to start rather than silently discarding cache state |
 | **Upstream base URL** | *(empty)* | **something else is already the gateway** — see below |
 
