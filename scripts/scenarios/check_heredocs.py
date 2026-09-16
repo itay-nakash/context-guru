@@ -6,9 +6,9 @@ interpreter runs it — which for these arms is after an hour of paid gateway ti
 
 # THE ASSERTION IS OVER THE POPULATION, NOT OVER WHAT THE MATCHER FOUND
 
-This is the third rewrite of this check and the first one built on the right principle. The two before
-it both looked complete and both had a silent hole, for the same reason each time — they counted the
-heredocs their own pattern liked, and reported success on the count:
+This is the fourth version of this check. Each of the first three looked complete and each had a hole,
+and the first two shared one cause — they counted the heredocs their own pattern liked, and reported
+success on the count:
 
   1. Matched the literal tag `PY`. An arm using `<<'EOF' | python3` was skipped in silence.
   2. Keyed on the python3 invocation instead, which fixed that instance and left the shape intact:
@@ -18,15 +18,22 @@ heredocs their own pattern liked, and reported success on the count:
 
 `found == 0` cannot see 6 → 5. That is the shape that ships, because everything still says ok.
 
-So this enumerates every heredoc redirection in these files and requires each one to be CLASSIFIED:
+  3. Enumerated every heredoc, which closed the missing direction and opened the opposite one:
+     classification word-searched the whole line and nothing stripped a trailing comment, so
+     `cat > x.yaml <<YAML   # not python3` was filed as python. It could no longer MISS a heredoc; it
+     could MIS-FILE one, and on a body that happens to be valid Python it did so silently while
+     printing a census that was wrong in the same run. See classify().
 
-  - fed to python3  -> compile it, and a syntax error fails
-  - fed to `cat`    -> a data file (lib.sh writes config.yaml this way); allowed, not compiled
-  - anything else    -> FAILURE, named as unclassified
+So this enumerates every heredoc redirection in these files and requires each one to be CLASSIFIED by
+the COMMAND WORD that owns it:
+
+  - python  -> compile the body, and a syntax error fails
+  - cat/tee -> a data file (lib.sh writes config.yaml this way); allowed, not compiled
+  - anything else -> FAILURE, named as unclassified
 
 An unmatched tag, a continuation, a new interpreter, a heredoc nobody thought about: all surface as
-"I could not classify this" rather than as absence. Absence is what the previous two versions
-reported.
+"I could not classify this" rather than as absence, which is what versions 1 and 2 reported — and none
+of them can be mis-filed by a comment, which is what version 3 did.
 """
 
 import glob
@@ -64,19 +71,71 @@ def is_comment(text):
     return text.lstrip().startswith("#")
 
 
+# `VAR=value` env prefixes, which precede the command word.
+ASSIGN = re.compile(r"^[A-Za-z_]\w*=")
+
+
+def strip_comment(text):
+    """Remove a trailing shell comment, leaving quoted # alone."""
+    out, quote = [], None
+    for ch in text:
+        if quote:
+            out.append(ch)
+            if ch == quote:
+                quote = None
+            continue
+        if ch in "'\"":
+            quote = ch
+            out.append(ch)
+            continue
+        if ch == "#":
+            break
+        out.append(ch)
+    return "".join(out)
+
+
 def classify(text):
-    """What does this command feed the heredoc to? None means 'cannot tell'."""
-    if re.search(r"\bpython3?\b", text):
-        return "python"
-    if re.search(r"\bcat\b", text):
-        return "data"
+    """What consumes this heredoc's body? None means 'cannot tell'.
+
+    KEYED ON THE COMMAND WORD, NOT ON A WORD-SEARCH OF THE LINE, and that distinction is a defect this
+    function shipped with. Version 3 asked whether "python" appeared anywhere in the logical line, and
+    nothing stripped a trailing comment — so
+
+        cat > "$d/config.yaml" <<YAML   # not python3
+
+    classified as PYTHON. Two outcomes, both wrong and one silent: our real config body fails to
+    compile and the run aborts blaming a python syntax error in a YAML file, and a body that happens to
+    be valid Python (`key: value` is an annotated assignment) compiles clean and is counted in the
+    "python compiled" total. The partition line added so nobody has to re-derive the census was then
+    wrong in the same run that printed it.
+
+    Version 3 could no longer MISS a heredoc; it could MIS-FILE one. Same family, opposite direction.
+
+    So: strip comments, take the segment that actually owns the redirection (a heredoc on `a | b <<T`
+    belongs to `b`), skip `VAR=value` prefixes, and read the command word. Anything unrecognised is
+    unclassified rather than guessed at.
+    """
+    before = strip_comment(text).split("<<")[0]
+    # The heredoc attaches to the last command in a pipeline or list.
+    segment = re.split(r"\|\||&&|[|;]", before)[-1]
+    for token in segment.split():
+        if ASSIGN.match(token) or token in ("!", "time", "exec", "env", "command", "then", "do", "else"):
+            continue
+        base = os.path.basename(token.strip("\"'()"))
+        if re.fullmatch(r"python3?(\.\d+)?", base):
+            return "python"
+        if base in ("cat", "tee"):
+            return "data"
+        return None
     return None
 
 
 def heredocs(path):
-    """Yield (kind, tag, body, physical_line, text) for every heredoc in path.
+    """Yield (kind, tag, body, physical_line, text, quoted) for every heredoc in path.
 
-    body is None when the terminator is never found.
+    body is None when the terminator is never found. quoted says whether the TAG was quoted, which is
+    what decides whether the shell expands the body before its consumer sees it — read off the match
+    rather than re-sniffed from the text, which is how the previous version got it wrong for `<<-`.
     """
     lines = open(path, encoding="utf-8").read().splitlines()
     consumed_to = -1
@@ -96,7 +155,8 @@ def heredocs(path):
                 body.append(lines[j])
                 j += 1
             consumed_to = j
-            yield (classify(text), tag, "\n".join(body) if found_end else None, first + 1, text)
+            quoted = bool(m.group(2) or m.group(3))
+            yield (classify(text), tag, "\n".join(body) if found_end else None, first + 1, text, quoted)
 
 
 def compile_body(body):
@@ -124,7 +184,7 @@ def main(root):
     compiled = data = bad = 0
     for path in paths:
         name = os.path.basename(path)
-        for kind, tag, body, line, text in heredocs(path):
+        for kind, tag, body, line, text, quoted in heredocs(path):
             if body is None:
                 print("UNTERMINATED: %s:%d heredoc <<%s never closed" % (name, line, tag))
                 bad += 1
@@ -140,7 +200,7 @@ def main(root):
             if kind == "data":
                 data += 1
                 continue
-            if "'" not in text.split("<<")[1][:2] and '"' not in text.split("<<")[1][:2]:
+            if not quoted:
                 print("WARNING: %s:%d feeds python an UNQUOTED heredoc (<<%s); the shell expands it "
                       "first, so this check sees different text than python will" % (name, line, tag))
             err = compile_body(body)
