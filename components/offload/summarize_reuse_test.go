@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 
@@ -27,9 +28,19 @@ import (
 // checkpoint to reuse) must NOT claim a reuse. A counter that fires unconditionally satisfies neither.
 func newSummarizeReusing(t *testing.T, resummarizeTokens int) *Summarize {
 	t.Helper()
+	// `min_request_frac: 0` IS WRITTEN EXPLICITLY, and it is not a guard being switched off to make a
+	// test pass. `0c21ead` gave summarize a default of 0.9, and FracResolvable then requires an EXACT
+	// window plus a non-zero PrevBilledInput — neither of which a six-message fixture has, so the trigger
+	// declined with `window_not_exact`, no summary was commissioned, and every assertion below was
+	// reached only through a t.Skip that read as a pass.
+	//
+	// 0 is a configuration the component supports on purpose ("compact in the pre-expiry window at ANY
+	// size"), and it is the honest one here: these tests are about CHECKPOINT REUSE, not about the size
+	// trigger, which has its own tests. Faking CtxWindowExact with a 900,000-token PrevBilledInput to
+	// satisfy 0.9 x 1,000,000 would be inventing a request shape the fixture does not have.
 	c, err := newSummarize([]byte(
 		"keep_last: 2\nmin_tokens: 10\nresummarize_tokens: " + itoa(resummarizeTokens) + "\n" +
-			"trigger:\n  min_messages: 2\n  min_request_tokens: 10\n"))
+			"trigger:\n  min_messages: 2\n  min_request_tokens: 10\n  min_request_frac: 0\n"))
 	if err != nil {
 		t.Fatalf("newSummarize: %v", err)
 	}
@@ -73,15 +84,28 @@ func TestSummarizeCheckpointReuseIsCounted(t *testing.T) {
 	if _, err := s.Offload(req1, &rep1, newCtx()); err != nil {
 		t.Fatal(err)
 	}
-	if rep1.Replays != 0 || rep1.Events["summary_checkpoint_reused"] != 0 {
+	if rep1.Replays != 0 || rep1.Events[EventReusedCheckpoint] != 0 {
 		t.Errorf("turn one claimed a reuse with no checkpoint to reuse (replays=%d events=%v)",
 			rep1.Replays, rep1.Events)
 	}
 	if rep1.Gates["summary_no_checkpoint"] == 0 {
 		t.Errorf("turn one did not record WHY it took the fresh path (gates: %v)", rep1.Gates)
 	}
-	if rep1.Skipped {
-		t.Skip("turn one did not summarize on this fixture, so there is no checkpoint for turn two")
+	// DRAIN THE ASYNC SUMMARY, then require a checkpoint. `0c21ead` moved summary production off the
+	// hot path, so turn one now COMMISSIONS a summary and returns Skipped while it runs — which made
+	// this test's `t.Skip` fire every run. A skip reads as a pass in the package line, so the assertions
+	// below stopped being evidence without anything reporting it.
+	//
+	// WaitForSummaryForTest waits on the same channel a real turn waits on, so passing here exercises
+	// the production synchronisation rather than a sleep tuned to one machine. And a missing checkpoint
+	// after the drain is now a FAILURE: "the fixture cannot summarize" is exactly the condition that
+	// would silently disarm every assertion in this test.
+	if !WaitForSummaryForTest("reuse-sess", 5*time.Second) {
+		t.Fatal("the commissioned summary never landed, so there is no checkpoint to reuse")
+	}
+	if _, ok := loadCheckpoint(newCtx()); !ok {
+		t.Fatalf("no checkpoint after the summary landed (turn one gates: %v events: %v)",
+			rep1.Gates, rep1.Events)
 	}
 
 	// TURN TWO: same session and store, same messages. The checkpoint must be reused, free.
@@ -90,7 +114,7 @@ func TestSummarizeCheckpointReuseIsCounted(t *testing.T) {
 	if _, err := s.Offload(req2, &rep2, newCtx()); err != nil {
 		t.Fatal(err)
 	}
-	if rep2.Events["summary_checkpoint_reused"] == 0 {
+	if rep2.Events[EventReusedCheckpoint] == 0 {
 		t.Fatalf("turn two did not record a checkpoint reuse (gates: %v events: %v)",
 			rep2.Gates, rep2.Events)
 	}
@@ -128,8 +152,14 @@ func TestSummarizeRecordsWhenTheCoveredSpanChangedUnderIt(t *testing.T) {
 	if _, err := s.Offload(req1, &rep1, newCtx()); err != nil {
 		t.Fatal(err)
 	}
-	if rep1.Skipped {
-		t.Skip("no checkpoint was created on this fixture")
+	// Same drain as above, and for the same reason: this test asserts on summary_covered_span_changed,
+	// which cannot be reached without a standing checkpoint to invalidate.
+	if !WaitForSummaryForTest("changed-sess", 5*time.Second) {
+		t.Fatal("the commissioned summary never landed, so there is no checkpoint to invalidate")
+	}
+	if _, ok := loadCheckpoint(newCtx()); !ok {
+		t.Fatalf("no checkpoint after the summary landed (turn one gates: %v events: %v)",
+			rep1.Gates, rep1.Events)
 	}
 
 	// Turn two, but with a message inside the covered span altered — what an earlier component in the
@@ -145,7 +175,7 @@ func TestSummarizeRecordsWhenTheCoveredSpanChangedUnderIt(t *testing.T) {
 		t.Errorf("an upstream mutation forced the paid path and nothing recorded it (gates: %v)",
 			rep2.Gates)
 	}
-	if rep2.Events["summary_checkpoint_reused"] != 0 {
+	if rep2.Events[EventReusedCheckpoint] != 0 {
 		t.Errorf("claimed a reuse on a span that had changed: %v", rep2.Events)
 	}
 }
@@ -191,6 +221,36 @@ func TestEveryFreshPathDeclineIsLabelled(t *testing.T) {
 			if strings.Contains(lines[j], "rep.Gate(") {
 				labelled = true
 				break
+			}
+		}
+		// TWO PATHS ARE GATED NON-ADJACENTLY, AND DELIBERATELY SO. `0c21ead` separated recording WHY a
+		// turn declines from deciding WHAT to forward, because conflating them was cache-destructive
+		// rather than merely lossy: the trigger's cache-state condition is false on most turns, so a
+		// `return` at the gate meant turn N emitted [head, summary, tail] and turn N+1 emitted the full
+		// transcript, re-writing the whole suffix at 1.25x. Its gates therefore fire at the point of
+		// DECISION and the function continues to the replay, which puts them well outside a six-line
+		// window.
+		//
+		// So these two are allowlisted BY THEIR OWN SOURCE ANCHOR rather than by line number, and the
+		// property this test defends is unchanged: a NEW unlabelled route to Skipped still fails, because
+		// it will match neither the adjacency rule nor an anchor. Widening the window instead would have
+		// made the test pass by making it vacuous — every gate in this function appears early, so a
+		// large-enough window labels everything.
+		if !labelled {
+			for j := i; j >= i-30 && j > start; j-- {
+				// The gated-or-no-model fall-through: gates are below_request_trigger,
+				// window_not_exact, cache_state_declined_* and no_model, all raised above.
+				if strings.Contains(lines[j], "if !fires || model == nil {") {
+					labelled = true
+					break
+				}
+				// The commissioned-summary tail: either rep.Gate(why) fired in the branch above, or
+				// EventSummaryStarted did — in which case the turn is not declining at all, it is
+				// proceeding while a summary runs off the hot path.
+				if strings.Contains(lines[j], "rep.Event(EventSummaryStarted)") {
+					labelled = true
+					break
+				}
 			}
 		}
 		if !labelled {

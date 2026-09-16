@@ -98,6 +98,15 @@ UPSTREAM_ARG=""
 # covered by the same permission rule as the rest of the command, and needs no symlink.
 BIN_ARG=""
 PORT_ARG=""
+# --preset and --idle-exit, the last two options that existed only as CLAUDE_PLUGIN_OPTION_* reads.
+#
+# They are here so a command handed to a HUMAN can carry them as flags. The alternative is an env
+# prefix, and this file already records what that costs: a pasted env-prefixed invocation split
+# across two lines, the assignments became a no-op statement, the script ran unrouted and exited
+# without a word, and three rounds of guessing followed. check-proxy.sh prints exactly such a
+# recovery command, so every value it needs to pass must have an argument form.
+PRESET_ARG=""
+IDLE_EXIT_ARG=""
 # Every discarded or malformed argument is REPORTED, never swallowed.
 #
 # The first version of this loop had no `*)` branch and took `$2` for `--upstream` on faith. All three
@@ -144,6 +153,10 @@ while [ $# -gt 0 ]; do
     # form twice over; this one was missed both times.
     --port) if takes_value --port "${2:-}"; then PORT_ARG="$2"; shift; fi ;;
     --port=*) if takes_value --port "${1#--port=}"; then PORT_ARG="${1#--port=}"; fi ;;
+    --preset) if takes_value --preset "${2:-}"; then PRESET_ARG="$2"; shift; fi ;;
+    --preset=*) if takes_value --preset "${1#--preset=}"; then PRESET_ARG="${1#--preset=}"; fi ;;
+    --idle-exit) if takes_value --idle-exit "${2:-}"; then IDLE_EXIT_ARG="$2"; shift; fi ;;
+    --idle-exit=*) if takes_value --idle-exit "${1#--idle-exit=}"; then IDLE_EXIT_ARG="${1#--idle-exit=}"; fi ;;
     *) note "ignoring unrecognised argument '$1'" ;;
   esac
   shift
@@ -152,6 +165,15 @@ FORCE="$START_UNROUTED"
 # BIN was resolved at the top from CONTEXT_GURU_BIN or the bare name; an explicit --bin overrides both.
 if [ -n "$BIN_ARG" ]; then
   BIN="$BIN_ARG"
+fi
+# An explicit --preset / --idle-exit overrides the option read at the top, same precedence as --bin.
+# Note this does NOT override a keepalive --config: that file states its own preset and --config
+# replaces the preset entirely, which is why the success note reports what the config says.
+if [ -n "$PRESET_ARG" ]; then
+  PRESET="$PRESET_ARG"
+fi
+if [ -n "$IDLE_EXIT_ARG" ]; then
+  IDLE_EXIT="$IDLE_EXIT_ARG"
 fi
 # PORT likewise, and everything derived from it has to be recomputed — the gate below compares against
 # it, and the log, pidfile, health URL and dashboard DB are all named after it. Re-deriving them here
@@ -227,7 +249,13 @@ command -v setsid >/dev/null 2>&1 || STARTER=(nohup)   # macOS has no setsid
 # was a 404. Its default DB path is `./context-guru-dashboard.db` — the current directory, i.e.
 # the user's repository — so the path must be set explicitly or the plugin litters the project it
 # was invited into.
-STATE="${XDG_STATE_HOME:-$HOME/.local/state}/context-guru"
+# CONTEXT_GURU_STATE first, like settings.py, reset.sh and check-proxy.sh. S10 in review: this was the
+# ONE script that ignored it, which had two consequences. A user who relocates their state directory
+# got the pidfile written somewhere else, and uninstall looks for it here — one way it loses track of a
+# running proxy. And it defeated the test isolation this PR added: pinning CONTEXT_GURU_STATE does not
+# isolate the hook tests if the hook they spawn does not read it, which is how a `go test` run wrote
+# four pidfiles into a reviewer's real ~/.local/state/context-guru.
+STATE="${CONTEXT_GURU_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/context-guru}"
 mkdir -p "$STATE" 2>/dev/null || STATE="${TMPDIR:-/tmp}"
 PIDFILE="${STATE}/proxy-${PORT}.pid"
 
@@ -263,8 +291,39 @@ fi
 # keep-alive was turned on, the exact opposite of what enabling it is supposed to do.
 CONFIG_ARGS=()
 KEEPALIVE_CFG="${STATE}/keepalive-${PORT}.yaml"
+
+# PRESET_NOTE is what the success note reports, and it is NOT $PRESET once --config is passed. Because
+# --config replaces the preset entirely (see above), the proxy runs whatever `preset:` the keep-alive
+# file recorded, while $PRESET still holds the plugin option. Reporting the option named a value that
+# was not in effect, and the two diverge the moment somebody changes the option after enabling
+# keep-alive — a confident report of something untrue, which is the failure this plugin exists to avoid.
+PRESET_NOTE="$PRESET"
 if [ -f "$KEEPALIVE_CFG" ]; then
   CONFIG_ARGS=(--config "$KEEPALIVE_CFG")
+  # Fails OPEN, and reports nothing rather than something wrong. This runs on the SessionStart path, so
+  # an unreadable, empty, comment-only or preset-less file must still start the proxy.
+  #
+  # What keeps that true is the ABSENCE of `set -e` combined with the PRESENCE of `set -uo pipefail`
+  # (line 28) — and it is pipefail that makes the combination load-bearing, not -e alone. With pipefail,
+  # a failing `sed` (a config that exists but cannot be read) becomes this assignment's exit status; add
+  # -e and the script dies with status 2 BEFORE the proxy is launched, which is the failure this file's
+  # own header calls the biggest risk in the feature. Do not add -e here without reading
+  # TestStartProxyReportsThePresetActuallyInEffect's unreadable-config row, which exists to catch it.
+  #
+  # Anchored at column zero: `preset:` is a top-level key, and a nested one (e.g. components.offload.
+  # preset) in a hand-edited file both LOADS and would win a first-match-any-indentation search, so the
+  # note would name the inner value while the proxy ran the outer one. Inline comments are stripped for
+  # the same reason — `preset: cache # why` used to leak the comment into the note.
+  cfg_preset=$(sed -n 's/^preset:[[:space:]]*//p' "$KEEPALIVE_CFG" 2>/dev/null \
+                 | head -1 | sed 's/[[:space:]]*#.*$//' | tr -d "\"'" | sed 's/[[:space:]]*$//')
+  if [ -n "$cfg_preset" ]; then
+    PRESET_NOTE="${cfg_preset} (from keepalive-${PORT}.yaml)"
+  else
+    # No preset: line. Do NOT say "compaction is off" — a config may set `pipeline:` directly without
+    # naming a preset, and files written before the always-state-the-preset rule exist in the wild. So
+    # report only what is known: the config decides, and it did not name one.
+    PRESET_NOTE="unstated in keepalive-${PORT}.yaml"
+  fi
 fi
 
 PRESET="$PRESET" \
@@ -307,11 +366,11 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   # and overwrites the pidfile with a pid that immediately exits), not on this one.
   if curl -fsS --max-time 1 "$HEALTH" >/dev/null 2>&1; then
       if [ -n "$UPSTREAM" ]; then
-      note "proxy up on 127.0.0.1:${PORT} (preset ${PRESET}, idle-exit ${IDLE_EXIT}), chained behind ${UPSTREAM}."
+      note "proxy up on 127.0.0.1:${PORT} (preset ${PRESET_NOTE}, idle-exit ${IDLE_EXIT}), chained behind ${UPSTREAM}."
       note "dashboard: http://127.0.0.1:${PORT}/dashboard/"
       exit 0
     fi
-    note "proxy up on 127.0.0.1:${PORT} (preset ${PRESET}, idle-exit ${IDLE_EXIT})."
+    note "proxy up on 127.0.0.1:${PORT} (preset ${PRESET_NOTE}, idle-exit ${IDLE_EXIT})."
     note "dashboard: http://127.0.0.1:${PORT}/dashboard/"
     exit 0
   fi

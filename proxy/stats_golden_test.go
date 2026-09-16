@@ -30,6 +30,20 @@ var statsGoldenTopLevel = []string{
 	// its own arm: folded into llm_*, an agentdiet arm whose every reflection call
 	// expired would report llm_timeouts 0 and read as having nothing to reduce.
 	"agentdiet_call_timeout_ms",
+	// cache_aware_summarizer. `declined` matters most to a reader of this contract: a declining
+	// arm is byte-identical to `off` on every other field here.
+	"cache_aware_summarizer_calls",
+	"cache_aware_summarizer_timeouts",
+	"cache_aware_summarizer_errors",
+	"cache_aware_summarizer_declined",
+	"cache_aware_summarizer_call_timeout_ms",
+	"cache_aware_summarizer_empty",
+	"cache_aware_summarizer_unverified_system",
+	"cache_aware_summarizer_refused_stash",
+	"cache_aware_summarizer_too_large",
+	"cache_aware_summarizer_async_started",
+	"cache_aware_summarizer_async_committed",
+
 	"agentdiet_errors",
 	"agentdiet_timeouts",
 	"attempted_tokens",
@@ -122,6 +136,18 @@ var statsGoldenTopLevel = []string{
 	"summarize_call_timeout_ms",
 	"summarize_errors",
 	"summarize_timeouts",
+	// The detached summarizer path's health. Seven fields, because the path they describe removed
+	// every other way to see it: inline, a slow or failing summarizer was visible as request
+	// latency and as a reverted component; detached, the request is already answered and no row
+	// carries the work until the session's next turn.
+	"summarize_async_started",
+	"summarize_async_committed",
+	"summarize_async_refused",
+	"summarize_async_unresolved",
+	"summarize_async_panics",
+	"summarize_awaited_ms",
+	"summarize_await_timeouts",
+	"summarize_async_concurrency",
 	"sync_enforced",
 	"tokens_after",
 	"tokens_before",

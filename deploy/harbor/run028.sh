@@ -238,6 +238,11 @@ base)
     aws/claude-sonnet-5) ;;
     *) TAG="$TAG-$(printf %s "$M" | tr -c 'A-Za-z0-9' '-')" ;;
   esac
+  # THE THINKING BUDGET IS PART OF THE TAG, for the same reason the model is. A bounded-thinking pass
+  # written to the plain tag would be SKIPPED by run_pass and adopted by `seed N` as arm A's baseline,
+  # comparing a bounded baseline against an unbounded arm A -- and the unbounded pilot it must be PAIRED
+  # against would have been overwritten by the very pass that needs it as a reference.
+  [ -n "${LOCA_THINKING_BUDGET:-}" ] && TAG="$TAG-tb$LOCA_THINKING_BUDGET"
   export LOCA_MODEL="$M"
   run_pass "$TAG" "cfg-iter028-baseline.yaml" "baseline" "$TC"
   echo

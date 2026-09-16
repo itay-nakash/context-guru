@@ -29,6 +29,7 @@ messages (`role:"tool"`; for Anthropic, `tool_result` blocks normalized to that 
 | `smartcrush` | Offload | middle items of a JSON array | via expand | JSON-array tool output | `min_items` (5), `min_tokens` (200), `keep_first` (3), `keep_last` (2) |
 | `mask` | Offload | older tool outputs (age-based) | via expand | more than `keep_recent` outputs | `keep_recent` (3), `min_tokens` (100), `keep_head_chars` (96), `cold_cache` (**true**) |
 | `summarize` | Offload (LLM) | the middle of the transcript → one summary | via expand | long trajectories | `summary_level` (regular), `keep_last` (3), `min_tokens` (500), `resummarize_tokens` (6000), `model.source`, `trigger` |
+| [`cache_aware_summarizer`](components/cache_aware_summarizer.md) | Offload (LLM) | the middle of the transcript → one summary, but the summarizer CALL reuses the conversation's own prefix instead of rebuilding a prompt | via expand | long trajectories on a prefix-caching backend; **needs a `MessagesModel`** and declines without one | `keep_last_turns` (10), `instruction_role` (auto), `model_id`, `min_tokens` (500), `resummarize_tokens` (6000), `profiles_path`, `model.source`, `trigger` |
 | [`agentdiet`](components/agentdiet.md) | Offload (LLM) | useless/redundant/**expired** content in the step that just aged past the delay | via expand | a step above `min_step_tokens`, `delay_steps` turns back | `delay_steps` (2), `context_steps` (1), `min_step_tokens` (500), `min_saved_tokens` (400), `max_keep_ratio` (0.8), `model.source` |
 
 Presets (`config/config.go`), verbatim: **`house`** (the proxy default), **`codesmart`** (the SWE-bench arm)
@@ -75,8 +76,21 @@ Every preset that touches caching carries `cachesplit`, never `cacheinject` — 
 context window** (resolved dynamically via LiteLLM's public model map, no hand-maintained list):
 `min_request_frac`, `min_output_frac`, and a hard `huge_output_frac` ("huge tool call" — act regardless of
 the request-level gate). `collapse.max_frac` scales its size budget likewise.
-Absolutes (`min_request_tokens`, etc.) still win; when the window is unknown, fractions are ignored and
-absolutes apply (backward compatible). This lets one config generalize across models/benchmarks.
+When the window is unknown, fractions are ignored and absolutes apply (backward compatible). This lets
+one config generalize across models/benchmarks.
+
+!!! note "`min_request_frac` and `min_request_tokens` are measured differently, and are ANDed"
+    A context window is stated in the tokens the **provider** bills — messages plus the system
+    prompt, the tool declarations and the JSON envelope. `min_request_frac` is therefore compared
+    against the provider's own reported input count for the session's previous turn.
+    `min_request_tokens` is compared against **message text only**, which is what this proxy's own
+    tokenizer can see, and on measured traffic runs a median **3.4x smaller** than the billed
+    figure. Because the two are on different scales they are separate conditions, both of which
+    must be met — taking the larger of them would be comparing unlike numbers. Set one or the
+    other unless you mean both.
+
+    The per-item fractions (`min_output_frac`, `huge_output_frac`) are unaffected: they size a
+    single tool output, where the same tokenizer is on both sides of the comparison.
 
 **Reversibility in practice.** The `context_guru_expand` tool is advertised on outgoing requests
 (`INJECT_EXPAND=auto|always|never`, default `auto` = whenever the request already declares tools,

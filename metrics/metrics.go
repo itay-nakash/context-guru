@@ -713,6 +713,32 @@ type Snapshot struct {
 	SummarizeTimeouts      int64 `json:"summarize_timeouts"`
 	SummarizeErrors        int64 `json:"summarize_errors"`
 	SummarizeCallTimeoutMs int64 `json:"summarize_call_timeout_ms"`
+	// SummarizeAsync* are the health of the DETACHED summarizer path, and they exist because that
+	// path removed every other way to see it. When the call was inline, a slow or failing summarizer
+	// showed up as request latency, as a `reverted` component, and in that request's own row. Off
+	// the hot path it shows up nowhere: the request has already been answered, and no row carries
+	// the work until the session's next turn.
+	//
+	// The pair that matters is Started vs Committed. A growing gap means calls are being paid for
+	// and lost — the only signal that exists for it. Refused counts what the GLOBAL bound turned
+	// away (the deployment shedding compaction under load, distinct from the ordinary per-session
+	// single-flight refusal, which is a gate). Unresolved is how many are outstanding right now.
+	//
+	// WaitedMs and WaitTimeouts are the other half: whether the wait cap is set anywhere near
+	// right. A climbing timeout count means turns are paying the full cap and getting nothing,
+	// which is the case for lowering it or for looking at the summarizer.
+	SummarizeAsyncStarted    int64 `json:"summarize_async_started"`
+	SummarizeAsyncCommitted  int64 `json:"summarize_async_committed"`
+	SummarizeAsyncRefused    int64 `json:"summarize_async_refused"`
+	SummarizeAsyncUnresolved int64 `json:"summarize_async_unresolved"`
+	// SummarizeAsyncPanics counts recovered panics in the detached goroutine. Fail-open is right
+	// there — a panic in a detached goroutine would otherwise take the process down — but the
+	// recover() was silent, so a panicking summarizer showed up only as a growing started/committed
+	// gap and nothing named the cause.
+	SummarizeAsyncPanics      int64 `json:"summarize_async_panics"`
+	SummarizeAwaitedMs        int64 `json:"summarize_awaited_ms"`
+	SummarizeAwaitTimeouts    int64 `json:"summarize_await_timeouts"`
+	SummarizeAsyncConcurrency int64 `json:"summarize_async_concurrency"`
 	// AgentDiet* are the same three figures for the `agentdiet` baseline, which owns a
 	// third budget: its prompt is a window of b+1+a serialized steps, so it sits
 	// between extract_llm's single tool output and summarize's whole span. Reported
@@ -721,6 +747,35 @@ type Snapshot struct {
 	AgentDietTimeouts      int64 `json:"agentdiet_timeouts"`
 	AgentDietErrors        int64 `json:"agentdiet_errors"`
 	AgentDietCallTimeoutMs int64 `json:"agentdiet_call_timeout_ms"`
+	// CacheAwareSummarizer* are cache_aware_summarizer's. That method's whole claim is WHERE the
+	// summarization request is built — the conversation plus an appended instruction, so the
+	// backend recognises a prefix it already has — which makes its cost profile different in
+	// kind from the summarizers it is compared against. Folding it into theirs would report the
+	// baseline's numbers for the treatment.
+	//
+	// ⭐ CacheAwareSummarizerDeclined IS THE LOAD-BEARING ONE. The component refuses to run when
+	// no components.MessagesModel is available, because the alternative — flattening the
+	// conversation into one prompt string — is precisely the prefix-destroying shape it exists to
+	// avoid. A declining arm therefore compacts NOTHING and is byte-identical to `off` on every
+	// other field in this struct. Non-zero means that arm measured nothing.
+	CacheAwareSummarizerCalls         int64 `json:"cache_aware_summarizer_calls"`
+	CacheAwareSummarizerTimeouts      int64 `json:"cache_aware_summarizer_timeouts"`
+	CacheAwareSummarizerErrors        int64 `json:"cache_aware_summarizer_errors"`
+	CacheAwareSummarizerDeclined      int64 `json:"cache_aware_summarizer_declined"`
+	CacheAwareSummarizerCallTimeoutMs int64 `json:"cache_aware_summarizer_call_timeout_ms"`
+	// a call was PAID FOR and returned nothing usable — the signature of an instruction the chat template dropped or hoisted, which is the silent failure the model registry exists to prevent
+	CacheAwareSummarizerEmpty int64 `json:"cache_aware_summarizer_empty"`
+	// declined because instruction_role was pinned to `system` for a model no registry profile verifies; the arm is configured for a silent failure and is refusing to take it
+	CacheAwareSummarizerUnverifiedSystem int64 `json:"cache_aware_summarizer_unverified_system"`
+	// a summary was abandoned because the store would not accept the span; a marker with no stash behind it would be a lossy Offload advertising reversibility it does not have
+	CacheAwareSummarizerRefusedStash int64 `json:"cache_aware_summarizer_refused_stash"`
+	// declined because the outbound request would exceed max_request_tokens; the session outgrew the method rather than anything failing
+	CacheAwareSummarizerTooLarge int64 `json:"cache_aware_summarizer_too_large"`
+	// detached summaries commissioned
+	CacheAwareSummarizerAsyncStarted int64 `json:"cache_aware_summarizer_async_started"`
+	// detached summaries that reached a checkpoint. The PAIR is the signal: started without committed is a summary paid for and lost
+	CacheAwareSummarizerAsyncCommitted int64 `json:"cache_aware_summarizer_async_committed"`
+
 	// Extract is extract_llm's own economics (#28 part F), including NET savings after
 	// its LLM cost — the honest headline for the one component that spends to save.
 	// Purely ADDITIVE: no field above was renamed or removed, so deploy/harbor/*.py

@@ -82,7 +82,8 @@ split shrinks that hangover to `stash_ttl_seconds` without making any removal ir
 | Offloader | Per-turn re-stash | If its payload is reclaimed |
 |---|---|---|
 | `mask`, `cmdfilter`, `collapse`, `failed_run`, `skeleton`, `readlifecycle`, `agentdiet` | `reapplyFrozen` → `commitRefresh`, every turn regardless of the tail gate | re-created on the request path; `stash_revived` |
-| `summarize`, `extract_llm` | only past their own gates — `summarize`'s trigger and model-availability checks, `extract_llm`'s `no_goal_keywords` | a skipped turn refreshes nothing, but it splices nothing either, so no marker of theirs dangles while the skip lasts |
+| `summarize` | **every turn once a checkpoint exists**, regardless of its trigger or whether a model is available — `replayStale`/`tryReuse` → `commitRefresh` | re-created on the request path; `stash_missing` if the payload has already gone, and the replay proceeds anyway because the summary text must stay byte-identical |
+| `extract_llm` | only past its own gate — `no_goal_keywords` | a skipped turn refreshes nothing, but it splices nothing either, so no marker of its own dangles while the skip lasts |
 | `dedup`, `extract`, `linecap`, `smartcrush` | **none** — no replay path at all; they redo the transformation from the re-sent original through the *refusable* `commitMark` | once reclaimed it is a new stash, so a saturated reserve **refuses** and the message goes upstream verbatim after earlier turns sent it compacted: `stash_refused` **plus a representation flip** |
 
 That last row is worth reading twice, because `stash_refused`'s own description promises "nothing
@@ -90,9 +91,44 @@ became irreversible" — true about reversibility, and silent about the cache-wr
 is reachable at `ttl_seconds` too, so it is not new; a shorter payload horizon shortens the distance
 to it.
 
-`summarize`'s trigger skip is **recurring**, not a one-off: the agent's own compaction shrinks the
-incoming request and can drop it back under the trigger's `min_request_tokens` for several
-consecutive turns.
+`summarize`'s trigger skip is **recurring**, not a one-off, and by default it is now the common case
+rather than the exception: `trigger.cache_state` defaults to `pre_expiry_or_cold`, so a turn fires only
+when the prompt cache is within a minute of expiring **or** has already expired past the clock-skew
+allowance. Neither is true of a turn that arrives seconds after the last one, so most turns of a long
+session are skipped turns.
+
+**Measured, on a real Claude Code session:** 0 of 53 turns fired under these defaults, with
+`cache_state_declined_warm` on 51 of them. The fill gate was not the obstacle — the session reached
+0.996 of the window and 12 turns were over the 0.9 threshold — the **idle time** was. `pre_expiry`
+needs roughly 240s of idle on a 5-minute entry, and the largest gap in that session was 44s.
+
+That is a measurement of a *continuously active* session, which is the one population where a cache
+entry cannot lapse. It is not evidence that the component does little: skipping costs nothing at all,
+and a turn that does fire prevents a full-prefix rewrite worth roughly **$0.15 per event** at haiku
+rates on a 175k prefix.
+
+**This is a deliberate shipped position, not an unresolved question.** `summarize`'s cache gate is
+**insurance**, and it is priced like insurance: no premium on the turns it skips, a large payout on the
+rare turn it fires. What it insures against is a session going idle past its TTL with a nearly-full
+context — someone stepping away, a job pausing, a task switching — which is also the moment a
+full-prefix rewrite costs the most. It is **not** a general per-turn saving and should not be described
+as one anywhere.
+
+The alternative was considered and rejected: making it fire on warm caches too would fire often and
+throw away a live prefix to do it, which is the exact waste the design exists to avoid. Lowering
+`min_request_frac` does not help either — the fill was never the obstacle, the cache timing was.
+
+See `docs/proposals/timely-compact-validation.md` for the arms that measure this and how to re-run them.
+
+(The agent's own compaction is a second route to the same skip — it shrinks the incoming request and
+can drop it back under `min_request_tokens` for several consecutive turns.)
+
+That is only safe because a skipped turn still **splices**. Once a checkpoint exists, every later turn
+re-emits the same summary bytes from it, with no model call, whichever gate declined and whether or
+not a summarizer is configured — see the first row of the table above. A skip that forwarded the full
+transcript instead would diverge from the cached prefix at the first summarized message and force a
+full-suffix cache-write, so under a rarely-firing trigger the component would cost money on nearly
+every turn to save it on a few.
 
 The exposure this leaves, stated plainly: a turn that runs **no pipeline** performs no refresh (an
 `x-context-guru-bypass` request, or the agent-compaction bypass), so an unbroken run of bypassed

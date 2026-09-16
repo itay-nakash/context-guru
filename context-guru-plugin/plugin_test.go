@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -60,8 +61,22 @@ func requireTool(t *testing.T, name string) string {
 // settings runs settings.py and returns its key=value output as a map, plus the exit code.
 func settings(t *testing.T, args ...string) (map[string]string, int) {
 	t.Helper()
+	return settingsIn(t, t.TempDir(), t.TempDir(), args...)
+}
+
+// settingsIn is settings() with the two directories settings.py now writes OUTSIDE the target file
+// made explicit: the state directory holding the escape hatch and its record, and HOME (the hatch
+// is also copied to ~/.local/bin when that exists).
+//
+// Every test goes through here, including the ones that predate the hatch, because otherwise
+// `go test` writes into the DEVELOPER'S real ~/.local/state/context-guru — recording temp paths in
+// the manifest their own hatch would later read, and rewriting the copy on their PATH. A test suite
+// for a recovery tool must not be able to disturb the developer's own recovery tool.
+func settingsIn(t *testing.T, state, home string, args ...string) (map[string]string, int) {
+	t.Helper()
 	py := requireTool(t, "python3")
 	cmd := exec.Command(py, append([]string{filepath.Join(scriptsDir(t), "settings.py")}, args...)...)
+	cmd.Env = append(sandboxEnv(t), "CONTEXT_GURU_STATE="+state, "HOME="+home)
 	out, err := cmd.CombinedOutput()
 	code := 0
 	if ee, ok := err.(*exec.ExitError); ok {
@@ -77,6 +92,52 @@ func settings(t *testing.T, args ...string) (map[string]string, int) {
 	}
 	t.Logf("settings.py %v -> exit %d, %v", args, code, facts)
 	return facts, code
+}
+
+// sandboxEnv is the base environment for EVERY subprocess this suite starts.
+//
+// S5 in review, reproduced live on a reviewer's machine: `go test ./context-guru-plugin/...` spawned
+// start-proxy.sh, which resolved the developer's REAL ~/.local/state/context-guru and left four
+// pidfiles in it. The PR's notes claimed this was fixed; it was fixed for the settings() helper only,
+// while ~28 other call sites still did `append(sandboxEnv(t), …)` and inherited the real HOME.
+//
+// A test suite for a recovery tool must not be able to disturb the developer's recovery tool, so the
+// isolation belongs in one place that every site goes through rather than in a habit each new test has
+// to remember. Everything that could redirect a write into real dotfiles — or make the suite's result
+// depend on the machine it runs on — is dropped and re-pinned to per-test temp directories.
+//
+// The ANTHROPIC_* variables are dropped for the second reason: the reviewer's box has CLAUDE_CONFIG_DIR
+// set and the suite FAILED there, and a developer machine running this plugin has ANTHROPIC_BASE_URL and
+// ANTHROPIC_CUSTOM_HEADERS exported, which would leak into assertions about an unrouted project.
+//
+// `extra` is appended last, so a test that deliberately sets one of these still wins.
+func sandboxEnv(t *testing.T, extra ...string) []string {
+	t.Helper()
+	sandboxed := map[string]bool{
+		"HOME": true, "XDG_STATE_HOME": true, "CONTEXT_GURU_STATE": true, "CLAUDE_CONFIG_DIR": true,
+		"CONTEXT_GURU_BIN": true, "ANTHROPIC_BASE_URL": true, "ANTHROPIC_UPSTREAM": true,
+		"ANTHROPIC_API_KEY": true, "ANTHROPIC_AUTH_TOKEN": true, "ANTHROPIC_CUSTOM_HEADERS": true,
+	}
+	var env []string
+	for _, kv := range os.Environ() {
+		if k, _, ok := strings.Cut(kv, "="); !ok || !sandboxed[k] {
+			env = append(env, kv)
+		}
+	}
+	// HOME and XDG_STATE_HOME are PINNED; CONTEXT_GURU_STATE is only DROPPED, not set.
+	//
+	// Setting it broke four pre-existing tests, and the reason is worth keeping: since S10,
+	// start-proxy.sh resolves CONTEXT_GURU_STATE ahead of XDG_STATE_HOME — so pinning it here outranked
+	// the XDG_STATE_HOME those tests deliberately pass, and the pidfile and keep-alive config landed
+	// somewhere they were not looking. Dropping it from the inherited environment is all the isolation
+	// needs: every state path then resolves through XDG_STATE_HOME or HOME, both of which are pinned
+	// below. A test that wants to pin CONTEXT_GURU_STATE itself passes it in `extra`, which wins.
+	root := t.TempDir()
+	env = append(env,
+		"HOME="+root,
+		"XDG_STATE_HOME="+filepath.Join(root, "xdg-state"),
+	)
+	return append(env, extra...)
 }
 
 func writeJSON(t *testing.T, path string, v any) {
@@ -267,7 +328,7 @@ func runStart(t *testing.T, env map[string]string) (out string, code int, starte
 	}
 
 	cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "start-proxy.sh"))
-	cmd.Env = append(os.Environ(), "CONTEXT_GURU_BIN="+fake, "TMPDIR="+dir)
+	cmd.Env = append(sandboxEnv(t), "CONTEXT_GURU_BIN="+fake, "TMPDIR="+dir)
 	for k, v := range env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
@@ -392,7 +453,7 @@ func TestHookNeverFailsTheSessionWhenTheBinaryIsMissing(t *testing.T) {
 	dir := t.TempDir()
 	cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "start-proxy.sh"))
 	// An unused high port: nothing answers /healthz, and the binary does not exist.
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(sandboxEnv(t),
 		"CLAUDE_PLUGIN_OPTION_PORT=8799",
 		"ANTHROPIC_BASE_URL=http://127.0.0.1:8799/anthropic",
 		"CONTEXT_GURU_BIN="+filepath.Join(dir, "does-not-exist"),
@@ -447,7 +508,7 @@ func TestHookStartsTheProxyAndWaitsForHealthz(t *testing.T) {
 	}
 
 	cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "start-proxy.sh"))
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(sandboxEnv(t),
 		"CLAUDE_PLUGIN_OPTION_PORT="+port,
 		"ANTHROPIC_BASE_URL=http://127.0.0.1:"+port+"/anthropic",
 		"CONTEXT_GURU_BIN="+fake,
@@ -686,7 +747,7 @@ func TestInstallRefusesAnUnverifiedDownload(t *testing.T) {
 
 	dest := filepath.Join(dir, "dest")
 	cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "install.sh"))
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(sandboxEnv(t),
 		"PATH="+bin+":"+os.Getenv("PATH"),
 		"CONTEXT_GURU_DEST="+dest,
 		"HOME="+dir,
@@ -741,7 +802,7 @@ func TestHookMakesTheProxyIdentifiable(t *testing.T) {
 
 	state := filepath.Join(dir, "state")
 	cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "start-proxy.sh"))
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(sandboxEnv(t),
 		"CLAUDE_PLUGIN_OPTION_PORT="+port,
 		"ANTHROPIC_BASE_URL=http://127.0.0.1:"+port+"/anthropic",
 		"CONTEXT_GURU_BIN="+fake,
@@ -889,7 +950,7 @@ func runCheck(t *testing.T, port, binBody string) (out string, code int, elapsed
 		t.Fatal(err)
 	}
 	cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "check-proxy.sh"))
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(sandboxEnv(t),
 		"CLAUDE_PLUGIN_ROOT="+root,
 		"CLAUDE_PLUGIN_OPTION_PORT="+port,
 		"ANTHROPIC_BASE_URL=http://127.0.0.1:"+port+"/anthropic",
@@ -949,7 +1010,17 @@ func TestCheckHookFinishesInsideItsOwnTimeout(t *testing.T) {
 	for _, want := range []string{
 		"nothing is answering there",
 		"Your request will hang with no error message",
-		"--dashboard", // the printed recovery command must not recreate the 404 dashboard
+		// This used to assert the literal "--dashboard", because the note restated the proxy's whole
+		// command line and a copy of it that forgot those flags left the user with a 404 dashboard.
+		// The note no longer restates anything — it points at start-proxy.sh, which always passes them
+		// — so the string is gone by design rather than by regression.
+		//
+		// The property itself did not move to prose: TestCheckProxyRecoveryCommandIsTheRealLaunchPath
+		// RUNS the printed command and asserts --dashboard in the argv the proxy is actually launched
+		// with, which is strictly stronger than finding the word in a paragraph. What is left to check
+		// here is that this path still hands the user something runnable at all.
+		"start-proxy.sh",
+		"--unrouted",
 	} {
 		if !strings.Contains(flat, want) {
 			t.Errorf("the diagnostic is missing %q; output was:\n%s", want, out)
@@ -990,7 +1061,7 @@ func TestCheckHookIsSilentWhereRoutingIsNotConfigured(t *testing.T) {
 				baseURL = "http://127.0.0.1:" + port + "/anthropic"
 			}
 			cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "check-proxy.sh"))
-			cmd.Env = append(os.Environ(),
+			cmd.Env = append(sandboxEnv(t),
 				"CLAUDE_PLUGIN_OPTION_PORT="+port,
 				"ANTHROPIC_BASE_URL="+baseURL,
 				// No recovery attempt: the binary is absent, so this exercises the gate and the
@@ -1077,7 +1148,7 @@ func TestStartHookBudgetsOnWallClockNotIterations(t *testing.T) {
 	}
 	limit := hookTimeout(t, "SessionStart")
 	cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "start-proxy.sh"))
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(sandboxEnv(t),
 		"CLAUDE_PLUGIN_OPTION_PORT="+port,
 		"ANTHROPIC_BASE_URL=http://127.0.0.1:"+port+"/anthropic",
 		"CONTEXT_GURU_BIN="+fake,
@@ -1195,7 +1266,7 @@ func TestInstallReportsPATHFromTheSourceFallbackToo(t *testing.T) {
 			path = dest + ":" + path
 		}
 		cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "install.sh"))
-		cmd.Env = append(os.Environ(), "PATH="+path, "CONTEXT_GURU_DEST="+dest, "HOME="+dir)
+		cmd.Env = append(sandboxEnv(t), "PATH="+path, "CONTEXT_GURU_DEST="+dest, "HOME="+dir)
 		out, err := cmd.CombinedOutput()
 		t.Logf("install.sh (dest on PATH=%v) -> %v, output:\n%s", pathHasDest, err, out)
 		if err != nil {
@@ -1382,7 +1453,7 @@ func TestUninstallDoesNotSignalAProcessThatIsNotOurs(t *testing.T) {
 				"  printf '%s\\n' \"$*\" >> " + strconv.Quote(killLog) + "\n" +
 				"}\n"
 			cmd := exec.Command("bash", "-c", preamble+block)
-			cmd.Env = append(os.Environ(),
+			cmd.Env = append(sandboxEnv(t),
 				"PATH="+stubs+":"+os.Getenv("PATH"),
 				"CLAUDE_PLUGIN_OPTION_PORT=8787",
 				"XDG_STATE_HOME="+filepath.Join(dir, "state"))
@@ -1671,7 +1742,7 @@ func TestStartProxyReportsArgumentsItCannotUse(t *testing.T) {
 			cmd := exec.Command("bash", append([]string{
 				filepath.Join(scriptsDir(t), "start-proxy.sh"), "--unrouted", "--bin", fake,
 			}, c.args...)...)
-			cmd.Env = append(os.Environ(),
+			cmd.Env = append(sandboxEnv(t),
 				"CLAUDE_PLUGIN_OPTION_PORT="+port,
 				"ANTHROPIC_BASE_URL=",
 				"ANTHROPIC_UPSTREAM=",
@@ -1735,7 +1806,7 @@ func TestRejectingAValueDoesNotEatTheNextFlag(t *testing.T) {
 	// --upstream has no value; --bin follows it and must survive.
 	cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "start-proxy.sh"),
 		"--unrouted", "--upstream", "--bin", fake)
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(sandboxEnv(t),
 		"CLAUDE_PLUGIN_OPTION_PORT="+port,
 		"ANTHROPIC_BASE_URL=",
 		"ANTHROPIC_UPSTREAM=",
@@ -1938,7 +2009,7 @@ func runStatusline(t *testing.T, env map[string]string, stdin string, args ...st
 	t.Helper()
 	py := requireTool(t, "python3")
 	cmd := exec.Command(py, append([]string{filepath.Join(scriptsDir(t), "statusline.py")}, args...)...)
-	cmd.Env = append(os.Environ(), "TMPDIR="+t.TempDir())
+	cmd.Env = append(sandboxEnv(t), "TMPDIR="+t.TempDir())
 	for k, v := range env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
@@ -2444,7 +2515,7 @@ func TestStatuslineCachesPerSession(t *testing.T) {
 	tmp := t.TempDir() // shared TMPDIR on purpose: this is what could let the cache files collide
 	run := func(sessionID string) string {
 		cmd := exec.Command(py, filepath.Join(scriptsDir(t), "statusline.py"))
-		cmd.Env = append(os.Environ(), "TMPDIR="+tmp,
+		cmd.Env = append(sandboxEnv(t), "TMPDIR="+tmp,
 			"ANTHROPIC_BASE_URL=http://127.0.0.1:"+port+"/anthropic",
 			"CLAUDE_PLUGIN_OPTION_PORT="+port)
 		cmd.Stdin = strings.NewReader(statuslinePayload(sessionID, 1.00, 10000, 1000))
@@ -2491,7 +2562,7 @@ func TestStatuslineCachesStatsAcrossQuickRenders(t *testing.T) {
 	tmp := t.TempDir()
 	run := func() string {
 		cmd := exec.Command(py, filepath.Join(scriptsDir(t), "statusline.py"))
-		cmd.Env = append(os.Environ(), "TMPDIR="+tmp,
+		cmd.Env = append(sandboxEnv(t), "TMPDIR="+tmp,
 			"ANTHROPIC_BASE_URL=http://127.0.0.1:"+port+"/anthropic",
 			"CLAUDE_PLUGIN_OPTION_PORT="+port)
 		cmd.Stdin = strings.NewReader("{}")
@@ -2511,14 +2582,61 @@ func TestStatuslineCachesStatsAcrossQuickRenders(t *testing.T) {
 
 // --- the keep-alive opt-in toggle -----------------------------------------------------------
 
+// keepalivePort is deliberately not 8787. These blocks name the config file after the port, so a
+// regression to `${CLAUDE_PLUGIN_OPTION_PORT:-8787}` writes a filename nothing reads — and at a
+// fixture port of 8787 that regression passes by coincidence, which is exactly how it shipped.
+const keepalivePort = "4041"
+
+// emptyPreset asks runKeepaliveBlock to substitute an EMPTY preset value, which is not the same as
+// passing "" — that means "this block has no <preset> line at all". Only the first models a model that
+// looked for `option_preset=` and found nothing to use.
+const emptyPreset = "\x00"
+
+// unfilledPlaceholder matches a `<lowercase>` placeholder left in an extracted block. Lower-case only
+// on purpose, so a heredoc delimiter (`<<EOF`) is not mistaken for one.
+var unfilledPlaceholder = regexp.MustCompile(`<[a-z][a-z_]*>`)
+
+// fillSkillPlaceholder substitutes one placeholder in an extracted skill block, failing loudly when
+// it is absent: an unsubstituted `PORT="<port>"` makes every path below look inert for the wrong
+// reason, which is what happened when the placeholder was introduced in the uninstall skill.
+func fillSkillPlaceholder(t *testing.T, skill, block, placeholder, value string) string {
+	t.Helper()
+	if !strings.Contains(block, placeholder) {
+		t.Fatalf("the %s block no longer carries %s; if that value is obtained differently now, this "+
+			"test needs to follow suit rather than execute a stale template:\n%s", skill, placeholder, block)
+	}
+	return strings.Replace(block, placeholder, value, 1)
+}
+
 // runKeepaliveBlock executes one bash block from skills/keepalive/SKILL.md with a controlled
 // environment, the same way runCheck/skillBlock drive the other skills' destructive snippets.
-func runKeepaliveBlock(t *testing.T, needle string, env map[string]string) (out string, code int) {
+//
+// The blocks are TEMPLATES: the skill tells the model to discover the port and preset with
+// `settings.py config` and substitute them, because CLAUDE_PLUGIN_OPTION_* never reaches a Bash tool
+// call. So fill the placeholders the way the model is instructed to, and run with those variables
+// EMPTY — that is the environment the blocks actually execute in.
+func runKeepaliveBlock(t *testing.T, needle, preset string, env map[string]string) (out string, code int) {
 	t.Helper()
 	requireTool(t, "bash")
 	block := skillBlock(t, "keepalive", needle)
+	block = fillSkillPlaceholder(t, "keepalive", block, `PORT="<port>"`, `PORT="`+keepalivePort+`"`)
+	if preset != "" {
+		v := preset
+		if v == emptyPreset {
+			v = ""
+		}
+		block = fillSkillPlaceholder(t, "keepalive", block, `PRESET="<preset>"`, `PRESET="`+v+`"`)
+	}
+	// Nothing below may execute a template. The per-call substitutions above are opt-in, so this is
+	// the check that does not have to be remembered: the day a block gains a placeholder no call site
+	// fills, it fails here instead of running literally and asserting on nothing.
+	if m := unfilledPlaceholder.FindString(block); m != "" {
+		t.Fatalf("the keepalive %q block still carries the placeholder %s after substitution; it would "+
+			"execute as a literal template and every assertion below would pass on nothing:\n%s",
+			needle, m, block)
+	}
 	cmd := exec.Command("bash", "-c", block)
-	cmd.Env = os.Environ()
+	cmd.Env = append(sandboxEnv(t), "CLAUDE_PLUGIN_OPTION_PORT=", "CLAUDE_PLUGIN_OPTION_PRESET=")
 	for k, v := range env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
@@ -2539,15 +2657,13 @@ func runKeepaliveBlock(t *testing.T, needle string, env map[string]string) (out 
 // keep-alive turned on — the opposite of what enabling it is supposed to do.
 func TestKeepaliveEnableWritesAPresetPreservingConfig(t *testing.T) {
 	state := t.TempDir()
-	out, code := runKeepaliveBlock(t, `cat > "$CFG" <<EOF`, map[string]string{
-		"CLAUDE_PLUGIN_OPTION_PORT":   "8787",
-		"CLAUDE_PLUGIN_OPTION_PRESET": "codesmart",
-		"XDG_STATE_HOME":              state,
+	out, code := runKeepaliveBlock(t, `cat > "$CFG" <<EOF`, "codesmart", map[string]string{
+		"XDG_STATE_HOME": state,
 	})
 	if code != 0 {
 		t.Fatalf("exit %d: %s", code, out)
 	}
-	cfg := filepath.Join(state, "context-guru", "keepalive-8787.yaml")
+	cfg := filepath.Join(state, "context-guru", "keepalive-"+keepalivePort+".yaml")
 	b, err := os.ReadFile(cfg)
 	if err != nil {
 		t.Fatalf("config was not written at %s: %v", cfg, err)
@@ -2569,14 +2685,13 @@ func TestKeepaliveEnableRefusesToClobberAForeignFile(t *testing.T) {
 	if err := os.MkdirAll(stateDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	cfg := filepath.Join(stateDir, "keepalive-8787.yaml")
+	cfg := filepath.Join(stateDir, "keepalive-"+keepalivePort+".yaml")
 	foreign := "# hand-written, not ours\npreset: cache\n"
 	if err := os.WriteFile(cfg, []byte(foreign), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	out, code := runKeepaliveBlock(t, `cat > "$CFG" <<EOF`, map[string]string{
-		"CLAUDE_PLUGIN_OPTION_PORT": "8787",
-		"XDG_STATE_HOME":            state,
+	out, code := runKeepaliveBlock(t, `cat > "$CFG" <<EOF`, "cache", map[string]string{
+		"XDG_STATE_HOME": state,
 	})
 	if code != 0 {
 		t.Fatalf("must not fail outright, just refuse: exit %d: %s", code, out)
@@ -2599,14 +2714,13 @@ func TestKeepaliveDisableOnlyRemovesOurOwnFile(t *testing.T) {
 		if err := os.MkdirAll(stateDir, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		cfg := filepath.Join(stateDir, "keepalive-8787.yaml")
+		cfg := filepath.Join(stateDir, "keepalive-"+keepalivePort+".yaml")
 		ours := "# context-guru: written by /context-guru:keepalive\npreset: cache\ncache:\n  keepalive: true\n"
 		if err := os.WriteFile(cfg, []byte(ours), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		out, code := runKeepaliveBlock(t, `rm -f "$CFG"`, map[string]string{
-			"CLAUDE_PLUGIN_OPTION_PORT": "8787",
-			"XDG_STATE_HOME":            state,
+		out, code := runKeepaliveBlock(t, `rm -f "$CFG"`, "", map[string]string{
+			"XDG_STATE_HOME": state,
 		})
 		if code != 0 {
 			t.Fatalf("exit %d: %s", code, out)
@@ -2622,14 +2736,13 @@ func TestKeepaliveDisableOnlyRemovesOurOwnFile(t *testing.T) {
 		if err := os.MkdirAll(stateDir, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		cfg := filepath.Join(stateDir, "keepalive-8787.yaml")
+		cfg := filepath.Join(stateDir, "keepalive-"+keepalivePort+".yaml")
 		foreign := "# hand-written\npreset: cache\n"
 		if err := os.WriteFile(cfg, []byte(foreign), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		out, code := runKeepaliveBlock(t, `rm -f "$CFG"`, map[string]string{
-			"CLAUDE_PLUGIN_OPTION_PORT": "8787",
-			"XDG_STATE_HOME":            state,
+		out, code := runKeepaliveBlock(t, `rm -f "$CFG"`, "", map[string]string{
+			"XDG_STATE_HOME": state,
 		})
 		if code != 0 {
 			t.Fatalf("exit %d: %s", code, out)
@@ -2639,6 +2752,35 @@ func TestKeepaliveDisableOnlyRemovesOurOwnFile(t *testing.T) {
 			t.Errorf("a config this skill never wrote was removed: %v, %q, output: %s", err, got, out)
 		}
 	})
+}
+
+// TestKeepaliveEnableRefusesAnEmptyPreset closes the hole the placeholder flow itself opens.
+//
+// `settings.py config` prints `option_preset=` only when that key is actually configured, so a user who
+// set the port and never touched the preset leaves the model with nothing to substitute. Writing the
+// resulting `preset:` line empty is not an error anywhere downstream: applyPreset returns early on
+// `Preset == ""` (config/config.go), so Load reports success, no pipeline is filled, and compaction is
+// entirely OFF while the keep-alive keeps spending the caller's credential on idle pings.
+//
+// That is strictly worse than the defaulted-`cache` bug this branch fixes, since `cache` at least ran
+// the split. The block already refuses to write over a file that is not its own; an unresolved preset
+// earns the same conservatism, and must leave no file behind.
+func TestKeepaliveEnableRefusesAnEmptyPreset(t *testing.T) {
+	state := t.TempDir()
+	out, code := runKeepaliveBlock(t, `cat > "$CFG" <<EOF`, emptyPreset, map[string]string{
+		"XDG_STATE_HOME": state,
+	})
+	if code == 0 {
+		t.Errorf("an unresolved preset was accepted; that writes `preset:` empty, which turns "+
+			"compaction off while keep-alive keeps paying for pings:\n%s", out)
+	}
+	if !strings.Contains(out, "REFUSING") {
+		t.Errorf("the refusal was not reported as such:\n%s", out)
+	}
+	cfg := filepath.Join(state, "context-guru", "keepalive-"+keepalivePort+".yaml")
+	if _, err := os.Stat(cfg); err == nil {
+		t.Errorf("a config was written anyway at %s, so the proxy would start with compaction off", cfg)
+	}
 }
 
 // TestStartProxyPicksUpAKeepaliveConfig proves the wiring between the opt-in toggle above and the
@@ -2687,7 +2829,7 @@ func TestStartProxyPicksUpAKeepaliveConfig(t *testing.T) {
 			}
 
 			cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "start-proxy.sh"))
-			cmd.Env = append(os.Environ(),
+			cmd.Env = append(sandboxEnv(t),
 				"CLAUDE_PLUGIN_OPTION_PORT="+port,
 				"ANTHROPIC_BASE_URL=http://127.0.0.1:"+port+"/anthropic",
 				"CONTEXT_GURU_BIN="+fake,
@@ -2714,6 +2856,597 @@ func TestStartProxyPicksUpAKeepaliveConfig(t *testing.T) {
 			}
 			if !c.wantConfig && hasAnyConfig {
 				t.Errorf("no keepalive config was written, but --config appeared anyway: %q", argv)
+			}
+		})
+	}
+}
+
+// TestEverySkillStatesThePerOptionFallback guards the wording, because the wording is the whole fix.
+//
+// `settings.py config` prints an `option_<name>=` line only for keys the user actually set, and reports
+// `source=(none)` only when the options object is missing or empty. All four skills that call it used to
+// document the fallback as keyed on `source=(none)` — so a PARTIAL config (a real `source=`, one option
+// absent) fell through every documented branch and left the model inventing a value at the exact point
+// those sections warn against it. For `uninstall` that builds a URL matching nothing, so the removal
+// silently finds nothing to remove.
+//
+// This asserts prose, which is unusual here and deliberate: the skills ARE the program on this path, and
+// the defect was a sentence rather than a statement. Kept to one required phrase rather than exact text,
+// so rewording stays cheap and deleting the rule does not.
+func TestEverySkillStatesThePerOptionFallback(t *testing.T) {
+	entries, err := os.ReadDir("skills")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checked := 0
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join("skills", e.Name(), "SKILL.md"))
+		if err != nil {
+			t.Errorf("reading %s: %v", e.Name(), err)
+			continue
+		}
+		body := string(b)
+		if !strings.Contains(body, `settings.py" config`) {
+			continue // this skill does not read the options, so it has no fallback to state
+		}
+		checked++
+		// The positive alone is the reassurance I suspected it of being: review demonstrated that
+		// restoring the old sentence while KEEPING the new rule passes. So assert the absence of the old
+		// instruction shape too.
+		//
+		// The needle is the CONDITION, "if it reports `source=(none)`", not "or 8787 if it reports". The
+		// narrower form was coupled to one phrasing and this repo had two: keepalive's own sentence said
+		// "or 8787 and `cache` if it reports …", which slipped straight through — the same failure as
+		// keying the fence scan on "```bash". Verified against both real phrasings (origin/main's status
+		// and e0ea8a9's keepalive: 1 each) and all five current skills (0).
+		//
+		// It cannot be `source=(none)` alone: the corrected prose says "reports `source=(none)` only
+		// when …", which is an explanation rather than a condition, so the token appears in every FIXED
+		// file. "if it reports" is what makes it an instruction to act on.
+		if strings.Contains(body, "if it reports `source=(none)`") {
+			t.Errorf("skills/%s/SKILL.md still tells the model to fall back \"if it reports "+
+				"`source=(none)`\", which is the condition this per-option rule replaces. A skill can "+
+				"state the rule and contradict it two lines later; that is what this catches.", e.Name())
+		}
+		if !strings.Contains(body, "is unconfigured") {
+			t.Errorf("skills/%s/SKILL.md reads `settings.py config` but never says that an option the "+
+				"output does not list is UNCONFIGURED. Without that, a partial config (a real `source=` "+
+				"with one option missing) matches no documented branch and the model invents a value.",
+				e.Name())
+		}
+	}
+	if checked < 4 {
+		t.Fatalf("only %d skills were found to read `settings.py config`; expected at least the four "+
+			"(install, status, uninstall, keepalive), so this guard proved less than it claims", checked)
+	}
+	t.Logf("checked %d skills that read the configured options", checked)
+}
+
+// fenceOpener matches a markdown fence and captures its info string. Leading whitespace is allowed
+// because an indented fence is still a fence — a block indented as a list continuation is executed
+// exactly like one at column zero.
+var fenceOpener = regexp.MustCompile("^[ \t]*```+[ \t]*([A-Za-z0-9_.+-]*)")
+
+// isShellFence reports whether a fence's info string means "this is shell the model will run". The
+// label is not a semantic boundary: ```sh and a bare ``` are executed the same as ```bash, so keying
+// a guard on the literal "```bash" leaves the same defect reachable one keystroke away.
+func isShellFence(info string) bool {
+	switch strings.ToLower(info) {
+	case "", "bash", "sh", "shell", "zsh", "console", "shell-session":
+		return true
+	}
+	return false
+}
+
+// TestNoSkillBlockReadsAPluginOption is a guard, not a discovery: it is the same defect as
+// TestTheConfiguredPortCanActuallyBeHonoured, which was found once in install/status/uninstall, fixed
+// there, and then reintroduced wholesale by a later skill that was written from the older pattern.
+//
+// CLAUDE_PLUGIN_OPTION_* reaches HOOK environments only, never a Bash tool call, so any
+// `${CLAUDE_PLUGIN_OPTION_X:-default}` inside a skill's fenced bash block is a silent wrong answer —
+// it always yields the default, whatever the user configured, and reports success while doing it.
+// Skills must obtain these values from `settings.py config` and substitute them.
+//
+// Scoped to fenced SHELL blocks in skills/, on purpose: the hook SCRIPTS (start-proxy.sh,
+// check-proxy.sh) do run in a hook environment and read these variables legitimately, and the skills'
+// PROSE has to be able to name the variable in order to warn about it.
+//
+// "Shell block" deliberately includes ```sh, a bare ```, and an indented fence, not just ```bash at
+// column zero. Round-1 review demonstrated both escapes: the same defect re-added under a ```sh fence,
+// and under a two-space-indented ```bash fence, each left this guard silent. A guard for a CLASS has
+// to match how the model reads a block, and the model does not care what the info string says.
+func TestNoSkillBlockReadsAPluginOption(t *testing.T) {
+	entries, err := os.ReadDir("skills")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checked := 0
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join("skills", e.Name(), "SKILL.md"))
+		if err != nil {
+			t.Errorf("reading %s: %v", e.Name(), err)
+			continue
+		}
+		// Two pieces of state, not one. Tracking only "am I in a block I care about" gets the
+		// PARITY wrong: a ```json fence would not open anything, so its CLOSING fence reads as an
+		// opener and every prose line after it looks like shell. That is not hypothetical — it
+		// misfired on install/SKILL.md's prose the first time this guard was widened.
+		inFence, isShell := false, false
+		for i, line := range strings.Split(string(b), "\n") {
+			if m := fenceOpener.FindStringSubmatch(line); m != nil {
+				if inFence {
+					inFence, isShell = false, false
+				} else {
+					inFence, isShell = true, isShellFence(m[1])
+				}
+				continue
+			}
+			if inFence && isShell && strings.Contains(line, "CLAUDE_PLUGIN_OPTION_") {
+				t.Errorf("skills/%s/SKILL.md:%d reads a plugin option inside an executable block, "+
+					"which always expands to the default in a Bash tool call:\n\t%s\n"+
+					"Obtain it from `settings.py config` and substitute a <placeholder> instead.",
+					e.Name(), i+1, strings.TrimSpace(line))
+			}
+		}
+		// An odd number of fence lines ends the loop still inside one, which means the scan lost its
+		// bearings partway through and everything after that point went unexamined. That is a false
+		// negative over the whole remainder rather than a misfire: round-2 review deleted one closing
+		// fence, re-added the defect to all four blocks, and this guard reported 0 of 4. A missing
+		// backtick line is an ordinary editing slip, so detect it — same argument as `checked == 0`
+		// below, and it costs nothing while every skill stays balanced.
+		if inFence {
+			t.Errorf("skills/%s/SKILL.md: fences are unbalanced, so the scan lost its bearings partway "+
+				"through and this guard proved nothing for the rest of the file", e.Name())
+		}
+		checked++
+	}
+	if checked == 0 {
+		t.Fatal("no skills were scanned, so this guard proved nothing")
+	}
+	t.Logf("scanned %d skills", checked)
+}
+
+// hasArgvFlag reports whether argv contains flag as a WHOLE token, and flagValue returns the token
+// after it. Substring matching is not good enough here and the difference is not academic:
+// `--dashboard` is a PREFIX of `--dashboard-db`, so `strings.Contains(argv, "--dashboard")` is
+// satisfied by the flag that follows it. Review deleted `--dashboard` from start-proxy.sh's launch
+// line and the assertion that exists to catch exactly that stayed green, with the dashboard off and
+// /dashboard/ returning 404.
+func hasArgvFlag(argv []string, flag string) bool {
+	for _, f := range argv {
+		if f == flag {
+			return true
+		}
+	}
+	return false
+}
+
+func argvFlagValue(argv []string, flag string) (string, bool) {
+	for i, f := range argv {
+		if f == flag && i+1 < len(argv) {
+			return argv[i+1], true
+		}
+	}
+	return "", false
+}
+
+// TestCheckProxyRecoveryCommandIsTheRealLaunchPath: the note printed when nothing answers on the port
+// used to carry a hand-rolled `context-guru-proxy --listen … --preset …`, and that duplicate had drifted
+// from what start-proxy.sh actually launches in four ways at once — it named the plugin option's preset
+// (which --config replaces anyway) and omitted --config, --anthropic-upstream and --idle-exit.
+//
+// Pasting it therefore turned keep-alive OFF for somebody who had enabled it and was paying for the
+// pings, bypassed a configured gateway, and left a proxy that never idle-exits. All silently, while the
+// user was already troubleshooting.
+//
+// So this does not assert on the note's WORDING. It extracts the command the note prints and RUNS it,
+// then asserts on the argv the proxy was launched with. A flag list can be repaired and drift again; what
+// has to hold is that the printed command produces the same proxy the hook would have started.
+func TestCheckProxyRecoveryCommandIsTheRealLaunchPath(t *testing.T) {
+	// The upstream cases matter because the printed command is re-parsed by the user's shell. An
+	// unquoted `&` backgrounds the command mid-way, so the paste succeeds, starts a proxy, and chains it
+	// to a TRUNCATED upstream with nothing said — a silent partial success, which is the same failure
+	// mode as everything else in this file.
+	for _, c := range []struct{ name, upstream string }{
+		{"a plain upstream", "http://gw.example:4000"},
+		{"an upstream whose query string contains &", "http://gw.example:4000/v1?tenant=acme&mode=chain"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			requireTool(t, "bash")
+			const preset, idle = "house", "90m"
+
+			dir := t.TempDir()
+			state := filepath.Join(dir, "state")
+			stateDir := filepath.Join(state, "context-guru")
+			if err := os.MkdirAll(stateDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			port := freePort(t)
+			// A keep-alive config exists, which is the case the old command silently discarded.
+			keepalive := filepath.Join(stateDir, "keepalive-"+port+".yaml")
+			if err := os.WriteFile(keepalive, []byte("preset: "+preset+"\ncache:\n  keepalive: true\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			// Step 1: get the note. Auto-recovery has to FAIL for it to print, so the binary is absent.
+			root, err := filepath.Abs(".")
+			if err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "check-proxy.sh"))
+			cmd.Env = append(sandboxEnv(t),
+				"CLAUDE_PLUGIN_ROOT="+root,
+				"CLAUDE_PLUGIN_OPTION_PORT="+port,
+				"CLAUDE_PLUGIN_OPTION_PRESET="+preset,
+				"CLAUDE_PLUGIN_OPTION_IDLE_EXIT="+idle,
+				"CLAUDE_PLUGIN_OPTION_UPSTREAM="+c.upstream,
+				"ANTHROPIC_BASE_URL=http://127.0.0.1:"+port+"/anthropic",
+				"CONTEXT_GURU_BIN="+filepath.Join(dir, "does-not-exist"),
+				"CONTEXT_GURU_HEALTH_BUDGET=1",
+				"XDG_STATE_HOME="+state,
+				"TMPDIR="+dir)
+			b, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("check-proxy.sh must never fail a prompt: %v\n%s", err, b)
+			}
+			note := string(b)
+			t.Logf("note ->\n%s", note)
+
+			// The duplicated command line must be gone, not merely corrected.
+			if strings.Contains(note, "context-guru-proxy --listen") {
+				t.Errorf("the note still prints a hand-rolled proxy command line; that duplicate is what "+
+					"drifted from the real launch path four times:\n%s", note)
+			}
+
+			// Step 2: pull the command out of the note and run it, with a proxy binary that works.
+			var recover string
+			for _, line := range strings.Split(note, "\n") {
+				if strings.Contains(line, "start-proxy.sh") && strings.Contains(line, "--unrouted") {
+					recover = strings.TrimSpace(line)
+					break
+				}
+			}
+			if recover == "" {
+				t.Fatalf("the note offers no runnable recovery command:\n%s", note)
+			}
+
+			argvFile := filepath.Join(dir, "argv")
+			fake := filepath.Join(dir, "fake-proxy")
+			py := requireTool(t, "python3")
+			script := "#!/usr/bin/env bash\n" +
+				"printf '%s\\n' \"$*\" > " + argvFile + "\n" +
+				"exec " + py + " -c '\n" +
+				"import http.server\n" +
+				"class H(http.server.BaseHTTPRequestHandler):\n" +
+				"    def do_GET(self):\n" +
+				"        self.send_response(200); self.end_headers(); self.wfile.write(b\"ok\")\n" +
+				"    def log_message(self, *a): pass\n" +
+				"http.server.HTTPServer((\"127.0.0.1\", " + port + "), H).serve_forever()\n'\n"
+			if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			// Deliberately NOT carrying the CLAUDE_PLUGIN_OPTION_* values: a terminal does not have them,
+			// which is the whole reason the printed command has to pass them as flags. Only CONTEXT_GURU_BIN
+			// and the state/tmp redirections are kept, because the test cannot install a real binary.
+			run := exec.Command("bash", "-c", recover)
+			run.Env = append(sandboxEnv(t),
+				"CLAUDE_PLUGIN_OPTION_PORT=", "CLAUDE_PLUGIN_OPTION_PRESET=", "CLAUDE_PLUGIN_OPTION_IDLE_EXIT=",
+				"CLAUDE_PLUGIN_OPTION_UPSTREAM=", "ANTHROPIC_BASE_URL=", "ANTHROPIC_UPSTREAM=",
+				"CONTEXT_GURU_BIN="+fake,
+				"XDG_STATE_HOME="+state,
+				"TMPDIR="+dir)
+			out2, err := run.CombinedOutput()
+			t.Cleanup(func() {
+				if pb, e := os.ReadFile(filepath.Join(stateDir, "proxy-"+port+".pid")); e == nil {
+					exec.Command("kill", strings.TrimSpace(string(pb))).Run() //nolint:errcheck
+				}
+			})
+			if err != nil {
+				t.Fatalf("the printed recovery command failed: %v\n%s", err, out2)
+			}
+			raw, rerr := os.ReadFile(argvFile)
+			if rerr != nil {
+				t.Fatalf("the printed recovery command never launched a proxy: %v\nnote:\n%s\nrun:\n%s",
+					rerr, note, out2)
+			}
+			argv := strings.Fields(string(raw))
+			t.Logf("recovery command launched: %s", strings.TrimSpace(string(raw)))
+
+			// Flags carrying a value: assert the VALUE, so a truncated one fails.
+			for _, want := range []struct{ what, flag, value string }{
+				{"the configured port", "--listen", "127.0.0.1:" + port},
+				{"the keep-alive config (omitting it turns off keep-alive the user is paying for)",
+					"--config", keepalive},
+				{"the configured upstream (a truncated one bypasses the gateway holding their credential)",
+					"--anthropic-upstream", c.upstream},
+			} {
+				got, ok := argvFlagValue(argv, want.flag)
+				if !ok {
+					t.Errorf("the recovered proxy never got %s (%s missing): %v", want.what, want.flag, argv)
+					continue
+				}
+				if got != want.value {
+					t.Errorf("%s is wrong: %s = %q, want %q", want.what, want.flag, got, want.value)
+				}
+			}
+			// Whole-token flags. --dashboard MUST be matched as a token: it is a prefix of --dashboard-db,
+			// and a substring check here passed with the bare flag deleted and the dashboard off.
+			for _, flag := range []string{"--dashboard", "--idle-exit=" + idle} {
+				if !hasArgvFlag(argv, flag) {
+					t.Errorf("the recovered proxy is missing %s, so it is not the proxy the hook would have "+
+						"started: %v", flag, argv)
+				}
+			}
+			// The pidfile is what uninstall uses; a recovery proxy it cannot find is unstoppable.
+			if _, err := os.Stat(filepath.Join(stateDir, "proxy-"+port+".pid")); err != nil {
+				t.Errorf("no pidfile, so uninstall could not stop the recovered proxy: %v", err)
+			}
+		})
+	}
+}
+
+// TestCheckProxySaysSoWhenThereIsNoStarterToPointAt: with CLAUDE_PLUGIN_ROOT wrong or the plugin
+// half-installed there is no script to delegate to. The note must say that rather than fall back to a
+// hand-written command line — reintroducing the duplicate in the one case where nothing is verifiable is
+// how the original defect would come back.
+func TestCheckProxySaysSoWhenThereIsNoStarterToPointAt(t *testing.T) {
+	requireTool(t, "bash")
+	dir := t.TempDir()
+	port := freePort(t)
+	cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "check-proxy.sh"))
+	cmd.Env = append(sandboxEnv(t),
+		"CLAUDE_PLUGIN_ROOT="+filepath.Join(dir, "not-the-plugin"),
+		"CLAUDE_PLUGIN_OPTION_PORT="+port,
+		"ANTHROPIC_BASE_URL=http://127.0.0.1:"+port+"/anthropic",
+		"CONTEXT_GURU_HEALTH_BUDGET=1",
+		"XDG_STATE_HOME="+filepath.Join(dir, "state"),
+		"TMPDIR="+dir)
+	b, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("must never fail a prompt: %v\n%s", err, b)
+	}
+	note := string(b)
+	t.Logf("note ->\n%s", note)
+	if strings.Contains(note, "context-guru-proxy --listen") {
+		t.Errorf("fell back to a hand-rolled command line, which is the defect this replaced:\n%s", note)
+	}
+	if !strings.Contains(note, "not where this hook expects it") {
+		t.Errorf("the missing starter is not reported:\n%s", note)
+	}
+	if !strings.Contains(note, "/context-guru:install") {
+		t.Errorf("no way forward is offered:\n%s", note)
+	}
+}
+
+// TestStartProxyTakesPresetAndIdleExitAsArguments: both existed only as CLAUDE_PLUGIN_OPTION_* reads,
+// which a terminal does not have — so the command check-proxy.sh prints could not carry them without an
+// env prefix, and this file's own gate comment records a human losing three rounds of debugging to a
+// pasted env prefix that split across lines and became a no-op.
+func TestStartProxyTakesPresetAndIdleExitAsArguments(t *testing.T) {
+	requireTool(t, "bash")
+	dir := t.TempDir()
+	argvFile := filepath.Join(dir, "argv")
+	fake := filepath.Join(dir, "fake-proxy")
+	body := "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" > " + argvFile + "\nprintenv PRESET >> " +
+		argvFile + "\nsleep 30\n"
+	if err := os.WriteFile(fake, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	port := freePort(t)
+	state := filepath.Join(dir, "state")
+	cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "start-proxy.sh"),
+		"--unrouted", "--bin", fake, "--port", port, "--preset", "house", "--idle-exit", "90m")
+	// The options say something DIFFERENT, so a passing test cannot be reading them instead.
+	cmd.Env = append(sandboxEnv(t),
+		"CLAUDE_PLUGIN_OPTION_PRESET=codesmart",
+		"CLAUDE_PLUGIN_OPTION_IDLE_EXIT=24h",
+		"ANTHROPIC_BASE_URL=",
+		"CONTEXT_GURU_BIN=",
+		"CONTEXT_GURU_HEALTH_BUDGET=1",
+		"XDG_STATE_HOME="+state,
+		"TMPDIR="+dir)
+	out, err := cmd.CombinedOutput()
+	t.Cleanup(func() { exec.Command("pkill", "-f", fake).Run() }) //nolint:errcheck
+	if err != nil {
+		t.Fatalf("must never fail a session: %v\n%s", err, out)
+	}
+	got, rerr := os.ReadFile(argvFile)
+	if rerr != nil {
+		t.Fatalf("the proxy never ran: %v\n%s", rerr, out)
+	}
+	launched := string(got)
+	t.Logf("launched: %s", launched)
+	if !strings.Contains(launched, "--idle-exit=90m") {
+		t.Errorf("--idle-exit was not honoured as an argument: %s", launched)
+	}
+	if strings.Contains(launched, "--idle-exit=24h") {
+		t.Errorf("the option beat the argument for idle-exit: %s", launched)
+	}
+	// PRESET reaches the proxy as an environment variable, so it is printed by the fake rather than argv.
+	if !strings.Contains(launched, "house") {
+		t.Errorf("--preset was not honoured as an argument: %s", launched)
+	}
+	if strings.Contains(launched, "codesmart") {
+		t.Errorf("the option beat the argument for preset: %s", launched)
+	}
+}
+
+// TestStartProxyReportsThePresetActuallyInEffect: the success note used to print $PRESET, which comes
+// from the plugin option, even though --config REPLACES the preset entirely. So with a keep-alive config
+// in play the proxy ran whatever `preset:` that file recorded while the note named the option — and the
+// two diverge the moment somebody changes the option after enabling keep-alive. Same species as the
+// defect this branch started from: a confident report of a value that is not in effect.
+//
+// The reading of the file happens on the SessionStart path, so every degenerate config must still START
+// the proxy, and must not produce a note that is wrong in the other direction. "Reported nothing" beats
+// "reported wrong", and neither beats "did not start" — hence the exit-0 and launched checks on every
+// row, not just the happy one.
+func TestStartProxyReportsThePresetActuallyInEffect(t *testing.T) {
+	const optionPreset = "codesmart" // what the PLUGIN OPTION says, and what the note must not parrot
+	for _, c := range []struct {
+		name       string
+		writeCfg   bool
+		cfg        string
+		unreadable bool // chmod 000 after writing: the ONLY config that makes sed itself fail
+		wantIn     []string
+		wantNotIn  []string
+	}{
+		{
+			name:     "the config's preset is reported, not the plugin option's",
+			writeCfg: true, cfg: "preset: house\ncache:\n  keepalive: true\n",
+			wantIn:    []string{"preset house"},
+			wantNotIn: []string{"preset " + optionPreset},
+		},
+		{
+			name:     "a quoted and padded value is still read",
+			writeCfg: true, cfg: "preset:   \"house\"  \ncache:\n  keepalive: true\n",
+			wantIn:    []string{"preset house"},
+			wantNotIn: []string{"preset " + optionPreset},
+		},
+		{
+			// Older files predate the always-state-the-preset rule. Report it as unstated: a config may
+			// set `pipeline:` directly, so claiming compaction is OFF would be wrong in the other
+			// direction — the failure mode this whole test exists to prevent.
+			name:     "no preset line: unstated, and never claimed to be off",
+			writeCfg: true, cfg: "cache:\n  keepalive: true\n",
+			wantIn:    []string{"unstated"},
+			wantNotIn: []string{"preset " + optionPreset, "compaction is OFF"},
+		},
+		{
+			name:     "a comment-only config claims nothing",
+			writeCfg: true, cfg: "# written by hand, nothing else\n",
+			wantIn:    []string{"unstated"},
+			wantNotIn: []string{"preset " + optionPreset},
+		},
+		{
+			name:     "an empty config claims nothing",
+			writeCfg: true, cfg: "",
+			wantIn:    []string{"unstated"},
+			wantNotIn: []string{"preset " + optionPreset},
+		},
+		{
+			name:     "malformed junk still starts the proxy and claims nothing",
+			writeCfg: true, cfg: "\x00\x01 not: [yaml: at all\n",
+			wantIn:    []string{"unstated"},
+			wantNotIn: []string{"preset " + optionPreset},
+		},
+		{
+			// The row that defends the fail-open property itself. Every other row has a config sed can
+			// READ — empty, comment-only and junk files all match nothing and exit 0 — so none of them
+			// can see `set -e` being added. This one can: with pipefail in force, an unreadable file
+			// makes the assignment non-zero, and -e would then kill the script before the proxy starts.
+			name:     "an unreadable config still starts the proxy (this is what -e would break)",
+			writeCfg: true, cfg: "preset: house\ncache:\n  keepalive: true\n", unreadable: true,
+			wantIn:    []string{"unstated"},
+			wantNotIn: []string{"preset " + optionPreset},
+		},
+		{
+			// Reachable by hand edit, not theoretical: this document LOADS, with a top-level preset of
+			// house and a full house pipeline, so a first-match-at-any-indentation read would name the
+			// inner value while the proxy ran the outer one.
+			name:      "a nested preset: does not shadow the top-level one",
+			writeCfg:  true,
+			cfg:       "components:\n  offload:\n    preset: inner\npreset: house\ncache:\n  keepalive: true\n",
+			wantIn:    []string{"preset house"},
+			wantNotIn: []string{"inner", "preset " + optionPreset},
+		},
+		{
+			name:     "an inline comment does not leak into the note",
+			writeCfg: true, cfg: "preset: house # kept for the split\ncache:\n  keepalive: true\n",
+			wantIn:    []string{"preset house"},
+			wantNotIn: []string{"kept for the split", "preset " + optionPreset},
+		},
+		{
+			// With no config there is no --config, so the plugin option IS what is in effect and the
+			// note should say so. Without this row the test would pass on a note that never reports a
+			// preset at all.
+			name:      "no keepalive config: the plugin option is the truth and is reported",
+			writeCfg:  false,
+			wantIn:    []string{"preset " + optionPreset},
+			wantNotIn: []string{"unstated"},
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			requireTool(t, "bash")
+			dir := t.TempDir()
+			argvFile := filepath.Join(dir, "argv")
+			fake := filepath.Join(dir, "fake-proxy")
+			port := freePort(t)
+			py := requireTool(t, "python3")
+			script := "#!/usr/bin/env bash\n" +
+				"printf '%s\\n' \"$*\" > " + argvFile + "\n" +
+				"exec " + py + " -c '\n" +
+				"import http.server\n" +
+				"class H(http.server.BaseHTTPRequestHandler):\n" +
+				"    def do_GET(self):\n" +
+				"        self.send_response(200); self.end_headers(); self.wfile.write(b\"ok\")\n" +
+				"    def log_message(self, *a): pass\n" +
+				"http.server.HTTPServer((\"127.0.0.1\", " + port + "), H).serve_forever()\n'\n"
+			if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			state := filepath.Join(dir, "state")
+			if c.writeCfg {
+				stateDir := filepath.Join(state, "context-guru")
+				if err := os.MkdirAll(stateDir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				cfgPath := filepath.Join(stateDir, "keepalive-"+port+".yaml")
+				if err := os.WriteFile(cfgPath, []byte(c.cfg), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if c.unreadable {
+					if os.Geteuid() == 0 {
+						t.Skip("root ignores mode 000, so this row cannot make the read fail")
+					}
+					if err := os.Chmod(cfgPath, 0o000); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+
+			cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "start-proxy.sh"))
+			cmd.Env = append(sandboxEnv(t),
+				"CLAUDE_PLUGIN_OPTION_PORT="+port,
+				"CLAUDE_PLUGIN_OPTION_PRESET="+optionPreset,
+				"ANTHROPIC_BASE_URL=http://127.0.0.1:"+port+"/anthropic",
+				"CONTEXT_GURU_BIN="+fake,
+				"XDG_STATE_HOME="+state,
+				"TMPDIR="+dir)
+			out, err := cmd.CombinedOutput()
+			t.Cleanup(func() {
+				if b, e := os.ReadFile(filepath.Join(state, "context-guru", "proxy-"+port+".pid")); e == nil {
+					exec.Command("kill", strings.TrimSpace(string(b))).Run() //nolint:errcheck
+				}
+			})
+			// Fails open: property 5 of this script is that it never fails a session, whatever the
+			// config on disk looks like.
+			if err != nil {
+				t.Fatalf("must never fail a session: %v\n%s", err, out)
+			}
+			if _, rerr := os.Stat(argvFile); rerr != nil {
+				t.Fatalf("the proxy was never launched, so this config stopped a session starting: %v\n%s",
+					rerr, out)
+			}
+			got := string(out)
+			t.Logf("note ->\n%s", got)
+			for _, w := range c.wantIn {
+				if !strings.Contains(got, w) {
+					t.Errorf("note does not contain %q:\n%s", w, got)
+				}
+			}
+			for _, w := range c.wantNotIn {
+				if strings.Contains(got, w) {
+					t.Errorf("note contains %q, which is not what is in effect:\n%s", w, got)
+				}
 			}
 		})
 	}
@@ -2755,7 +3488,7 @@ func TestTheConfiguredPortCanActuallyBeHonoured(t *testing.T) {
 		})
 		py := requireTool(t, "python3")
 		cmd := exec.Command(py, filepath.Join(scriptsDir(t), "settings.py"), "config")
-		cmd.Env = append(os.Environ(), "CLAUDE_CONFIG_DIR="+cfg)
+		cmd.Env = append(sandboxEnv(t), "CLAUDE_CONFIG_DIR="+cfg)
 		cmd.Dir = dir // so the project-scope candidates do not accidentally match
 		out, err := cmd.CombinedOutput()
 		if err != nil {
@@ -2786,7 +3519,7 @@ func TestTheConfiguredPortCanActuallyBeHonoured(t *testing.T) {
 		cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "start-proxy.sh"),
 			"--unrouted", "--bin", fake, "--port", port)
 		// Deliberately NO CLAUDE_PLUGIN_OPTION_PORT: that is the situation a Bash tool call is in.
-		cmd.Env = append(os.Environ(),
+		cmd.Env = append(sandboxEnv(t),
 			"CLAUDE_PLUGIN_OPTION_PORT=",
 			"ANTHROPIC_BASE_URL=",
 			"CONTEXT_GURU_BIN=",
@@ -2812,12 +3545,53 @@ func TestTheConfiguredPortCanActuallyBeHonoured(t *testing.T) {
 		}
 	})
 
+	// The state none of the four skills was written for: SOME options set, others not. cmd_config
+	// prints a line only for keys actually present and falls back to `source=(none)` only when the
+	// whole options object is missing, so a partial config reports a real `source=` and simply omits
+	// the rest. Every skill documented its fallback as keyed on `source=(none)`, which does not apply
+	// here — leaving the model to invent a value at the exact point those sections warn is dangerous.
+	t.Run("a partial config reports a real source and omits the options not set", func(t *testing.T) {
+		dir := t.TempDir()
+		cfg := filepath.Join(dir, "cfg")
+		if err := os.MkdirAll(cfg, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// port set, preset never touched — the common case, and the one that used to mislead.
+		writeJSON(t, filepath.Join(cfg, "settings.json"), map[string]any{
+			"pluginConfigs": map[string]any{
+				"context-guru@context-guru": map[string]any{
+					"options": map[string]any{"port": 4041},
+				},
+			},
+		})
+		py := requireTool(t, "python3")
+		cmd := exec.Command(py, filepath.Join(scriptsDir(t), "settings.py"), "config")
+		cmd.Env = append(sandboxEnv(t), "CLAUDE_CONFIG_DIR="+cfg)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("config failed: %v\n%s", err, out)
+		}
+		got := string(out)
+		t.Logf("config ->\n%s", got)
+		if !strings.Contains(got, "option_port=4041") {
+			t.Errorf("the configured port was not reported:\n%s", got)
+		}
+		if strings.Contains(got, "option_preset=") {
+			t.Errorf("an unconfigured option was reported as though it had a value:\n%s", got)
+		}
+		if strings.Contains(got, "source=(none)") {
+			t.Errorf("a partial config reported source=(none); the skills' per-option fallback rule "+
+				"exists precisely because this reports a real source:\n%s", got)
+		}
+	})
+
 	t.Run("a non-numeric port is reported, not used", func(t *testing.T) {
 		requireTool(t, "bash")
 		dir := t.TempDir()
 		cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "start-proxy.sh"),
 			"--unrouted", "--port", "not-a-port")
-		cmd.Env = append(os.Environ(), "ANTHROPIC_BASE_URL=", "CONTEXT_GURU_BIN=/nonexistent/x",
+		cmd.Env = append(sandboxEnv(t), "ANTHROPIC_BASE_URL=", "CONTEXT_GURU_BIN=/nonexistent/x",
 			"CONTEXT_GURU_HEALTH_BUDGET=1", "XDG_STATE_HOME="+dir, "TMPDIR="+dir)
 		out, _ := cmd.CombinedOutput()
 		if !strings.Contains(string(out), "ignoring --port") {
@@ -2863,5 +3637,1312 @@ func TestSettingsReportsOSErrorsAsData(t *testing.T) {
 	// And it must not have damaged the file it could not replace.
 	if env := readJSON(t, path)["env"].(map[string]any); env["MINE"] != "keep" {
 		t.Errorf("the original file was altered on a failed write: %v", env)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The escape hatch.
+//
+// These tests exist because of an incident rather than a design review. A colleague installed the
+// plugin, ended up with 401 on every request, and found that `/context-guru:uninstall` — the
+// documented undo — could not run: it is a skill, and a skill needs a session that can reach a
+// model. The undo path was unavailable for precisely the reason he needed it.
+//
+// So the properties below are not "the hatch works". They are "the hatch works when everything
+// this plugin provides is gone": no Claude, no proxy, no plugin directory, no interpreter beyond
+// POSIX sh. Each test removes one of those and asserts recovery anyway.
+// ---------------------------------------------------------------------------
+
+// hatchPath is where settings.py installs the hatch, and asserts the two properties that make it a
+// hatch at all: it is executable, and it is NOT inside the plugin.
+func hatchPath(t *testing.T, state string) string {
+	t.Helper()
+	p := filepath.Join(state, "context-guru-reset")
+	fi, err := os.Stat(p)
+	if err != nil {
+		t.Fatalf("no escape hatch at %s: %v", p, err)
+	}
+	if runtime.GOOS != "windows" && fi.Mode().Perm()&0o100 == 0 {
+		t.Fatalf("the hatch at %s is not executable (mode %v) — a user in trouble should not have "+
+			"to work out that they need to prefix it with `sh`", p, fi.Mode().Perm())
+	}
+	if strings.HasPrefix(p, scriptsDir(t)) {
+		t.Fatalf("the hatch was installed INSIDE the plugin (%s). `/plugin uninstall`, a "+
+			"marketplace refresh or a wiped plugin cache would take the recovery tool with it", p)
+	}
+	return p
+}
+
+// runHatch executes the installed hatch with a controlled environment. cwd matters: the no-record
+// path reports files relative to the project the user is in.
+func runHatch(t *testing.T, state, home, cwd string, args ...string) (string, int) {
+	t.Helper()
+	cmd := exec.Command(hatchPath(t, state), args...)
+	cmd.Dir = cwd
+	cmd.Env = []string{
+		"CONTEXT_GURU_STATE=" + state,
+		"HOME=" + home,
+		"PATH=" + os.Getenv("PATH"),
+	}
+	out, err := cmd.CombinedOutput()
+	code := 0
+	if ee, ok := err.(*exec.ExitError); ok {
+		code = ee.ExitCode()
+	} else if err != nil {
+		t.Fatalf("running the hatch: %v (%s)", err, out)
+	}
+	t.Logf("hatch %v -> exit %d\n%s", args, code, out)
+	return string(out), code
+}
+
+// TestInstallLeavesAWayBackOutsideThePlugin is the whole feature in one assertion: after an install
+// there is a runnable recovery tool that does not live in the plugin, its path was REPORTED so the
+// skill can tell the user, and it holds a record of the file that was edited.
+func TestInstallLeavesAWayBackOutsideThePlugin(t *testing.T) {
+	state, home, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	path := filepath.Join(proj, "settings.json")
+	writeJSON(t, path, map[string]any{"theme": "dark"})
+
+	facts, code := settingsIn(t, state, home, "add", "--file", path, "--url", ourURL)
+	if code != 0 {
+		t.Fatalf("add: exit %d, %v", code, facts)
+	}
+	// Reported, not merely present. The install skill has to hand the path to the user while the
+	// session still works, because afterwards it may not.
+	if facts["reset_hatch"] == "" || facts["reset_hatch"] == "unavailable" {
+		t.Errorf("add did not report a usable reset_hatch: %v", facts)
+	}
+	if got, want := facts["reset_hatch"], hatchPath(t, state); got != want {
+		t.Errorf("reported reset_hatch=%q, but the hatch is at %q", got, want)
+	}
+	record, err := os.ReadFile(filepath.Join(state, "reset-manifest.tsv"))
+	if err != nil {
+		t.Fatalf("no record for the hatch to read: %v", err)
+	}
+	if !strings.Contains(string(record), path) {
+		t.Errorf("the record does not name the file that was edited:\n%s", record)
+	}
+}
+
+// TestTheHatchNeedsNothingButPOSIXSh: the hatch runs in a state where the proxy is down and Claude
+// cannot talk, so anything it depends on is a way for it to be unavailable too. Asserted against
+// the script's text, since "it happened to work on this machine" is not the claim.
+// TestTheHatchRunsUnderEveryShellItClaims does what the static check below cannot: it RUNS the hatch
+// under each POSIX shell available on this machine and asserts it actually recovers.
+//
+// S7 in review, and the repo has a commit titled "assert the fallback CONDITION, not one sentence that
+// expressed it" — the static test asserts a shebang string and five banned words, which is a proxy for
+// portability, not portability. `dash` and `busybox sh` are where a bashism actually shows up, and the
+// filter now contains an awk program, which the word list would never have caught.
+func TestTheHatchRunsUnderEveryShellItClaims(t *testing.T) {
+	var shells []string
+	for _, sh := range []string{"sh", "dash", "bash", "busybox"} {
+		if p, err := exec.LookPath(sh); err == nil {
+			shells = append(shells, p)
+		}
+	}
+	if len(shells) == 0 {
+		t.Fatal("no POSIX shell on PATH at all")
+	}
+	for _, sh := range shells {
+		name := filepath.Base(sh)
+		t.Run(name, func(t *testing.T) {
+			state, home, proj := t.TempDir(), t.TempDir(), t.TempDir()
+			path := filepath.Join(proj, "settings.json")
+			writeJSON(t, path, map[string]any{"model": "opus",
+				"permissions": map[string]any{"allow": []string{"Bash(ls:*)"}}})
+			pristine, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, code := settingsIn(t, state, home, "add", "--file", path, "--url", ourURL); code != 0 {
+				t.Fatal("add failed")
+			}
+			args := []string{filepath.Join(state, "context-guru-reset"), "--yes"}
+			if name == "busybox" {
+				args = append([]string{"sh"}, args...)
+			}
+			cmd := exec.Command(sh, args...)
+			cmd.Dir = proj
+			cmd.Env = sandboxEnv(t, "CONTEXT_GURU_STATE="+state, "HOME="+home)
+			b, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("%s: %v\n%s", name, err, b)
+			}
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != string(pristine) {
+				t.Errorf("%s: did not restore the file\n got:  %s\n want: %s\n%s",
+					name, got, pristine, b)
+			}
+			if !strings.Contains(string(b), "Done. 1 file(s) put back.") {
+				t.Errorf("%s: no success summary:\n%s", name, b)
+			}
+		})
+	}
+}
+
+func TestTheHatchNeedsNothingButPOSIXSh(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join(scriptsDir(t), "reset.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(b)
+	if !strings.HasPrefix(body, "#!/bin/sh") {
+		t.Errorf("the hatch must be POSIX sh; its shebang is %q",
+			strings.SplitN(body, "\n", 2)[0])
+	}
+	// Line-by-line, with comments stripped, so a word that appears while EXPLAINING the absence of
+	// a dependency is not read as the dependency. `claude` is deliberately not in this list: the
+	// script names it in the prose it prints ("start a NEW claude session"), which is advice rather
+	// than an invocation — the first version of this test failed on exactly that line.
+	for i, line := range strings.Split(body, "\n") {
+		code := line
+		if idx := strings.Index(line, "#"); idx >= 0 {
+			code = line[:idx]
+		}
+		for _, banned := range []string{"python", "curl ", "context-guru-proxy", "jq ", "$(claude"} {
+			if strings.Contains(code, banned) {
+				t.Errorf("reset.sh:%d depends on %q, which may be exactly what is missing:\n%s",
+					i+1, banned, line)
+			}
+		}
+	}
+}
+
+// TestTheOriginalCopyOutlivesTheRollingBackups is the reason the hatch keeps its own copy rather
+// than trusting the *.context-guru-backup-* files beside the settings file: those are capped at ten
+// and BOTH add and remove write one, so on a machine that has installed and uninstalled a few times
+// the backup holding the user's pre-context-guru state is the first one deleted. The copy recovery
+// depends on cannot be on a rolling window.
+func TestTheOriginalCopyOutlivesTheRollingBackups(t *testing.T) {
+	state, home, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	path := filepath.Join(proj, "settings.json")
+	writeJSON(t, path, map[string]any{"env": map[string]any{"MY_OWN": "keepme"}})
+	pristine, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 12; i++ { // KEEP_BACKUPS is 10; twelve cycles writes 24 of them
+		if _, code := settingsIn(t, state, home, "add", "--file", path, "--url", ourURL); code != 0 {
+			t.Fatalf("cycle %d: add failed", i)
+		}
+		if _, code := settingsIn(t, state, home, "remove", "--file", path, "--url", ourURL); code != 0 {
+			t.Fatalf("cycle %d: remove failed", i)
+		}
+	}
+
+	entries, err := os.ReadDir(filepath.Join(state, "originals"))
+	if err != nil {
+		t.Fatalf("the originals directory is gone: %v", err)
+	}
+	var found string
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".original") {
+			found = filepath.Join(state, "originals", e.Name())
+		}
+		// A leading dot would make the copy invisible to `ls` and to every glob — including a
+		// user's own, in a directory that exists to be read by hand. The natural name starts with
+		// one, because the parent directory of a real target is `.claude`.
+		if strings.HasPrefix(e.Name(), ".") {
+			t.Errorf("the pre-edit copy %q is a hidden file", e.Name())
+		}
+	}
+	if found == "" {
+		t.Fatalf("no pre-edit copy survived twelve install/uninstall cycles: %v", entries)
+	}
+	got, err := os.ReadFile(found)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(pristine) {
+		t.Errorf("the pre-edit copy is not the file as the user had it:\ngot:  %s\nwant: %s",
+			got, pristine)
+	}
+}
+
+// TestHatchRestoresWithThePluginDeleted is the scenario the hatch is for. The user's way out must
+// not be inside the thing they are trying to get away from, so: install, delete the plugin's own
+// copy of the script, and recover anyway.
+func TestHatchRestoresWithThePluginDeleted(t *testing.T) {
+	state, home, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	path := filepath.Join(proj, "settings.json")
+	writeJSON(t, path, map[string]any{
+		"theme":       "dark",
+		"env":         map[string]any{"MY_OWN": "keepme"},
+		"permissions": map[string]any{"allow": []string{"Bash(ls)"}},
+	})
+	pristine, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, code := settingsIn(t, state, home, "add", "--file", path, "--url", ourURL,
+		"--upstream", "https://gateway.corp.example"); code != 0 {
+		t.Fatal("add failed")
+	}
+	// Prove the fixture: routing really is in the file, so the restore below is doing work.
+	if b, _ := os.ReadFile(path); !strings.Contains(string(b), "127.0.0.1:8787") {
+		t.Fatalf("fixture is wrong — no routing key was written:\n%s", b)
+	}
+
+	// The hatch's own copy is the one that runs. Delete the plugin's, restoring it afterwards, to
+	// prove the installed copy is not quietly delegating to a file that may no longer exist.
+	src := filepath.Join(scriptsDir(t), "reset.sh")
+	body, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(src); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.WriteFile(src, body, 0o755) })
+
+	out, code := runHatch(t, state, home, proj, "--yes")
+	if code != 0 {
+		t.Fatalf("hatch: exit %d\n%s", code, out)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(pristine) {
+		t.Errorf("the file was not restored to its pre-install state:\ngot:  %s\nwant: %s",
+			got, pristine)
+	}
+	// Reversible in its own right: whatever was there before the restore is kept, for the user who
+	// runs this and then finds the routing was not their problem.
+	// Under the STATE directory, not beside the settings file (S6): these are complete copies of a
+	// file that can hold a credential, and the old location dropped them inside the user's git tree.
+	pre, err := filepath.Glob(filepath.Join(state, "prereset", "*"))
+	if err != nil || len(pre) == 0 {
+		t.Errorf("the hatch overwrote the routed file without keeping a copy of it")
+	}
+	stray, _ := filepath.Glob(path + ".context-guru-prereset-*")
+	if len(stray) != 0 {
+		t.Errorf("left a full copy of a settings file in the project tree: %v", stray)
+	}
+}
+
+// TestHatchDeletesAFileTheInstallCreated: "put it back" means DELETE when the install is the reason
+// the file exists. Restoring an empty file instead would leave a stub in the user's project that
+// they did not write and would have no reason to suspect.
+func TestHatchDeletesAFileTheInstallCreated(t *testing.T) {
+	state, home, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	path := filepath.Join(proj, "settings.local.json")
+
+	if _, code := settingsIn(t, state, home, "add", "--file", path, "--url", ourURL); code != 0 {
+		t.Fatal("add failed")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("fixture: the install did not create the file: %v", err)
+	}
+	out, code := runHatch(t, state, home, proj, "--yes")
+	if code != 0 {
+		t.Fatalf("hatch: exit %d\n%s", code, out)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("a file the install created was left behind (err=%v)", err)
+	}
+}
+
+// TestHatchSecondRunChangesNothing: people re-run a recovery tool — the first run tells them to
+// start a new session, and they check. The second run must be a real no-op rather than another
+// copy, another backup file, and another "1 file put back".
+func TestHatchSecondRunChangesNothing(t *testing.T) {
+	state, home, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	path := filepath.Join(proj, "settings.json")
+	writeJSON(t, path, map[string]any{"theme": "dark"})
+
+	if _, code := settingsIn(t, state, home, "add", "--file", path, "--url", ourURL); code != 0 {
+		t.Fatal("add failed")
+	}
+	if _, code := runHatch(t, state, home, proj, "--yes"); code != 0 {
+		t.Fatal("first hatch run failed")
+	}
+	before, _ := filepath.Glob(filepath.Join(state, "prereset", "*"))
+
+	out, code := runHatch(t, state, home, proj, "--yes")
+	if code != 0 {
+		t.Fatalf("second run: exit %d\n%s", code, out)
+	}
+	if !strings.Contains(out, "already matches") && !strings.Contains(out, "Nothing to restore") {
+		t.Errorf("the second run did not report itself as a no-op:\n%s", out)
+	}
+	after, _ := filepath.Glob(filepath.Join(state, "prereset", "*"))
+	if len(after) != len(before) {
+		t.Errorf("the second run wrote %d more backup(s) for no reason", len(after)-len(before))
+	}
+}
+
+// TestHatchDryRunWritesNothing. The routed file is what the user may still need; a preview that
+// modifies it is not a preview.
+func TestHatchDryRunWritesNothing(t *testing.T) {
+	state, home, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	path := filepath.Join(proj, "settings.json")
+	writeJSON(t, path, map[string]any{"theme": "dark"})
+	if _, code := settingsIn(t, state, home, "add", "--file", path, "--url", ourURL); code != 0 {
+		t.Fatal("add failed")
+	}
+	routed, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, code := runHatch(t, state, home, proj, "--dry-run")
+	if code != 0 {
+		t.Fatalf("dry run: exit %d\n%s", code, out)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(routed) {
+		t.Errorf("--dry-run modified the file")
+	}
+	if !strings.Contains(out, "nothing written") {
+		t.Errorf("--dry-run did not say it wrote nothing:\n%s", out)
+	}
+}
+
+// TestHatchWithNoRecordTellsTheUserWhereToLook: a hand-edited settings file, or a wiped state
+// directory. "Nothing to do" is the least useful thing that could be said to somebody whose
+// sessions are down, so the absent-record path has to do the diagnosis a human would.
+func TestHatchWithNoRecordTellsTheUserWhereToLook(t *testing.T) {
+	state, home, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	// The real target, at the real path, because this branch's whole job is to point a user at the
+	// places routing hides — and the paths it prints are project-relative.
+	if err := os.MkdirAll(filepath.Join(proj, ".claude"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(proj, ".claude", "settings.local.json")
+	writeJSON(t, path, map[string]any{"theme": "dark"})
+	if _, code := settingsIn(t, state, home, "add", "--file", path, "--url", ourURL); code != 0 {
+		t.Fatal("add failed")
+	}
+	hatch := hatchPath(t, state)
+	// Keep the hatch, lose the record — the state directory is not sacred, and a user may well
+	// have cleaned it out on advice from the uninstall skill.
+	if err := os.Remove(filepath.Join(state, "reset-manifest.tsv")); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(hatch, "--yes")
+	cmd.Dir = proj
+	cmd.Env = []string{"CONTEXT_GURU_STATE=" + state, "HOME=" + home, "PATH=" + os.Getenv("PATH")}
+	b, err := cmd.CombinedOutput()
+	code := 0
+	if ee, ok := err.(*exec.ExitError); ok {
+		code = ee.ExitCode()
+	} else if err != nil {
+		t.Fatal(err)
+	}
+	out := string(b)
+	if code != 3 {
+		t.Errorf("exit %d; want 3 (finished, with something left for a human)\n%s", code, out)
+	}
+	for _, want := range []string{"settings.local.json", "ANTHROPIC_BASE_URL", "127.0.0.1"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the no-record path never mentions %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestHatchReportsCredentialsByLocationAndNeverByValue. The incident that produced this hatch was
+// not a routing fault at all: both ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN were set, the gateway
+// rejected whichever won, and the export was one line in a shell rc. Restoring settings cannot
+// reach that, so the hatch reports it — and must do so without echoing a live key into a terminal
+// buffer, a log, or a pasted transcript.
+func TestHatchReportsCredentialsByLocationAndNeverByValue(t *testing.T) {
+	state, home, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	path := filepath.Join(proj, "settings.json")
+	writeJSON(t, path, map[string]any{"theme": "dark"})
+	if _, code := settingsIn(t, state, home, "add", "--file", path, "--url", ourURL); code != 0 {
+		t.Fatal("add failed")
+	}
+
+	const secret = "sk-THIS-MUST-NEVER-BE-PRINTED"
+	rc := "# a comment\nexport PATH=\"$HOME/bin:$PATH\"\nexport ANTHROPIC_API_KEY=" + secret + "\n"
+	if err := os.WriteFile(filepath.Join(home, ".zshrc"), []byte(rc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(hatchPath(t, state), "--dry-run")
+	cmd.Dir = proj
+	cmd.Env = []string{
+		"CONTEXT_GURU_STATE=" + state,
+		"HOME=" + home,
+		"PATH=" + os.Getenv("PATH"),
+		"ANTHROPIC_API_KEY=" + secret,
+		"ANTHROPIC_AUTH_TOKEN=sk-a-different-one",
+	}
+	b, err := cmd.CombinedOutput()
+	if err != nil {
+		if _, ok := err.(*exec.ExitError); !ok {
+			t.Fatal(err)
+		}
+	}
+	out := string(b)
+	if strings.Contains(out, secret) {
+		t.Errorf("the hatch printed a credential value:\n%s", out)
+	}
+	if !strings.Contains(out, "BOTH set") {
+		t.Errorf("the hatch did not flag two credential variables being set at once:\n%s", out)
+	}
+	if !strings.Contains(out, ".zshrc:3") {
+		t.Errorf("the hatch did not report the file and line of the export:\n%s", out)
+	}
+}
+
+// TestDeadProxyNoteNamesTheEscapeHatch. This hook fires on the prompt that is ABOUT to hang, which
+// makes it the single best place to hand the user their way out — and the advice it used to end on
+// was "edit the JSON by hand, or run /context-guru:uninstall from a session that still works". The
+// second half is unavailable to the user this note is written for: if their projects route through
+// the same dead port, no session still works. That is how the incident behind the hatch played out.
+func TestDeadProxyNoteNamesTheEscapeHatch(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell hook is POSIX-only")
+	}
+	requireTool(t, "bash")
+	dir := t.TempDir()
+	state := filepath.Join(dir, "state", "context-guru")
+	if err := os.MkdirAll(state, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hatch := filepath.Join(state, "context-guru-reset")
+	if err := os.WriteFile(hatch, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A binary that cannot start, so the hook reaches its "I could not fix this" note.
+	fake := filepath.Join(dir, "fake-proxy")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	root, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := freePort(t) // nothing listening: refused fast, so the hook goes straight to the note
+
+	cmd := exec.Command("bash", filepath.Join(scriptsDir(t), "check-proxy.sh"))
+	cmd.Env = append(sandboxEnv(t),
+		"CLAUDE_PLUGIN_ROOT="+root,
+		"CLAUDE_PLUGIN_OPTION_PORT="+port,
+		"ANTHROPIC_BASE_URL=http://127.0.0.1:"+port+"/anthropic",
+		"CONTEXT_GURU_BIN="+fake,
+		"XDG_STATE_HOME="+filepath.Join(dir, "state"),
+		"TMPDIR="+dir)
+	b, err := cmd.CombinedOutput()
+	if err != nil {
+		if _, ok := err.(*exec.ExitError); !ok {
+			t.Fatalf("running check-proxy.sh: %v (%s)", err, b)
+		}
+	}
+	out := string(b)
+	if !strings.Contains(out, hatch) {
+		t.Errorf("the dead-proxy note does not name the escape hatch at %s:\n%s", hatch, out)
+	}
+	if !strings.Contains(out, "no\nworking Claude session") &&
+		!strings.Contains(strings.Join(strings.Fields(out), " "), "no working Claude session") {
+		t.Errorf("the note names the hatch without saying it works when Claude cannot:\n%s", out)
+	}
+}
+
+// TestDeadProxyNoteFallsBackWhenThereIsNoHatch is the negative control for the test above: pointing
+// a stuck user at a path that does not exist would be worse than the manual instructions, so the
+// hatch is named only when it is on disk.
+func TestDeadProxyNoteFallsBackWhenThereIsNoHatch(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell hook is POSIX-only")
+	}
+	out, _, _ := runCheck(t, freePort(t), "#!/bin/sh\nexit 1\n")
+	flat := strings.Join(strings.Fields(out), " ")
+	if strings.Contains(flat, "context-guru-reset") {
+		t.Errorf("named a hatch that is not installed:\n%s", out)
+	}
+	if !strings.Contains(flat, "remove env.ANTHROPIC_BASE_URL from .claude/settings.local.json") {
+		t.Errorf("the fallback instructions are gone, so a user with no hatch is told nothing:\n%s", out)
+	}
+}
+
+// TestAnAlreadyRoutedProjectStillGetsAHatch covers the machines that need one most: everybody who
+// installed BEFORE the hatch existed. Their re-run of /context-guru:install reports
+// `result=unchanged` and writes nothing, so the code path that installs the hatch never runs — and
+// re-running the install is the first thing anyone does when something looks wrong.
+//
+// There is no pre-edit copy to invent, so the hatch must be honest rather than absent: it names the
+// file, and says the original content is not recoverable from its own record.
+func TestAnAlreadyRoutedProjectStillGetsAHatch(t *testing.T) {
+	state, home, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	path := filepath.Join(proj, "settings.json")
+	// Routed already, by a version of the plugin that kept no record — which is what the state
+	// directory being empty represents.
+	writeJSON(t, path, map[string]any{"env": map[string]any{"ANTHROPIC_BASE_URL": ourURL}})
+
+	facts, code := settingsIn(t, state, home, "add", "--file", path, "--url", ourURL)
+	if code != 0 || facts["result"] != "unchanged" {
+		t.Fatalf("fixture: wanted result=unchanged exit 0, got %v exit %d", facts, code)
+	}
+	if facts["reset_hatch"] == "" || facts["reset_hatch"] == "unavailable" {
+		t.Fatalf("a no-op re-run left the machine with no hatch: %v", facts)
+	}
+	if facts["reset_original"] != "unavailable" {
+		t.Errorf("reset_original=%q; the pre-install content genuinely is not recoverable here and "+
+			"claiming otherwise would promise a restore that cannot happen", facts["reset_original"])
+	}
+	out, code := runHatch(t, state, home, proj, "--yes")
+	if code != 3 {
+		t.Errorf("hatch exit %d; want 3 — it has a file to name but cannot restore it\n%s", code, out)
+	}
+	if !strings.Contains(out, path) {
+		t.Errorf("the hatch does not name the routed file:\n%s", out)
+	}
+	if b, _ := os.ReadFile(path); !strings.Contains(string(b), ourURL) {
+		t.Errorf("the hatch modified a file it had no pre-edit copy of")
+	}
+}
+
+// TestAConflictIsNeverRecordedAsOurEdit is the guard on the branch above. `result=conflict` is
+// somebody else's base URL that this script refused to touch — a corporate gateway, a benchmark
+// endpoint. Recording it would tell the hatch that context-guru edited a file it never wrote to,
+// and the hatch's whole safety property is that it only touches files it has a record of editing.
+func TestAConflictIsNeverRecordedAsOurEdit(t *testing.T) {
+	state, home, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	path := filepath.Join(proj, "settings.json")
+	theirs := "https://gateway.corp.example/anthropic"
+	writeJSON(t, path, map[string]any{"env": map[string]any{"ANTHROPIC_BASE_URL": theirs}})
+
+	facts, code := settingsIn(t, state, home, "add", "--file", path, "--url", ourURL)
+	if code != 2 || facts["result"] != "conflict" {
+		t.Fatalf("fixture: wanted result=conflict exit 2, got %v exit %d", facts, code)
+	}
+	if b, err := os.ReadFile(filepath.Join(state, "reset-manifest.tsv")); err == nil {
+		if strings.Contains(string(b), path) {
+			t.Errorf("a refused conflict was recorded as our own edit:\n%s", b)
+		}
+	}
+}
+
+// TestAddRefusesTheMachineWideFileWithoutBeingTold. The default scope was documented in the install
+// skill and nowhere else — the script wrote whatever --file it was handed. A prompt is not a
+// guardrail against a machine-wide lockout: it can be skipped, or read differently by the next
+// model, and the cost is every Claude Code session on the machine, including the ones the user would
+// use to recover. So the refusal lives in the script.
+func TestAddRefusesTheMachineWideFileWithoutBeingTold(t *testing.T) {
+	state, home := t.TempDir(), t.TempDir()
+	userScope := filepath.Join(home, ".claude", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(userScope), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeJSON(t, userScope, map[string]any{"theme": "dark"})
+	before, err := os.ReadFile(userScope)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	facts, code := settingsIn(t, state, home, "add", "--file", userScope, "--url", ourURL)
+	if code != 2 || facts["reason"] != "user_scope_needs_flag" {
+		t.Fatalf("wanted exit 2 reason=user_scope_needs_flag, got exit %d %v", code, facts)
+	}
+	after, err := os.ReadFile(userScope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Errorf("the machine-wide file was modified by a call that reported refusing:\n%s", after)
+	}
+
+	// With the flag — i.e. the user asked for --global and confirmed — it goes through.
+	facts, code = settingsIn(t, state, home, "add", "--file", userScope, "--url", ourURL, "--user-scope")
+	if code != 0 || facts["result"] != "added" {
+		t.Fatalf("--user-scope did not permit the write: exit %d %v", code, facts)
+	}
+	env, _ := readJSON(t, userScope)["env"].(map[string]any)
+	if env["ANTHROPIC_BASE_URL"] != ourURL {
+		t.Errorf("routing not written with --user-scope: %v", env)
+	}
+}
+
+// TestRemoveIsNeverGatedByScope: uninstall loops over all three scopes, and it is the recovery path.
+// Gating removal the way `add` is gated would make a machine-wide install unremovable by the tool
+// that installed it — erring on exactly the wrong side.
+func TestRemoveIsNeverGatedByScope(t *testing.T) {
+	state, home := t.TempDir(), t.TempDir()
+	userScope := filepath.Join(home, ".claude", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(userScope), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeJSON(t, userScope, map[string]any{"theme": "dark"})
+	if _, code := settingsIn(t, state, home, "add", "--file", userScope, "--url", ourURL,
+		"--user-scope"); code != 0 {
+		t.Fatal("fixture: --user-scope add failed")
+	}
+
+	facts, code := settingsIn(t, state, home, "remove", "--file", userScope, "--url", ourURL)
+	if code != 0 {
+		t.Fatalf("remove from user scope: exit %d %v", code, facts)
+	}
+	env, _ := readJSON(t, userScope)["env"].(map[string]any)
+	if _, still := env["ANTHROPIC_BASE_URL"]; still {
+		t.Errorf("routing survived removal from the machine-wide file: %v", env)
+	}
+	if readJSON(t, userScope)["theme"] != "dark" {
+		t.Errorf("removal damaged the machine-wide file")
+	}
+}
+
+// --- fixes from review round 1 of #236 -----------------------------------------------------
+
+// TestRemoveFirstNeverProducesAnOriginalHoldingRouting is the assertion the reviewer asked to have
+// pinned, and it names the defect exactly: record_touch() runs from save(), and save() is ALSO
+// cmd_remove's write path — so when the first recorded touch of a file was a REMOVAL, the O_EXCL
+// "copy taken before the first edit" was a copy of the ROUTED file, permanently. The hatch then
+// faithfully restored routing into an unrouted project.
+//
+// Who reaches it: every pre-hatch install that upgrades and then uninstalls, and anyone whose state
+// directory was wiped between install and remove. That is the population this whole feature is for.
+func TestRemoveFirstNeverProducesAnOriginalHoldingRouting(t *testing.T) {
+	state, home, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	path := filepath.Join(proj, "settings.local.json")
+	// A file as a PRE-HATCH install left it: routed, with the metadata that version recorded, and no
+	// pre-edit copy anywhere because that version did not take one.
+	writeJSON(t, path, map[string]any{
+		"env":           map[string]any{"ANTHROPIC_BASE_URL": ourURL},
+		"permissions":   map[string]any{"allow": []string{"Bash(ls:*)"}},
+		"$context-guru": map[string]any{"installed_base_url": ourURL},
+	})
+
+	if _, code := settingsIn(t, state, home, "remove", "--file", path, "--url", ourURL); code != 0 {
+		t.Fatal("remove failed")
+	}
+	// Whatever the record holds, nothing calling itself a pre-edit copy may contain routing.
+	//
+	// The loop below is VACUOUS on its own for this fixture — no copy is the expected outcome, and an
+	// empty glob asserts nothing — so the expected count is asserted explicitly and the record is
+	// checked to say so. Flagged in review as the pattern worth propagating: an absence assertion
+	// needs a companion that proves the path ran.
+	originals, _ := filepath.Glob(filepath.Join(state, "originals", "*.original"))
+	if len(originals) != 0 {
+		t.Errorf("took %d pre-edit copy/copies of a file that was already routed: %v",
+			len(originals), originals)
+	}
+	rec, err := os.ReadFile(filepath.Join(state, "reset-manifest.tsv"))
+	if err != nil {
+		t.Fatalf("no record was written at all, so the rest of this test proves little: %v", err)
+	}
+	if !strings.Contains(string(rec), path) {
+		t.Errorf("the record does not mention the file, so the hatch would not know about it:\n%s", rec)
+	}
+	for _, o := range originals {
+		b, err := os.ReadFile(o)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(b), "ANTHROPIC_BASE_URL") {
+			t.Fatalf("%s is called a pre-edit copy and contains routing:\n%s", o, b)
+		}
+	}
+
+	// End to end: the hatch must not put back what the remove took out.
+	out, code := runHatch(t, state, home, proj, "--yes")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "ANTHROPIC_BASE_URL") {
+		t.Errorf("the recovery tool re-introduced routing (exit %d):\n%s\nfile:\n%s", code, out, b)
+	}
+	if !strings.Contains(string(b), "Bash(ls:*)") {
+		t.Errorf("the user's own permission grant was lost:\n%s", b)
+	}
+}
+
+// TestEmptyPlanNeverClaimsSuccessWhenNothingCouldBeRestored. An empty plan is reached from two very
+// different states — genuinely clean, and "this file is routed and I have no copy to fix it with" —
+// and both used to end on "already back to their pre-install state". Exit 3 was correct, but nobody
+// reads an exit code; they read the last line, and it said the opposite of the truth to the one user
+// who is locked out.
+func TestEmptyPlanNeverClaimsSuccessWhenNothingCouldBeRestored(t *testing.T) {
+	state, home, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	path := filepath.Join(proj, "settings.json")
+	writeJSON(t, path, map[string]any{"env": map[string]any{"ANTHROPIC_BASE_URL": ourURL}})
+	// Routed already, no record: the pre-hatch install picking up a hatch on a no-op re-run.
+	if _, code := settingsIn(t, state, home, "add", "--file", path, "--url", ourURL); code != 0 {
+		t.Fatal("fixture: add failed")
+	}
+
+	out, code := runHatch(t, state, home, proj, "--yes")
+	if code != 3 {
+		t.Errorf("exit %d, want 3", code)
+	}
+	if strings.Contains(out, "already back to their pre-install state") {
+		t.Errorf("told the user they are unrouted while the file is still routed:\n%s", out)
+	}
+	for _, want := range []string{"NOT back to their pre-install state", "ANTHROPIC_BASE_URL"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the honest branch is missing %q:\n%s", want, out)
+		}
+	}
+	if b, _ := os.ReadFile(path); !strings.Contains(string(b), ourURL) {
+		t.Error("it modified a file it has no pre-edit copy of")
+	}
+}
+
+// TestARestoreWarnsThatItRevertsTheWholeFile. The primary path is `cp`, so it reverts everything in
+// the file — and Claude Code appends permission grants to settings.local.json as the user approves
+// tools, so a months-old install means months of grants. The confirmation prompt asked "restore
+// these files?" and said nothing about that, which makes it consent to something unstated.
+func TestARestoreWarnsThatItRevertsTheWholeFile(t *testing.T) {
+	state, home, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	path := filepath.Join(proj, "settings.json")
+	writeJSON(t, path, map[string]any{"permissions": map[string]any{"allow": []string{"Bash(ls:*)"}}})
+	if _, code := settingsIn(t, state, home, "add", "--file", path, "--url", ourURL); code != 0 {
+		t.Fatal("add failed")
+	}
+	// The user then approves another tool and sets a model, the way a real month of use looks.
+	cur := readJSON(t, path)
+	cur["model"] = "opus"
+	cur["permissions"] = map[string]any{"allow": []string{"Bash(ls:*)", "Bash(git push:*)"}}
+	writeJSON(t, path, cur)
+
+	out, code := runHatch(t, state, home, proj, "--dry-run")
+	if code != 0 {
+		t.Fatalf("dry run: exit %d\n%s", code, out)
+	}
+	flat := strings.Join(strings.Fields(out), " ")
+	for _, want := range []string{
+		"reverts the WHOLE file",
+		"prereset",             // and that it is undoable
+		"The two files differ", // shown as evidence, before the prompt
+	} {
+		if !strings.Contains(flat, want) {
+			t.Errorf("the plan does not warn about %q before asking:\n%s", want, out)
+		}
+	}
+	// It must not claim a filtered count of "your" changes: settings.py rewrites the file with
+	// indent=2, so a compact original differs on every line, and our own metadata spans lines that
+	// carry none of the words such a filter greps out. The first version of this reported 16 lines
+	// of user changes for a file whose only real change was one permission grant.
+	if strings.Contains(flat, "that are NOT context-guru's") {
+		t.Errorf("re-introduced a filtered line count that cannot be computed without a JSON parser:\n%s", out)
+	}
+}
+
+// TestMissingCopyIsNotRenderedAsAPath: the record carries "-" when no copy was ever taken, and
+// printing it verbatim gave "the pre-edit copy is missing (-)" — which reads as a bug in the tool
+// rather than a known limit of what it holds, on the pre-hatch path that is now the common case.
+func TestMissingCopyIsNotRenderedAsAPath(t *testing.T) {
+	state, home, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	path := filepath.Join(proj, "settings.json")
+	writeJSON(t, path, map[string]any{"env": map[string]any{"ANTHROPIC_BASE_URL": ourURL}})
+	if _, code := settingsIn(t, state, home, "add", "--file", path, "--url", ourURL); code != 0 {
+		t.Fatal("add failed")
+	}
+	out, _ := runHatch(t, state, home, proj, "--dry-run")
+	if strings.Contains(out, "missing (-)") {
+		t.Errorf("rendered the empty-copy marker as a path:\n%s", out)
+	}
+	if !strings.Contains(out, "no pre-edit copy was taken") {
+		t.Errorf("did not explain why there is no copy:\n%s", out)
+	}
+}
+
+// TestDryRunAgreesWithARealRunAboutWhatIsLeft: --dry-run exited 0 unconditionally, so it and a real
+// run disagreed about whether anything was left for a human.
+func TestDryRunAgreesWithARealRunAboutWhatIsLeft(t *testing.T) {
+	state, home, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	path := filepath.Join(proj, "settings.json")
+	writeJSON(t, path, map[string]any{"env": map[string]any{"ANTHROPIC_BASE_URL": ourURL}})
+	if _, code := settingsIn(t, state, home, "add", "--file", path, "--url", ourURL); code != 0 {
+		t.Fatal("add failed")
+	}
+	_, dry := runHatch(t, state, home, proj, "--dry-run")
+	_, real := runHatch(t, state, home, proj, "--yes")
+	if dry != real {
+		t.Errorf("--dry-run exited %d but the real run exited %d; they must agree about whether "+
+			"anything is left for a human", dry, real)
+	}
+}
+
+// TestAnUnusableStateDirectoryNeverFailsTheInstall. "Fail open, always" is a hard boundary in this
+// repo, and the hatch machinery is the newest thing in the write path. An install that would
+// otherwise have worked must not be broken by the recovery bookkeeping — it must report that the
+// hatch is unavailable and carry on.
+func TestAnUnusableStateDirectoryNeverFailsTheInstall(t *testing.T) {
+	home, proj := t.TempDir(), t.TempDir()
+	// A FILE where the state directory should be, so every path inside it is unusable.
+	blocked := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocked, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(proj, "settings.json")
+	writeJSON(t, path, map[string]any{"theme": "dark"})
+
+	facts, code := settingsIn(t, blocked, home, "add", "--file", path, "--url", ourURL)
+	if code != 0 || facts["result"] != "added" {
+		t.Fatalf("an unusable state dir broke the install: exit %d, %v", code, facts)
+	}
+	if facts["reset_hatch"] != "unavailable" {
+		t.Errorf("reset_hatch=%q; it must say so rather than imply a hatch exists", facts["reset_hatch"])
+	}
+	env, _ := readJSON(t, path)["env"].(map[string]any)
+	if env["ANTHROPIC_BASE_URL"] != ourURL {
+		t.Errorf("the routing itself did not get written: %v", env)
+	}
+	if readJSON(t, path)["theme"] != "dark" {
+		t.Error("the user's settings were damaged")
+	}
+}
+
+// --- fixes from review round 2 of #236 -----------------------------------------------------
+
+// TestThePlanNeverPrintsACredential. The whole-file warning added in round 1 diffs the settings
+// file, and `env` is exactly where people keep ANTHROPIC_API_KEY — so `--dry-run`, the invocation the
+// docs tell people to run FIRST, printed a live key twice, once per side of the diff. It contradicted
+// the principle stated 150 lines above it in the same script.
+//
+// The audience is what makes it worse than a secret in a log: somebody debugging a 401, whose next
+// move is to paste the output into an issue or a screenshot, precisely because it is written to be
+// read and acted on. TestHatchReportsCredentialsByLocationAndNeverByValue covers the rc-file half and
+// did not cover this path, which is how it got through.
+func TestThePlanNeverPrintsACredential(t *testing.T) {
+	state, home, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	path := filepath.Join(proj, "settings.json")
+	const (
+		apiKey    = "sk-ant-SUPERSECRET-do-not-print-me"
+		oddlyName = "hunter2-also-secret" // a key-ish name that is not spelled ANTHROPIC_*
+		urlCreds  = "pw123"
+	)
+	// Written COMPACT, the way a hand-edited settings file actually looks, and not via writeJSON.
+	// That matters for what this test covers: writeJSON indents, settings.py rewrites with the same
+	// indent, so the credential lines came out byte-identical on both sides of the diff and never
+	// appeared in it. The secret-absence assertion then passed for the wrong reason — nothing to
+	// redact — which is exactly what the "no redaction marker" check below caught.
+	fixture := `{"env": {"ANTHROPIC_API_KEY": "` + apiKey + `", "authToken": "` + oddlyName +
+		`", "MY_GATEWAY": "https://alice:` + urlCreds + `@gw.example/v1"},` +
+		` "permissions": {"allow": ["Bash(ls:*)"]}}`
+	if err := os.WriteFile(path, []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, code := settingsIn(t, state, home, "add", "--file", path, "--url", ourURL); code != 0 {
+		t.Fatal("add failed")
+	}
+	// A later change, so the whole-file warning and its diff are reached at all.
+	cur := readJSON(t, path)
+	cur["permissions"] = map[string]any{"allow": []string{"Bash(ls:*)", "Bash(git push:*)"}}
+	writeJSON(t, path, cur)
+
+	for _, args := range [][]string{{"--dry-run"}, {"--yes"}} {
+		out, _ := runHatch(t, state, home, proj, args...)
+		for _, secret := range []string{apiKey, oddlyName, urlCreds} {
+			if strings.Contains(out, secret) {
+				t.Errorf("hatch %v printed a credential (%q):\n%s", args, secret, out)
+			}
+		}
+		if args[0] == "--dry-run" {
+			// The redaction must not gut the diff: showing THAT a line changed is its whole purpose.
+			if !strings.Contains(out, "git push") {
+				t.Errorf("redaction removed the change the diff exists to show:\n%s", out)
+			}
+			if !strings.Contains(out, "value not shown") {
+				t.Errorf("no redaction marker, so the diff may simply not have run:\n%s", out)
+			}
+		}
+	}
+}
+
+// TestNormalUninstallDoesNotClaimTheOriginalIsGone. An ordinary uninstall of an ordinarily-installed
+// project takes the "file already carries our keys" branch — correctly, since a copy of the file at
+// that moment would be meaningless. But it also SET reset_original=unavailable, while the good,
+// verified-clean copy from the install sat on disk. install/SKILL.md turns that fact into "the hatch
+// can unroute but not restore", so the skill would have told users their content was unrecoverable
+// when it was not: the same class of inverted reassurance as round 1's finding 2.
+func TestNormalUninstallDoesNotClaimTheOriginalIsGone(t *testing.T) {
+	state, home, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	path := filepath.Join(proj, "settings.json")
+	writeJSON(t, path, map[string]any{"permissions": map[string]any{"allow": []string{"Bash(ls:*)"}}})
+
+	if _, code := settingsIn(t, state, home, "add", "--file", path, "--url", ourURL); code != 0 {
+		t.Fatal("add failed")
+	}
+	facts, code := settingsIn(t, state, home, "remove", "--file", path, "--url", ourURL)
+	if code != 0 {
+		t.Fatalf("remove: exit %d, %v", code, facts)
+	}
+	if facts["reset_original"] == "unavailable" {
+		t.Errorf("remove reported reset_original=unavailable; the record's copy is what matters, "+
+			"not whether THIS call could take one: %v", facts)
+	}
+	// And the copy really is there, really is clean.
+	originals, _ := filepath.Glob(filepath.Join(state, "originals", "*.original"))
+	if len(originals) != 1 {
+		t.Fatalf("want exactly one original, got %v", originals)
+	}
+	b, err := os.ReadFile(originals[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "ANTHROPIC_BASE_URL") {
+		t.Errorf("the original holds routing:\n%s", b)
+	}
+}
+
+// TestAnExportedBaseURLIsNotCalledAFileProblem. INCOMPLETE grew to include an environment condition
+// (a base URL exported in the user's shell, which no settings change can override), and wiring that
+// into the empty-plan branch made it lie in the other direction: with clean files and a routed shell
+// it printed "your settings files are NOT back to their pre-install state" plus instructions to
+// repair a file, two lines under a line saying that file already matched its pre-install copy.
+//
+// Which sentence to print is a question about files; the exit code is a question about whether
+// anything is left for a human. Two questions, two flags.
+func TestAnExportedBaseURLIsNotCalledAFileProblem(t *testing.T) {
+	state, home, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	path := filepath.Join(proj, "settings.json")
+	writeJSON(t, path, map[string]any{"permissions": map[string]any{"allow": []string{"Bash(ls:*)"}}})
+	if _, code := settingsIn(t, state, home, "add", "--file", path, "--url", ourURL); code != 0 {
+		t.Fatal("add failed")
+	}
+	if _, code := runHatch(t, state, home, proj, "--yes"); code != 0 {
+		t.Fatal("first run should be a clean restore")
+	}
+
+	// Same clean state, but the shell itself is routed.
+	cmd := exec.Command(hatchPath(t, state), "--yes")
+	cmd.Dir = proj
+	cmd.Env = []string{
+		"CONTEXT_GURU_STATE=" + state, "HOME=" + home, "PATH=" + os.Getenv("PATH"),
+		"ANTHROPIC_BASE_URL=" + ourURL,
+	}
+	b, err := cmd.CombinedOutput()
+	code := 0
+	if ee, ok := err.(*exec.ExitError); ok {
+		code = ee.ExitCode()
+	} else if err != nil {
+		t.Fatal(err)
+	}
+	out := string(b)
+	if code != 3 {
+		t.Errorf("exit %d, want 3: an exported loopback base URL is left for a human", code)
+	}
+	if strings.Contains(out, "NOT back to their pre-install state") {
+		t.Errorf("called a clean file a file problem:\n%s", out)
+	}
+	for _, want := range []string{"already back to their pre-install state", "Your FILES are fine",
+		"exported in THIS SHELL"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestLoopbackDetectionCoversTheShapesThatMatter. The predicate guarding round 1's severe finding
+// used a startswith tuple, and everything it missed was a false NEGATIVE — the direction that
+// re-introduces the defect, by taking a copy of an already-routed file and calling it an original.
+func TestLoopbackDetectionCoversTheShapesThatMatter(t *testing.T) {
+	for _, tc := range []struct {
+		url     string
+		ourFile bool
+	}{
+		{"http://127.0.0.1:8787/anthropic", true},
+		{"http://127.0.0.1/anthropic", true}, // no port
+		{"http://0.0.0.0:8787/anthropic", true},
+		{"http://[::1]/anthropic", true}, // v6, no port
+		{"https://localhost:8787/anthropic", true},
+		{"https://gateway.corp.example/anthropic", false},
+		{"https://not-localhost.example.com/v1", false}, // must not match on substring
+	} {
+		state, home, proj := t.TempDir(), t.TempDir(), t.TempDir()
+		path := filepath.Join(proj, "settings.json")
+		// No metadata and none of our other keys, so the loopback clause is the only thing deciding.
+		writeJSON(t, path, map[string]any{"env": map[string]any{"ANTHROPIC_BASE_URL": tc.url}})
+		if _, code := settingsIn(t, state, home, "remove", "--file", path, "--url", tc.url); code != 0 {
+			t.Fatalf("%s: remove failed", tc.url)
+		}
+		originals, _ := filepath.Glob(filepath.Join(state, "originals", "*.original"))
+		if tc.ourFile && len(originals) != 0 {
+			b, _ := os.ReadFile(originals[0])
+			t.Errorf("%s: took a pre-edit copy of an already-routed file:\n%s", tc.url, b)
+		}
+		if !tc.ourFile && len(originals) != 1 {
+			t.Errorf("%s: declined to copy a file that is not ours (want an original, got %v)",
+				tc.url, originals)
+		}
+	}
+}
+
+// TestTroubleshootingLeadsWithTheCommand. Discoverability is part of the feature, not documentation
+// polish: a user who needs the hatch is searching the docs with a Claude that cannot answer
+// questions. Troubleshooting is the section they open, and it did not name the hatch at all.
+func TestTroubleshootingLeadsWithTheCommand(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "docs", "how-to", "install-plugin.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, after, ok := strings.Cut(string(b), "## Troubleshooting")
+	if !ok {
+		t.Fatal("no Troubleshooting section")
+	}
+	// Within the first entry, not somewhere further down the section.
+	head := after
+	if len(head) > 900 {
+		head = head[:900]
+	}
+	for _, want := range []string{"context-guru-reset", "hangs", "cannot run"} {
+		if !strings.Contains(head, want) {
+			t.Errorf("the first Troubleshooting entry does not cover %q:\n%s", want, head)
+		}
+	}
+}
+
+// --- fixes from review round 3 of #236 -----------------------------------------------------
+
+// redactShapes is the ledger behind reset.sh's `redact` filter, one row per credential shape.
+//
+// It exists because that filter is a DENYLIST on a recovery tool, and a denylist is a list that will
+// be wrong again — it has now been wrong three times in this PR alone, in three different shapes.
+// Inverting it to an allowlist is worse on a diff of arbitrary JSON (it would redact the
+// `permissions` entries the diff exists to show), so the discipline is this table instead: ADD A ROW
+// WHEN YOU ADD A RULE, and the next miss is a row somebody forgot rather than an invisible leak.
+//
+// The must-survive rows matter as much as the leak rows. A filter that redacts everything passes
+// every absence assertion and makes the diff useless, which is the failure this table also pins.
+var redactShapes = []struct {
+	name string
+	line string
+	// secret must not appear in the output. Empty means the line must pass through UNCHANGED.
+	secret string
+}{
+	{"ANTHROPIC_API_KEY", `  "ANTHROPIC_API_KEY": "sk-ant-REALKEY0000",`, "REALKEY0000"},
+	{"ANTHROPIC_AUTH_TOKEN", `  "ANTHROPIC_AUTH_TOKEN": "REALTOKENVALUE",`, "REALTOKENVALUE"},
+	// The one that matters most here, and not a shape invented for the test.
+	//
+	// PROVENANCE, recorded because it is the strongest argument for this whole table: this leak was
+	// LIVE, not theoretical. `ANTHROPIC_CUSTOM_HEADERS` carrying a `<header>: <token>` string is how a
+	// Context Guru credential is set on this project's own development machines — set for interactive
+	// sessions and explicitly unset for benchmark runs — and it was present in the real
+	// ~/.claude/settings.json of the machine this filter was written on, where the author had read
+	// that file earlier the same day and not connected it to the filter.
+	//
+	// So the single most likely credential to appear in a context-guru user's env block was the one
+	// the first two versions of the filter did not catch, and its name contains none of
+	// key/token/secret/password/credential. HEADER is in the name class because of this row.
+	{"ANTHROPIC_CUSTOM_HEADERS", `  "ANTHROPIC_CUSTOM_HEADERS": "x-context-guru-token: cg_live_REALGURU",`, "REALGURU"},
+	{"authorization bearer JWT", `  "authorization": "Bearer eyJhbGciOiJIUzI1NiJ9.REALJWTBODY",`, "REALJWTBODY"},
+	{"github PAT", `  "GITHUB_PAT": "ghp_REALPAT00000000",`, "REALPAT00000000"},
+	{"credential in a query param", `  "ANTHROPIC_UPSTREAM": "https://gw/anthropic?api_key=REALQUERYKEY",`, "REALQUERYKEY"},
+	{"credential in URL userinfo", `  "MY_GW": "https://svc:REALURLPASS@gw.corp/anthropic",`, "REALURLPASS"},
+	{"slack token", `  "SLACK": "xoxb-REALSLACKTOKEN",`, "REALSLACKTOKEN"},
+	{"aws access key id", `  "AWS_ACCESS_KEY_ID": "AKIAREALAWSKEY0000",`, "REALAWSKEY"},
+	{"bare exported base URL with userinfo", `https://svc:REALURLPASS@gw.corp/anthropic`, "REALURLPASS"},
+
+	// The four shapes the second review found escaping the denylist. Each is the reason the
+	// `"key": value` case is now an allowlist: none of these key names or value shapes was on any list.
+	{"sk_live_ (underscore, not sk-)", `  "STRIPE_KEY": "sk_live_REALSTRIPEKEY",`, "REALSTRIPEKEY"},
+	{"secret in a URL path", `  "HOOK": "https://hooks.slack.com/services/T00/B00/REALWEBHOOK",`, "REALWEBHOOK"},
+	{"credential in ?auth=", `  "ANTHROPIC_BASE_URL": "https://gw.corp/anthropic?auth=REALAUTHSECRET",`, "REALAUTHSECRET"},
+	// apiKeyHelper is a real Claude Code settings key whose entire purpose is producing a credential,
+	// and a non-string value escaped a rule that required a quote straight after the colon.
+	{"apiKeyHelper with an object value", `  "apiKeyHelper": {"cmd": "echo REALHELPERSECRET"},`, "REALHELPERSECRET"},
+	// The property the allowlist buys, and the reason it is worth the inversion: a credential key
+	// nobody has thought of yet is covered on the day it is invented, not the day a rule is added.
+	{"an entirely unknown key", `  "SOME_FUTURE_CREDENTIAL": "REALFUTURESECRET",`, "REALFUTURESECRET"},
+	{"a secret in a non-permission array", `      "REALARRAYSECRET",`, "REALARRAYSECRET"},
+	{"a deep path on a routing key", `  "ANTHROPIC_BASE_URL": "https://gw/a/b/REALDEEPSECRET",`, "REALDEEPSECRET"},
+
+	{"permission grant must survive", `      "Bash(git push:*)",`, ""},
+	{"model must survive", `  "model": "opus",`, ""},
+	{"theme must survive", `  "theme": "dark",`, ""},
+	{"a plain loopback base URL must survive", `  "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787/anthropic",`, ""},
+	// These three are what the verify pass and the no-record grep exist to SHOW the user — they are
+	// the routing itself, not a credential. AUTH and HEADER in the name class match more broadly than
+	// the original five did, so each is pinned here: over-redacting these would leave a locked-out
+	// user reading "<value not shown>" where they need to see which port they are pointed at.
+	{"a corporate base URL must survive", `  "ANTHROPIC_BASE_URL": "https://gateway.corp.example/anthropic",`, ""},
+	{"ANTHROPIC_UPSTREAM must survive", `  "ANTHROPIC_UPSTREAM": "https://gateway.corp.example",`, ""},
+	{"CONTEXT_GURU_BIN must survive", `  "CONTEXT_GURU_BIN": "/home/user/.local/bin/context-guru-proxy",`, ""},
+	// Structure must survive, or the diff becomes unreadable: a container opening is not a value, and
+	// its members are judged on their own lines.
+	{"a container opening must survive", `  "apiKeyHelper": {`, ""},
+	{"a diff marker must survive", `> "model": "sonnet",`, ""},
+}
+
+// TestRedactCoversEveryKnownCredentialShape drives the real filter, lifted out of reset.sh, rather
+// than a copy of it — a copy would drift from the thing that ships.
+func TestRedactCoversEveryKnownCredentialShape(t *testing.T) {
+	requireTool(t, "bash")
+	body, err := os.ReadFile(filepath.Join(scriptsDir(t), "reset.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Slice out REDACT_NAME through the end of the redact() function.
+	_, rest, ok := strings.Cut(string(body), "REDACT_MARK=")
+	if !ok {
+		t.Fatal("reset.sh no longer defines REDACT_MARK; this test is extracting the wrong thing")
+	}
+	fnEnd := strings.Index(rest, "\n}\n")
+	if fnEnd < 0 {
+		t.Fatal("could not find the end of redact(); extraction would be silently partial")
+	}
+	fn := "REDACT_MARK=" + rest[:fnEnd+3]
+	if !strings.Contains(fn, "redact()") || !strings.Contains(fn, "awk") {
+		t.Fatalf("extracted fragment does not look like the filter:\n%s", fn)
+	}
+	fnPath := filepath.Join(t.TempDir(), "redact.sh")
+	if err := os.WriteFile(fnPath, []byte(fn), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range redactShapes {
+		cmd := exec.Command("sh", "-c",
+			`. "$1"; printf '%s\n' "$2" | redact`, "_", fnPath, tc.line)
+		b, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s: running redact: %v (%s)", tc.name, err, b)
+		}
+		got := strings.TrimRight(string(b), "\n")
+		if tc.secret == "" {
+			if got != tc.line {
+				t.Errorf("%s: over-redacted, so the diff loses what it exists to show\n got:  %q\n want: %q",
+					tc.name, got, tc.line)
+			}
+			continue
+		}
+		if strings.Contains(got, tc.secret) {
+			t.Errorf("%s: LEAKED %q\n got: %q", tc.name, tc.secret, got)
+		}
+		if got == tc.line {
+			t.Errorf("%s: line passed through untouched, so no rule matched it at all\n got: %q",
+				tc.name, got)
+		}
+	}
+}
+
+// TestNoPrinterOfContentEscapesTheFilter walks every site in reset.sh that prints real content and
+// plants a credential in each. The round-2 fix covered the plan diff; the review then found a FOURTH
+// site inside report_environment itself — the function whose own header promises values are never
+// printed — because that test only exercised the diff. So this one is organised by SITE.
+func TestNoPrinterOfContentEscapesTheFilter(t *testing.T) {
+	const secret = "REALSECRET-do-not-print-me"
+
+	t.Run("the verify pass", func(t *testing.T) {
+		// A user's own gateway carrying credentials in the URL, taken over with --force and then
+		// handed back. Verify greps the restored file and prints the matching lines.
+		state, home, proj := t.TempDir(), t.TempDir(), t.TempDir()
+		path := filepath.Join(proj, "settings.json")
+		theirs := "https://svc:" + secret + "@gw.corp.example/anthropic"
+		writeJSON(t, path, map[string]any{"env": map[string]any{"ANTHROPIC_BASE_URL": theirs}})
+		if _, code := settingsIn(t, state, home, "add", "--file", path, "--url", ourURL,
+			"--force"); code != 0 {
+			t.Fatal("add --force failed")
+		}
+		out, _ := runHatch(t, state, home, proj, "--yes")
+		if strings.Contains(out, secret) {
+			t.Errorf("the verify pass printed a credential:\n%s", out)
+		}
+		if !strings.Contains(out, "still mentions") {
+			t.Fatalf("the verify branch never ran, so this asserted nothing:\n%s", out)
+		}
+	})
+
+	t.Run("the environment report", func(t *testing.T) {
+		state, home, proj := t.TempDir(), t.TempDir(), t.TempDir()
+		path := filepath.Join(proj, "settings.json")
+		writeJSON(t, path, map[string]any{"theme": "dark"})
+		if _, code := settingsIn(t, state, home, "add", "--file", path, "--url", ourURL); code != 0 {
+			t.Fatal("add failed")
+		}
+		cmd := exec.Command(hatchPath(t, state), "--dry-run")
+		cmd.Dir = proj
+		cmd.Env = []string{
+			"CONTEXT_GURU_STATE=" + state, "HOME=" + home, "PATH=" + os.Getenv("PATH"),
+			"ANTHROPIC_BASE_URL=https://svc:" + secret + "@gw.corp.example/anthropic",
+		}
+		b, _ := cmd.CombinedOutput()
+		out := string(b)
+		if strings.Contains(out, secret) {
+			t.Errorf("report_environment printed a credential:\n%s", out)
+		}
+		if !strings.Contains(out, "exported in this shell") {
+			t.Fatalf("the branch that prints $base never ran:\n%s", out)
+		}
+	})
+
+	t.Run("the no-record grep", func(t *testing.T) {
+		state, home, proj := t.TempDir(), t.TempDir(), t.TempDir()
+		if err := os.MkdirAll(filepath.Join(proj, ".claude"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(proj, ".claude", "settings.local.json")
+		writeJSON(t, path, map[string]any{"theme": "dark"})
+		if _, code := settingsIn(t, state, home, "add", "--file", path, "--url", ourURL,
+			"--upstream", "https://gw.corp/anthropic?api_key="+secret); code != 0 {
+			t.Fatal("add failed")
+		}
+		hatch := hatchPath(t, state)
+		if err := os.Remove(filepath.Join(state, "reset-manifest.tsv")); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command(hatch, "--yes")
+		cmd.Dir = proj
+		cmd.Env = []string{"CONTEXT_GURU_STATE=" + state, "HOME=" + home, "PATH=" + os.Getenv("PATH")}
+		b, _ := cmd.CombinedOutput()
+		out := string(b)
+		if strings.Contains(out, secret) {
+			t.Errorf("the no-record grep printed a credential:\n%s", out)
+		}
+		if !strings.Contains(out, "ANTHROPIC_UPSTREAM") {
+			t.Fatalf("the grep never printed the key line, so this asserted nothing:\n%s", out)
+		}
+	})
+}
+
+// TestASuccessfulRestoreSaysSoEvenWhenTheShellIsRouted. The final summary tested INCOMPLETE for a
+// question about files — the same bug fixed in the empty-plan branch, one branch further down. So a
+// COMPLETELY successful restore, verified unrouted, run from a shell with an exported base URL (a
+// hosted agent, or simply the shell they installed from) printed "Finished with something left for
+// you" and never printed the count: $RESTORED was thrown away on the one run where it is the good
+// news, and the user who had just recovered was told the run did not finish.
+//
+// It survived three rounds because NO test grepped for "Done." at all.
+func TestASuccessfulRestoreSaysSoEvenWhenTheShellIsRouted(t *testing.T) {
+	state, home, proj := t.TempDir(), t.TempDir(), t.TempDir()
+	path := filepath.Join(proj, "settings.json")
+	writeJSON(t, path, map[string]any{"permissions": map[string]any{"allow": []string{"Bash(ls:*)"}}})
+	if _, code := settingsIn(t, state, home, "add", "--file", path, "--url", ourURL); code != 0 {
+		t.Fatal("add failed")
+	}
+
+	// Non-empty plan (a real restore) AND a routed shell: the two conditions together.
+	cmd := exec.Command(hatchPath(t, state), "--yes")
+	cmd.Dir = proj
+	cmd.Env = []string{
+		"CONTEXT_GURU_STATE=" + state, "HOME=" + home, "PATH=" + os.Getenv("PATH"),
+		"ANTHROPIC_BASE_URL=" + ourURL,
+	}
+	b, err := cmd.CombinedOutput()
+	code := 0
+	if ee, ok := err.(*exec.ExitError); ok {
+		code = ee.ExitCode()
+	} else if err != nil {
+		t.Fatal(err)
+	}
+	out := string(b)
+	if !strings.Contains(out, "restored:") {
+		t.Fatalf("no restore happened, so this test asserted nothing:\n%s", out)
+	}
+	if !strings.Contains(out, "Done. 1 file(s) put back.") {
+		t.Errorf("a fully successful restore never reported its count:\n%s", out)
+	}
+	if strings.Contains(out, "Finished with something left for you") {
+		t.Errorf("told the user the run did not finish after a verified-clean restore:\n%s", out)
+	}
+	if code != 3 {
+		t.Errorf("exit %d, want 3: the exported base URL is still left for a human", code)
+	}
+	if !strings.Contains(out, "environment report above") {
+		t.Errorf("did not point at what is actually left:\n%s", out)
 	}
 }

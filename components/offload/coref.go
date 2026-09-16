@@ -159,7 +159,13 @@ func (cf *Coref) Offload(req *bschemas.BifrostChatRequest, rep *components.Repor
 	// (below) is NOT gated on it: a latched cut must be re-applied on every turn whether
 	// or not this turn would have decided to cut anything, or the output flips
 	// cut→full→cut and churns the very cache this component is budgeting.
-	fires := cf.trigger.Fires(req, c.CtxWindow)
+	// `c`, not `c.CtxWindow`: `0c21ead` changed Trigger.Fires to measure min_request_frac against the
+	// CLIENT's compaction point and its billed input, rather than against the model window and our own
+	// token count. coref adopts that unchanged — the failure it fixes applies here identically. A client
+	// that compacts early resets the transcript before billed input ever reaches frac x window, so a
+	// component gated on the window NEVER FIRES on that deployment and looks exactly like a gate that is
+	// working. Inert for a config that sets only min_messages / min_request_tokens.
+	fires := cf.trigger.Fires(req, c)
 
 	// Index the PRISTINE request, before any replay rewrites a message. Two reasons, and
 	// the second is the load-bearing one: the agent re-sends originals every turn, so the
