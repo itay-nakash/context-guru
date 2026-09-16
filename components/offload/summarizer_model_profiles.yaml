@@ -198,9 +198,15 @@ profiles:
   #   https://huggingface.co/unsloth/Meta-Llama-3.1-8B-Instruct/raw/main/tokenizer_config.json
   #   https://huggingface.co/unsloth/Llama-3.3-70B-Instruct/raw/main/tokenizer_config.json
   #   https://huggingface.co/NousResearch/Meta-Llama-3.1-8B-Instruct/raw/main/tokenizer_config.json
-  - match: llama-3
+  # ⛔ MATCHED ON THE FULL VERSION, not `llama-3` — matching is a plain SUBSTRING test, and
+  # "codeLlama-34b" contains "llama-3". A test caught exactly that. Only the two builds whose
+  # templates were read get `system`; anything else falls through to default_role.
+  - match: llama-3.1
     role: system
-    verified: "Llama 3.1/3.3 tokenizer_config chat_template, 2026-09-15 — generic role branch renders a non-first system message in place"
+    verified: "Llama-3.1 tokenizer_config chat_template, 2026-09-15 — generic role branch renders a non-first system message in place"
+  - match: llama-3.3
+    role: system
+    verified: "Llama-3.3 tokenizer_config chat_template, 2026-09-15 — same generic role branch"
   # ⛔ NO BROAD `llama` FALLBACK. Substring matching would catch llama-2-7b-chat (whose template
   # enforces alternation and RAISES), codellama and llama-guard — none of them the 3.x templates
   # verified above. Only the verified prefix gets `system`.

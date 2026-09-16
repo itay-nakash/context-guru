@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/components"
@@ -14,14 +15,13 @@ import (
 	"github.com/rossoctl/context-guru/store"
 )
 
-// capturingModel records the message array it was asked with, so a test can assert on the
-// REQUEST rather than on a model's wording. It implements both components.Model (unused
-// here, but a real client always does) and components.MessagesModel.
+// capturingModel records the message array it was asked with, so a test can assert on the REQUEST
+// rather than on a model's wording. It implements both components.Model and MessagesModel.
 type capturingModel struct {
 	gotSystem string
 	gotMsgs   []bschemas.ChatMessage
 	out       string
-	calls     int
+	calls     int64
 }
 
 func (m *capturingModel) Complete(context.Context, string) (string, error) {
@@ -46,15 +46,29 @@ func (m *plainModel) Complete(context.Context, string) (string, error) {
 	return "<summary>should never be reached</summary>", nil
 }
 
+type caErroringModel struct{}
+
+func (caErroringModel) Complete(context.Context, string) (string, error) { return "", nil }
+func (caErroringModel) CompleteMessages(context.Context, string, []bschemas.ChatMessage) (string, error) {
+	return "", errors.New("upstream refused")
+}
+
+type caEmptyModel struct{}
+
+func (caEmptyModel) Complete(context.Context, string) (string, error) { return "", nil }
+func (caEmptyModel) CompleteMessages(context.Context, string, []bschemas.ChatMessage) (string, error) {
+	return "   ", nil
+}
+
 func caMsg(role bschemas.ChatMessageRole, text string) bschemas.ChatMessage {
 	m := bschemas.ChatMessage{Role: role}
 	schema.SetMessageText(&m, text)
 	return m
 }
 
-// caToolPair returns an assistant message that REQUESTS a tool call plus its result, so the
-// fixture exercises pairing rather than a flat list of text messages: without real ToolCalls /
-// ToolCallID the atomicity logic and the wire mapping's tool branches are never reached.
+// caToolPair returns an assistant message that REQUESTS a tool call plus its result, so the fixture
+// exercises pairing rather than a flat list of text messages: without real ToolCalls / ToolCallID
+// the atomicity logic and the wire mapping's tool branches are never reached.
 func caToolPair(text, tool, args, id, out string) []bschemas.ChatMessage {
 	a := caMsg(bschemas.ChatMessageRoleAssistant, text)
 	a.ChatAssistantMessage = &bschemas.ChatAssistantMessage{
@@ -90,44 +104,70 @@ func newCacheAware(t *testing.T, yamlCfg string) *CacheAwareSummarizer {
 	return s
 }
 
-func caCtx() *components.Ctx {
-	return &components.Ctx{Ctx: context.Background(), Session: "ca",
+func caCtx(session string) *components.Ctx {
+	return &components.Ctx{Ctx: context.Background(), Session: session,
 		Store: store.NewMemory(store.Options{}), MaxCachedIdx: -1}
 }
 
 // marker_mode is FULL on purpose: "off" would leave the whole reversibility path — Marshal,
-// commitMark, hashKey, recordOwner, expand.Marker — uncovered, which is where the store-refusal
-// defect lived. resummarize_tokens: 0 keeps the single-turn cases deterministic; the reuse path
-// has its own test.
-const caBaseCfg = "keep_last_turns: 2\nmin_tokens: 10\nresummarize_tokens: 0\n" +
+// PutStash, hashKey, expand.Marker — uncovered, which is where the store-refusal defect lived.
+const caBaseCfg = "keep_last_turns: 2\nmin_tokens: 10\nresummarize_tokens: 6000\n" +
 	"trigger:\n  min_messages: 4\n  min_request_tokens: 10\n"
+
+// caTurn runs ONE turn and returns the forwarded request.
+func caTurn(t *testing.T, s *CacheAwareSummarizer, c *components.Ctx, msgs []bschemas.ChatMessage) (*bschemas.BifrostChatRequest, *components.Report) {
+	t.Helper()
+	req := &bschemas.BifrostChatRequest{Input: append([]bschemas.ChatMessage(nil), msgs...)}
+	var rep components.Report
+	if _, err := s.Offload(req, &rep, c); err != nil {
+		t.Fatalf("Offload: %v", err)
+	}
+	return req, &rep
+}
+
+// caRun drives the REAL two-turn sequence. The summary is commissioned OFF the hot path, so turn 1
+// forwards UNTOUCHED and turn 2 is the turn that splices. Draining on the production channel
+// (WaitForSummaryForTest) rather than sleeping is what makes this deterministic — and it is the same
+// channel a real later turn waits on, so a passing test exercises production synchronisation.
+func caRun(t *testing.T, s *CacheAwareSummarizer, session string, msgs []bschemas.ChatMessage) (*bschemas.BifrostChatRequest, *components.Ctx) {
+	t.Helper()
+	c := caCtx(session)
+	t1, _ := caTurn(t, s, c, msgs)
+	if len(t1.Input) != len(msgs) {
+		t.Fatalf("turn 1 spliced (%d -> %d); it must forward untouched and commission the summary",
+			len(msgs), len(t1.Input))
+	}
+	if !WaitForSummaryForTest(session, 5*time.Second) {
+		t.Fatalf("the commissioned summary never landed, so turn 2 has nothing to splice")
+	}
+	t2, _ := caTurn(t, s, c, msgs)
+	return t2, c
+}
+
+func holdsText(msgs []bschemas.ChatMessage, want string) bool {
+	for i := range msgs {
+		if strings.Contains(schema.MessageText(msgs[i]), want) {
+			return true
+		}
+	}
+	return false
+}
 
 // ⭐ THE PROPERTY THE WHOLE DESIGN RESTS ON.
 //
-// The saving comes from the backend recognising a prefix it already has. That only happens
-// if the request is the conversation UNCHANGED with the instruction appended — every other
-// summarizer here rebuilds the prompt, and rebuilding is exactly what destroys the match.
-// So the assertion is on bytes, not on shape-in-spirit: marshal each input message and the
-// corresponding sent message and require them equal, in order, for all n; then require
-// exactly one extra message at the end.
-//
-// Marshalling rather than reflect.DeepEqual is deliberate — the wire bytes are what the
-// backend hashes, so byte equality is the property that actually matters.
+// The saving comes from the backend recognising a prefix it already has. That only happens if the
+// request is the conversation UNCHANGED with the instruction appended — every other summarizer here
+// rebuilds the prompt, and rebuilding is what destroys the match. So the assertion is on BYTES:
+// marshal each input message and the corresponding sent message and require them equal, in order,
+// then require exactly one extra message at the end. The wire bytes are what the backend hashes, so
+// byte equality is the property that actually matters.
 func TestCacheAwareSendsTheConversationUnchangedPlusOneMessage(t *testing.T) {
 	s := newCacheAware(t, caBaseCfg+"instruction_role: user\n")
 	model := &capturingModel{out: "<summary>explored the handler, 3 tests fail.</summary>"}
 	s.modelClient = model
 
 	in := caFixture()
-	req := &bschemas.BifrostChatRequest{Input: append([]bschemas.ChatMessage(nil), in...)}
-	var rep components.Report
-	if _, err := s.Offload(req, &rep, caCtx()); err != nil {
-		t.Fatalf("Offload: %v", err)
-	}
-	if rep.Skipped {
-		t.Fatalf("declined; the fixture must clear every gate or the assertions are vacuous")
-	}
-	if model.calls != 1 {
+	if _, _ = caRun(t, s, "ca-bytes", in); model.calls != 1 {
 		t.Fatalf("model called %d times, want exactly 1", model.calls)
 	}
 	if got, want := len(model.gotMsgs), len(in)+1; got != want {
@@ -143,31 +183,27 @@ func TestCacheAwareSendsTheConversationUnchangedPlusOneMessage(t *testing.T) {
 			t.Fatal(err)
 		}
 		if string(wantB) != string(gotB) {
-			t.Fatalf("message %d was MODIFIED before sending — that forfeits the prefix match "+
-				"this component exists for.\n want: %s\n got:  %s", i, wantB, gotB)
+			t.Fatalf("message %d was MODIFIED before sending — that forfeits the prefix match this "+
+				"component exists for.\n want: %s\n got:  %s", i, wantB, gotB)
 		}
 	}
-	// The appended message is the instruction, and nothing else.
 	last := model.gotMsgs[len(model.gotMsgs)-1]
 	if last.Role != bschemas.ChatMessageRoleUser {
-		t.Errorf("appended instruction role = %q, want user (instruction_role: user)", last.Role)
+		t.Errorf("appended instruction role = %q, want user", last.Role)
 	}
 	if !strings.Contains(schema.MessageText(last), "OPERATOR INSTRUCTION") {
-		t.Errorf("appended message is not the user-variant instruction: %.80q",
-			schema.MessageText(last))
+		t.Errorf("appended message is not the user-variant instruction: %.80q", schema.MessageText(last))
 	}
-	// system is empty on purpose: an extra leading block the parent did not send changes the
-	// prefix in the costliest position.
+	// system is empty on purpose: a leading block the parent never sent changes the prefix in the
+	// costliest position.
 	if model.gotSystem != "" {
-		t.Errorf("system = %q, want empty — a synthesized system block breaks the prefix match",
-			model.gotSystem)
+		t.Errorf("system = %q, want empty", model.gotSystem)
 	}
 }
 
-// The instruction role must be the configured one, and the two variants must differ in the
-// way the profile registry describes: the user variant has to say in TEXT that this is an
-// operator instruction and that the task must not be continued, because the system channel
-// carries that for free.
+// The instruction role must be the configured one, and the two variants must differ in the way the
+// registry describes: the user variant has to say in TEXT that this is an operator instruction and
+// that the task must not be continued, because the system channel carries both for free.
 func TestCacheAwareInstructionRoleAndPromptVariant(t *testing.T) {
 	for _, tc := range []struct {
 		role     string
@@ -185,13 +221,9 @@ func TestCacheAwareInstructionRoleAndPromptVariant(t *testing.T) {
 		s := newCacheAware(t, cfg)
 		model := &capturingModel{out: "<summary>ok</summary>"}
 		s.modelClient = model
-		req := &bschemas.BifrostChatRequest{Input: caFixture()}
-		var rep components.Report
-		if _, err := s.Offload(req, &rep, caCtx()); err != nil {
-			t.Fatalf("%s: Offload: %v", tc.role, err)
-		}
-		if rep.Skipped {
-			t.Fatalf("%s: declined", tc.role)
+		caRun(t, s, "ca-role-"+tc.role, caFixture())
+		if model.calls == 0 {
+			t.Fatalf("%s: no call was made, so the assertions below are vacuous", tc.role)
 		}
 		last := model.gotMsgs[len(model.gotMsgs)-1]
 		if last.Role != tc.wantRole {
@@ -206,9 +238,9 @@ func TestCacheAwareInstructionRoleAndPromptVariant(t *testing.T) {
 	}
 }
 
-// ⛔ A client that cannot send a message array must make the component DECLINE, never fall
-// back to Complete(). The fallback would report this method's latency while paying the
-// rebuild cost — i.e. measure the opposite of the hypothesis — and it would do so silently.
+// ⛔ A client that cannot send a message array must make the component DECLINE, never fall back to
+// Complete(). The fallback would report this method's latency while paying the rebuild cost — i.e.
+// measure the opposite of the hypothesis — and it would do so silently.
 func TestCacheAwareDeclinesRatherThanFlatteningThePrompt(t *testing.T) {
 	before := CacheAwareSummarizerDeclined()
 	s := newCacheAware(t, caBaseCfg+"instruction_role: user\n")
@@ -216,11 +248,7 @@ func TestCacheAwareDeclinesRatherThanFlatteningThePrompt(t *testing.T) {
 	s.modelClient = plain
 
 	in := caFixture()
-	req := &bschemas.BifrostChatRequest{Input: append([]bschemas.ChatMessage(nil), in...)}
-	var rep components.Report
-	if _, err := s.Offload(req, &rep, caCtx()); err != nil {
-		t.Fatalf("Offload: %v", err)
-	}
+	req, rep := caTurn(t, s, caCtx("ca-decline"), in)
 	if !rep.Skipped {
 		t.Error("did not skip on a client with no CompleteMessages")
 	}
@@ -231,21 +259,26 @@ func TestCacheAwareDeclinesRatherThanFlatteningThePrompt(t *testing.T) {
 		t.Errorf("transcript was modified on a decline: %d -> %d", len(in), len(req.Input))
 	}
 	if CacheAwareSummarizerDeclined() != before+1 {
-		t.Errorf("declined counter did not increment; a declining arm would be "+
-			"indistinguishable from `off` (before=%d after=%d)", before, CacheAwareSummarizerDeclined())
+		t.Errorf("declined counter did not increment; a declining arm would be indistinguishable "+
+			"from `off` (before=%d after=%d)", before, CacheAwareSummarizerDeclined())
 	}
 }
 
-// The registry resolves auto per model. Qwen is the verified system-capable case on this
-// stack; an unknown id must fall to user, because that is the direction that cannot fail
-// silently.
+// The registry resolves auto per model. Qwen is the verified system-capable case on this stack; an
+// unknown id must fall to user, because that is the direction that cannot fail silently.
 func TestCacheAwareAutoRoleResolvesFromTheRegistry(t *testing.T) {
 	for _, tc := range []struct{ id, want string }{
 		{"Qwen/Qwen3.6-27B", "system"},
+		{"meta-llama/Llama-3.3-70B-Instruct", "system"},
 		{"claude-opus-5", "system"},
 		{"claude-sonnet-5", "user"},
 		{"deepseek-ai/DeepSeek-V3", "user"},
 		{"mistralai/Mistral-7B-Instruct-v0.3", "user"},
+		// Narrowed away deliberately: an inherited profile is unknown in the sense that matters,
+		// and substring matching reached templates that were never checked.
+		{"meta-llama/Llama-2-7b-chat-hf", "user"},
+		{"codellama/CodeLlama-34b", "user"},
+		{"Qwen/Qwen2-7B-Instruct", "user"},
 		{"some-model-nobody-has-checked", "user"},
 		{"", "user"},
 	} {
@@ -256,100 +289,68 @@ func TestCacheAwareAutoRoleResolvesFromTheRegistry(t *testing.T) {
 	}
 }
 
-// The output shape must match summarization_llmd's so the two A/B as one variable, and the
-// spliced summary must never be system-role: a system message anywhere but index 0 is
-// rejected by the provider.
+// The output shape must be [head, summary, tail], and the spliced summary must never be
+// system-role: a system message anywhere but index 0 is rejected by the provider.
 func TestCacheAwareSpliceShape(t *testing.T) {
 	s := newCacheAware(t, caBaseCfg+"instruction_role: user\n")
 	s.modelClient = &capturingModel{out: "<summary>ok</summary>"}
 	in := caFixture()
-	req := &bschemas.BifrostChatRequest{Input: append([]bschemas.ChatMessage(nil), in...)}
-	var rep components.Report
-	if _, err := s.Offload(req, &rep, caCtx()); err != nil {
-		t.Fatalf("Offload: %v", err)
+	out, _ := caRun(t, s, "ca-shape", in)
+	if len(out.Input) < 3 || len(out.Input) >= len(in) {
+		t.Errorf("spliced to %d messages, want between 3 and %d", len(out.Input), len(in)-1)
 	}
-	if rep.Skipped {
-		t.Fatal("declined")
+	if !holdsText(out.Input, "TASK:") {
+		t.Errorf("head not preserved: %v", roles(out.Input))
 	}
-	// [first-1, summary, tail]. The tail is NOT simply last-2: alignTailToTurn retracts off a
-	// leading tool message so its call is not summarized away, which keeps one extra turn —
-	// the documented safe direction. So assert the INVARIANT, not a count: the head survives,
-	// the summary sits at index 1, and the tail never begins with a tool result.
-	if len(req.Input) < 3 || len(req.Input) >= len(in) {
-		t.Errorf("spliced to %d messages, want between 3 and %d", len(req.Input), len(in)-1)
-	}
-	if req.Input[2].Role == bschemas.ChatMessageRoleTool {
-		t.Errorf("the kept tail BEGINS with a tool result — its tool call was summarized away, " +
-			"which the provider rejects (alignTailToTurn should have retracted past it)")
-	}
-	if txt := schema.MessageText(req.Input[0]); !strings.Contains(txt, "TASK:") {
-		t.Errorf("head not preserved: %.60q", txt)
-	}
-	for i := range req.Input {
-		if req.Input[i].Role == bschemas.ChatMessageRoleSystem {
+	for i := range out.Input {
+		if out.Input[i].Role == bschemas.ChatMessageRoleSystem {
 			t.Errorf("system-role message at index %d — the provider rejects this", i)
 		}
 	}
-	if !strings.Contains(schema.MessageText(req.Input[1]), "cache-aware summary") {
-		t.Errorf("summary message missing its wrapper: %.80q", schema.MessageText(req.Input[1]))
+	if !holdsText(out.Input, "cache-aware summary") {
+		t.Error("summary message missing its wrapper")
+	}
+	// The kept tail must never BEGIN with a tool result whose call was summarized away.
+	if out.Input[2].Role == bschemas.ChatMessageRoleTool {
+		t.Error("the kept tail begins with a tool result — its call was summarized away")
 	}
 }
 
-// ⭐ BLOCKER: without a checkpoint this component invalidates the cache it is named for. The
-// spliced summary must be REUSED byte-identically on a later turn — no second model call — until
-// the untouched tail passes resummarize_tokens. A fresh summary every turn would change the
-// FORWARDED request's prefix at the head on every turn, so the request carrying the agent's own
-// answer would never get a hit past it.
+// ⭐ BLOCKER: without a checkpoint this component invalidates the cache it is named for. Turn 3 must
+// REUSE the summary byte-identically — no second model call — so the forwarded prefix is stable.
 func TestCacheAwareReusesItsSummaryRatherThanReDerivingIt(t *testing.T) {
-	s := newCacheAware(t, "keep_last_turns: 2\nmin_tokens: 10\nresummarize_tokens: 100000\n"+
-		"instruction_role: user\ntrigger:\n  min_messages: 4\n  min_request_tokens: 10\n")
+	s := newCacheAware(t, caBaseCfg+"instruction_role: user\n")
 	model := &capturingModel{out: "<summary>explored the handler.</summary>"}
 	s.modelClient = model
-	c := caCtx()
 
 	in := caFixture()
-	t1 := &bschemas.BifrostChatRequest{Input: append([]bschemas.ChatMessage(nil), in...)}
-	var r1 components.Report
-	if _, err := s.Offload(t1, &r1, c); err != nil {
-		t.Fatalf("turn 1: %v", err)
-	}
-	if r1.Skipped {
-		t.Fatal("turn 1 declined; the fixture must act or this proves nothing")
-	}
-	first := schema.MessageText(t1.Input[1])
-
-	// Turn 2: the same session, one more exchange appended.
-	in2 := append(append([]bschemas.ChatMessage(nil), in...),
-		caMsg(bschemas.ChatMessageRoleAssistant, "one more step"))
-	t2 := &bschemas.BifrostChatRequest{Input: in2}
-	var r2 components.Report
-	if _, err := s.Offload(t2, &r2, c); err != nil {
-		t.Fatalf("turn 2: %v", err)
-	}
+	t2, c := caRun(t, s, "ca-reuse", in)
+	first := schema.MessageText(t2.Input[1])
 	if model.calls != 1 {
-		t.Errorf("model called %d times across two turns, want 1 — turn 2 must REUSE the "+
-			"checkpoint, not re-derive a summary", model.calls)
+		t.Fatalf("model called %d times through turn 2, want 1", model.calls)
 	}
-	if got := schema.MessageText(t2.Input[1]); got != first {
-		t.Errorf("the spliced summary changed between turns, so the forwarded prefix changed and "+
-			"the cache this component exists to protect was invalidated:\n turn1: %.60q\n turn2: %.60q",
-			first, got)
+	// Turn 3: one more exchange appended, still well under resummarize_tokens.
+	in3 := append(append([]bschemas.ChatMessage(nil), in...),
+		caMsg(bschemas.ChatMessageRoleAssistant, "one more step"))
+	t3, _ := caTurn(t, s, c, in3)
+	if model.calls != 1 {
+		t.Errorf("model called %d times by turn 3, want 1 — turn 3 must REUSE the checkpoint", model.calls)
+	}
+	if got := schema.MessageText(t3.Input[1]); got != first {
+		t.Errorf("the spliced summary changed between turns, so the forwarded prefix changed and the "+
+			"cache this component exists to protect was invalidated:\n t2: %.60q\n t3: %.60q", first, got)
 	}
 }
 
 // ⛔ A pinned `system` for a model no profile verifies is the silent-failure path the registry
-// exists to prevent — a template that drops or hoists the instruction leaves the model answering
-// the conversation, and that answer is recorded as the summary. It must DECLINE, visibly.
+// exists to prevent. It must DECLINE, visibly, rather than risk a summary that is really the
+// model's next turn.
 func TestCacheAwareDeclinesAPinnedSystemRoleForAnUnverifiedModel(t *testing.T) {
 	before := CacheAwareSummarizerUnverifiedSystem()
 	s := newCacheAware(t, caBaseCfg+"instruction_role: system\nmodel_id: some-model-nobody-checked\n")
 	model := &capturingModel{out: "<summary>ok</summary>"}
 	s.modelClient = model
-	req := &bschemas.BifrostChatRequest{Input: caFixture()}
-	var rep components.Report
-	if _, err := s.Offload(req, &rep, caCtx()); err != nil {
-		t.Fatalf("Offload: %v", err)
-	}
+	_, rep := caTurn(t, s, caCtx("ca-unverified"), caFixture())
 	if !rep.Skipped {
 		t.Error("did not decline a pinned system role for an unverified model")
 	}
@@ -361,56 +362,55 @@ func TestCacheAwareDeclinesAPinnedSystemRoleForAnUnverifiedModel(t *testing.T) {
 	}
 }
 
-// Fail-open: a model error must revert the component and leave the transcript untouched, with the
-// failure counted so an arm cannot look healthy while compacting nothing.
-type caErroringModel struct{}
-
-func (caErroringModel) Complete(context.Context, string) (string, error) { return "", nil }
-func (caErroringModel) CompleteMessages(context.Context, string, []bschemas.ChatMessage) (string, error) {
-	return "", errors.New("upstream refused")
-}
-
+// Fail-open on a model error. The call is DETACHED, so Offload returns nil and the transcript is
+// untouched; the failure shows up in the counter and in the started/committed gap, which is the only
+// place a degraded summarizer surfaces when nothing on the hot path waits for it.
 func TestCacheAwareFailsOpenAndCountsTheError(t *testing.T) {
-	before := CacheAwareSummarizerErrors()
+	beforeErr := CacheAwareSummarizerErrors()
+	startedBefore, committedBefore, _, _ := CacheAwareAsyncStats()
 	s := newCacheAware(t, caBaseCfg+"instruction_role: user\n")
 	s.modelClient = caErroringModel{}
+
 	in := caFixture()
-	req := &bschemas.BifrostChatRequest{Input: append([]bschemas.ChatMessage(nil), in...)}
-	var rep components.Report
-	if _, err := s.Offload(req, &rep, caCtx()); err == nil {
-		t.Error("returned nil on a model error; the pipeline needs the error to revert this component")
+	c := caCtx("ca-failopen")
+	t1, _ := caTurn(t, s, c, in)
+	if len(t1.Input) != len(in) {
+		t.Errorf("transcript was modified on a failing turn: %d -> %d", len(in), len(t1.Input))
 	}
-	if len(req.Input) != len(in) {
-		t.Errorf("transcript was modified on a failure: %d -> %d", len(in), len(req.Input))
+	if !WaitForSummaryForTest("ca-failopen", 5*time.Second) {
+		t.Fatal("the detached call never resolved")
 	}
-	if CacheAwareSummarizerErrors() != before+1 {
+	if CacheAwareSummarizerErrors() != beforeErr+1 {
 		t.Error("the model error was not counted")
 	}
+	started, committed, _, _ := CacheAwareAsyncStats()
+	if started != startedBefore+1 || committed != committedBefore {
+		t.Errorf("started/committed = %d/%d, want %d/%d — the gap is what says work was lost",
+			started-startedBefore, committed-committedBefore, 1, 0)
+	}
+	// No checkpoint was written, so the next turn forwards untouched rather than splicing nothing.
+	t2, _ := caTurn(t, s, c, in)
+	if len(t2.Input) != len(in) {
+		t.Errorf("turn 2 spliced after a failed summary: %d -> %d", len(in), len(t2.Input))
+	}
 }
 
-// An empty reply is PAID FOR and useless — the signature of an instruction the template dropped.
-// It must skip and be counted separately from a transport error.
-type caEmptyModel struct{}
-
-func (caEmptyModel) Complete(context.Context, string) (string, error) { return "", nil }
-func (caEmptyModel) CompleteMessages(context.Context, string, []bschemas.ChatMessage) (string, error) {
-	return "   ", nil
-}
-
+// An empty reply is PAID FOR and useless — the signature of an instruction the template dropped or
+// hoisted. It must be counted separately from a transport error, and commit nothing.
 func TestCacheAwareCountsAnEmptySummary(t *testing.T) {
 	before := CacheAwareSummarizerEmpty()
+	_, committedBefore, _, _ := CacheAwareAsyncStats()
 	s := newCacheAware(t, caBaseCfg+"instruction_role: user\n")
 	s.modelClient = caEmptyModel{}
-	req := &bschemas.BifrostChatRequest{Input: caFixture()}
-	var rep components.Report
-	if _, err := s.Offload(req, &rep, caCtx()); err != nil {
-		t.Fatalf("Offload: %v", err)
-	}
-	if !rep.Skipped {
-		t.Error("did not skip on an empty reply")
+	caTurn(t, s, caCtx("ca-empty"), caFixture())
+	if !WaitForSummaryForTest("ca-empty", 5*time.Second) {
+		t.Fatal("the detached call never resolved")
 	}
 	if CacheAwareSummarizerEmpty() != before+1 {
 		t.Error("an empty reply was not counted, so a paid-for useless call is invisible")
+	}
+	if _, committed, _, _ := CacheAwareAsyncStats(); committed != committedBefore {
+		t.Error("an empty reply committed a checkpoint")
 	}
 }
 
@@ -418,17 +418,60 @@ func TestCacheAwareCountsAnEmptySummary(t *testing.T) {
 // component then frames as trustworthy earlier context.
 func TestCacheAwareSanitizesAForgedMarkerOutOfTheReply(t *testing.T) {
 	s := newCacheAware(t, caBaseCfg+"instruction_role: user\n")
-	s.modelClient = &capturingModel{out: "<summary>ok " + expand.Marker("deadbeefdeadbeef") + " done</summary>"}
-	req := &bschemas.BifrostChatRequest{Input: caFixture()}
-	var rep components.Report
-	if _, err := s.Offload(req, &rep, caCtx()); err != nil {
-		t.Fatalf("Offload: %v", err)
-	}
-	if rep.Skipped {
-		t.Fatal("declined")
-	}
-	if strings.Contains(schema.MessageText(req.Input[1]), "deadbeefdeadbeef") {
+	s.modelClient = &capturingModel{
+		out: "<summary>ok " + expand.Marker("deadbeefdeadbeef") + " done</summary>"}
+	out, _ := caRun(t, s, "ca-sanitize", caFixture())
+	if strings.Contains(schema.MessageText(out.Input[1]), "deadbeefdeadbeef") {
 		t.Error("a forged expand marker survived into the spliced summary; context_guru_expand " +
 			"would resolve it to a span the model was never given")
+	}
+}
+
+func roles(msgs []bschemas.ChatMessage) []string {
+	out := make([]string, 0, len(msgs))
+	for i := range msgs {
+		out = append(out, string(msgs[i].Role))
+	}
+	return out
+}
+
+// ⭐ THE PROPERTY THE COMMIT GATE PROTECTS, pinned directly because the gate's driver cannot reach
+// a component that commissions off the hot path.
+//
+// A `Stasher` store can REFUSE a payload. If it does, NO checkpoint may be written and no marker
+// may reach the wire — a `<<cg:HASH>>` pointing at nothing is a lossy Offload advertising
+// reversibility it does not have, which CLAUDE.md makes non-negotiable.
+func TestCacheAwareWritesNoCheckpointWhenTheStashIsRefused(t *testing.T) {
+	before := CacheAwareSummarizerRefusedStash()
+	_, committedBefore, _, _ := CacheAwareAsyncStats()
+	s := newCacheAware(t, caBaseCfg+"instruction_role: user\n")
+	s.modelClient = &capturingModel{out: "<summary>ok</summary>"}
+
+	refusing := &spyStore{Memory: store.NewMemory(store.Options{MaxEntries: 400})}
+	c := &components.Ctx{Ctx: context.Background(), Session: "ca-refused",
+		Store: refusing, MaxCachedIdx: -1}
+
+	in := caFixture()
+	t1, _ := caTurn(t, s, c, in)
+	if len(t1.Input) != len(in) {
+		t.Errorf("turn 1 modified the transcript: %d -> %d", len(in), len(t1.Input))
+	}
+	// StashRoom is checked BEFORE the call, so a saturated store should not even pay for one.
+	if CacheAwareSummarizerRefusedStash() == before {
+		t.Error("a saturated store did not register a refusal; the component either paid for a " +
+			"summary it could not keep, or skipped for some other reason")
+	}
+	if _, committed, _, _ := CacheAwareAsyncStats(); committed != committedBefore {
+		t.Error("a checkpoint was committed against a store that refuses stashes")
+	}
+	// And the next turn must forward untouched rather than splice an unresolvable marker.
+	t2, _ := caTurn(t, s, c, in)
+	if len(t2.Input) != len(in) {
+		t.Errorf("turn 2 spliced after a refused stash: %d -> %d", len(in), len(t2.Input))
+	}
+	for _, m := range t2.Input {
+		if strings.Contains(schema.MessageText(m), "<<cg:") {
+			t.Error("a marker reached the wire with no stash behind it")
+		}
 	}
 }

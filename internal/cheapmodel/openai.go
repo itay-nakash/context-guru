@@ -99,6 +99,12 @@ func (o OpenAI) CompleteMessages(ctx context.Context, system string, msgs []bsch
 		if m.Content != nil {
 			e["content"] = m.Content
 		}
+		// `name` is request-legal on OpenAI (bifrost tags it "for chat completions"). Passed through
+		// rather than dropped: if inbound traffic sets it, omitting it makes this request diverge
+		// from the parent's rendered prefix — the exact byte-identity this method exists for.
+		if m.Name != nil && *m.Name != "" {
+			e["name"] = *m.Name
+		}
 		if m.ChatToolMessage != nil && m.ChatToolMessage.ToolCallID != nil {
 			e["tool_call_id"] = *m.ChatToolMessage.ToolCallID
 		}

@@ -1996,6 +1996,13 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
 	snap.CacheAwareSummarizerErrors = offload.CacheAwareSummarizerErrors()
 	snap.CacheAwareSummarizerDeclined = offload.CacheAwareSummarizerDeclined()
 	snap.CacheAwareSummarizerCallTimeoutMs = offload.CacheAwareSummarizerCallTimeout().Milliseconds()
+	snap.CacheAwareSummarizerEmpty = offload.CacheAwareSummarizerEmpty()
+	snap.CacheAwareSummarizerUnverifiedSystem = offload.CacheAwareSummarizerUnverifiedSystem()
+	snap.CacheAwareSummarizerRefusedStash = offload.CacheAwareSummarizerRefusedStash()
+	snap.CacheAwareSummarizerTooLarge = offload.CacheAwareSummarizerTooLarge()
+	caStarted, caCommitted, _, _ := offload.CacheAwareAsyncStats()
+	snap.CacheAwareSummarizerAsyncStarted, snap.CacheAwareSummarizerAsyncCommitted = caStarted, caCommitted
+
 	// Freeze-replay health, same layering: the counters live with the code that owns
 	// them (offload for the replay path, the store for dropped/repaired decisions).
 	// Reversibility's two failure causes, split because they need opposite responses and one of

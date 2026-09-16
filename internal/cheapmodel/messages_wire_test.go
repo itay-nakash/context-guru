@@ -72,7 +72,10 @@ func TestCompleteMessagesSendsOnlyWireFields(t *testing.T) {
 		t.Fatalf("messages = %#v", body["messages"])
 	}
 	m := msgs[0].(map[string]any)
-	for _, forbidden := range []string{"reasoning", "reasoning_details", "annotations", "refusal", "audio", "name"} {
+	// `name` is NOT in this list: bifrost tags it "for chat completions" and it is request-legal,
+	// so dropping it would make the request diverge from the parent's rendered prefix. Its
+	// passthrough has its own test below.
+	for _, forbidden := range []string{"reasoning", "reasoning_details", "annotations", "refusal", "audio"} {
 		if _, bad := m[forbidden]; bad {
 			t.Errorf("assistant message carries non-wire field %q", forbidden)
 		}
@@ -152,5 +155,50 @@ func TestCompleteMessagesPreservesContentBlocks(t *testing.T) {
 	m := body["messages"].([]any)[0].(map[string]any)
 	if _, isArray := m["content"].([]any); !isArray {
 		t.Errorf("block content was flattened to %T — that changes the rendered prefix", m["content"])
+	}
+}
+
+// `name` is request-legal on OpenAI, so it must survive: omitting a field the parent sent changes
+// the rendered prefix, which is the byte-identity this method exists for.
+func TestCompleteMessagesPassesNameThrough(t *testing.T) {
+	name, txt := "alice", "hello"
+	body := captureBody(t, func(o OpenAI) error {
+		_, err := o.CompleteMessages(context.Background(), "", []bschemas.ChatMessage{{
+			Role:    bschemas.ChatMessageRoleUser,
+			Name:    &name,
+			Content: &bschemas.ChatMessageContent{ContentStr: &txt},
+		}})
+		return err
+	})
+	m := body["messages"].([]any)[0].(map[string]any)
+	if m["name"] != "alice" {
+		t.Errorf("name = %#v, want alice — a dropped request-legal field breaks the prefix match", m["name"])
+	}
+}
+
+// ⚠️ A tool message whose content is a BLOCK ARRAY. apply's normalize synthesises role=tool
+// messages on Anthropic-shaped traffic, and this client is the only MessagesModel, so that traffic
+// reaches here. The block array is passed through rather than flattened — flattening would change
+// the rendered prefix — so this test records what actually goes on the wire for that case, which is
+// the shape a backend expecting a string would reject.
+func TestCompleteMessagesToolMessageWithBlockContent(t *testing.T) {
+	tid, txt := "call_1", "3 failures"
+	body := captureBody(t, func(o OpenAI) error {
+		_, err := o.CompleteMessages(context.Background(), "", []bschemas.ChatMessage{{
+			Role: bschemas.ChatMessageRoleTool,
+			Content: &bschemas.ChatMessageContent{ContentBlocks: []bschemas.ChatContentBlock{
+				{Type: bschemas.ChatContentBlockTypeText, Text: &txt},
+			}},
+			ChatToolMessage: &bschemas.ChatToolMessage{ToolCallID: &tid},
+		}})
+		return err
+	})
+	m := body["messages"].([]any)[0].(map[string]any)
+	if m["tool_call_id"] != "call_1" {
+		t.Errorf("tool_call_id lost: %#v", m["tool_call_id"])
+	}
+	if _, isArray := m["content"].([]any); !isArray {
+		t.Errorf("block content on a tool message was flattened to %T; the prefix would diverge "+
+			"from the parent's", m["content"])
 	}
 }

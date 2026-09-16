@@ -1,7 +1,6 @@
 package offload
 
 import (
-	"context"
 	_ "embed"
 	"encoding/json"
 	"errors"
@@ -65,6 +64,7 @@ type CacheAwareSummarizer struct {
 	profilesPath      string
 	profiles          *summarizerProfiles
 	minTokens         int
+	maxRequestTokens  int
 	resummarizeTokens int
 	modelSource       string
 	modelClient       components.Model
@@ -100,6 +100,16 @@ type cacheAwareSummarizerConfig struct {
 	// sentinel and the document must still build, which an os.ReadFile of a sentinel path cannot.
 	ProfilesPath string `yaml:"profiles_path"`
 	MinTokens    int    `yaml:"min_tokens"`
+	// MaxRequestTokens refuses to commission a summary whose OUTBOUND request would exceed this
+	// many tokens. 0 = no cap.
+	//
+	// ⛔ A REFUSAL, NEVER A TRUNCATION. min_tokens asks "is the span worth a call"; this asks "can
+	// we afford the call", and they are different questions because the request carries the WHOLE
+	// conversation, not the span. Truncating it to fit is not available: the appended-suffix shape
+	// is the entire mechanism, and a truncated conversation is a different prefix that matches
+	// nothing. So an over-large session declines and says so, rather than paying for a call that
+	// cannot hit and may evict the prefix the forwarded request needs.
+	MaxRequestTokens int `yaml:"max_request_tokens"`
 	// ResummarizeTokens: once a summary exists, REUSE it — no model call, and the spliced message
 	// stays byte-identical so the forwarded prefix is stable — until the untouched tail since that
 	// checkpoint grows past this many tokens. 0 = re-summarize every eligible turn.
@@ -221,6 +231,7 @@ var (
 	cacheAwareRefusedStash     int64
 	cacheAwareProfileFallbacks int64
 	cacheAwareUnverifiedSystem int64
+	cacheAwareTooLarge         int64
 )
 
 func CacheAwareSummarizerCalls() int64    { return atomic.LoadInt64(&cacheAwareCalls) }
@@ -256,6 +267,11 @@ func CacheAwareSummarizerUnverifiedSystem() int64 {
 	return atomic.LoadInt64(&cacheAwareUnverifiedSystem)
 }
 
+// CacheAwareSummarizerTooLarge counts turns declined because the outbound request would have
+// exceeded max_request_tokens. Non-zero means this session outgrew the method rather than that
+// anything failed.
+func CacheAwareSummarizerTooLarge() int64 { return atomic.LoadInt64(&cacheAwareTooLarge) }
+
 func CacheAwareSummarizerCallTimeout() time.Duration { return cacheAwareTimeout }
 
 func init() {
@@ -276,7 +292,12 @@ func init() {
 				"unreadable path falls back to the embedded registry and increments " +
 				"cache_aware_summarizer_profile_fallbacks."},
 		{Key: "min_tokens", Type: components.FieldInt, Default: 500, Min: 1,
-			Hint: "Smallest span worth one model call."},
+			Hint: "Smallest span worth one model call. Note this gates the SPAN; the request carries " +
+				"the whole conversation — see max_request_tokens."},
+		{Key: "max_request_tokens", Type: components.FieldInt, Default: 0, Min: 0,
+			Hint: "Refuse to commission a summary whose outbound request would exceed this many " +
+				"tokens (0 = no cap). A refusal, never a truncation: truncating the conversation " +
+				"would change the prefix and defeat the mechanism."},
 		{Key: "resummarize_tokens", Type: components.FieldInt, Default: 6000, Min: 0,
 			Hint: "Reuse the existing summary with no model call until the tail since that " +
 				"checkpoint grows past this many tokens. 0 = re-summarize every eligible turn, " +
@@ -301,6 +322,9 @@ func newCacheAwareSummarizer(raw []byte) (components.Component, error) {
 	if cfg.MinTokens < 1 {
 		return nil, errors.New("cache_aware_summarizer: min_tokens must be >= 1")
 	}
+	if cfg.MaxRequestTokens < 0 {
+		return nil, errors.New("cache_aware_summarizer: max_request_tokens must be >= 0")
+	}
 	if cfg.ResummarizeTokens < 0 {
 		return nil, errors.New("cache_aware_summarizer: resummarize_tokens must be >= 0")
 	}
@@ -313,7 +337,7 @@ func newCacheAwareSummarizer(raw []byte) (components.Component, error) {
 	}
 	c := &CacheAwareSummarizer{
 		keepLastTurns: cfg.KeepLastTurns, modelID: cfg.ModelID, profilesPath: cfg.ProfilesPath,
-		profiles: profiles, minTokens: cfg.MinTokens, resummarizeTokens: cfg.ResummarizeTokens,
+		profiles: profiles, minTokens: cfg.MinTokens, maxRequestTokens: cfg.MaxRequestTokens, resummarizeTokens: cfg.ResummarizeTokens,
 		modelSource: cfg.Model.Source, modelClient: cfg.Model.Client(),
 		trigger: cfg.Trigger, mode: parseMarkerMode(cfg.MarkerMode),
 	}
@@ -358,6 +382,9 @@ func (s *CacheAwareSummarizer) InstructionRole() string { return string(s.instru
 // turn and this component would invalidate the cache it exists to protect.
 func (s *CacheAwareSummarizer) Offload(req *bschemas.BifrostChatRequest, rep *components.Report, c *components.Ctx) ([]string, error) {
 	msgs := req.Input
+	// Attribute any spend a DETACHED summarizer call incurred since this session's last turn.
+	// First thing, and unconditionally: the money was spent whatever this turn decides.
+	takeDeferredUsage(c)
 	headCount, start, end := summarizeSpan(msgs, s.keepLastTurns)
 	if !s.trigger.Fires(req, c) || end <= start {
 		rep.Skipped = true
@@ -384,6 +411,15 @@ func (s *CacheAwareSummarizer) Offload(req *bschemas.BifrostChatRequest, rep *co
 
 	span := msgs[start:end]
 	if schema.MessagesTokens(&bschemas.BifrostChatRequest{Input: span}) < s.minTokens {
+		rep.Skipped = true
+		return nil, nil
+	}
+	// The bill is set by the WHOLE conversation, because that is what gets sent. Checked before the
+	// client is even resolved, so an over-large session costs nothing to decline.
+	if s.maxRequestTokens > 0 &&
+		schema.MessagesTokens(&bschemas.BifrostChatRequest{Input: msgs}) > s.maxRequestTokens {
+		atomic.AddInt64(&cacheAwareTooLarge, 1)
+		rep.Gate("request_over_max_tokens")
 		rep.Skipped = true
 		return nil, nil
 	}
@@ -442,56 +478,14 @@ func (s *CacheAwareSummarizer) Offload(req *bschemas.BifrostChatRequest, rep *co
 	ask = append(ask, msgs...)
 	ask = append(ask, instruction)
 
-	ctx, cancel := context.WithTimeout(c.Ctx, cacheAwareTimeout)
-	defer cancel()
-	atomic.AddInt64(&cacheAwareCalls, 1)
-	// system is "" deliberately: the pipeline cannot see the parent's top-level system field, and
-	// inventing one would ADD a block the parent never sent — changing the prefix in the costliest
-	// position.
-	out, err := mm.CompleteMessages(ctx, "", ask)
-	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			atomic.AddInt64(&cacheAwareTimeouts, 1)
-		} else {
-			atomic.AddInt64(&cacheAwareErrors, 1)
-		}
-		return nil, err // fail-open: the pipeline reverts this component
+	// COMMISSION, do not block. The call covers most of the transcript against a 300 s budget, so
+	// running it inline would stall the triggering turn by minutes — billed against the agent's own
+	// timeout. summarize_async.go exists for exactly this reason. So this turn forwards UNTOUCHED
+	// and the next eligible turn finds the checkpoint and splices; see cache_aware_async.go.
+	if gate := s.startAsyncSummary(c, mm, ask, span, end-start); gate != "" {
+		rep.Gate(gate)
 	}
-	if strings.TrimSpace(out) == "" {
-		atomic.AddInt64(&cacheAwareEmpty, 1)
-		rep.Gate("empty_summary")
-		rep.Skipped = true
-		return nil, nil
-	}
-	// The reply is UNTRUSTED. The whole trajectory reached the summarizer, so planted text in any
-	// tool output had a long run at it — strip forged expand markers (both spellings), the summary
-	// sentinel and a premature </summary> before this text is framed as trustworthy context.
-	summary := ensureSummaryTags(sanitizeSummary(out))
-
-	var key string
-	if mode == markerFull {
-		key = hashKey(string(spanJSON))
-		// commitMark, not a bare Put: a Stasher store can REFUSE the payload, and stamping the
-		// marker anyway would hand the agent a <<cg:HASH>> pointing at nothing.
-		if !commitMark(c, rep, mode, key, string(spanJSON)) {
-			atomic.AddInt64(&cacheAwareRefusedStash, 1)
-			rep.Skipped = true
-			return nil, nil
-		}
-		recordOwner(c, key)
-	} else {
-		rep.Irreversible = true
-	}
-
-	summaryText := cacheAwareSummaryWrapper(summary, key, mode)
-	saveCheckpoint(c, sumCheckpoint{
-		SummaryMsg: summaryText, CoveredCount: end - start,
-		CoveredHash: spanHash(span), Key: key,
-	})
-	req.Input = s.splice(msgs, headCount, end, summaryText)
-	if key != "" {
-		return []string{key}, nil
-	}
+	rep.Skipped = true
 	return nil, nil
 }
 

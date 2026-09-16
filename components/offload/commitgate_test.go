@@ -125,11 +125,12 @@ var gateExempt = map[string]string{
 		"its candidates are steps rather than messages; pinned by " +
 		"TestAgentDietDoesNotPayForAReflectionItCannotStash and " +
 		"TestAgentDietRefusalsReachTheRefusalCounter",
-	"cache_aware_summarizer": "replaces a span rather than one message, exactly as summarize " +
-		"does, so 'left verbatim' means a whole skipped compaction; and its model step is " +
-		"unreachable without a components.MessagesModel, which the gate fixture's plain Model " +
-		"is not — pinned instead by TestCacheAwareDeclinesRatherThanFlatteningThePrompt and " +
-		"TestCacheAwareSendsTheConversationUnchangedPlusOneMessage",
+	"cache_aware_summarizer": "commissions its summary OFF the hot path, so a single Offload " +
+		"stamps no marker at all — the gate's driver requires one call to produce one, which this " +
+		"component cannot do for the same structural reason summarize cannot. The property the gate " +
+		"protects is pinned directly instead by " +
+		"TestCacheAwareWritesNoCheckpointWhenTheStashIsRefused (a saturated store must leave NO " +
+		"checkpoint and NO marker) and TestCacheAwareReusesItsSummaryRatherThanReDerivingIt",
 	"summarize": "replaces a span rather than one message, so 'left verbatim' means a whole " +
 		"skipped checkpoint; pinned by TestSummarizeSkipsTheCheckpointWhenTheSpanCannotBeStashed " +
 		"and TestSummarizeReplaysItsCheckpointRatherThanFlippingCachedContent",

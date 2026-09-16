@@ -749,6 +749,19 @@ type Snapshot struct {
 	CacheAwareSummarizerErrors        int64 `json:"cache_aware_summarizer_errors"`
 	CacheAwareSummarizerDeclined      int64 `json:"cache_aware_summarizer_declined"`
 	CacheAwareSummarizerCallTimeoutMs int64 `json:"cache_aware_summarizer_call_timeout_ms"`
+	// a call was PAID FOR and returned nothing usable — the signature of an instruction the chat template dropped or hoisted, which is the silent failure the model registry exists to prevent
+	CacheAwareSummarizerEmpty int64 `json:"cache_aware_summarizer_empty"`
+	// declined because instruction_role was pinned to `system` for a model no registry profile verifies; the arm is configured for a silent failure and is refusing to take it
+	CacheAwareSummarizerUnverifiedSystem int64 `json:"cache_aware_summarizer_unverified_system"`
+	// a summary was abandoned because the store would not accept the span; a marker with no stash behind it would be a lossy Offload advertising reversibility it does not have
+	CacheAwareSummarizerRefusedStash int64 `json:"cache_aware_summarizer_refused_stash"`
+	// declined because the outbound request would exceed max_request_tokens; the session outgrew the method rather than anything failing
+	CacheAwareSummarizerTooLarge int64 `json:"cache_aware_summarizer_too_large"`
+	// detached summaries commissioned
+	CacheAwareSummarizerAsyncStarted int64 `json:"cache_aware_summarizer_async_started"`
+	// detached summaries that reached a checkpoint. The PAIR is the signal: started without committed is a summary paid for and lost
+	CacheAwareSummarizerAsyncCommitted int64 `json:"cache_aware_summarizer_async_committed"`
+
 	// Extract is extract_llm's own economics (#28 part F), including NET savings after
 	// its LLM cost — the honest headline for the one component that spends to save.
 	// Purely ADDITIVE: no field above was renamed or removed, so deploy/harbor/*.py

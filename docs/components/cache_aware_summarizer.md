@@ -59,6 +59,32 @@ direction that cannot fail silently. A pinned `instruction_role: system` for a m
 verifies **declines** at request time and increments
 `cache_aware_summarizer_unverified_system`, rather than risking the silent case.
 
+## The call is detached, so compaction takes two turns
+
+A summary here covers most of the transcript, so the call is large by construction and its budget is
+300 s. Running that inline would stall the triggering turn by minutes, billed against the agent's own
+timeout — `summarize_async.go` exists because that was already found too expensive on the request
+path.
+
+So the control flow is the same two-turn shape `summarize` uses: **the turn that triggers commissions
+a summary and forwards untouched; the next eligible turn finds the checkpoint and splices.** The
+detached goroutine reuses the shared flight registry and the global concurrency bound, so a saturated
+proxy sheds compaction (`cache_aware_summarizer_async_refused`) rather than queueing a call nobody is
+waiting for.
+
+Read the `async_started` / `async_committed` **pair**: started without committed is a summary that was
+paid for and lost, which no other counter would reveal.
+
+## Two gates, two different quantities
+
+`min_tokens` asks *is the span worth a call*. `max_request_tokens` asks *can we afford the call* — and
+they differ because the request carries the **whole conversation**, not the span.
+
+`max_request_tokens` is a **refusal, never a truncation**. Truncating the conversation to fit is not
+available: the appended-suffix shape is the entire mechanism, and a truncated conversation is a
+different prefix that matches nothing. An over-large session declines and says so
+(`cache_aware_summarizer_too_large`).
+
 ## Reversibility and reuse
 
 `marker_mode: full` (default) stashes the replaced span through `commitMark`, so a store that
@@ -87,6 +113,8 @@ tool output gets a long run at it.
 | `cache_aware_summarizer_unverified_system` | declined a pinned `system` role for a model no profile verifies |
 | `cache_aware_summarizer_refused_stash` | the store would not accept the span, so the compaction was skipped |
 | `cache_aware_summarizer_profile_fallbacks` | `profiles_path` was unreadable, so the embedded registry was used |
+| `cache_aware_summarizer_too_large` | declined because the outbound request would exceed `max_request_tokens` |
+| `cache_aware_summarizer_async_started` / `_committed` | the **pair** is the signal — started without committed is a summary paid for and lost |
 | `cache_aware_summarizer_timeouts` / `_errors` | fail-open paths; a timeout means the budget is too small for this load, an error means the route is wrong |
 
 ## Not yet measured
