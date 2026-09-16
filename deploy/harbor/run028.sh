@@ -7,6 +7,10 @@
 # how iteration 026 spent a full run to discover a zero.
 #
 #   ./run028.sh preflight    the four conditions from PREREGISTRATION.md section 2. No reward pass, ~$8.
+#   ./run028.sh thprobe 2048     does BOUNDING thinking stop the truncation, and at what cost to
+#                            accuracy? Two tasks, 4096 output budget, ~$5. This is the live question.
+#   ./run028.sh mtprobe 8192     does raising LOCA's output budget stop the harness killing episodes?
+#                            Two tasks, baseline config, ~$10. Reward is NOT measured.
 #   ./run028.sh base 1 [model]   the BASELINE pass of seed 1 only, on an optional agent model. No ask
 #                            spend; with the default model this IS seed 1's baseline and `seed 1`
 #                            will reuse it rather than pay for it twice.
@@ -128,6 +132,89 @@ preflight)
   echo
   echo "Pre-flight passed. Nothing about reward is known. Next: ./run028.sh seed 1"
   ;;
+thprobe)
+  # THE BOUNDED-THINKING PROBE, and the one the 8192 probe argued for. Same two environments, same 4096
+  # output budget as every earlier pass, with thinking BOUNDED instead of left adaptive.
+  #
+  # It answers the only thing the gateway measurements could not: whether sonnet's edge depends on the
+  # unbounded thinking. Sonnet solves 5 of 12 live environments where haiku solves 1, and haiku never
+  # thinks at all -- so bounding thinking might cost the difference, or might cost nothing. The three
+  # repetitions on the gateway say the OUTPUT stops running away (capped 3/3 -> 0/3); they say nothing
+  # about task success, which needs the rig.
+  #
+  # READ: truncations should fall from 16 (at 8192) and from 5-9 (at 4096 unbounded) toward zero. If they
+  # do AND an environment comes off zero, this is the rig setting for the whole iteration. If truncations
+  # fall but both stay at zero, the setting is still right -- it removes a large noise source and 7x of
+  # cost -- but it is not the reason these two never score, and that has to be said rather than assumed.
+  #
+  # This probe cannot spiral the way the 8192 one did ($19 against a $10 estimate): bounded thinking
+  # produces fewer truncations, so fewer broken tool calls and fewer retries.
+  TB="${2:-2048}"
+  TAG="i028-tb$TB"
+  export LOCA_THINKING_BUDGET="$TB"
+  run_pass "$TAG" "cfg-iter028-baseline.yaml" "baseline" "$H/task-configs/i028-mtprobe.json"
+  echo
+  echo "===== $TAG: did bounding thinking stop the truncation? ====="
+  echo -n "  LOCA config banner -- max tokens: "
+  grep -oE "Max tokens +[0-9]+" "$H/i022loca-$TAG.log" | head -1
+  echo -n "  LOCA config banner -- thinking:  "
+  grep -A2 -E "Extended Thinking|Enabled" "$H/i022loca-$TAG.log" | grep -oE "(Enabled|Budget tokens) +\S+" | head -2 | tr '\n' ' '
+  echo
+  echo -n "  stop_reason max_tokens responses: "
+  grep -c "stop_reason: max_tokens" "$H/i022loca-$TAG.log" || true
+  echo -n "  tool validation failures:         "
+  grep -cE "validation error for call|Missing required argument" "$H/i022loca-$TAG.log" || true
+  echo -n "  responses carrying thinking:      "
+  grep -c "Response contains .* thinking block" "$H/i022loca-$TAG.log" || true
+  python3 "$H/perenv028.py" "$TAG"
+  echo
+  echo "COMPARE AGAINST: unbounded at 4096 -- CanvasArrangeExam 0.000 (1 trunc), NhlB2b 0.000 (5 trunc),"
+  echo "                 \$2.02 and \$2.49; unbounded at 8192 -- both 0.000, 16 truncations, \$19.19 total."
+  ;;
+mtprobe)
+  # THE OUTPUT-BUDGET PROBE. Answers three things and nothing about reward:
+  #   1. does the raised `--max-tokens` actually reach the request, or is it clamped somewhere,
+  #   2. do the harness's truncation KILLS stop, and
+  #   3. does an environment that has never scored on sonnet score once it is allowed to finish.
+  #
+  # Two environments, both of which were truncation-killed in BOTH seed-1 sonnet arms.
+  # CanvasArrangeExam is the informative one: it is on the never-scores list, and haiku -- which killed no
+  # episodes at all -- solved it outright at 35/35 courses matched, so it is demonstrably winnable and its
+  # zero on sonnet is the budget rather than the task. NhlB2bAnalysis is a live environment that carries
+  # real power, so the probe is not read only off a task we had already written off.
+  #
+  # BASELINE CONFIG, so the sweep is inert: this measures the RIG, and an ask would only add a variable
+  # and a cost to a question that has nothing to do with selection.
+  #
+  # A PROBE THAT SEES NO RESPONSE OVER 4096 TOKENS IS INCONCLUSIVE, NOT A PASS. Either the flag never
+  # reached the request or nothing wanted the extra budget, and those need opposite responses -- so the
+  # check below reads the request bodies rather than trusting that the flag was honoured.
+  MT="${2:-8192}"
+  TAG="i028-mt$MT"
+  export LOCA_MAX_TOKENS="$MT"
+  run_pass "$TAG" "cfg-iter028-baseline.yaml" "baseline" "$H/task-configs/i028-mtprobe.json"
+  echo
+  echo "===== $TAG: did the budget reach the request, and did the kills stop? ====="
+  # LOCA'S OWN CONFIG BANNER is the authoritative record that the flag took effect -- it prints
+  # "Max tokens <n>" before the first task. NOT the capture hop's body dump: i022body-*.json holds a
+  # RESPONSE (an SSE fragment), so grepping it for max_tokens finds output-token counts at best and
+  # nothing at worst, and a blank line there would read as "the flag was ignored" when it was honoured.
+  echo -n "  LOCA config banner says: "
+  grep -oE "Max tokens +[0-9]+" "$H/i022loca-$TAG.log" | head -1 || echo "(not found -- cannot confirm the budget)"
+  echo -n "  responses over 4096 output tokens: "
+  grep -oE "output: [0-9]+" "$H/i022loca-$TAG.log" | grep -oE "[0-9]+" |
+    awk -v n=0 '{if ($1>4096) n++} END {print n}'
+  echo -n "  responses at exactly $MT (the new wall): "
+  grep -c "output: $MT" "$H/i022loca-$TAG.log" || true
+  echo -n "  stop_reason max_tokens responses: "
+  grep -c "stop_reason: max_tokens" "$H/i022loca-$TAG.log" || true
+  python3 "$H/perenv028.py" "$TAG"
+  echo
+  echo "READ IT AS: kills gone AND an environment off zero => raise the budget for the whole iteration"
+  echo "            and re-run seed 1 whole, both arms. Kills merely fewer => the wall moved, not away;"
+  echo "            decide on a higher value. No response over 4096 => INCONCLUSIVE, the flag did not"
+  echo "            take effect or nothing needed it. Do not pool this pass with a reward seed either way."
+  ;;
 base)
   # BASELINE ONLY, for a question that is not about reward: can the AGENT solve these tasks at all on a
   # given model. The baseline config leaves the sweep inert, so this pass carries no ask spend and is not
@@ -177,5 +264,5 @@ seed)
 readout)
   python3 "$H/readout028.py"
   ;;
-*) die "unknown step '$STEP' (preflight | base N [model] | seed N | readout)" ;;
+*) die "unknown step '$STEP' (preflight | mtprobe [budget] | thprobe [budget] | base N [model] | seed N | readout)" ;;
 esac

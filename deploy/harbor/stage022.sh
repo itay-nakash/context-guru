@@ -26,6 +26,48 @@ NAME="$1"; BIN="$2"; CFG="$3"; PORT="$4"; TASKCFG="$5"; BAND="${6:-32}"
 # and model_info_unresolved goes non-zero — the failure that voided iterations 008-024.
 # model-window-128k.json carries aws/claude-{sonnet-5,haiku-4-5} and their bare forms.
 LOCA_MODEL="${LOCA_MODEL:-aws/claude-sonnet-5}"
+# THE OUTPUT BUDGET, defaulted to LOCA's own default so every earlier run028/run027 invocation is
+# unchanged. It is a parameter because it is not a comfort setting: the harness ENDS an episode when a
+# response hits this cap, and a killed episode never scores. Measured across iteration 024's ten passes,
+# 63 of 150 episodes (42%) ended on a truncated response and none of the 63 scored, while 94% of the
+# survivors did -- so accuracy has been close to `1 - kill_rate` and this number is a first-order term in
+# every reward comparison the project has made, not a detail.
+#
+# CHANGING IT CHANGES WHAT IS COMPARABLE. A pass at 8192 cannot be pooled with one at 4096: the arms would
+# differ in how often the harness shoots the episode, which is worth more accuracy than any effect being
+# measured. Raise it for a whole iteration, never for one arm or one subset of tasks.
+LOCA_MAX_TOKENS="${LOCA_MAX_TOKENS:-4096}"
+
+# THINKING, BOUNDED. Empty (the default) reproduces every earlier run exactly: LOCA adds no `thinking`
+# field at all when --no-enable-thinking, and Sonnet 5 then applies its OWN adaptive default and thinks
+# anyway. That is why the banner has always printed "Extended thinking: DISABLED" while 68% of sonnet's
+# responses carried thinking blocks.
+#
+# Measured on the gateway, same prompt, max_tokens 4096, three repetitions each:
+#   field omitted (today)                    4096, 4096, 4096  -- capped 3/3
+#   thinking {enabled, budget_tokens 1024}   1327, 1279, 1729  -- capped 0/3
+#   thinking {enabled, budget_tokens 2048}   1746, 1459, 1405  -- capped 0/3
+#   thinking {disabled}                      1143, 1422, 1419  -- capped 0/3
+# So 2048 and 1024 produce the same amount of output: the bound is not binding, HAVING one is what stops
+# the runaway. Hence the counter-intuitive shape of this switch -- thinking is turned ON in order to
+# BOUND it, because "off" in this rig means "unbounded adaptive".
+#
+# WHY IT MATTERS BEYOND COST: a truncated response cuts the tool_use JSON mid-object, and the tool then
+# fails schema validation. 93 of 96 tool validation failures in the seed-1 baseline, and 120 of 123 in
+# arm A, landed immediately after a truncated response. The agent then retries, burning steps.
+#
+# DO NOT reach for a bigger --max-tokens instead: measured, 8192 let thinking expand into the new budget
+# and produced 16 responses at the new wall, the same two zeros, and $18.02 on one task against $2.49.
+#
+# NOT `effort`. `thinking.adaptive.effort` is rejected 400 ("Extra inputs are not permitted"), and a
+# TOP-LEVEL `effort` returns 200 and is SILENTLY IGNORED -- thinking still capped 3/3. `output_config`
+# `{effort: low}` does work (1532, 1110, 1342) but LOCA has no flag for it, whereas the two flags below
+# are already shipped.
+LOCA_THINKING_BUDGET="${LOCA_THINKING_BUDGET:-}"
+THINK_ARGS=()
+if [ -n "$LOCA_THINKING_BUDGET" ]; then
+  THINK_ARGS=(--enable-thinking --thinking-budget-tokens "$LOCA_THINKING_BUDGET")
+fi
 # BAND selects the declared window AND LOCA's clearing threshold together. They must agree:
 # a proxy told 64k while LOCA clears at 32k measures a pressure curve nothing else shares.
 CLEAR_AT=$((BAND*1000)); CLEAR_LEAST=$((BAND*1000/4))
@@ -127,6 +169,7 @@ echo "  shim pid=$SHPID on :$SHIM_PORT"
 echo "########## i022 ARM $NAME (${BAND}k) cfg=$(basename "$CFG") ##########"; date -u
 LOCA_ANTHROPIC_BASE_URL="http://localhost:$SHIM_PORT" LOCA_ANTHROPIC_API_KEY="held-by-proxy" \
 timeout 21600 .venv/bin/loca run-claude-api -c "$TASKCFG" -m "$LOCA_MODEL" \
+  --max-tokens "$LOCA_MAX_TOKENS" ${THINK_ARGS[@]+"${THINK_ARGS[@]}"} \
   --max-workers 8 --max-tool-uses 400 \
   --use-clear-tool-uses --clear-trigger-tokens "$CLEAR_AT" --clear-at-least-tokens "$CLEAR_LEAST" \
   > "$H/i022loca-$NAME.log" 2>&1
