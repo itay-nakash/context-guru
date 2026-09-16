@@ -101,12 +101,15 @@ type rewritePricing struct {
 	// creditRemoval measures the turn horizon on the request AS THE REMOVAL WILL LEAVE IT rather than
 	// as it arrived. See turnsRemainingAfter and #232.
 	//
-	// OPT-IN, and coref does not take it, which is a deliberate choice rather than caution. The credit
-	// is arithmetically right for any caller pricing a removal — but coref's drop SELECTION was
-	// calibrated against the uncredited form (prefixRewriteNet, which is unchanged), and quietly moving
-	// the objective a measured component optimises would invalidate those measurements rather than
-	// improve them. Two components sharing a break-even is the reason this file exists; two components
-	// sharing it while one of them silently changed is how a shared price becomes two prices.
+	// OPT-IN, and coref does not take it: coref calls prefixRewritePays (coref.go:390), which passes
+	// creditRemoval false, so its arithmetic is untouched. THAT default is what protects coref's
+	// calibration — not the state of prefixRewriteNet.
+	//
+	// AN EARLIER VERSION OF THIS COMMENT SAID OTHERWISE, and the correction is worth keeping. It claimed
+	// "coref's drop SELECTION was calibrated against the uncredited form (prefixRewriteNet, which is
+	// unchanged)", which read as a reason not to credit that function. coref never calls it:
+	// prefixRewriteNet has exactly one caller, extract_llm_sweep's selectAffordableDrops. So the
+	// asymmetry it described was protecting nothing, and it cost iteration 028's pre-flight 8 of 9 drops.
 	creditRemoval bool
 }
 
@@ -227,10 +230,10 @@ func estimateTurnsRemaining(reqTokens, turns, window int) int {
 // Passing the same value for both reproduces the original expression term for term, which is what
 // estimateTurnsRemaining above does and what keeps coref's arithmetic untouched.
 //
-// NOTE the asymmetry with prefixRewriteNet, which still measures its horizon on the pre-removal
-// request: coref's drop selection was calibrated against that form, and silently changing the
-// objective a measured component optimises would invalidate those measurements rather than improve
-// them. Deliberate, and tracked with #232 rather than left as an inconsistency to be tidied.
+// BOTH CALLERS NOW CREDIT THE REMOVAL. prefixRewriteNet did not until iteration 028, on a stated
+// rationale that turned out to be misattributed — see the correction on rewritePricing.creditRemoval.
+// coref's arithmetic is unaffected either way, because coref reaches this through prefixRewritePays,
+// which passes creditRemoval false.
 func turnsRemainingAfter(reqBefore, reqAfter, turns, window int) int {
 	if window <= 0 || turns <= 0 || reqBefore <= 0 || reqAfter >= window {
 		return 0
@@ -279,6 +282,27 @@ func prefixRewriteNet(req *bschemas.BifrostChatRequest, saved, shallowest int, c
 	if rewritten < 0 {
 		rewritten = 0
 	}
-	turns = estimateTurnsRemaining(schema.MessagesTokens(req), modelTurns(req), c.CtxWindow)
+	// THE HORIZON IS CREDITED HERE TOO, and it has to be. This function is deciding WHETHER TO REMOVE
+	// `saved` tokens, so measuring the turns remaining on the request as it ARRIVED asks "how long do we
+	// last if we do nothing" and then charges the removal against that answer. #232 fixed exactly this in
+	// prefixRewritePaysWith and left it standing here.
+	//
+	// MEASURED CONSEQUENCE of leaving it uncredited, from iteration 028's pre-flight: a 73,550-token
+	// request against a 64,000 window has `reqAfter >= window`, so turnsRemainingAfter returns 0, so
+	// S*T is 0 for every subset and net = -11.5*W. The walk below then keeps whichever subset has the
+	// smallest W -- which is k=1, because k==1 is accepted unconditionally as the initial best. Observed:
+	// the model authorised 9 drops, 8 were pruned, 105 tokens were removed across 64 requests.
+	//
+	// NO BELIEF TERM, and that is the difference from the trigger. There, the credit uses
+	// `expected = saved * approval` because the ask has not happened and the mass is a projection. Here
+	// the votes are IN HAND: `saved` is the actual mass of the subset being priced, so the post-removal
+	// size is a fact about this decision rather than an estimate. The credit is less arguable here than
+	// where it was first applied.
+	reqNow := schema.MessagesTokens(req)
+	after := reqNow - saved
+	if after < 1 {
+		after = 1
+	}
+	turns = turnsRemainingAfter(reqNow, after, modelTurns(req), c.CtxWindow)
 	return float64(saved)*float64(turns) - cacheWriteX*float64(rewritten), rewritten, turns
 }
