@@ -1,8 +1,13 @@
 # Validating the cache-aware trigger end to end
 
-One live run that shows the whole chain works: a session reaches the fill threshold, its cache goes
-near-expiry, `summarize` fires, the chat continues, and the Components tab's episode figures agree
-with what the database says happened.
+One live run that shows the whole chain works: a session reaches the fill threshold, `summarize`
+fires, the chat continues, and the Components tab's episode figures agree with what the database says
+happened.
+
+> **The cache-state link in that chain is gone.** This document was written when firing also required
+> the cache to be near expiry or already cold. Those states were withdrawn and the default is now
+> `any`, so the chain is fill → fire. The cache phase still matters to `cache_state: pre_expiry`, whose
+> caller needs a live prefix to reuse, and the arms below say which of them still assume the old chain.
 
 This is a **functional validation of the proxy**, so the traffic must go **through** Context Guru —
 it is not a benchmark measurement of an agent, and the "benchmarks bypass Guru" rule does not apply.
@@ -551,23 +556,37 @@ check.
 
 ## What this run does not prove
 
-**The base rate of the event this insures against.** Arm A measures the firing rate on a
-*continuously active* session and gets zero — but that is the one population where a cold event
-cannot occur, because an active agent keeps touching its own cache. So arm A bounds the wrong
-quantity, and reading it as "the feature does not fire" is a mistake.
+> ## ⛔ THE INSURANCE FRAMING BELOW IS RETRACTED
+>
+> This section argued that the cache gate was cheap insurance whose base rate had not been measured,
+> and that the open question was how many production conversations go idle past the TTL. **The gate is
+> withdrawn**, so the question no longer decides anything. Arm A's zero was not an unmeasured base
+> rate — it was the gate declining 51 warm turns it should have fired on. The three reasons are in
+> `summarizeDefaultCacheState`; the shortest is that the corpus cost of firing warm and being wrong
+> was **−$0.84 in total**, which is not a risk worth insuring.
+>
+> Kept, not deleted, because the reasoning error is the useful part: "declining costs nothing" was
+> true per turn and false per session, and that is what made a rare trigger look free instead of
+> expensive.
 
-The structure is cheap insurance with a rare trigger and a large payout. Declining costs nothing: the
-component splices nothing and spends nothing on a turn it skips. Firing costs one summarizer call
-plus a cache write. Arm B measures the payout at roughly **$0.15 per prevented rewrite** of ~115,000
-tokens. So the question that decides whether the default earns its place is not "how often does it
-fire on a busy session" but **how many production conversations reach the fill threshold and then go
-idle past the TTL** — someone goes to lunch, a job pauses, a person switches tasks.
+**~~The base rate of the event this insures against.~~** Arm A measures the firing rate on a
+*continuously active* session and got zero under the withdrawn default — the one population where a
+cold event cannot occur, because an active agent keeps touching its own cache. That was read as "the
+feature rarely fires, which is fine"; it should have been read as "the gate is declining the turns the
+payback argument says to fire on".
 
-That is a query over stored data, not an experiment: per conversation, did it reach the fill
-threshold, and did any later turn arrive after more than TTL + `ColdMargin` of idle? `dash/kvcache.go`
-already records the per-request idle gap, and the panel already has the field to report the answer —
-`coverage.no_episode_cold_usd` sizes exactly what the conversations we did *not* fire on paid to
-re-create expired prefixes. It needs production data, not new code.
+~~The structure is cheap insurance with a rare trigger and a large payout.~~ Declining costs nothing
+*on that turn* — the component splices nothing and spends nothing — and that is exactly the sentence
+that hid the cost. Over a session, declining means every later turn re-reads a prefix that would have
+been three quarters smaller. Firing costs one summarizer call plus a cache write, and pays that back
+in 2-3 turns. Arm B's **$0.15 per prevented rewrite** of ~115,000 tokens still stands as the payout
+figure; what changed is that it is no longer the only thing on the credit side.
+
+**What genuinely remains unmeasured** is narrower: how much a *compacted* session saves over its
+remaining turns on natural traffic, which is the 14k-per-turn side of the payback arithmetic rather
+than the rare-event side. `dash/kvcache.go` records the per-request idle gap and
+`coverage.no_episode_cold_usd` still sizes what conversations we did not fire on paid to re-create
+expired prefixes. It needs production data, not new code.
 
 **A net over a settled span on natural traffic.** Arm B and arm C both force their conditions. A
 forced span that is cut short shows a loss almost by construction, because t0 pays the model call and
@@ -655,7 +674,7 @@ See the arm descriptions above for what each proves and how to read the output.
 A rig that fails silently certifies nothing, and each of these looked like "the feature does not work":
 
 1. **`PATH` replaced rather than prepended** drops `~/.local/bin`, so every turn exits 127 while the log shows only "no rows".
-2. **A gap of 310s** is past a 5-minute TTL and still inside `ColdMargin`, so the provider has already dropped the entry and the gate correctly refuses to say so. The gap must exceed **TTL + margin**.
+2. **A gap of 310s** was past a 5-minute TTL and still inside the withdrawn gate's clock-skew margin, so the provider had already dropped the entry while the gate refused to say so. That gate is gone, so nothing waits for the arithmetic's permission any more — but a gap still has to clear the TTL **with room to spare**, because the *provider's* entry can outlive its nominal lifetime (a measured turn at 383s came back a partial hit). Arm B keeps `GAP=380` for that reason and checks the verdict it got rather than assuming one. The surviving margin constant is `apply.coldMargin`, which computes `Ctx.ColdCache`; `components.ColdMargin` no longer exists.
 3. **Bridging turns that read files.** Two prompts that made the agent read large files wrote 20,095 tokens of new tail against a 20,000 span, closing it before the first idle gap — and produced a `$0.00` cold credit that was written up as a property of the design. Post-summary turns in a cold-event arm must add almost nothing.
 4. **Reading the provenance GROUP instead of the EPISODE.** Group credit fields accumulate over CLOSED episodes only; an open episode's figures are in `open_net_usd`. Reading the group printed `0.00000000` for every bucket on a perfectly healthy run.
 5. **Hand-checking a different population than the panel measured.** Summing `saved_gross` over every turn after t0 rather than over the turns inside the span disagreed by three whole cold events, and neither figure was wrong.

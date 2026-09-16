@@ -137,27 +137,36 @@ func (t Trigger) PreExpiry() time.Duration {
 // An unrecognised value permits, rather than silently disabling the component. Constructors
 // validate the string and refuse a bad one at config time, which is where a typo belongs.
 func (t Trigger) CacheAllows(c *Ctx, p CachePhase) bool {
-	// UNKNOWN IS ONLY SAFE WHEN THERE IS PROVABLY NO LIVE PREFIX, and the justification above used
-	// to assert that Unknown implied exactly that. It does not: a request can carry
-	// MaxCachedIdx >= 0 with no readable TTL, and then Unknown means "there is a cached prefix and
-	// we cannot say how much life is left in it" — the one state where compacting is most
-	// expensive and this gate was most permissive.
+	// UNKNOWN CANNOT ESTABLISH THAT A PREFIX IS ALIVE, which is the whole reason this guard exists —
+	// and it is NOT the reason it was written. The original argument was that compacting over a live
+	// prefix is expensive, so a phase that hides one must decline. That argument is withdrawn: the
+	// shipped default now compacts over live prefixes deliberately, because it pays back in 2-3
+	// turns (see summarizeDefaultCacheState). Leaving the old prose here would put two opposite
+	// valuations of one event in a single package, which is the defect this key's history is made of.
 	//
-	// A REVIEW OBSERVED THE GATE OPENING OVER A LIVE 8-MESSAGE PREFIX on 13 of 26 turns, reached by
-	// ordinary concurrency rather than by any exotic deployment. That particular route (two turns
-	// in the same millisecond reading as zero-idle-therefore-unknown) is now fixed at its root in
-	// apply, but two others remain reachable — apply's legacy no-Tracker path, which every library
-	// consumer of BodyFull/BodyOpts takes, and `cache_mode: on` against a provider whose TTL this
-	// repo does not derive. Both leave MaxCachedIdx set and CacheTTLMs at zero.
+	// THE GUARD SURVIVES BECAUSE ITS ONLY REMAINING CALLER ASKS A DIFFERENT QUESTION. With `""` and
+	// `any` exempt below, the sole state that reaches this condition is `pre_expiry`, and
+	// `pre_expiry` does not mean "invalidation is cheap here" — it means "my model call reuses this
+	// prefix, so it has to be provably still alive". A request carrying MaxCachedIdx >= 0 with no
+	// readable TTL says there IS a cached prefix and says nothing about its remaining life, so it
+	// cannot establish that. Declining is then the honest answer rather than a cautious one: firing
+	// would pay fresh prefill for the whole conversation with nothing guaranteed to hit.
 	//
-	// AND ONE FALSE POSITIVE POISONS THE WHOLE SESSION, which is why this belongs here rather than
-	// at the splice. Once a checkpoint exists the replay runs before and independently of this gate
-	// (deliberately — a gated turn must still replay, or it reverts to the full transcript at the
-	// worst moment), so a single wrongly-permitted turn commissions a summary against a live prefix
-	// and then rewrites the forwarded prefix for the rest of the session, warm turns included.
+	// WHAT THAT MEANS FOR THE DEFAULT IS A DECISION, not a leftover scoping clause. Two routes reach
+	// this state — apply's legacy no-Tracker path, which every library consumer of
+	// BodyFull/BodyOpts takes, and `cache_mode: on` against a provider whose TTL this repo does not
+	// derive; both leave MaxCachedIdx set and CacheTTLMs at zero. On those deployments the default
+	// now compacts across a prefix whose remaining life is unknown, and that is intended: the
+	// payback argument does not depend on knowing the lifetime, only on the session continuing. A
+	// third route — two turns in the same millisecond reading as zero-idle-therefore-unknown, which
+	// a review observed opening the old gate over a live 8-message prefix on 13 of 26 turns — was
+	// fixed at its root in apply and is no longer reachable.
 	//
-	// Scoped to a caller that asked for a cache state at all: `""` and `any` are the callers that
-	// never wanted this gate, and declining there would disable components that do not consult it.
+	// ⚠️ DO NOT DELETE THE `any` CLAUSE BELOW ON THE STRENGTH OF THAT RETRACTION. It used to exempt
+	// an opt-out; it now exempts the DEFAULT, so removing it stops summarize firing at all on both
+	// routes above — a much larger consequence than when it was written, and one no reading of the
+	// paragraphs above would predict. TestTheDefaultStillFiresWhenAnUnknownPhaseHidesALivePrefix is
+	// the guard on the guard.
 	if p == CachePhaseUnknown && c != nil && c.CacheAware && c.MaxCachedIdx >= 0 &&
 		t.CacheState != "" && t.CacheState != CacheStateAny {
 		return false
@@ -327,7 +336,8 @@ func TriggerFields(prefix string) []Field {
 	}
 	return append(f,
 		Field{Key: p + "cache_state", Type: FieldEnum, Default: CacheStateAny, Options: CacheStates,
-			Hint: "Restrict firing by the prompt cache's state: any (no constraint), pre_expiry (the entry still exists but is about to expire — acting then invalidates almost nothing), cold (the entry is gone), or either. A component whose default is not `any` documents its own."},
+			Withdrawn: removedCacheStates,
+			Hint:      "Restrict firing by the prompt cache's state: any (no constraint) or pre_expiry (the entry still exists but is about to expire). Only useful to a component whose MODEL CALL reuses the cached prefix and therefore needs it alive — a compactor that builds its own prompt gains nothing from waiting. A component whose default is not `any` documents its own."},
 		Field{Key: p + "pre_expiry_seconds", Type: FieldInt, Default: int(DefaultPreExpiry / time.Second),
 			Min:  0,
 			Hint: "How wide the pre-expiry window is, in seconds. Wider fires more often and invalidates more remaining cache lifetime; narrower fires rarely. Must stay below the shortest prompt-cache lifetime (300s), or every warm request counts as pre-expiry. Unmeasured either way."},

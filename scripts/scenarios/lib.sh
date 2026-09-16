@@ -66,13 +66,19 @@ scen_build() {
 # An arm passing either does not produce a wrong measurement, it produces a proxy that will not start
 # and a run with no rows — which is the failure shape this directory's own trap list is made of, so
 # the value is checked here rather than discovered in an empty summary.
+#
+# ⚠️ IT IS `exit`, NOT `return`, AND THAT IS THE DIFFERENCE BETWEEN A GUARD AND A COMMENT. No arm sets
+# `set -e` — they are all `set -u` only — so a `return 2` here prints two lines to stderr and then
+# lets scen_home, scen_work and every scen_turn run against a directory with no config.yaml and no
+# proxy. That is precisely the silently-empty run this guard exists to prevent, reached through a
+# different door, and the only caller who can ever trip it is the person the message is written for.
 scen_start() {
   local name=$1 port=$2 frac=$3 state=${4:-}
   case "$state" in
     cold|pre_expiry_or_cold)
       echo "scen_start: cache_state '$state' was withdrawn; the proxy refuses it and this run would" >&2
       echo "  produce no rows. Use '' (shipped default) or 'pre_expiry'." >&2
-      return 2
+      exit 2
       ;;
   esac
   local d="$SCEN_ROOT/$name"
