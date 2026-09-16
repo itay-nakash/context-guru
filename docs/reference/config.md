@@ -91,34 +91,46 @@ became irreversible" — true about reversibility, and silent about the cache-wr
 is reachable at `ttl_seconds` too, so it is not new; a shorter payload horizon shortens the distance
 to it.
 
-`summarize`'s trigger skip is **recurring**, not a one-off, and by default it is now the common case
-rather than the exception: `trigger.cache_state` defaults to `pre_expiry_or_cold`, so a turn fires only
-when the prompt cache is within a minute of expiring **or** has already expired past the clock-skew
-allowance. Neither is true of a turn that arrives seconds after the last one, so most turns of a long
-session are skipped turns.
+`summarize`'s trigger skip is a **fill** skip: `trigger.min_request_frac` defaults to `0.9`, so a turn
+fires only once the provider has billed past 90% of **C** — the point where the client's own compaction
+would act (see `Ctx.FillDenominator`). A long session therefore skips its early turns and then fires.
 
-**Measured, on a real Claude Code session:** 0 of 53 turns fired under these defaults, with
+**`trigger.cache_state` defaults to `any`, and that is a retraction.** For one release it defaulted to
+`pre_expiry_or_cold`: fire only when the prompt cache was within a minute of expiring, or had already
+expired past a clock-skew allowance. The reasoning was that compaction should wait until invalidating
+the cached prefix was free. It does not survive its own measurements.
+
+**Measured, on a real Claude Code session:** 0 of 53 turns fired under that default, with
 `cache_state_declined_warm` on 51 of them. The fill gate was not the obstacle — the session reached
 0.996 of the window and 12 turns were over the 0.9 threshold — the **idle time** was. `pre_expiry`
 needs roughly 240s of idle on a 5-minute entry, and the largest gap in that session was 44s.
 
-That is a measurement of a *continuously active* session, which is the one population where a cache
-entry cannot lapse. It is not evidence that the component does little: skipping costs nothing at all,
-and a turn that does fire prevents a full-prefix rewrite worth roughly **$0.15 per event** at haiku
-rates on a 175k prefix.
+Three things retired it:
 
-**This is a deliberate shipped position, not an unresolved question.** `summarize`'s cache gate is
-**insurance**, and it is priced like insurance: no premium on the turns it skips, a large payout on the
-rare turn it fires. What it insures against is a session going idle past its TTL with a nearly-full
-context — someone stepping away, a job pausing, a task switching — which is also the moment a
-full-prefix rewrite costs the most. It is **not** a general per-turn saving and should not be described
-as one anywhere.
+1. **The downside it avoided is −$0.84.** Across the whole corpus, that is the total cost of every
+   session that crossed 90% and then simply ended — which is the entire population a warm-cache fire
+   can waste money on. Against a $531 upside, the gate was insuring a rounding error.
+2. **Firing warm pays back in 2-3 turns.** At 0.9 of 200k a 180k prefix compacts to roughly 40k. The
+   compacting turn writes 40k at 1.25x instead of reading 180k at 0.1x — about 32k base-equivalents
+   more — and every later turn then reads 40k instead of 180k, saving about 14k. The ratio is
+   rate-independent, so it is the same arithmetic on haiku and opus.
+3. **A cold gate cannot prevent the first cold rewrite.** Compaction is two-turn: the turn that fires
+   commissions a summary and forwards the transcript **untouched**, and a later turn splices. So the
+   turn that first sees a cold cache is carrying the full prefix and pays that rewrite in full.
+   Waiting for cold pays the first of the median 7 rewrites and prevents the rest; compacting while
+   warm prevents all 7.
 
-The alternative was considered and rejected: making it fire on warm caches too would fire often and
-throw away a live prefix to do it, which is the exact waste the design exists to avoid. Lowering
-`min_request_frac` does not help either — the fill was never the obstacle, the cache timing was.
+**What the cache-aware work was worth stands.** `Fires` resolves the fraction against the provider's
+billed input rather than our own token count, and against C rather than the raw context window. Those
+are what made "0.9" denote anything at all. The gate on top of them did not.
 
-See `docs/proposals/timely-compact-validation.md` for the arms that measure this and how to re-run them.
+**`pre_expiry` survives, for a different question.** A summarizer whose model call reuses the
+conversation's own prefix — see [`cache_aware_summarizer`](../components/cache_aware_summarizer.md) —
+needs a **live** prefix for that call to hit, which is genuinely phase-dependent. `summarize` flattens
+its prompt into a single string and shares no prefix with anything, so no cache phase changes what its
+call costs. `cold` and `pre_expiry_or_cold` are **withdrawn**: a config carrying either is refused at
+startup with the replacement named, rather than silently migrated to a value that fires at a different
+moment.
 
 (The agent's own compaction is a second route to the same skip — it shrinks the incoming request and
 can drop it back under `min_request_tokens` for several consecutive turns.)

@@ -115,7 +115,7 @@ span is transcript **growth** from t0.
 
 | Phase | Action | Gap before it | Expected |
 |---|---|---|---|
-| **A** build-up | 4-6 turns, each pasting ~4-6k tokens of filler so the transcript grows fast | ~5s (stay warm) | no summary. Gate `cache_state_declined_warm` on every turn once past 27k, which is itself a result: it proves the size gate opened and the cache gate held |
+| **A** build-up | 4-6 turns, each pasting ~4-6k tokens of filler so the transcript grows fast | ~5s (stay warm) | under `cache_state: pre_expiry`, no summary and `cache_state_declined_warm` on every turn once past 27k — which proves the size gate opened and the cache gate held. **Under the shipped default (`any`) this phase now SUMMARIZES**, because nothing waits for the cache; the gate names to expect are fill-only |
 | **B** fire | one turn | **250s** | `summarize` acts. `fresh_summary` in its events, and the request body upstream is `[msg0, summary, last-3]` |
 | **C** cold turn | one turn | **310s** (past the TTL) | `cache_miss_reason = ttl_expiry`, `cache_read = 0`, `cache_write > 0`. This is the turn that earns **cold credit** |
 | **D** close | 3-5 turns, small | ~5s | each replays the checkpoint (`reused_checkpoint`, zero model calls) and earns **read credit**; the span closes when growth reaches 3,000 |
@@ -184,7 +184,7 @@ with the named gate present:
 
 | Control | Expected gate |
 |---|---|
-| a warm turn (5s gap) above the fill | `cache_state_declined_warm` |
+| a warm turn (5s gap) above the fill | fires under the shipped default; `cache_state_declined_warm` only under `cache_state: pre_expiry` |
 | a pre-expiry turn on a small transcript | `below_request_trigger` |
 | a pre-expiry turn above the fill on a model **absent** from the price list, with `MODEL_INFO=off` so only the substring table answers | `window_not_exact` |
 | a session's **first** turn (no previous billed figure) | `window_not_exact` |
@@ -239,8 +239,17 @@ request to the production Guru without a word. The endpoint has to be written in
 
 This is the arm with no forcing in it, and therefore the only one whose result does not depend on any
 of this feature's code being correct. It runs a real `claude -p` session on the **shipped**
-`min_request_frac: 0.9` and `cache_state: pre_expiry_or_cold`, with no injected gaps, and reports how
-many turns fired.
+`min_request_frac: 0.9`, with no injected gaps, and reports how many turns fired.
+
+> **This arm's result is what withdrew a default.** When it was written the shipped `cache_state` was
+> `pre_expiry_or_cold`, and this arm measured **0 fires in 53 turns** with `cache_state_declined_warm`
+> on 51 — the largest gap between any two values the key ever had. That, plus the −$0.84 corpus cost
+> of firing warm and the two-turn shape that makes a cold gate pay the first rewrite anyway, retired
+> the cold-gated states entirely. The default is now `any`, so **re-running this arm today should show
+> the fill gate as the only gate**: fires once the session passes 0.9 of C, and a firing rate near
+> zero now means the fill threshold was never reached, not that the cache stayed warm. To reproduce
+> the original measurement, set `cache_state: pre_expiry` — which is not the same configuration, and
+> should fire even less.
 
 It also records the number that decides whether 0.9 is reachable *at all* on this client: **where
 Claude Code runs its own compaction.** If the client caps its transcript below 0.9 of the model
@@ -522,11 +531,16 @@ On its last run a turn arriving **383 s** after the previous one — past the no
 the 60 s clock-skew allowance — came back as a **partial hit** (`read=22,441 write=10,829`) rather than
 a full miss. Two later turns at the same 383 s gap did miss completely.
 
-So the provider's entry can outlive its nominal lifetime, and by more than the margin. That is direct
-support for `CertainlyColdByClock` requiring `ColdMargin` past expiry before claiming an entry is gone:
-a gate that trusted `remaining <= 0` would have called that turn cold and rewritten a prefix that was
-still partly live. It also means a scenario arm cannot *guarantee* a cold turn by waiting — it can only
-make one likely, which is why arm B checks the verdict it actually got rather than assuming.
+So the provider's entry can outlive its nominal lifetime, and by more than the margin. That was direct
+support for the strict cold test requiring a clock-skew margin past expiry before claiming an entry was
+gone: a gate trusting `remaining <= 0` would have called that turn cold and rewritten a prefix that was
+still partly live.
+
+That gate is gone — the cold-gated cache states were withdrawn — so this observation no longer defends
+a threshold. **It still constrains the rig**, which is the reason it stays: a scenario arm cannot
+*guarantee* a cold turn by waiting, only make one likely, which is why arm B checks the verdict it
+actually got rather than assuming one. It also remains the evidence for `apply.coldMargin`, which
+computes `Ctx.ColdCache` and is now the only margin-bearing cold verdict in the codebase.
 
 ### Reading a run
 
@@ -587,9 +601,11 @@ Run: `go test ./components/... ./apply/...`
 | A backwards clock stays Unknown | `cachephase_test.go` | never invent warmth from a clock that went backwards |
 | Unknown **with a live prefix** is refused | `cachephase_test.go` | the B1 blocker. Every pre-existing guard set `MaxCachedIdx: -1`, the one value that makes Unknown safe, which is why none caught it |
 | Unknown with **no** prefix is still permitted | `cachephase_test.go` | the guard must not disable the component on non-cache-aware deployments — the failure the guard could easily have traded for |
-| The compaction **dead zone** at nominal expiry | `cachephase_test.go` | the sweep needs a LIVE entry, the compactor a DEAD one, so the two cold tests differ on purpose. Collapsing them into one threshold is a real temptation and a test catches it |
+| `pre_expiry` declines once the entry reaches nominal expiry | `cachephase_test.go` | replaces the old **dead zone** row. There used to be two cold thresholds — the sweep needing a LIVE entry, the compactor a DEAD one — and a one-minute window between them where compaction declined. The compactor's threshold went away with the cold-gated cache states, so what is asserted now is that `pre_expiry`, whose caller needs a prefix that is still live, does not fire on an entry that may already be gone |
 | `pre_expiry_seconds` validated against the TTL | `trigger_test.go` | a 600s window on a 300s TTL makes every warm turn PreExpiry → compaction every turn. Asserted by first *demonstrating* the misclassification |
 | `cache_state` typo refused | `trigger_test.go` | a typo must not read as `any` |
+| a **withdrawn** `cache_state` refused, with the replacement named | `trigger_test.go`, `summarize_cachegate_test.go` | `cold` and `pre_expiry_or_cold` are refused rather than aliased — an alias would change when the component fires without saying so. The error has to name `any` / `pre_expiry`, because this operator's config worked yesterday and did not contain a typo |
+| the shipped default fires on a **live** cache, and `pre_expiry` declines the same turn | `summarize_anygate_test.go` | the pair is what pins the difference to one key. Asserting only that the default fires would still pass with the cache gate deleted; asserting only that `pre_expiry` declines would still pass if the default had been broken into never firing |
 | The two size thresholds are **ANDed**, not `max()`ed | `trigger_test.go` | a semantic change nothing asserted. No shipped config sets both, which is exactly when a test is worth writing |
 
 ## Level 2 — Go tests, the accounting (`dash/`)

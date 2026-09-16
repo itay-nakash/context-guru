@@ -14,22 +14,33 @@ set -u
 
 N=warmonly
 PORT=4213
-# THE GAP MUST EXCEED THE TTL PLUS THE CLOCK-SKEW MARGIN, not just the TTL.
+
+# ⚠️ THIS ARM NO LONGER FORCES A COLD TURN, AND THAT IS THE POINT OF THE CHANGE.
 #
-# 310s looked right — past a 5-minute entry — and the gate declined every time. The provider HAD
-# already dropped the entry (the turn billed a full 183,660-token rewrite with zero cache read), but
-# components.CertainlyColdByClock requires ColdMargin (60s) PAST nominal expiry before it will make
-# the positive claim that an entry is gone, mirroring apply.cacheIsCold over the same timestamps. At
-# 310s idle the arithmetic says "-10s remaining", which is inside the allowance, so the gate refuses.
+# It used to sleep GAP=380s to open a `pre_expiry_or_cold` gate, because a warm turn could not fire.
+# Two things followed from that, and both are now gone:
 #
-# That is the intended conservatism — forgoing an opportunity beats rewriting a prefix that may still
-# be live — and it is worth knowing it costs real firing opportunities: a session that returns between
-# 300s and 360s of idle finds the entry gone AND the gate shut.
-GAP=380   # > TTL (300) + components.ColdMargin (60)
+#   - the gap was 380 rather than 310 because the strict cold test required a 60s clock-skew margin
+#     PAST nominal expiry. 310s looked right — the provider HAD dropped the entry, the turn billed a
+#     full 183,660-token rewrite with zero cache read — and the gate still refused, because the
+#     arithmetic read "-10s remaining", inside the allowance. That conservatism cost real firing
+#     opportunities: a session returning between 300s and 360s of idle found the entry gone AND the
+#     gate shut.
+#   - the forced fire was the arm's t0, so every later turn was warm by construction.
+#
+# The cold-gated cache states were withdrawn and the default is `any`, so the fire now happens on a
+# WARM turn as soon as the transcript passes 0.5 of C. Keeping the sleep would invert the arm's own
+# invariant: t0 would move earlier, the 380s gap would land AFTER t0, and the ttl_expiry turn it
+# produces would put money in cold_credit_usd — which this arm asserts is exactly zero. So the sleep
+# is removed rather than retuned, and the arm is now a more direct test of what it always measured:
+# every credit after t0 priced at the cache-READ rate.
+#
+# resummarize_tokens is 200000 in lib.sh, so the checkpoint is replayed rather than re-summarized on
+# every later turn. That is what keeps t0 unique without a gate holding it back.
 
 echo "=== SCENARIO C: warm turns only after the summary (the read rate) ==="
 scen_build
-scen_start  "$N" "$PORT" 0.5 pre_expiry_or_cold
+scen_start  "$N" "$PORT" 0.5
 scen_home   "$N" "$PORT"
 scen_work   "$N"
 
@@ -41,10 +52,11 @@ scen_turn "$N" g05 continue "Read e.go in full. List every place usage is attrib
 scen_turn "$N" g06 continue "Read f.go in full. Explain how the boundary is computed."
 scen_turn "$N" g07 continue "Read g.go in full. Explain baselineDeltaUSD and repeatRate."
 
-scen_sleep "$GAP" "past the TTL so the gate fires"
+# No sleep: the fire happens on a warm turn at 0.5 of C. This turn is simply the next warm one — kept
+# because more turns after t0 is what gives the read-rate assertion something to sum.
 scen_turn "$N" f01 continue "In one sentence, what is the most important invariant in a.go?"
 
-# Warm from here on: every turn within seconds of the last.
+# Warm throughout: every turn within seconds of the last.
 for k in 01 02 03 04 05 06 07 08; do
   scen_turn "$N" "w$k" continue "In one sentence, name one thing h.go decides."
 done

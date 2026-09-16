@@ -171,17 +171,52 @@ func newSummarize(raw []byte) (components.Component, error) {
 // extra turn spent on a compacted context — so there is no knee to sit in. 0.9 is the
 // conservative end of a defensible range.
 //
-// WHAT STOPS A SESSION THAT NEVER ENTERS THE WINDOW: nothing here, deliberately. A session whose
-// turns are seconds apart stays warm indefinitely and this trigger declines on every turn while
-// the transcript grows. The ceiling is the CLIENT's: Claude Code runs its own compaction as it
-// approaches its budget. A deployment whose client does not — anything driving a raw API — must
-// set `cache_state: any` to get the old size-only behaviour, and both shipped example configs do
-// exactly that. This is a documented requirement rather than a backstop in the code because a
-// backstop firing at 0.99 would be compacting on a live prefix, which is the cost the whole
-// design avoids.
+// # THE CACHE STATE IS `any`, AND THAT IS A RETRACTION
+//
+// This default was `pre_expiry_or_cold` for one release: fire only when the prompt cache is about
+// to expire or already has, so the cache write compaction costs was going to be paid anyway. The
+// argument was wrong, and three things in the paragraphs above and below say so.
+//
+//  1. THE DOWNSIDE IT AVOIDED IS −$0.84. That is the figure four paragraphs up, for every session
+//     in the corpus that crossed 90% and then simply ended — which is the entire population that a
+//     warm-cache fire can waste money on. It was cited as the reason the FILL threshold could be
+//     low, and it is equally the reason the cache gate buys nothing: it was insuring a rounding
+//     error against a $531 upside.
+//
+//  2. FIRING WARM PAYS BACK IN 2-3 TURNS. At 0.9 of 200k a 180k prefix compacts to roughly 40k.
+//     The turn that compacts pays 40k at the 1.25x write rate instead of reading 180k at 0.1x,
+//     so it costs about 32k base-equivalents more; every later turn then reads 40k instead of
+//     180k and saves about 14k. That is 2.3 turns to break even, and it is rate-independent
+//     because read, write and base all scale together — the same arithmetic on haiku and opus.
+//     Any session sitting at 0.9 has far more than three turns left in it.
+//
+//  3. A COLD GATE CANNOT PREVENT THE FIRST COLD REWRITE, which is the structural half and the
+//     part that is not a judgement call. Compaction here is two-turn: the turn that fires
+//     COMMISSIONS a summary and forwards the transcript untouched (EventSummaryStarted), and a
+//     later turn splices the checkpoint. So the turn that first observes a cold cache is carrying
+//     the full 180k prefix and pays that rewrite in full. Waiting for cold therefore pays the
+//     first of the median 7 rewrites and prevents the rest; compacting while warm prevents all 7,
+//     for the one-time ~32k above.
+//
+// WHAT THE CACHE-AWARE WORK WAS ACTUALLY WORTH is the other half of the same release, and it
+// stands: Fires resolves the fraction against Ctx.PrevBilledInput (the provider's ruler) rather
+// than schema.MessagesTokens, and against C (the client's own compaction point) rather than the
+// raw window. Those are what made "0.9" denote anything. The gate on top of them did not.
+//
+// `pre_expiry` IS STILL THE RIGHT ANSWER FOR A DIFFERENT QUESTION, and that is why the value
+// survives. A summarizer whose model call reuses the conversation's own prefix — see
+// cache_aware_summarizer — needs a LIVE prefix for that call to hit, which is the opposite
+// concern to this one and genuinely phase-dependent. This component flattens its prompt into one
+// string and shares no prefix with anything, so no cache phase changes what its call costs.
+//
+// WHAT STOPS A SESSION THAT NEVER ENTERS THE WINDOW: nothing here, deliberately. The ceiling is
+// the CLIENT's — Claude Code runs its own compaction as it approaches C, and Fires now measures
+// against C for that reason. A deployment whose client does not cap its context must set
+// `min_request_frac` low enough, or an absolute `min_request_tokens`, to compact before the
+// provider rejects the request.
 const (
 	summarizeDefaultRequestFrac = 0.9
-	summarizeDefaultCacheState  = components.CacheStatePreExpiryOrCold
+	summarizeDefaultCacheState  = components.CacheStateAny
 )
 
 // The four names summarize files on Report.Events. Promoted to constants because a SECOND

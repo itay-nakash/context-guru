@@ -144,9 +144,14 @@ func TestTriggerValidateRejectsWhatTheFormWouldAccept(t *testing.T) {
 	}{
 		{"the zero trigger is valid", Trigger{}, false},
 		{"an empty cache_state means no constraint", Trigger{CacheState: ""}, false},
-		{"every declared cache state is accepted", Trigger{CacheState: CacheStatePreExpiryOrCold}, false},
+		{"every declared cache state is accepted", Trigger{CacheState: CacheStatePreExpiry}, false},
 		{"a typo in cache_state is refused, not read as `any`",
 			Trigger{CacheState: "pre_expiryy"}, true},
+		// A WITHDRAWN VALUE IS REFUSED, NOT ALIASED. Both once meant "wait until invalidating the
+		// cached prefix is free", and mapping either onto a surviving value would change when the
+		// component fires without saying so. See removedCacheStates.
+		{"the withdrawn `cold` is refused", Trigger{CacheState: "cold"}, true},
+		{"the withdrawn `pre_expiry_or_cold` is refused", Trigger{CacheState: "pre_expiry_or_cold"}, true},
 		// A WINDOW AT OR ABOVE THE TTL SWALLOWS THE WHOLE LIFETIME: `remaining <= preExpiry` is then
 		// true for every request that has an entry at all, so CachePhase returns PreExpiry always and
 		// Warm never, and a component gated on pre_expiry rewrites a live prefix on EVERY turn. The

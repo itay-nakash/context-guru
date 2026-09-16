@@ -55,11 +55,30 @@ scen_build() {
   echo "built $(ls -la "$SCEN_ROOT/cg-scen" | awk '{print $5}') bytes"
 }
 
-# scen_start <name> <port> <frac> <cache_state>
+# scen_start <name> <port> <frac> [cache_state]
+#
+# cache_state is OPTIONAL and omitting it is meaningful: the key then does not appear in the config at
+# all, so the arm runs whatever summarize's shipped default is. That is the only faithful way to write
+# a "shipped defaults" arm, and writing the current default's value by hand is not the same thing — it
+# would keep passing unchanged through exactly the kind of default change that already happened here.
+#
+# `cold` and `pre_expiry_or_cold` are REFUSED by the proxy since the cold-gated states were withdrawn.
+# An arm passing either does not produce a wrong measurement, it produces a proxy that will not start
+# and a run with no rows — which is the failure shape this directory's own trap list is made of, so
+# the value is checked here rather than discovered in an empty summary.
 scen_start() {
-  local name=$1 port=$2 frac=$3 state=$4
+  local name=$1 port=$2 frac=$3 state=${4:-}
+  case "$state" in
+    cold|pre_expiry_or_cold)
+      echo "scen_start: cache_state '$state' was withdrawn; the proxy refuses it and this run would" >&2
+      echo "  produce no rows. Use '' (shipped default) or 'pre_expiry'." >&2
+      return 2
+      ;;
+  esac
   local d="$SCEN_ROOT/$name"
   mkdir -p "$d"
+  local stateline=""
+  [ -n "$state" ] && stateline="      cache_state: $state"
   cat > "$d/config.yaml" <<YAML
 pipeline: [summarize]
 components:
@@ -69,7 +88,7 @@ components:
     resummarize_tokens: 200000
     trigger:
       min_request_frac: $frac
-      cache_state: $state
+$stateline
       pre_expiry_seconds: 60
     summary_wait_seconds: 120
 YAML

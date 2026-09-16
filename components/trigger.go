@@ -42,8 +42,8 @@ type Trigger struct {
 	HugeOutputFrac float64 `yaml:"huge_output_frac"` // HARD per-item trigger: a single output >= frac*window
 
 	// CacheState restricts firing by where the request sits in its prompt cache's life:
-	// "" / "any" (no constraint), "pre_expiry", "cold", "pre_expiry_or_cold". See
-	// CacheAllows, and CachePhase for what the phases mean.
+	// "" / "any" (no constraint) or "pre_expiry". See CacheAllows, and CachePhase for what the
+	// phases mean. "cold" and "pre_expiry_or_cold" were withdrawn — see removedCacheStates.
 	CacheState string `yaml:"cache_state"`
 	// PreExpirySeconds is how wide the pre-expiry window is (0 = DefaultPreExpiry). Wider
 	// fires more often and invalidates more remaining lifetime; narrower fires rarely.
@@ -55,16 +55,54 @@ type Trigger struct {
 // CacheState values. "any" is spelled explicitly rather than left as "" because it has to be
 // SAYABLE: a component whose default is a restrictive state needs an opt-out an operator can
 // write down, and "" is what the settings form posts for "unset" (see config/form.go normalize).
+//
+// # THERE ARE ONLY TWO, AND THAT IS THE RESULT OF A RETRACTION
+//
+// This key shipped with four values — `cold` and `pre_expiry_or_cold` alongside these two — on the
+// argument that compaction should wait until invalidating the cached prefix was free. Three things
+// retired that argument, and they are recorded on summarizeDefaultCacheState because that is where
+// the default lived. In short: the downside it avoided was measured at **−$0.84 across the whole
+// corpus**, the payback for firing on a WARM cache is 2-3 turns, and the two-turn commission shape
+// means a cold-gated component pays the first full rewrite anyway.
+//
+// So there is exactly one question left worth asking about the cache, and it is not "is
+// invalidation free" but "is there a live prefix for the summarizing CALL to hit". Only a component
+// whose model call reuses the conversation's own prefix has that question, which is why
+// `pre_expiry` survives while the two cold states do not.
 const (
-	CacheStateAny             = "any"
-	CacheStatePreExpiry       = "pre_expiry"
-	CacheStateCold            = "cold"
-	CacheStatePreExpiryOrCold = "pre_expiry_or_cold"
+	CacheStateAny       = "any"
+	CacheStatePreExpiry = "pre_expiry"
+
+	// Removed. Kept as identifiers ONLY so Validate can name them in a targeted error and so this
+	// comment has something to hang on: a config carrying either is refused at construction
+	// rather than aliased, because every alias would change behaviour silently. See
+	// removedCacheStates.
+	cacheStateCold            = "cold"
+	cacheStatePreExpiryOrCold = "pre_expiry_or_cold"
 )
 
 // CacheStates is the permitted set, in display order — the Options for the settings form and
 // the set a constructor validates against.
-var CacheStates = []string{CacheStateAny, CacheStatePreExpiry, CacheStateCold, CacheStatePreExpiryOrCold}
+var CacheStates = []string{CacheStateAny, CacheStatePreExpiry}
+
+// removedCacheStates maps a withdrawn value to what to write instead.
+//
+// REFUSED, NOT ALIASED, and the distinction is the point. Either value could be mapped to a
+// surviving one without a config error, but both would change when the component fires — and a
+// gate that silently starts firing at a different moment is the failure mode this key's own
+// history is made of. An operator who wrote `pre_expiry_or_cold` chose a behaviour that no longer
+// exists; they are entitled to be told so rather than migrated.
+var removedCacheStates = map[string]string{
+	cacheStateCold: "cache_state: cold was withdrawn — it fired only once the prefix was already " +
+		"dead, which is strictly later than any surviving value for no measured gain. Write " +
+		"`any` to compact on the size gates alone (what almost every deployment wants), or " +
+		"`pre_expiry` if this component's model call needs a live prefix to reuse",
+	cacheStatePreExpiryOrCold: "cache_state: pre_expiry_or_cold was withdrawn — waiting for the " +
+		"cache to be free to invalidate costs more than it saves (payback for firing warm is 2-3 " +
+		"turns, and the corpus cost of firing warm and being wrong was −$0.84 in total). Write " +
+		"`any` to compact on the size gates alone, or `pre_expiry` if this component's model call " +
+		"needs a live prefix to reuse",
+}
 
 // DefaultPreExpiry is the pre-expiry window's width when none is configured. One minute,
 // which is this codebase's own clock-uncertainty margin for cache expiry (see apply.cacheIsCold)
@@ -127,48 +165,14 @@ func (t Trigger) CacheAllows(c *Ctx, p CachePhase) bool {
 	switch t.CacheState {
 	case CacheStatePreExpiry:
 		return p == CachePhasePreExpiry || p == CachePhaseUnknown
-	case CacheStateCold:
-		return coldByArithmetic(c) || p == CachePhaseUnknown
-	case CacheStatePreExpiryOrCold:
-		return p == CachePhasePreExpiry || coldByArithmetic(c) || p == CachePhaseUnknown
 	default: // "" and "any"
+		// A WITHDRAWN VALUE LANDS HERE, and it is the right place for it to land. Validate refuses
+		// `cold` and `pre_expiry_or_cold` at construction, so the only way either reaches this
+		// switch is a Trigger built as a struct literal in code that skipped the constructor —
+		// tests, and any future in-repo caller. Permitting is then the fail-open answer and it
+		// matches the guidance Validate prints for both.
 		return true
 	}
-}
-
-// coldByArithmetic reports that this request's cache entry is expired ACCORDING TO THE CLOCK, as
-// opposed to according to Ctx.ColdCache.
-//
-// THE DISTINCTION IS THE WHOLE FUNCTION, and without it permitting Cold would be a regression.
-// ColdCache is a KNOWN FALSE POSITIVE on a keep-alive'd session: proxy/keepalive.go never updates
-// the turn tracker, so a session whose entry the keeper has been refreshing reads cold while the
-// entry is very much alive — the −$708 mechanism proxy/promexport.go:807 documents. A trigger that
-// accepted the flag would therefore compact LIVE prefixes on exactly the sessions someone is
-// paying pings to protect, which is the single most expensive thing this component can do.
-//
-// CacheRemaining separates "cannot tell" from "expired": it reports ok=false when the TTL or the
-// idle time is unknown, and a non-positive duration only when both are known and the entry's
-// lifetime has run out. Unknown is NOT cold here — a component that cannot tell must fall through
-// to the Unknown branch, which the caller permits for its own documented reasons, rather than
-// borrow a verdict it has not earned.
-//
-// AND THE TEST IS CertainlyColdByClock, NOT `remaining <= 0`, which is the threshold CachePhase uses
-// for the opposite question. A compactor needs the entry to be certainly GONE; the sweep needs it to
-// still EXIST, and the safe error runs the other way for each. Requiring only `remaining <= 0` here
-// made this gate willing to permit a rewrite for a full minute during which apply still called the
-// same entry warm — see CertainlyColdByClock for why the two thresholds differ on purpose, and for
-// the dead zone between them where compaction declines.
-//
-// THE KEEP-ALIVE FALSE POSITIVE IS NOT FULLY ANSWERED HERE, and the paragraph above should not be
-// read as claiming otherwise. IdleMs derives from the same prevAt that keepalive.go never updates,
-// so on a kept-alive session with a real gap past the TTL this function returns true and permits
-// compacting a live prefix — the very thing it was written to prevent, on exactly the sessions
-// someone is paying pings to protect. It cannot be fixed by adjusting the arithmetic, because the
-// input it trusts is stale for those sessions: either keepalive.go updates the tracker, or the cold
-// signal must not derive from prevAt at all. Tracked as its own issue.
-func coldByArithmetic(c *Ctx) bool {
-	remaining, ok := c.CacheRemaining()
-	return ok && CertainlyColdByClock(remaining)
 }
 
 // FracResolvable reports whether the configured fractions can be resolved against a window worth
@@ -354,7 +358,7 @@ const maxPreExpirySeconds = 300
 //
 // WHAT THIS DELIBERATELY DOES NOT DO: refuse a cache_state on a component that ignores it.
 // `extract` and `extract_llm` embed a Trigger and call neither CacheAllows nor CachePhase anywhere,
-// so `cache_state: cold` on either of them is silently inert while the settings form describes it as
+// so `cache_state: pre_expiry` on either of them is silently inert while the settings form describes it as
 // "Restrict firing by the prompt cache's state". A review found that, and both obvious fixes were
 // tried here and both break a contract this repo already keeps:
 //
@@ -377,6 +381,14 @@ const maxPreExpirySeconds = 300
 func (t Trigger) Validate(component string) error {
 	// Refused rather than silently read as "any": a typo in the one key that decides WHEN a
 	// component fires would otherwise turn the cache gate off and look like it was on.
+	//
+	// A WITHDRAWN VALUE GETS ITS OWN MESSAGE, because "is not one of [any pre_expiry]" is the least
+	// useful thing to tell someone whose config worked yesterday. They did not make a typo — they
+	// wrote a value that was documented, defaulted to, and then retired on evidence, so the error
+	// says which replacement matches what they were trying to buy.
+	if why, withdrawn := removedCacheStates[t.CacheState]; withdrawn {
+		return fmt.Errorf("%s: %s", component, why)
+	}
 	if t.CacheState != "" && !slices.Contains(CacheStates, t.CacheState) {
 		return fmt.Errorf("%s: trigger.cache_state %q is not one of %v",
 			component, t.CacheState, CacheStates)

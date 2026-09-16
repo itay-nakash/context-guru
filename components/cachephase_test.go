@@ -99,7 +99,7 @@ func TestCacheAllowsPermitsUnknownWhileTheExactPhaseTestDoesNot(t *testing.T) {
 	if unknown != CachePhaseUnknown {
 		t.Fatalf("fixture does not produce Unknown, it produces %s — the rest of this test is vacuous", unknown)
 	}
-	for _, state := range []string{CacheStatePreExpiry, CacheStateCold, CacheStatePreExpiryOrCold} {
+	for _, state := range []string{CacheStatePreExpiry} {
 		if !(Trigger{CacheState: state}).CacheAllows(nil, unknown) {
 			t.Errorf("cache_state %q refused an UNKNOWN phase: on any deployment where the "+
 				"cache-aware path does not run — a non-caching provider, cache_mode: off, a "+
@@ -147,88 +147,46 @@ func TestCacheRemainingSeparatesUnknownFromExpired(t *testing.T) {
 	}
 }
 
-// PERMITTING COLD IS ONLY SOUND IF IT READS THE CLOCK RATHER THAN THE FLAG, and this is the test
-// that says so.
+// AT NOMINAL EXPIRY THE PHASE IS COLD, AND THE ONE SURVIVING RESTRICTIVE STATE DECLINES THERE.
 //
-// Ctx.ColdCache is a known false positive on a keep-alive'd session: proxy/keepalive.go never
-// updates the turn tracker, so a session whose entry the keeper has been refreshing reads cold
-// while the entry is alive (proxy/promexport.go:807, the −$708 mechanism). A default of
-// pre_expiry_or_cold that trusted the flag would compact LIVE prefixes on exactly the sessions
-// someone is paying pings to protect — turning the cheapest moment to compact into the most
-// expensive one.
-func TestColdIsAcceptedFromTheClockAndNotFromTheFlagAlone(t *testing.T) {
-	const ttl = 5 * 60 * 1000
-	for _, state := range []string{CacheStateCold, CacheStatePreExpiryOrCold} {
-		// The keep-alive shape: the flag says cold, the clock says there is life left. This is
-		// the case that must NOT fire.
-		flagOnly := &Ctx{ColdCache: true, CacheTTLMs: ttl, IdleMs: 30 * 1000}
-		if (Trigger{CacheState: state}).CacheAllows(flagOnly, flagOnly.CachePhase(time.Minute)) {
-			t.Errorf("%s: permitted a session whose entry has %dms of life left because the flag "+
-				"said cold; that compacts a live prefix on a keep-alive'd session",
-				state, ttl-30*1000)
-		}
-		// Genuinely expired by the clock: this is the cheapest moment to compact, because the
-		// turn is paying to create an entry either way.
-		expired := &Ctx{ColdCache: true, CacheTTLMs: ttl, IdleMs: ttl + 60*1000}
-		if !(Trigger{CacheState: state}).CacheAllows(expired, expired.CachePhase(time.Minute)) {
-			t.Errorf("%s: refused a genuinely expired entry; that turn pays a write regardless, "+
-				"so declining leaves the full-prefix rewrite on the table", state)
-		}
-		// Nothing known either way stays Unknown, which every state permits for its own
-		// documented reasons — it must not be silently treated as cold.
-		unknown := &Ctx{}
-		if !(Trigger{CacheState: state}).CacheAllows(unknown, unknown.CachePhase(time.Minute)) {
-			t.Errorf("%s: refused an Unknown phase; see CacheAllows on why Unknown permits", state)
-		}
-	}
-}
-
-// THE TWO COLD TESTS DIFFER ON PURPOSE, and the window between them is a dead zone where compaction
-// declines. This is the case a review found missing.
+// This used to assert a DEAD ZONE: a window one minute wide, just past nominal expiry, where the
+// strict cold test said "not certainly gone" while CachePhase said Cold, so `cold` and
+// `pre_expiry_or_cold` both declined. Those states are withdrawn and the strict test went with them,
+// so the dead zone is no longer a thing that exists — but the case it was built from still matters,
+// because `pre_expiry` must not fire here.
 //
-// CachePhase answers "might this entry be gone?" — the sweep's question, where assuming it IS gone is
-// the safe error. CertainlyColdByClock answers "is this entry definitely gone?" — the compactor's
-// question, where assuming it might still be ALIVE is the safe error. At and just past nominal expiry
-// those give different answers, and both are correct for their own caller.
-//
-// Before the fix, summarize's gate used the sweep's threshold: for a full minute of every session's
-// expiry it permitted rewriting deep history while apply still called the same entry warm and the
-// rest of the pipeline treated its prefix as live.
-func TestTheCompactionDeadZoneAtNominalExpiry(t *testing.T) {
+// CachePhase answers "might this entry be gone?", which is extract_llm_sweep's question and the
+// reason nominal expiry counts as Cold. A component whose model call needs a LIVE prefix to reuse
+// (cache_aware_summarizer's question) therefore gets a decline at nominal expiry rather than a hit
+// on an entry that may already have lapsed — which is the conservative direction for that caller.
+func TestPreExpiryDeclinesOnceTheEntryReachesNominalExpiry(t *testing.T) {
 	const ttlMs = int64(5 * 60 * 1000)
-	// Just past nominal expiry, inside the clock-skew allowance.
+	// Just past nominal expiry.
 	c := &Ctx{CacheAware: true, MaxCachedIdx: -1, CacheTTLMs: ttlMs, IdleMs: ttlMs + 1_000}
 
 	if got := c.CachePhase(DefaultPreExpiry); got != CachePhaseCold {
-		t.Fatalf("precondition: CachePhase = %s, want %s — the sweep must stand down here",
+		t.Fatalf("precondition: CachePhase = %s, want %s — the rest of this test is vacuous",
 			got, CachePhaseCold)
 	}
 	remaining, ok := c.CacheRemaining()
 	if !ok {
 		t.Fatal("precondition: the remaining lifetime must be known for this case to mean anything")
 	}
-	if CertainlyColdByClock(remaining) {
-		t.Errorf("CertainlyColdByClock said the entry is GONE %v past nominal expiry, inside the "+
-			"%v clock-skew allowance. apply still calls this entry warm, so a rewrite here "+
-			"invalidates a prefix the rest of the pipeline is treating as live", -remaining, ColdMargin)
+	if remaining > 0 {
+		t.Fatalf("precondition: %v of life left, so this is not the expiry case", remaining)
 	}
-	// So every cache_state that asks for cold declines, and the one that asks for pre-expiry does
-	// too, because this turn is not PreExpiry either. That is the honest answer for a window where
-	// we cannot tell whether the entry is alive or dead.
-	for _, state := range []string{CacheStateCold, CacheStatePreExpiry, CacheStatePreExpiryOrCold} {
-		tr := Trigger{CacheState: state}
-		if tr.CacheAllows(c, c.CachePhase(tr.PreExpiry())) {
-			t.Errorf("cache_state %q permitted compaction inside the skew allowance; the entry may "+
-				"still be live and rewriting it costs a cache-write of the whole suffix", state)
-		}
+
+	tr := Trigger{CacheState: CacheStatePreExpiry}
+	if tr.CacheAllows(c, c.CachePhase(tr.PreExpiry())) {
+		t.Error("cache_state pre_expiry permitted a turn at nominal expiry. That state exists for a " +
+			"call that reuses the cached prefix, and an entry at expiry may already be gone — " +
+			"firing here pays fresh prefill for the whole conversation with nothing to hit")
 	}
-	// And well past the allowance it IS cold, so the gate opens — or the dead zone would have
-	// swallowed the case the component exists for.
-	cold := &Ctx{CacheAware: true, MaxCachedIdx: -1, CacheTTLMs: ttlMs, IdleMs: ttlMs + ColdMargin.Milliseconds() + 1_000}
-	tr := Trigger{CacheState: CacheStateCold}
-	if !tr.CacheAllows(cold, cold.CachePhase(tr.PreExpiry())) {
-		t.Error("cache_state cold declined an entry well past expiry AND past the skew allowance; " +
-			"the dead zone must be one minute wide, not unbounded")
+
+	// And `any` fires here, because it imposes no cache constraint at all. This is the pair that
+	// keeps the assertion above from passing on a Trigger that simply declines everything.
+	if !(Trigger{CacheState: CacheStateAny}).CacheAllows(c, CachePhaseCold) {
+		t.Error("cache_state any declined a Cold phase; it must impose no cache constraint")
 	}
 }
 
@@ -256,7 +214,7 @@ func TestUnknownIsRefusedWhenAPrefixIsLive(t *testing.T) {
 		t.Fatalf("precondition: phase = %s, want %s — this case is only interesting on Unknown",
 			got, CachePhaseUnknown)
 	}
-	for _, state := range []string{CacheStateCold, CacheStatePreExpiry, CacheStatePreExpiryOrCold} {
+	for _, state := range []string{CacheStatePreExpiry} {
 		tr := Trigger{CacheState: state}
 		if tr.CacheAllows(live, CachePhaseUnknown) {
 			t.Errorf("cache_state %q permitted compaction on an UNKNOWN phase with max_cached_idx=8. "+
@@ -269,7 +227,7 @@ func TestUnknownIsRefusedWhenAPrefixIsLive(t *testing.T) {
 	// one silent failure for another: declining everywhere would make summarize dead on every
 	// deployment whose cache-aware path does not run.
 	noPrefix := &Ctx{CacheAware: false, MaxCachedIdx: -1}
-	for _, state := range []string{CacheStateCold, CacheStatePreExpiry, CacheStatePreExpiryOrCold} {
+	for _, state := range []string{CacheStatePreExpiry} {
 		tr := Trigger{CacheState: state}
 		if !tr.CacheAllows(noPrefix, CachePhaseUnknown) {
 			t.Errorf("cache_state %q refused an UNKNOWN phase with no cached prefix; there is "+
@@ -301,8 +259,8 @@ func TestConcurrentTurnsAreWarmNotUnknown(t *testing.T) {
 			"has the entry's whole lifetime ahead of it, which is the WARMEST state there is — "+
 			"reading it as Unknown is what let the compaction gate open over a live prefix", got, CachePhaseWarm)
 	}
-	tr := Trigger{CacheState: CacheStatePreExpiryOrCold}
+	tr := Trigger{CacheState: CacheStatePreExpiry}
 	if tr.CacheAllows(c, c.CachePhase(tr.PreExpiry())) {
-		t.Error("the shipped cache_state permitted compaction on a prefix cached 0 ms ago")
+		t.Error("cache_state pre_expiry permitted compaction on a prefix cached 0 ms ago")
 	}
 }
