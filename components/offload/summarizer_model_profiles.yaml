@@ -104,6 +104,13 @@ prompts:
 default_role: user # ⛔ never change this to system — see "THE SAFE DIRECTION" above
 
 profiles:
+  # ⚠️ THE ANTHROPIC ROWS BELOW ARE NOT REACHABLE TODAY. cache_aware_summarizer needs a
+  # components.MessagesModel, and only the OpenAI-shaped client implements it — the Anthropic
+  # client keeps `system` top-level and has no role=tool, so the same mapping would be wrong
+  # there and the component declines on it. These rows encode the provider's documented rules so
+  # they are correct when that client gains the capability; until then `claude-opus-5` +
+  # instruction_role: auto does NOT get you a system-role instruction, it gets a decline.
+  #
   # ── Anthropic ───────────────────────────────────────────────────────────────────────
   # Mid-conversation system messages are a documented, GA feature (no beta header): append
   # {"role":"system","content":"..."} to messages[] instead of editing top-level system,
@@ -174,9 +181,9 @@ profiles:
   - match: qwen3
     role: system
     verified: "Qwen3-32B tokenizer_config.json chat_template, 2026-09-15 — `system and not loop.first` renders in place. NOT re-verified on Qwen3.6-27B."
-  - match: qwen/qwen
-    role: system
-    verified: "same template lineage as Qwen3-32B — inherited, not independently checked"
+  # ⛔ NO BROAD `qwen/qwen` FALLBACK. It would catch Qwen1.5/Qwen2 builds whose templates were
+  # never checked, and an entry whose own provenance says "inherited" is unknown in the sense
+  # that matters — so it must fall through to default_role, exactly as gemma does.
 
   # ── Llama 3.x ⭐ VERIFIED SUPPORTED ──────────────────────────────────────────────────
   # The system extraction checks ONLY messages[0]:
@@ -194,9 +201,9 @@ profiles:
   - match: llama-3
     role: system
     verified: "Llama 3.1/3.3 tokenizer_config chat_template, 2026-09-15 — generic role branch renders a non-first system message in place"
-  - match: llama
-    role: system
-    verified: "same template family as Llama 3.1/3.3 — inherited; re-read the template for a 4.x build"
+  # ⛔ NO BROAD `llama` FALLBACK. Substring matching would catch llama-2-7b-chat (whose template
+  # enforces alternation and RAISES), codellama and llama-guard — none of them the 3.x templates
+  # verified above. Only the verified prefix gets `system`.
 
   # ── Families where a trailing system message is WRONG: default to `user` ─────────────
   #

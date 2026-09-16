@@ -153,9 +153,14 @@ var notExportedWhy = map[string]string{
 	// silent: this change deliberately adds ONE family (cg_expand_unresolved_total, the
 	// alertable one) instead of growing the exposition by fourteen series inside a
 	// dashboard PR. Moving any entry out of this map is a small, self-contained change.
-	"LLMTruncated":      "NOT EXPORTED YET — full price, zero result; a real alert candidate",
-	"SummarizeTimeouts": "NOT EXPORTED YET — summarize's fail-open path is invisible in Prometheus",
-	"SummarizeErrors":   "NOT EXPORTED YET — as above",
+	"LLMTruncated":                      "NOT EXPORTED YET — full price, zero result; a real alert candidate",
+	"CacheAwareSummarizerCallTimeoutMs": "configured budget, not a measurement",
+	"CacheAwareSummarizerCalls":         "NOT EXPORTED YET — this method's cost is per compacted turn, so a delta read without it is unattributable",
+	"CacheAwareSummarizerTimeouts":      "NOT EXPORTED YET — its fail-open path is invisible in Prometheus, as summarize's is",
+	"CacheAwareSummarizerErrors":        "NOT EXPORTED YET — as above",
+	"CacheAwareSummarizerDeclined":      "NOT EXPORTED YET — and it is the one that most deserves a series: a declining arm compacts nothing and is byte-identical to `off` on every other field here, so this is the only signal that separates 'ran' from 'no-op'",
+	"SummarizeTimeouts":                 "NOT EXPORTED YET — summarize's fail-open path is invisible in Prometheus",
+	"SummarizeErrors":                   "NOT EXPORTED YET — as above",
 	// The detached summarizer path's health. Listed here rather than exported, following this
 	// block's own rule: adding seven cg_* series inside a PR about the trigger is exactly the
 	// exposition growth it exists to prevent. They ARE on /stats, which is what the review round

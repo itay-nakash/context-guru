@@ -14,6 +14,7 @@ import (
 	"github.com/rossoctl/context-guru/components"
 	"github.com/rossoctl/context-guru/expand"
 	"github.com/rossoctl/context-guru/schema"
+	"github.com/rossoctl/context-guru/store"
 	"gopkg.in/yaml.v3"
 )
 
@@ -22,87 +23,100 @@ func init() { components.Register("cache_aware_summarizer", newCacheAwareSummari
 //go:embed summarizer_model_profiles.yaml
 var summarizerProfilesYAML []byte
 
-// CacheAwareSummarizer summarizes by APPENDING the instruction instead of rebuilding the
-// prompt, so the summarization call reuses the prefix the agent's own turn just cached.
+// CacheAwareSummarizer summarizes by APPENDING the instruction to the conversation instead of
+// rebuilding the prompt, so the summarization call can reuse a prefix the backend already has
+// rather than paying fresh prefill for tokens it has already seen.
 //
-// THE COST IT REMOVES. Every other summarizer here builds a fresh prompt — a system
-// preamble plus "Trajectory: {rendered transcript}" — and sends it as one user message.
-// That prompt shares NO prefix with the conversation it describes, so the call pays full
-// prefill on every token: measured at ~57k prompt tokens per call over 1,372 calls on a
-// 50-task SWE-bench arm. The tokens are the same tokens the agent just sent; only the
-// framing differs, and the framing is what destroys the match.
+// `summarize` builds a fresh prompt — a preamble plus the rendered transcript as one user
+// message — which shares no prefix with the conversation it describes, so that call is a cache
+// miss on every token. This one sends [the conversation, verbatim and in order] + [one appended
+// instruction]. It is the shape prompt-caching guidance prescribes for a fork: reuse the
+// parent's prefix and append only what the fork adds.
 //
-// This component sends [the conversation, verbatim and in order] + [one instruction] and
-// asks for the summary. The rendered prefix up to the last agent message is byte-identical
-// to the request the agent itself just made, so on a prefix-caching backend the summarizer
-// pays prefill only on the appended suffix. It is the shape Anthropic's caching guidance
-// prescribes for exactly this case: "Fork operations must reuse the parent's exact prefix
-// … copy the parent's system, tools and model verbatim, then append fork-specific content
-// at the end."
+// ⛔ HOW FAR THE REUSE ACTUALLY GOES, because the naive reading of the paragraph above is wrong
+// after the first compaction. The prefix that would be hit is one the BACKEND has seen, and the
+// backend only ever receives what this proxy forwards. The agent keeps sending its own full
+// uncompacted history, but from the first triggering turn onward the backend has received
+// COMPACTED requests — so there is no full-history prefix upstream to match, and the shared
+// prefix is roughly the pinned head. Two consequences worth measuring rather than assuming:
+// the saving is largest on the first compaction and smaller afterwards, and sending the full
+// growing history as a side call can evict the compacted prefix the forwarded request needs.
+// Judge this component on the backend's own telemetry (vllm:prefix_cache_hits_total, or
+// usage.cache_read_input_tokens, which the OpenAI client records) — never on a savings percentage.
 //
-// ⚠️ WHAT IT DOES NOT AND CANNOT DO, so the saving is measured rather than assumed:
+// ⛔ IT NEEDS A components.MessagesModel AND DECLINES WITHOUT ONE. A plain Model flattens the
+// conversation to one string, which is exactly the prefix-destroying shape this exists to avoid,
+// so a client without the capability makes the component skip. A silent fallback would report
+// this method's latency while paying the old method's cost. Because a declining arm compacts
+// nothing and is byte-identical to `off` on every other metric, the decline is COUNTED: read
+// CacheAwareSummarizerDeclined before believing any delta from this arm.
 //
-//   - The pipeline never sees the parent's top-level `system` field on Anthropic-shaped
-//     traffic (there is no Ctx.System to read), and never sees `tools` on any path. Both
-//     render BEFORE messages, so on that traffic the shared prefix begins after them and
-//     the saving is smaller than the token count suggests. Read the backend's cache-hit
-//     telemetry — vllm:prefix_cache_hits_total, or usage.cache_read_input_tokens — and
-//     believe that, not this comment.
-//   - It needs a components.MessagesModel. A plain Model flattens to one string, which is
-//     precisely the prefix-destroying shape this component exists to avoid, so a client
-//     that cannot send a message array makes the component DECLINE rather than silently
-//     fall back to the expensive path. A silent fallback would report this method's
-//     latency while measuring the old method's cost.
-//
-// Output shape is deliberately identical to summarization_llmd's — [first-N, summary,
-// last-M] with both cuts turn-aligned — so the two can be A/B'd as one variable: where
-// the summarization REQUEST was built, and nothing else.
+// Span selection, kept-verbatim repair and orphan repair all come from summarize_pairing.go —
+// the same functions `summarize` uses, not a second implementation. A tool exchange is atomic
+// and both boundaries must respect that; a private copy of the invariant would be a second
+// place for it to drift, and the drift would surface as an exception-rate difference blamed on
+// the method under test.
 type CacheAwareSummarizer struct {
-	keepFirstTurns  int
-	keepLastTurns   int
-	instructionRole bschemas.ChatMessageRole
-	// roleAuto records that the role should be resolved per model from the profile
-	// registry rather than pinned, so an unresolvable model falls to the safe default.
-	roleAuto    bool
-	modelID     string
-	profiles    *summarizerProfiles
-	minTokens   int
-	modelSource string
-	modelClient components.Model
-	trigger     components.Trigger
-	mode        markerMode
+	keepLastTurns     int
+	instructionRole   bschemas.ChatMessageRole
+	roleAuto          bool
+	explicitSystem    bool
+	modelID           string
+	profilesPath      string
+	profiles          *summarizerProfiles
+	minTokens         int
+	resummarizeTokens int
+	modelSource       string
+	modelClient       components.Model
+	trigger           components.Trigger
+	mode              markerMode
+	// overrideProfiles caches the on-disk registry after the first successful read.
+	overrideProfiles atomic.Value
 }
 
 type cacheAwareSummarizerConfig struct {
-	// KeepFirstTurns / KeepLastTurns pin messages verbatim at each end; the span between
-	// them is what the summary replaces. Both cuts are turn-aligned (see alignHeadToTurn),
-	// because a tool result whose call was summarized away is a provider 400.
-	KeepFirstTurns int `yaml:"keep_first_turns"`
-	KeepLastTurns  int `yaml:"keep_last_turns"`
-	// InstructionRole is where the appended instruction goes: auto (default, resolved per
-	// model from the profile registry) | system | user.
+	// KeepLastTurns is how many trailing messages stay verbatim; the span between the pinned
+	// head and them is what the summary replaces. The head is summarizeSpan's, so it is not a
+	// knob here — see that function for why it is 1 and when it drops to 0.
+	KeepLastTurns int `yaml:"keep_last_turns"`
+	// InstructionRole is where the appended instruction goes: auto (resolved per model from the
+	// profile registry) | system | user.
 	//
-	// ⛔ `system` is the correct OPERATOR channel where it exists — it is non-spoofable,
-	// and a trailing user turn on a long trajectory reads to the model as more trajectory.
-	// But it is not universally accepted, and the two failure modes are not equally
-	// visible: Anthropic returns a 400, while a chat template that drops or hoists the
-	// message fails SILENTLY — the model continues the task and the arm records that
-	// continuation as its summary. Hence auto, and hence a `user` default.
+	// ⛔ The two failure modes are not equally visible. A provider that rejects a trailing
+	// system message returns a 400. A chat template that DROPS or HOISTS it fails silently: the
+	// model continues the task and its next turn is recorded as the summary. Hence auto, hence a
+	// `user` default, and hence the construction-time refusal of an explicit `system` for a model
+	// the registry has not verified.
 	InstructionRole string `yaml:"instruction_role"`
-	// ModelID is the served model id used to resolve `auto`. Leave it unset and auto falls
-	// to the registry's default_role, which is `user`.
+	// ModelID is the served model id that `auto` resolves against. Without it `auto` falls to the
+	// registry's default_role.
 	ModelID string `yaml:"model_id"`
 	// ProfilesPath overrides the embedded registry with a file on disk, so a deployment can
-	// promote a model it has verified itself without rebuilding.
-	ProfilesPath string             `yaml:"profiles_path"`
-	MinTokens    int                `yaml:"min_tokens"`
-	MarkerMode   string             `yaml:"marker_mode"` // full (default) | summary | off
-	Model        modelConfig        `yaml:"model"`
-	Trigger      components.Trigger `yaml:"trigger"`
+	// promote a model it verified itself without rebuilding.
+	//
+	// ⚠️ Read LAZILY and NON-FATALLY, falling back to the embedded registry and counting the
+	// fallback. Reading it at construction made this the only component whose config could not be
+	// swept by the settings form's perturbation test — every declared string field is set to a
+	// sentinel and the document must still build, which an os.ReadFile of a sentinel path cannot.
+	ProfilesPath string `yaml:"profiles_path"`
+	MinTokens    int    `yaml:"min_tokens"`
+	// ResummarizeTokens: once a summary exists, REUSE it — no model call, and the spliced message
+	// stays byte-identical so the forwarded prefix is stable — until the untouched tail since that
+	// checkpoint grows past this many tokens. 0 = re-summarize every eligible turn.
+	//
+	// ⛔ Not optional for a component named for cache reuse. Without a checkpoint every triggering
+	// turn re-derives a different summary, so the FORWARDED request's prefix changes at the head
+	// on every turn and the request carrying the agent's answer never gets a hit past it — the
+	// component would invalidate the cache it exists to protect, and pay a synchronous model call
+	// per turn to do it.
+	ResummarizeTokens int                `yaml:"resummarize_tokens"`
+	MarkerMode        string             `yaml:"marker_mode"` // full (default) | summary | off
+	Model             modelConfig        `yaml:"model"`
+	Trigger           components.Trigger `yaml:"trigger"`
 }
 
-// summarizerProfiles is summarizer_model_profiles.yaml. See that file for the research
-// behind every entry and for how to verify a model before promoting it.
+// summarizerProfiles is summarizer_model_profiles.yaml; see that file for the provenance of
+// every entry and for how to verify a model before promoting it.
 type summarizerProfiles struct {
 	Prompts struct {
 		System string `yaml:"system"`
@@ -116,31 +130,31 @@ type summarizerProfiles struct {
 	} `yaml:"profiles"`
 }
 
-// roleFor resolves the appended instruction's role for a model id. The FIRST substring
-// match wins, so specific ids must precede family prefixes in the file. An unmatched or
-// empty id falls to default_role, which the file pins to `user` — the safe direction,
-// because every template and every provider accepts a user turn.
-func (p *summarizerProfiles) roleFor(modelID string) (bschemas.ChatMessageRole, string) {
+// roleFor resolves the appended instruction's role for a model id, and reports whether the
+// answer came from a PROFILE or from the default. The first substring match wins, so specific
+// ids precede family prefixes in the file. matched=false means nothing in the registry covers
+// this model, which is the state an explicit `system` is refused for.
+func (p *summarizerProfiles) roleFor(modelID string) (role bschemas.ChatMessageRole, matched bool) {
 	id := strings.ToLower(strings.TrimSpace(modelID))
 	if id != "" {
 		for _, e := range p.Profiles {
 			if e.Match != "" && strings.Contains(id, strings.ToLower(e.Match)) {
 				if strings.EqualFold(e.Role, "system") {
-					return bschemas.ChatMessageRoleSystem, e.Verified
+					return bschemas.ChatMessageRoleSystem, true
 				}
-				return bschemas.ChatMessageRoleUser, e.Verified
+				return bschemas.ChatMessageRoleUser, true
 			}
 		}
 	}
 	if strings.EqualFold(p.DefaultRole, "system") {
-		return bschemas.ChatMessageRoleSystem, "registry default_role"
+		return bschemas.ChatMessageRoleSystem, false
 	}
-	return bschemas.ChatMessageRoleUser, "registry default_role (no profile matched)"
+	return bschemas.ChatMessageRoleUser, false
 }
 
-// prompt returns the instruction text for a role. The two differ by more than tone: the
-// user variant has to establish in TEXT that it is an operator instruction and that the
-// task must not be continued, because the system channel is what carries that for free.
+// prompt returns the instruction text for a role. The two differ by more than tone: the user
+// variant has to establish in TEXT that this is an operator instruction and that the task must
+// not be continued, because the system channel carries both for free.
 func (p *summarizerProfiles) prompt(role bschemas.ChatMessageRole) string {
 	if role == bschemas.ChatMessageRoleSystem && strings.TrimSpace(p.Prompts.System) != "" {
 		return p.Prompts.System
@@ -157,101 +171,149 @@ func loadSummarizerProfiles(raw []byte) (*summarizerProfiles, error) {
 	if err := yaml.Unmarshal(raw, &p); err != nil {
 		return nil, err
 	}
-	// Refused rather than defaulted: an empty user prompt would append a blank instruction
-	// and the model would simply continue the conversation, which scores as a summary.
+	// Refused rather than defaulted: an empty user prompt would append a blank instruction and
+	// the model would simply continue the conversation, which then scores as a summary.
 	if strings.TrimSpace(p.Prompts.User) == "" {
 		return nil, errNoSummarizerPrompt
 	}
 	return &p, nil
 }
 
-// defaultCacheAwareTimeout matches summarize's ceiling: one call over most of the
-// transcript, so the budget must cover queue wait plus a large prefill plus generation.
-// It is lower-RISK than summarize's on a caching backend — the prefill is the part the
-// cache absorbs — but the queue term is unchanged, and the queue is what a loaded server
-// actually charges.
+// resolveProfiles returns the on-disk override when profiles_path is set and readable, else the
+// embedded registry. A read or parse failure is non-fatal and COUNTED — silently running on the
+// embedded registry while an operator believes their override is live is exactly the kind of
+// invisible divergence this component's counters exist to prevent.
+func (s *CacheAwareSummarizer) resolveProfiles() *summarizerProfiles {
+	if s.profilesPath == "" {
+		return s.profiles
+	}
+	if p, ok := s.overrideProfiles.Load().(*summarizerProfiles); ok && p != nil {
+		return p
+	}
+	b, err := os.ReadFile(s.profilesPath)
+	if err == nil {
+		if p, perr := loadSummarizerProfiles(b); perr == nil {
+			s.overrideProfiles.Store(p)
+			return p
+		}
+	}
+	atomic.AddInt64(&cacheAwareProfileFallbacks, 1)
+	s.overrideProfiles.Store(s.profiles)
+	return s.profiles
+}
+
+// defaultCacheAwareTimeout matches summarize's ceiling: one call over most of the transcript, so
+// the budget must cover server queue wait plus a large prefill plus generation.
 const defaultCacheAwareTimeout = 300 * time.Second
 
 var cacheAwareTimeout = resolveTimeoutEnv("CONTEXT_GURU_CACHE_AWARE_SUMMARIZER_TIMEOUT",
 	resolveTimeoutEnv("CONTEXT_GURU_SUMMARIZE_TIMEOUT", defaultCacheAwareTimeout))
 
-// Counters. Calls is reported for the same reason summarization_llmd reports it: this
-// method's cost is per compacted turn, and a reward or latency delta read without it is
-// unattributable. Declined is its own counter because the two decline reasons — no
-// message-array client, and a resolved role the backend rejected — call for opposite
-// fixes, and `reverted` cannot tell them apart.
+// Counters. Calls is reported because this method's cost is per compacted turn, so a reward or
+// latency delta read without it is unattributable. The rest each name ONE failure, because they
+// call for different fixes and `reverted` cannot tell them apart.
 var (
-	cacheAwareCalls    int64
-	cacheAwareTimeouts int64
-	cacheAwareErrors   int64
-	cacheAwareDeclined int64
+	cacheAwareCalls            int64
+	cacheAwareTimeouts         int64
+	cacheAwareErrors           int64
+	cacheAwareDeclined         int64
+	cacheAwareEmpty            int64
+	cacheAwareRefusedStash     int64
+	cacheAwareProfileFallbacks int64
+	cacheAwareUnverifiedSystem int64
 )
 
 func CacheAwareSummarizerCalls() int64    { return atomic.LoadInt64(&cacheAwareCalls) }
 func CacheAwareSummarizerTimeouts() int64 { return atomic.LoadInt64(&cacheAwareTimeouts) }
 func CacheAwareSummarizerErrors() int64   { return atomic.LoadInt64(&cacheAwareErrors) }
 
-// CacheAwareSummarizerDeclined counts turns that reached the model step and stopped
-// because no MessagesModel was available. Non-zero means this arm is NOT measuring
-// cache-reuse compaction — it is measuring `off` — which is the one failure that looks
-// like a clean run.
+// CacheAwareSummarizerDeclined counts turns that reached the model step and stopped because no
+// components.MessagesModel was available. That is the ONLY reason it counts — a role the backend
+// rejects returns an error and lands in Errors, not here. Non-zero means this arm is not
+// measuring cache-reuse compaction; it is measuring `off`.
 func CacheAwareSummarizerDeclined() int64 { return atomic.LoadInt64(&cacheAwareDeclined) }
+
+// CacheAwareSummarizerEmpty counts calls that were PAID FOR and returned nothing usable. It is
+// the signature of the silent failure the profile registry guards against: an instruction the
+// template dropped or hoisted, so the model answered the conversation instead of the request.
+func CacheAwareSummarizerEmpty() int64 { return atomic.LoadInt64(&cacheAwareEmpty) }
+
+// CacheAwareSummarizerRefusedStash counts summaries abandoned because the store would not accept
+// the span. The splice is skipped rather than completed, because a marker promising a span the
+// store never took is a lossy Offload advertising reversibility it does not have.
+func CacheAwareSummarizerRefusedStash() int64 { return atomic.LoadInt64(&cacheAwareRefusedStash) }
+
+// CacheAwareSummarizerProfileFallbacks counts turns that fell back to the embedded registry
+// because profiles_path was unreadable or unparseable.
+func CacheAwareSummarizerProfileFallbacks() int64 {
+	return atomic.LoadInt64(&cacheAwareProfileFallbacks)
+}
+
+// CacheAwareSummarizerUnverifiedSystem counts turns declined because instruction_role was pinned
+// to `system` for a model no registry profile marks as accepting a trailing system message.
+// Non-zero means the arm is configured for a silent failure and is refusing to take it.
+func CacheAwareSummarizerUnverifiedSystem() int64 {
+	return atomic.LoadInt64(&cacheAwareUnverifiedSystem)
+}
 
 func CacheAwareSummarizerCallTimeout() time.Duration { return cacheAwareTimeout }
 
 func init() {
 	components.RegisterFields("cache_aware_summarizer", cacheAwareSummarizerConfig{}, append([]components.Field{
-		{Key: "keep_first_turns", Type: components.FieldInt, Default: 1, Min: 0,
-			Hint: "Messages kept verbatim at the head, before the summarized span. Both cuts are " +
-				"aligned to turn boundaries, so alignment may keep more than asked — never less."},
 		{Key: "keep_last_turns", Type: components.FieldInt, Default: 10, Min: 0,
-			Hint: "Messages kept verbatim at the tail. 10 is the one tail size measured to win on " +
-				"agentic traffic: 3 loses on the turn term, 20 on the per-turn term."},
+			Hint: "Messages kept verbatim at the tail. The default matches summarize's tuned tail " +
+				"so the two are comparable; it is a chosen starting point, not a measured optimum."},
 		{Key: "instruction_role", Type: components.FieldEnum, Default: "auto",
 			Options: []string{"auto", "system", "user"},
-			Hint: "Where the appended summarization instruction goes. auto resolves per model from " +
-				"the embedded registry and needs model_id; without it auto falls to user. Do not " +
-				"hand-set system for an unverified model: a provider returns a clean 400, but a " +
-				"chat template that DROPS or HOISTS the message fails silently and the model's " +
-				"next turn is recorded as the summary."},
+			Hint: "Where the appended instruction goes. auto resolves per model from the embedded " +
+				"registry and needs model_id. An explicit `system` for a model the registry has " +
+				"not verified is REFUSED at construction: a provider returns a clean 400, but a " +
+				"chat template that drops or hoists the message fails silently."},
 		{Key: "model_id", Type: components.FieldString,
 			Hint: "The served model id that instruction_role: auto resolves against."},
 		{Key: "profiles_path", Type: components.FieldString,
-			Hint: "Overrides the embedded model registry with a file on disk, so a deployment can " +
-				"promote a model it has verified itself without rebuilding."},
+			Hint: "Overrides the embedded model registry with a file on disk. Read lazily; an " +
+				"unreadable path falls back to the embedded registry and increments " +
+				"cache_aware_summarizer_profile_fallbacks."},
 		{Key: "min_tokens", Type: components.FieldInt, Default: 500, Min: 1,
 			Hint: "Smallest span worth one model call."},
+		{Key: "resummarize_tokens", Type: components.FieldInt, Default: 6000, Min: 0,
+			Hint: "Reuse the existing summary with no model call until the tail since that " +
+				"checkpoint grows past this many tokens. 0 = re-summarize every eligible turn, " +
+				"which changes the forwarded prefix every turn and forfeits the cache stability " +
+				"this component exists for."},
 		markerModeField(),
 	}, append(modelFields("model"), components.TriggerFields("trigger")...)...))
 }
 
 func newCacheAwareSummarizer(raw []byte) (components.Component, error) {
 	cfg := cacheAwareSummarizerConfig{
-		KeepFirstTurns: 1, KeepLastTurns: 10, MinTokens: 500, InstructionRole: "auto",
+		KeepLastTurns: 10, MinTokens: 500, ResummarizeTokens: 6000, InstructionRole: "auto",
 	}
-	if len(raw) > 0 {
-		if err := yaml.Unmarshal(raw, &cfg); err != nil {
-			return nil, err
-		}
+	if err := components.Decode(raw, &cfg); err != nil {
+		return nil, err
 	}
-	if cfg.KeepFirstTurns < 0 || cfg.KeepLastTurns < 0 {
-		return nil, errors.New("cache_aware_summarizer: keep_first_turns and keep_last_turns must be >= 0")
+	if cfg.KeepLastTurns < 0 {
+		return nil, errors.New("cache_aware_summarizer: keep_last_turns must be >= 0")
 	}
-	profileSrc := summarizerProfilesYAML
-	if p := strings.TrimSpace(cfg.ProfilesPath); p != "" {
-		b, err := readProfilesFile(p)
-		if err != nil {
-			return nil, err
-		}
-		profileSrc = b
+	// Validated here as well as declared: the settings form clamps Min, a hand-written YAML file
+	// does not, and min_tokens: 0 silently disables the gate.
+	if cfg.MinTokens < 1 {
+		return nil, errors.New("cache_aware_summarizer: min_tokens must be >= 1")
 	}
-	profiles, err := loadSummarizerProfiles(profileSrc)
+	if cfg.ResummarizeTokens < 0 {
+		return nil, errors.New("cache_aware_summarizer: resummarize_tokens must be >= 0")
+	}
+	if err := cfg.Trigger.Validate("cache_aware_summarizer"); err != nil {
+		return nil, err
+	}
+	profiles, err := loadSummarizerProfiles(summarizerProfilesYAML)
 	if err != nil {
 		return nil, err
 	}
 	c := &CacheAwareSummarizer{
-		keepFirstTurns: cfg.KeepFirstTurns, keepLastTurns: cfg.KeepLastTurns,
-		modelID: cfg.ModelID, profiles: profiles, minTokens: cfg.MinTokens,
+		keepLastTurns: cfg.KeepLastTurns, modelID: cfg.ModelID, profilesPath: cfg.ProfilesPath,
+		profiles: profiles, minTokens: cfg.MinTokens, resummarizeTokens: cfg.ResummarizeTokens,
 		modelSource: cfg.Model.Source, modelClient: cfg.Model.Client(),
 		trigger: cfg.Trigger, mode: parseMarkerMode(cfg.MarkerMode),
 	}
@@ -259,64 +321,72 @@ func newCacheAwareSummarizer(raw []byte) (components.Component, error) {
 	case "", "auto":
 		c.roleAuto = true
 		c.instructionRole, _ = profiles.roleFor(cfg.ModelID)
-	case "system":
-		c.instructionRole = bschemas.ChatMessageRoleSystem
 	case "user":
 		c.instructionRole = bschemas.ChatMessageRoleUser
+	case "system":
+		// Pinned, and checked at the point of USE rather than here. The dangerous combination is
+		// an explicit `system` for a model no profile marks as accepting a trailing system
+		// message: a template that drops or hoists it leaves the model answering the conversation,
+		// and that answer is recorded as the summary. Offload DECLINES on that combination — the
+		// same discipline as the missing-MessagesModel case, and for the same reason: loud refusal
+		// beats an invisible wrong answer.
+		//
+		// ⚠️ Not a construction error, deliberately. Every declared enum option must still build a
+		// valid document (config/form_test.go sets each one in turn), so refusing here would make
+		// this the one component whose config surface the settings form cannot sweep — exactly the
+		// trap profiles_path fell into.
+		c.explicitSystem = true
+		c.instructionRole = bschemas.ChatMessageRoleSystem
 	default:
 		return nil, errors.New("cache_aware_summarizer: instruction_role must be auto|system|user, got " +
 			cfg.InstructionRole)
 	}
-	// An explicit model id that resolves to system while the id itself is unknown to the
-	// registry is the silent-failure case this component is most exposed to, so it is
-	// refused at construction rather than discovered mid-run.
-	if c.instructionRole == bschemas.ChatMessageRoleSystem && cfg.ModelID != "" {
-		if _, why := profiles.roleFor(cfg.ModelID); strings.HasPrefix(why, "registry default_role") &&
-			c.roleAuto {
-			c.instructionRole = bschemas.ChatMessageRoleUser
-		}
-	}
 	return c, nil
-}
-
-// readProfilesFile loads an on-disk override of the embedded registry, so a deployment can
-// promote a model it has verified without rebuilding the binary.
-func readProfilesFile(path string) ([]byte, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil, errors.New("cache_aware_summarizer: profiles_path " + path + ": " + err.Error())
-	}
-	return b, nil
 }
 
 func (CacheAwareSummarizer) Name() string                 { return "cache_aware_summarizer" }
 func (CacheAwareSummarizer) Enabled(*components.Ctx) bool { return true }
 func (*CacheAwareSummarizer) NeedsModel() bool            { return true }
 
-// InstructionRole exposes the resolved role so /stats and a probe can report which channel
-// this arm actually used. Two arms differing only in this field is the intended A/B, and it
-// cannot be read from the config alone once `auto` is in play.
+// InstructionRole exposes the resolved role so /stats and a probe can report which channel this
+// arm actually used; with `auto` it cannot be read off the config alone.
 func (s *CacheAwareSummarizer) InstructionRole() string { return string(s.instructionRole) }
 
-// Offload rewrites the transcript to [first-N, summary, last-M]. The summary comes from a
-// model call built as [the whole conversation] + [instruction], which is the entire point.
+// Offload rewrites the transcript to [head, summary, tail]. The summary comes from a model call
+// built as [the whole conversation] + [instruction], and is REUSED across turns until the tail
+// grows past resummarize_tokens — without that reuse the forwarded prefix would change every
+// turn and this component would invalidate the cache it exists to protect.
 func (s *CacheAwareSummarizer) Offload(req *bschemas.BifrostChatRequest, rep *components.Report, c *components.Ctx) ([]string, error) {
 	msgs := req.Input
-	if !s.trigger.Fires(req, c) {
+	headCount, start, end := summarizeSpan(msgs, s.keepLastTurns)
+	if !s.trigger.Fires(req, c) || end <= start {
 		rep.Skipped = true
 		return nil, nil
 	}
-	head, tail, ok := s.boundaries(msgs)
-	if !ok {
+	// Never summarize away content the agent just expanded: that is the bounce loop cg:keep:
+	// exists to prevent, and it falsifies expand.RestoredInPlace's "present above" pointer.
+	if trimmed := trimSpanForKeptVerbatim(msgs, start, end, func(content string) bool {
+		_, skip := skipReduce(c, content)
+		return skip
+	}); trimmed <= start {
 		rep.Skipped = true
 		return nil, nil
+	} else {
+		end = trimmed
 	}
-	span := msgs[head:tail]
+
+	// Reuse first: no model call, and the spliced bytes stay identical so the forwarded prefix is
+	// stable. This is the path that makes the component's name true.
+	if out, keys, ok := s.tryReuse(c, msgs, headCount, start, end); ok {
+		req.Input = out
+		return keys, nil
+	}
+
+	span := msgs[start:end]
 	if schema.MessagesTokens(&bschemas.BifrostChatRequest{Input: span}) < s.minTokens {
 		rep.Skipped = true
 		return nil, nil
 	}
-
 	model := s.modelClient
 	if model == nil {
 		model = c.Model.For(s.modelSource)
@@ -325,27 +395,49 @@ func (s *CacheAwareSummarizer) Offload(req *bschemas.BifrostChatRequest, rep *co
 		rep.Skipped = true
 		return nil, nil
 	}
-	// THE CAPABILITY GATE, and it must decline rather than degrade. A plain Model flattens
-	// the conversation into one string, which is the prefix-destroying shape this component
-	// exists to avoid — falling back to it would report cache-reuse latency while paying
-	// the rebuild cost, i.e. measure the opposite of the hypothesis.
 	mm, okModel := model.(components.MessagesModel)
 	if !okModel {
-		// No Report.Gate on this tree, so the counter is the only channel — which is why
-		// CacheAwareSummarizerDeclined is exported and why report.py must read it: a
-		// declining arm is indistinguishable from `off` on every other metric.
 		atomic.AddInt64(&cacheAwareDeclined, 1)
+		rep.Gate("no_messages_model")
+		rep.Skipped = true
+		return nil, nil
+	}
+	// Don't pay for a summary the store cannot keep: a full marker promises the span is
+	// restorable, so check the room before the call rather than discovering it after.
+	mode := effectiveMode(c, s.mode)
+	// Size the room check against the payload we would actually stash, not a token guess.
+	spanJSON, jerr := json.Marshal(span)
+	if jerr != nil {
+		return nil, jerr
+	}
+	if mode == markerFull && !store.StashRoom(c.Store, len(spanJSON)) {
+		atomic.AddInt64(&cacheAwareRefusedStash, 1)
+		rep.Gate("no_stash_room")
 		rep.Skipped = true
 		return nil, nil
 	}
 
+	profiles := s.resolveProfiles()
+	// The pinned-system guard, at the point of use. Declining costs this arm its compaction;
+	// proceeding would risk a summary that is really the model's next turn, which no metric here
+	// would reveal.
+	if s.explicitSystem {
+		if r, matched := profiles.roleFor(s.modelID); !matched || r != bschemas.ChatMessageRoleSystem {
+			atomic.AddInt64(&cacheAwareUnverifiedSystem, 1)
+			rep.Gate("unverified_system_role")
+			rep.Skipped = true
+			return nil, nil
+		}
+	}
 	role := s.instructionRole
+	if s.roleAuto && s.profilesPath != "" {
+		role, _ = profiles.roleFor(s.modelID)
+	}
 	instruction := bschemas.ChatMessage{Role: role}
-	schema.SetMessageText(&instruction, s.profiles.prompt(role))
+	schema.SetMessageText(&instruction, profiles.prompt(role))
 
-	// [conversation..., instruction]. The conversation is passed UNMODIFIED and in order:
-	// any edit here changes the rendered prefix and forfeits the cache hit that is the
-	// whole reason this component exists.
+	// [conversation..., instruction]. The conversation is passed UNMODIFIED and in order: any
+	// edit changes the rendered prefix and forfeits the match this component exists for.
 	ask := make([]bschemas.ChatMessage, 0, len(msgs)+1)
 	ask = append(ask, msgs...)
 	ask = append(ask, instruction)
@@ -353,9 +445,9 @@ func (s *CacheAwareSummarizer) Offload(req *bschemas.BifrostChatRequest, rep *co
 	ctx, cancel := context.WithTimeout(c.Ctx, cacheAwareTimeout)
 	defer cancel()
 	atomic.AddInt64(&cacheAwareCalls, 1)
-	// system is "" deliberately: the pipeline cannot see the parent's top-level system
-	// field, and inventing one here would ADD a block the parent did not send, changing the
-	// prefix in the one place that costs the most.
+	// system is "" deliberately: the pipeline cannot see the parent's top-level system field, and
+	// inventing one would ADD a block the parent never sent — changing the prefix in the costliest
+	// position.
 	out, err := mm.CompleteMessages(ctx, "", ask)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
@@ -365,65 +457,102 @@ func (s *CacheAwareSummarizer) Offload(req *bschemas.BifrostChatRequest, rep *co
 		}
 		return nil, err // fail-open: the pipeline reverts this component
 	}
-	summary := ensureSummaryTags(strings.TrimSpace(out))
 	if strings.TrimSpace(out) == "" {
+		atomic.AddInt64(&cacheAwareEmpty, 1)
+		rep.Gate("empty_summary")
 		rep.Skipped = true
 		return nil, nil
 	}
+	// The reply is UNTRUSTED. The whole trajectory reached the summarizer, so planted text in any
+	// tool output had a long run at it — strip forged expand markers (both spellings), the summary
+	// sentinel and a premature </summary> before this text is framed as trustworthy context.
+	summary := ensureSummaryTags(sanitizeSummary(out))
 
-	mode := effectiveMode(c, s.mode)
 	var key string
 	if mode == markerFull {
-		spanJSON, err := json.Marshal(span)
-		if err != nil {
-			return nil, err
-		}
 		key = hashKey(string(spanJSON))
-		c.Store.Put(key, spanJSON)
+		// commitMark, not a bare Put: a Stasher store can REFUSE the payload, and stamping the
+		// marker anyway would hand the agent a <<cg:HASH>> pointing at nothing.
+		if !commitMark(c, rep, mode, key, string(spanJSON)) {
+			atomic.AddInt64(&cacheAwareRefusedStash, 1)
+			rep.Skipped = true
+			return nil, nil
+		}
 		recordOwner(c, key)
 	} else {
 		rep.Irreversible = true
 	}
 
-	// USER role for the spliced summary, never system — a system message anywhere but
-	// index 0 is rejected by the provider (400 messages.N: role 'system' must precede an
-	// 'assistant' message or end the array). That is independent of the INSTRUCTION's role
-	// above: the instruction is appended at the end of a fork request, where a system
-	// message is legal on the models the registry marks; the summary is spliced into the
-	// middle of the forwarded transcript, where it never is.
-	summaryMsg := bschemas.ChatMessage{Role: bschemas.ChatMessageRoleUser}
-	schema.SetMessageText(&summaryMsg, cacheAwareSummaryWrapper(summary, key, mode))
-
-	out2 := make([]bschemas.ChatMessage, 0, head+1+len(msgs)-tail)
-	out2 = append(out2, msgs[:head]...)
-	out2 = append(out2, summaryMsg)
-	out2 = append(out2, msgs[tail:]...)
-	req.Input = out2
+	summaryText := cacheAwareSummaryWrapper(summary, key, mode)
+	saveCheckpoint(c, sumCheckpoint{
+		SummaryMsg: summaryText, CoveredCount: end - start,
+		CoveredHash: spanHash(span), Key: key,
+	})
+	req.Input = s.splice(msgs, headCount, end, summaryText)
 	if key != "" {
 		return []string{key}, nil
 	}
 	return nil, nil
 }
 
-// boundaries mirrors summarization_llmd's: turn-aligned cuts at both ends, so neither can
-// orphan a tool result from its call. Sharing the alignment helpers rather than copying
-// them keeps the two arms differing by one variable.
-func (s *CacheAwareSummarizer) boundaries(msgs []bschemas.ChatMessage) (head, tail int, ok bool) {
-	n := len(msgs)
-	head = s.keepFirstTurns
-	if head > n {
-		head = n
+// splice builds [head, summary, tail] and repairs orphans already present in the inbound
+// request — alignment stops this component from CREATING one, but not from forwarding one.
+func (s *CacheAwareSummarizer) splice(msgs []bschemas.ChatMessage, headCount, boundary int, summaryText string) []bschemas.ChatMessage {
+	// USER role, never system: a system message anywhere but index 0 is rejected by the provider.
+	// That is independent of the INSTRUCTION's role, which is appended at the end of a fork
+	// request where a trailing system message is legal on the models the registry marks.
+	summaryMsg := bschemas.ChatMessage{Role: bschemas.ChatMessageRoleUser}
+	schema.SetMessageText(&summaryMsg, summaryText)
+	out := make([]bschemas.ChatMessage, 0, headCount+1+len(msgs)-boundary)
+	out = append(out, msgs[:headCount]...)
+	out = append(out, summaryMsg)
+	out = append(out, msgs[boundary:]...)
+	if repaired, n := dropOrphanedToolResults(out); n > 0 {
+		out = repaired
 	}
-	tail = n - s.keepLastTurns
-	if tail < 0 {
-		tail = 0
+	return out
+}
+
+// tryReuse re-emits the existing summary when the covered prefix is byte-unchanged and the tail
+// since that checkpoint is still under resummarize_tokens. No model call, and the summary message
+// is identical to the one the previous turn forwarded — which is the property that keeps the
+// provider's prefix alive past the head.
+//
+// ⚠️ The checkpoint namespace is shared with `summarize` (store.SumPrefix + session). Safe
+// because both components restructure the message list and therefore must run ALONE, so they
+// cannot both be in one pipeline; and CoveredHash rejects a checkpoint whose covered prefix does
+// not match, so a preset switch mid-session degrades to a fresh summary rather than reusing a
+// stale one.
+func (s *CacheAwareSummarizer) tryReuse(c *components.Ctx, msgs []bschemas.ChatMessage, headCount, start, end int) ([]bschemas.ChatMessage, []string, bool) {
+	if s.resummarizeTokens <= 0 {
+		return nil, nil, false
 	}
-	head = alignHeadToTurn(msgs, head)
-	tail = alignTailToTurn(msgs, tail, head)
-	if tail <= head {
-		return 0, 0, false
+	cp, ok := loadCheckpoint(c)
+	if !ok || cp.CoveredCount <= 0 || cp.SummaryMsg == "" {
+		return nil, nil, false
 	}
-	return head, tail, true
+	boundary := start + cp.CoveredCount
+	if boundary > end {
+		return nil, nil, false
+	}
+	covered := msgs[start:boundary]
+	if spanHash(covered) != cp.CoveredHash {
+		return nil, nil, false
+	}
+	if schema.MessagesTokens(&bschemas.BifrostChatRequest{Input: msgs[boundary:end]}) >= s.resummarizeTokens {
+		return nil, nil, false
+	}
+	// Refresh the stashed original so expand keeps resolving it.
+	if cp.Key != "" {
+		if b, err := json.Marshal(covered); err == nil {
+			c.Store.Put(cp.Key, b)
+		}
+	}
+	out := s.splice(msgs, headCount, boundary, cp.SummaryMsg)
+	if cp.Key != "" {
+		return out, []string{cp.Key}, true
+	}
+	return out, nil, true
 }
 
 func cacheAwareSummaryWrapper(summary, key string, mode markerMode) string {

@@ -3,11 +3,13 @@ package offload
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/components"
+	"github.com/rossoctl/context-guru/expand"
 	"github.com/rossoctl/context-guru/schema"
 	"github.com/rossoctl/context-guru/store"
 )
@@ -50,18 +52,29 @@ func caMsg(role bschemas.ChatMessageRole, text string) bschemas.ChatMessage {
 	return m
 }
 
+// caToolPair returns an assistant message that REQUESTS a tool call plus its result, so the
+// fixture exercises pairing rather than a flat list of text messages: without real ToolCalls /
+// ToolCallID the atomicity logic and the wire mapping's tool branches are never reached.
+func caToolPair(text, tool, args, id, out string) []bschemas.ChatMessage {
+	a := caMsg(bschemas.ChatMessageRoleAssistant, text)
+	a.ChatAssistantMessage = &bschemas.ChatAssistantMessage{
+		ToolCalls: []bschemas.ChatAssistantMessageToolCall{
+			{ID: &id, Function: bschemas.ChatAssistantMessageToolCallFunction{Name: &tool, Arguments: args}},
+		},
+	}
+	t := caMsg(bschemas.ChatMessageRoleTool, out)
+	t.ChatToolMessage = &bschemas.ChatToolMessage{ToolCallID: &id}
+	return []bschemas.ChatMessage{a, t}
+}
+
 func caFixture() []bschemas.ChatMessage {
 	body := strings.Repeat("ran pytest tests/test_handler.py, 3 failures in src/mod/file.py\n", 40)
-	return []bschemas.ChatMessage{
-		caMsg(bschemas.ChatMessageRoleUser, "TASK: fix the failing handler"),
-		caMsg(bschemas.ChatMessageRoleAssistant, "reading the file"),
-		caMsg(bschemas.ChatMessageRoleTool, body),
-		caMsg(bschemas.ChatMessageRoleAssistant, "running the tests"),
-		caMsg(bschemas.ChatMessageRoleTool, body),
-		caMsg(bschemas.ChatMessageRoleAssistant, "patching"),
-		caMsg(bschemas.ChatMessageRoleTool, body),
-		caMsg(bschemas.ChatMessageRoleUser, "keep going"),
-	}
+	out := []bschemas.ChatMessage{caMsg(bschemas.ChatMessageRoleUser, "TASK: fix the failing handler")}
+	out = append(out, caToolPair("reading the file", "read", `{"p":"a"}`, "call_1", body)...)
+	out = append(out, caToolPair("running the tests", "bash", `{"c":"pytest"}`, "call_2", body)...)
+	out = append(out, caToolPair("patching", "edit", `{"p":"a"}`, "call_3", body)...)
+	out = append(out, caMsg(bschemas.ChatMessageRoleUser, "keep going"))
+	return out
 }
 
 func newCacheAware(t *testing.T, yamlCfg string) *CacheAwareSummarizer {
@@ -82,7 +95,11 @@ func caCtx() *components.Ctx {
 		Store: store.NewMemory(store.Options{}), MaxCachedIdx: -1}
 }
 
-const caBaseCfg = "keep_first_turns: 1\nkeep_last_turns: 2\nmin_tokens: 10\nmarker_mode: \"off\"\n" +
+// marker_mode is FULL on purpose: "off" would leave the whole reversibility path — Marshal,
+// commitMark, hashKey, recordOwner, expand.Marker — uncovered, which is where the store-refusal
+// defect lived. resummarize_tokens: 0 keeps the single-turn cases deterministic; the reuse path
+// has its own test.
+const caBaseCfg = "keep_last_turns: 2\nmin_tokens: 10\nresummarize_tokens: 0\n" +
 	"trigger:\n  min_messages: 4\n  min_request_tokens: 10\n"
 
 // ⭐ THE PROPERTY THE WHOLE DESIGN RESTS ON.
@@ -160,7 +177,12 @@ func TestCacheAwareInstructionRoleAndPromptVariant(t *testing.T) {
 		{"system", bschemas.ChatMessageRoleSystem, "Summarize the conversation above."},
 		{"user", bschemas.ChatMessageRoleUser, "OPERATOR INSTRUCTION"},
 	} {
-		s := newCacheAware(t, caBaseCfg+"instruction_role: "+tc.role+"\n")
+		// A pinned `system` needs a model the registry VERIFIES, or Offload declines by design.
+		cfg := caBaseCfg + "instruction_role: " + tc.role + "\n"
+		if tc.role == "system" {
+			cfg += "model_id: Qwen/Qwen3.6-27B\n"
+		}
+		s := newCacheAware(t, cfg)
 		model := &capturingModel{out: "<summary>ok</summary>"}
 		s.modelClient = model
 		req := &bschemas.BifrostChatRequest{Input: caFixture()}
@@ -270,5 +292,143 @@ func TestCacheAwareSpliceShape(t *testing.T) {
 	}
 	if !strings.Contains(schema.MessageText(req.Input[1]), "cache-aware summary") {
 		t.Errorf("summary message missing its wrapper: %.80q", schema.MessageText(req.Input[1]))
+	}
+}
+
+// ⭐ BLOCKER: without a checkpoint this component invalidates the cache it is named for. The
+// spliced summary must be REUSED byte-identically on a later turn — no second model call — until
+// the untouched tail passes resummarize_tokens. A fresh summary every turn would change the
+// FORWARDED request's prefix at the head on every turn, so the request carrying the agent's own
+// answer would never get a hit past it.
+func TestCacheAwareReusesItsSummaryRatherThanReDerivingIt(t *testing.T) {
+	s := newCacheAware(t, "keep_last_turns: 2\nmin_tokens: 10\nresummarize_tokens: 100000\n"+
+		"instruction_role: user\ntrigger:\n  min_messages: 4\n  min_request_tokens: 10\n")
+	model := &capturingModel{out: "<summary>explored the handler.</summary>"}
+	s.modelClient = model
+	c := caCtx()
+
+	in := caFixture()
+	t1 := &bschemas.BifrostChatRequest{Input: append([]bschemas.ChatMessage(nil), in...)}
+	var r1 components.Report
+	if _, err := s.Offload(t1, &r1, c); err != nil {
+		t.Fatalf("turn 1: %v", err)
+	}
+	if r1.Skipped {
+		t.Fatal("turn 1 declined; the fixture must act or this proves nothing")
+	}
+	first := schema.MessageText(t1.Input[1])
+
+	// Turn 2: the same session, one more exchange appended.
+	in2 := append(append([]bschemas.ChatMessage(nil), in...),
+		caMsg(bschemas.ChatMessageRoleAssistant, "one more step"))
+	t2 := &bschemas.BifrostChatRequest{Input: in2}
+	var r2 components.Report
+	if _, err := s.Offload(t2, &r2, c); err != nil {
+		t.Fatalf("turn 2: %v", err)
+	}
+	if model.calls != 1 {
+		t.Errorf("model called %d times across two turns, want 1 — turn 2 must REUSE the "+
+			"checkpoint, not re-derive a summary", model.calls)
+	}
+	if got := schema.MessageText(t2.Input[1]); got != first {
+		t.Errorf("the spliced summary changed between turns, so the forwarded prefix changed and "+
+			"the cache this component exists to protect was invalidated:\n turn1: %.60q\n turn2: %.60q",
+			first, got)
+	}
+}
+
+// ⛔ A pinned `system` for a model no profile verifies is the silent-failure path the registry
+// exists to prevent — a template that drops or hoists the instruction leaves the model answering
+// the conversation, and that answer is recorded as the summary. It must DECLINE, visibly.
+func TestCacheAwareDeclinesAPinnedSystemRoleForAnUnverifiedModel(t *testing.T) {
+	before := CacheAwareSummarizerUnverifiedSystem()
+	s := newCacheAware(t, caBaseCfg+"instruction_role: system\nmodel_id: some-model-nobody-checked\n")
+	model := &capturingModel{out: "<summary>ok</summary>"}
+	s.modelClient = model
+	req := &bschemas.BifrostChatRequest{Input: caFixture()}
+	var rep components.Report
+	if _, err := s.Offload(req, &rep, caCtx()); err != nil {
+		t.Fatalf("Offload: %v", err)
+	}
+	if !rep.Skipped {
+		t.Error("did not decline a pinned system role for an unverified model")
+	}
+	if model.calls != 0 {
+		t.Errorf("paid for %d model call(s) on a configuration that cannot be trusted", model.calls)
+	}
+	if CacheAwareSummarizerUnverifiedSystem() != before+1 {
+		t.Error("the decline was not counted, so it would be invisible at /stats")
+	}
+}
+
+// Fail-open: a model error must revert the component and leave the transcript untouched, with the
+// failure counted so an arm cannot look healthy while compacting nothing.
+type caErroringModel struct{}
+
+func (caErroringModel) Complete(context.Context, string) (string, error) { return "", nil }
+func (caErroringModel) CompleteMessages(context.Context, string, []bschemas.ChatMessage) (string, error) {
+	return "", errors.New("upstream refused")
+}
+
+func TestCacheAwareFailsOpenAndCountsTheError(t *testing.T) {
+	before := CacheAwareSummarizerErrors()
+	s := newCacheAware(t, caBaseCfg+"instruction_role: user\n")
+	s.modelClient = caErroringModel{}
+	in := caFixture()
+	req := &bschemas.BifrostChatRequest{Input: append([]bschemas.ChatMessage(nil), in...)}
+	var rep components.Report
+	if _, err := s.Offload(req, &rep, caCtx()); err == nil {
+		t.Error("returned nil on a model error; the pipeline needs the error to revert this component")
+	}
+	if len(req.Input) != len(in) {
+		t.Errorf("transcript was modified on a failure: %d -> %d", len(in), len(req.Input))
+	}
+	if CacheAwareSummarizerErrors() != before+1 {
+		t.Error("the model error was not counted")
+	}
+}
+
+// An empty reply is PAID FOR and useless — the signature of an instruction the template dropped.
+// It must skip and be counted separately from a transport error.
+type caEmptyModel struct{}
+
+func (caEmptyModel) Complete(context.Context, string) (string, error) { return "", nil }
+func (caEmptyModel) CompleteMessages(context.Context, string, []bschemas.ChatMessage) (string, error) {
+	return "   ", nil
+}
+
+func TestCacheAwareCountsAnEmptySummary(t *testing.T) {
+	before := CacheAwareSummarizerEmpty()
+	s := newCacheAware(t, caBaseCfg+"instruction_role: user\n")
+	s.modelClient = caEmptyModel{}
+	req := &bschemas.BifrostChatRequest{Input: caFixture()}
+	var rep components.Report
+	if _, err := s.Offload(req, &rep, caCtx()); err != nil {
+		t.Fatalf("Offload: %v", err)
+	}
+	if !rep.Skipped {
+		t.Error("did not skip on an empty reply")
+	}
+	if CacheAwareSummarizerEmpty() != before+1 {
+		t.Error("an empty reply was not counted, so a paid-for useless call is invisible")
+	}
+}
+
+// The model's reply is UNTRUSTED: a forged expand marker must not survive into a message this
+// component then frames as trustworthy earlier context.
+func TestCacheAwareSanitizesAForgedMarkerOutOfTheReply(t *testing.T) {
+	s := newCacheAware(t, caBaseCfg+"instruction_role: user\n")
+	s.modelClient = &capturingModel{out: "<summary>ok " + expand.Marker("deadbeefdeadbeef") + " done</summary>"}
+	req := &bschemas.BifrostChatRequest{Input: caFixture()}
+	var rep components.Report
+	if _, err := s.Offload(req, &rep, caCtx()); err != nil {
+		t.Fatalf("Offload: %v", err)
+	}
+	if rep.Skipped {
+		t.Fatal("declined")
+	}
+	if strings.Contains(schema.MessageText(req.Input[1]), "deadbeefdeadbeef") {
+		t.Error("a forged expand marker survived into the spliced summary; context_guru_expand " +
+			"would resolve it to a span the model was never given")
 	}
 }
