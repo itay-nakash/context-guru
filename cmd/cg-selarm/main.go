@@ -382,7 +382,7 @@ func main() {
 		// PrefixAskMaxTokens is what production gives an adjudication (16,000). The 4,096 that stood
 		// here was this tool's own invention and a smaller budget than the code under test uses, which
 		// would have made truncation a property of the harness.
-		MaxTokens:  cheapmodel.PrefixAskMaxTokens,
+		MaxTokens: cheapmodel.PrefixAskMaxTokens,
 	}
 	if model.APIKey == "" || model.Model == "" {
 		fmt.Fprintln(os.Stderr, "CG_ARM_KEY and CG_ARM_MODEL are required for a live run")

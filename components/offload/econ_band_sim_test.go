@@ -1,8 +1,8 @@
 package offload
 
 import (
-	"context"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -455,10 +455,10 @@ func TestApprovalEstimatorDynamics(t *testing.T) {
 			t.Logf("  %-56s %6s %6s %12s %9s %s", "estimator", "asks", "pass%", "removedTok", "finalAppr", "shutdownAfterAsk")
 			ests := []approvalEstimator{
 				&shippedEstimator{},
-				newShrunk(300000, 1.0),                        // no floor, bucketed
-				newShrunkOpts(300000, 1.0, true, true),        // + floor  -> isolates the floor
-				newShrunkOpts(300000, 1.0, true, false),       // + floor, pooled -> isolates bucketing
-				newShrunkOpts(1000000, 1.0, true, true),       // is more shrinkage still better?
+				newShrunk(300000, 1.0),                  // no floor, bucketed
+				newShrunkOpts(300000, 1.0, true, true),  // + floor  -> isolates the floor
+				newShrunkOpts(300000, 1.0, true, false), // + floor, pooled -> isolates bucketing
+				newShrunkOpts(1000000, 1.0, true, true), // is more shrinkage still better?
 			}
 			for _, est := range ests {
 				var asks, evals, removed int
