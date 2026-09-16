@@ -1,6 +1,6 @@
 ---
 name: cache-strategy-picker
-description: Show which named cache strategy is in effect and switch between them - `split`, `5-min-ping` (the default, which spends the caller's own credential on idle pings) and `1-hour-head`. Use when the user asks which cache strategy is running, to change it, to turn idle keep-alive pings on or off, to stop spending money between turns, or to keep the cache warm.
+description: Show which named cache strategy is in effect and switch between them - `none`, `5-min-ping` (the default, which spends the caller's own credential on idle pings) and `1-hour-head`. Use when the user asks which cache strategy is running, to change it, to turn idle keep-alive pings on or off, to stop spending money between turns, or to keep the cache warm.
 allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/scripts/settings.py)
 ---
 
@@ -39,9 +39,10 @@ that one alone (port 8787, preset `cache`, cache strategy `5-min-ping`).
 "${CLAUDE_PLUGIN_ROOT}/scripts/settings.py" strategy show --port <port>
 ```
 
-- `strategy=split` with `file=(none)` — no config for this port. That is not a fault or an
-  "unknown": it is exactly what `split` means, and it is what a `--cache-strategy split` install
-  leaves behind.
+- `strategy=none` with `file=(none)` — no config for this port. That is not a fault or an
+  "unknown": it is exactly what `none` means, and it is what a `--cache-strategy none` install
+  leaves behind. The retired spelling `split` still resolves to it, so an older install reports
+  the current name rather than a name that no longer describes anything.
 - `strategy=(unnamed)` — armed before strategies had names (a config written by the older
   `/context-guru:keepalive`). Re-setting it with a name is safe and is what gives them the word
   back.
@@ -66,9 +67,9 @@ curl -fsS --max-time 3 "http://127.0.0.1:<port>/api/stats" | \
 
 | Name | What it does | Cost |
 |---|---|---|
-| `split` | the preset's `cachesplit` alone. Written as the ABSENCE of a config | free — no model calls |
-| `5-min-ping` | split **+** an idle ping at 280 s (just under the provider's 5-minute TTL), ≤2 per idle span, ≥20k-token prefix, ≤$0.25/ping | **spends the caller's own credential between turns** |
-| `1-hour-head` | split **+** the 1-hour tier on the `tools`/`system` breakpoints, **only on >=50k-token prefixes** | free, and often $0 of benefit — see below |
+| `none` | no cache strategy: the preset runs and nothing else. Written as the ABSENCE of a config | free — no model calls |
+| `5-min-ping` | an idle ping at 280 s (just under the provider's 5-minute TTL), ≤2 per idle span, ≥20k-token prefix, ≤$0.25/ping | **spends the caller's own credential between turns** |
+| `1-hour-head` | the 1-hour tier on the `tools`/`system` breakpoints, **only on >=50k-token prefixes** | free, and often $0 of benefit — see below |
 
 **Say the cost before switching TO `5-min-ping`, once, in one line.** It spends the caller's money
 (or usage-limit budget) while nobody is at the keyboard, and it applies to every session routed
@@ -120,7 +121,7 @@ recorded and takes effect at the next session's start.
 
 - `keepalive_ping_usd` is what the pings spent; `keepalive_saved_usd` is the prefix re-creations
   they avoided; `keepalive_net_usd` is the difference. **A negative net means the strategy is
-  costing more than it saves on this traffic** — say that plainly and offer `split`, rather than
+  costing more than it saves on this traffic** — say that plainly and offer `none`, rather than
   reporting a ping count as if it were a win.
 - The status line (`/context-guru:statusline`) shows `ka Np` once pings have actually happened —
   never before, and it never triggers one itself.

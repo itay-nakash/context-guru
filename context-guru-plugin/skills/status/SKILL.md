@@ -79,10 +79,13 @@ These caveats are not hedging; each one is a way a confident reading would be wr
 - **A fresh install shows almost nothing, and that is expected.** The cache effect appears on
   the *second and later* turns of a session; the first request of a session is nearly always
   cold — measured, 1,105 of 1,127 session starts.
-- **Check whether this is even a git repository, before offering any other explanation.** The
-  split works on the environment snapshot Claude Code appends to its system prompt, and outside a
-  git repo there is no snapshot to split — `cachesplit` reports `verdict: skipped`, `mutated: 0`,
-  and the saving is exactly zero. This is the common case for a casual first trial, and telling
+- **Check the preset before explaining a zero prefix-cache saving at all.** The default preset is
+  `off`, which runs no components, so `cachesplit` is not in the pipeline and a zero saving there is
+  the expected state rather than a symptom. Only if a preset containing `cachesplit` was chosen does
+  the next paragraph apply.
+- **Then check whether this is even a git repository.** The split works on the environment snapshot
+  Claude Code appends to its system prompt, and outside a git repo there is no snapshot to split —
+  `cachesplit` reports `verdict: skipped`, `mutated: 0`, and the saving is exactly zero. This is the common case for a casual first trial, and telling
   such a user "the cache warms up on later turns" is true in general and wrong here:
 
   ```bash

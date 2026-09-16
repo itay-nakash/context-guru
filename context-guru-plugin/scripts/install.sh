@@ -247,7 +247,7 @@ route_confirm_command() {
   [ -n "$R_BASEURL" ] && c="$c --base-url $(shq "$R_BASEURL")"
   [ -n "$R_ONCONFLICT" ] && c="$c --on-conflict $(shq "$R_ONCONFLICT")"
   # The strategy was missing, and it is the one decision that spends the user's money. Dropped from
-  # here, a user who asked for `split` ("install it, but do not spend my quota") ran the printed
+  # here, a user who asked for `none` ("install it, but do not spend my quota") ran the printed
   # command, the strategy re-resolved to the `5-min-ping` default, and the install reported
   # `result=routed` — success, while doing the opposite of what was asked. The consent artefact has
   # to name the whole proposition the user was asked to agree to, not just the interception.
@@ -430,7 +430,7 @@ route_main() {
 
   # A typo'd strategy name used to reach step 4b, where `settings.py strategy set` correctly refused it
   # with exit 2 — and `|| true` plus a catch-all `*)` turned that refusal into `strategy_warning=`.
-  # No config file written means `split`, so `--cache-strategy 5-minute-ping` installed a DIFFERENT
+  # No config file written means `none`, so `--cache-strategy 5-minute-ping` installed a DIFFERENT
   # mechanism from the one named and reported `result=routed`. That is the same shape as the unknown
   # flag this script refuses eighty lines down: a dropped decision that reports success. Checked here,
   # before a binary is downloaded, against the one machine-readable list of names.

@@ -1,6 +1,6 @@
 ---
 name: install
-description: Install a local context-guru proxy and route this project's Claude Code sessions through it, so long sessions stop paying to re-create the prompt cache. Use when the user asks to install, set up, enable, try or start context-guru, or to route Claude Code through it. Accepts --global to route every project on the machine instead of just this one, --cache-strategy <split|5-min-ping|1-hour-head> to override the default cache strategy, and --attach <url> to point at a proxy that already exists (a gateway or shared pod) instead of starting one.
+description: Install a local context-guru proxy and route this project's Claude Code sessions through it, so long sessions stop paying to re-create the prompt cache. Use when the user asks to install, set up, enable, try or start context-guru, or to route Claude Code through it. Accepts --global to route every project on the machine instead of just this one, --cache-strategy <none|5-min-ping|1-hour-head> to override the default cache strategy, and --attach <url> to point at a proxy that already exists (a gateway or shared pod) instead of starting one.
 ---
 
 # Install context-guru for Claude Code

@@ -130,12 +130,17 @@ That installs a statically-linked binary (no Go, no C compiler), routes **this p
 default, starts the proxy on demand and lets it exit when idle. `/context-guru:uninstall` undoes it,
 restoring any base URL it replaced.
 
-**Keep-alive is on by default**, as `cache_strategy=5-min-ping`: a ping just under the provider's
-5-minute cache TTL, so the prompt cache is still warm when you come back to an idle session. It
-**spends a little of your own quota** while nobody is at the keyboard — that is the mechanism, not a
-side effect. `/context-guru:cache-strategy-picker` names the alternatives and what each costs.
-Separately, `--preset cache` is the compaction pipeline: prompt-cache handling only, nothing dropped
-from your requests.
+**With the defaults, it does not touch your context.** The preset is `off` — no components run at
+all, so your requests are forwarded byte-for-byte. Nothing is dropped, no markers are written, no
+tool is injected and no model is called; not as a promise, but because there is nothing in the
+pipeline to do any of it. Pick a preset like `house` or `housellm` and you are opting into context
+editing, which is a deliberate step rather than a default.
+
+**What it does do is keep your prompt cache warm.** `cache_strategy=5-min-ping` pings just under the
+provider's 5-minute cache TTL so the cache is still live when you come back to an idle session. That
+**spends a little of your own quota** while nobody is at the keyboard — the mechanism, not a side
+effect — and it is the one part of this plugin with a measured net saving.
+`/context-guru:cache-strategy-picker` names the alternatives and what each costs; `none` turns it off.
 
 **If it ever breaks and Claude cannot fix it:** `~/.local/state/context-guru/context-guru-reset` undoes
 the routing from a plain terminal — no working session, no proxy, no network. A dead proxy fails every

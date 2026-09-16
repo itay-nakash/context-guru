@@ -17,7 +17,7 @@ The mapping, so nothing is lost in the rename:
 | what this skill used to do | the strategy name now |
 |---|---|
 | keep-alive ON, with the default tuning | `5-min-ping` — **and it is the install default** |
-| keep-alive OFF | `split` (the prompt-cache split alone, no pings, no spend) |
+| keep-alive OFF | `none` (the preset runs alone, no pings, no spend) |
 
 Two things worth carrying over verbatim, because they are the reason this mechanism is
 deliberate rather than automatic:
@@ -26,6 +26,6 @@ deliberate rather than automatic:
   nobody is at the keyboard, for every session routed through the proxy. It is the default because
   holding the cache warm across an idle gap is what most people install this for — not because it
   is free. `keepalive_net_usd` is what says whether it is paying for itself on real traffic; a
-  negative net means say so and offer `split`.
+  negative net means say so and offer `none`.
 - **Nothing on a render path may ever arm it.** The status line draws on every keystroke; if a
   display hook could turn this on, it would double as an unbounded traffic generator.
