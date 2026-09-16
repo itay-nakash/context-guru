@@ -510,6 +510,91 @@ The last two are raised **exclusively**, and reading them as one number loses th
 the batch cannot repay the price of *asking* about it. `prefix_rewrite_repaid` is the matching event when
 the trigger does fire — and it says the batch was worth asking about, never that a saving was banked.
 
+## Enabling it on real traffic
+
+This component has never been measured on a workload independent of the one its thresholds were tuned
+on. Every corpus behind `min_inventory`, `min_tokens`, `min_later_turns` and the 6%-vs-58% live-kept
+curve is LOCA-derived (see [LOCA iteration 028](../experiments/loca/iter028/results.md#5-why-the-iteration-was-stopped-the-workload-cannot-price-this-feature)),
+and on LOCA the cache arithmetic came out at 11.0 against a break-even of 11.5 — with `S` and `T` both
+structurally thin there. So the first real deployment is a **measurement**, not a rollout, and it should
+be configured to be readable rather than aggressive.
+
+### The two keys that turn it on
+
+```yaml
+extract_llm_sweep:
+  econ_trigger: true    # without this it will almost never fire under load
+  evidence: true        # co-reference index into the inventory line
+```
+
+`econ_trigger` is not optional in practice. The pre-expiry trigger fires on an idle clock, and any
+concurrently-served deployment keeps refreshing the cached prefix — `not_in_pre_expiry_window` was
+286/286 requests on LOCA, 378/378 on iteration 024 and 18/18 on iteration 022. Ship without
+`econ_trigger` and you will measure a component that never ran.
+
+Leave `reward_premium` at its default of 1 for a first deployment. Above 1 it asserts a removed token is
+worth more than the cache read it saves, which is a belief about headroom value — and the one instrument
+that could have priced it (the harness's own context clearing) has never fired, so nothing has tested it.
+
+### Whether it *can* pay, before asking whether it did
+
+The gate is `S·T > 11.5·W`: mass removed, times turns remaining, against the cache-write it forces. Three
+properties of the traffic decide it, and all three are readable before enabling anything:
+
+| property | why it matters | what to look for |
+|---|---|---|
+| **candidates per request** | the model's judgement is a function of how many it compares; below `min_inventory` the component declines without asking | ≥10 settled, undecided tool outputs over `min_tokens`. LOCA supplied **1.5** and asked on 5% of requests |
+| **session length** | `T` is turns *remaining*; a short session has nothing for a removal to pay back over | long-running sessions. LOCA's 10–30 step tasks are close to the worst case |
+| **output size** | the rewrite cost is set by the **shallowest** removal, so mass per invalidation is what clears the break-even | large tool results, ideally several at similar depth. `min_tokens: 100` excluded 1,008 candidate-instances on LOCA |
+
+A deployment that cannot supply ~10 candidates per request will produce a component that declines
+correctly and teaches you nothing. Check that first.
+
+### What to read, in order
+
+**1. Did it fire at all?** `acted`, `sweep_prefix_cache_read_ok`, `sweep_adjudicated`. If `acted` is 0,
+read the gates before touching a threshold — `not_in_pre_expiry_window` (needs `econ_trigger`),
+`sweep_below_min_pressure`, `sweep_inventory_below_min`. Note that `sweep_inventory_below_min` is raised
+with `GateN(len(cands))`, so it counts **candidates, not requests**; dividing it by request count is a
+misreading.
+
+**2. Did it lose anything?** This is the question that decides whether to continue.
+
+- `expand_unresolved_missing` **must stay 0.** It is the direct measure of a removal the agent then asked
+  for and could not get back. It was 0 → 0 across iteration 028's arms with 105 drops performed.
+- `sweep_drop_refused_obligation` — the model tried to remove an output it had just said was still
+  needed. The removal did not happen, but a non-zero rate means the contract is not holding.
+- `sweep_quote_fabricated` — the model cited transcript text that is not in the transcript. On this
+  design it is the only signal that says the model is inventing.
+
+**3. Did it pay?** Not from the dollar total — on LOCA the pass-level dollar difference was +4% and
+paired per environment it was `+$0.077 ± $0.80`, i.e. noise. Compute the ratio instead, which is exact:
+
+```
+saved_tokens                     (component counter)
+incremental cache creation       (arm with the sweep − arm without, or before/after enabling)
+ratio = saved_tokens / incremental_cache_creation
+```
+
+**A ratio above 11.5 means the removals paid for the cache writes they forced; below it they did not.**
+11.5 is `(2.50 − 0.20) / 0.20` — the incremental price of writing a token to cache rather than reading
+it. LOCA realised **11.0**. Because the rewrite span is fixed by the shallowest removal, the lever is
+**drops per invalidation** (`sweep_dropped / acted`; LOCA managed 8.75), not the number of asks.
+
+**4. Is the ask worth its own price?** `econ_ask_not_repaid` and `prefix_rewrite_not_repaid` are raised
+**exclusively** and must not be summed: the first means the batch cannot repay the price of *asking*, the
+second that the cache-write does not earn itself back.
+
+### A first deployment that answers the question
+
+- **Enable for a subset of sessions**, ideally long-running ones with large tool results — that is where
+  `S·T` is largest and where a null result would be informative rather than structural.
+- **Record the ratio, not the dollar delta.** The ratio is arithmetic on counters and needs no control
+  arm; the dollar delta needs one and is dominated by step-count variance.
+- **Treat any non-zero `expand_unresolved_missing` as a stop**, not as a rate to tune.
+- **Expect it to decline often.** On LOCA it asked 15 times in 286 requests and that was correct
+  behaviour, not a fault. `sweep_kept_everything` is likewise a deliberate keep-all.
+
 ## What is not measured
 
 Three questions the design records rather than answers. The full argument, including which
