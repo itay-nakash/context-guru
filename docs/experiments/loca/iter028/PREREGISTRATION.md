@@ -34,8 +34,8 @@ shipped gate functions (`TestEconGatePassRateByBand`), as a fraction of **all** 
 
 | window | `min_inventory` | qualify | ask/all | dead tokens behind asks |
 |---|---|---|---|---|
-| **64k** | **10** | 44% | **36%** | 5.54M |
-| 128k | 10 | 44% | 43% | 7.40M |
+| 64k | 10 | 44% | 36% | 5.54M |
+| **128k** | **10** | 44% | **43%** | **7.40M** |
 
 Iteration 024's measured rate was **28%** (626 asks / 2,207 requests). So 64k with the fixed estimator
 exceeds the only firing rate that ever produced reward, **without** the 1,000,000-token window that
@@ -48,7 +48,7 @@ approved **1.24%**. `min_inventory: 10` feeds the ledger the evidence that keeps
 **Pre-flight gate — do not start the run unless all four hold.** Iterations 008–024 all ran outside
 their declared band without anyone noticing, and iteration 026 spent a full run to discover a zero.
 
-1. `model_info_unresolved` = 0 and the resolved `ctx_window` printed as **64000**.
+1. `model_info_unresolved` = 0 and the resolved `ctx_window` printed as **128000**.
 2. A probe pass shows `sweep_offered` > 0 and at least **five** asks across the pass.
 3. `sweep_inventory_below_min` and `sweep_offered` both reported, so the half declined by the floor is
    visible rather than inferred.
@@ -61,7 +61,8 @@ their declared band without anyone noticing, and iteration 026 spent a full run 
 Arms B and C from an earlier draft of this file are **deferred**, at the operator's direction: nothing
 is worth comparing until the fixed configuration is shown to beat doing nothing.
 
-Both arms share: pipeline = `housellm` + `summarize`, **no `collapse`**; band **64k**;
+Both arms share: pipeline = `housellm` + `summarize`, **no `collapse`**; band **128k** (see the
+amendment below; this file originally said 64k);
 `min_inventory: 10`; `min_later_turns: 3`; `keep_recheck_turns: 4`; the same 15 environments and the
 same 5 seeds iteration 024 used.
 
@@ -188,6 +189,53 @@ runs. That does not reconcile with $40.89 per 15-task pass ($2.73/task), and whi
 refers to is unresolved. The measured per-pass figure is used here and the discrepancy is flagged rather
 than settled quietly.
 
+## 5b. Amendment, 2026-09-16: the band is 128k and the pruner's horizon is credited
+
+Written after the pre-flight and before any reward pass. No seed had been run, so nothing is
+retro-fitted.
+
+**Why the band moved.** At a 64k declared band this agent's requests EXCEED the window — 73,550
+tokens measured, pressures of 1.15 and 3.62 — and `turnsRemainingAfter` returns 0 whenever
+`reqAfter >= window`. That zeroes three terms at once: the econ trigger's `have`, the horizon credit,
+and `selectAffordableDrops`' `S·T`. The measured cascade:
+
+| stage | |
+|---|---|
+| candidates offered | 349 |
+| declined by `min_inventory: 10` | **339** |
+| asks made | **1** |
+| verdicts | 10 |
+| drops the model authorised | 9 |
+| **pruned as unaffordable** | **8** |
+| **tokens removed, whole pass** | **105** |
+
+105 tokens against a baseline that removes 0 is not separable at any n, so the pre-flight did the job
+it exists for: it cost ~$14 instead of $430.
+
+At 128k the same 73,550-token request sits at 0.57 pressure with a real horizon. **This is also the
+first mechanical account of iteration 024**: its window resolved to 1,000,000, so that request sat at
+7% pressure and every term was healthy. Its result was not bought by a permissive gate in any
+transferable sense — it was bought by a window large enough for the arithmetic to be non-degenerate.
+Every gate tightening since iteration 024 was treating a symptom.
+
+**Why the pruner changed.** `prefixRewriteNet` measured its horizon on the pre-removal request while
+deciding whether to remove — #232's defect, in the one place #232 did not reach. The comment
+justifying the asymmetry attributed it to coref's calibration, but coref never calls that function;
+it reaches the break-even through `prefixRewritePays`, which passes `creditRemoval` false. So the
+asymmetry protected nothing and cost 8 of 9 drops.
+
+**What neither change claims.** 128k is not large enough for every request — the 3.62-pressure
+request is still 1.81 at 128k and still degenerates. What improves is the common case, and a large
+enough removal can now bring a heavy request back under the window rather than being refused for
+having no runway.
+
+**Also noted, and not yet a plan.** The pre-flight's two environments both scored 0.0000 where
+iteration 024 scores them at 0.89 and 0.47. With 105 tokens removed and
+`expand_unresolved_missing = 0`, the arm cannot be the cause; that is an environment failure in the
+chosen pair and it means the pre-flight says nothing about task outcomes. A pre-flight condition for
+"the tasks actually ran" is missing and should be added before the pair is trusted for anything but a
+firing check.
+
 ## 6. What this cannot settle
 
 - **Nothing about the 46% of mass that is `opaque`.** No offline instrument can score it (iteration 027
@@ -198,6 +246,14 @@ than settled quietly.
   proxy cannot see positional or non-identifier reuse at all.
 - **Generalisation past LOCA.** One benchmark, and really 12 non-degenerate environments. SWE-bench is
   deliberately out of scope until a configuration beats the baseline here.
+- **Whether the agent model matters.** Everything here runs the agent on `aws/claude-sonnet-5`, and the
+  sweep necessarily uses the same model — its ask carries only an inventory and reads the outputs from
+  that model's prompt cache, so `source: config` is refused by the component rather than merely
+  discouraged. Running the agent on haiku is therefore a change to BOTH the agent and the adjudicator at
+  once. It is ~3x cheaper per pass and the published table has haiku matching sonnet on live-kept at
+  bulk (58% both, at 1/12 the cost per call), so it is worth one seed on its own — but it risks flooring
+  the accuracy endpoint, since power lives in the 12 non-degenerate environments and a weaker agent
+  pushes more of them to zero. Tracked as the next question after this iteration, not folded into it.
 - **Whether selection quality matters at all.** That was the three-arm question and it is deferred: this
   run asks only whether the fixed configuration beats doing nothing. If it does, the agreement-gated arm
   becomes worth its own iteration; if it does not, that question is moot.
