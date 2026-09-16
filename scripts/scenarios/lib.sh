@@ -212,6 +212,15 @@ scen_sleep() {
 # times wider, and the narrow one closes after one or two file-reading turns. Trap 3 in
 # timely-compact-validation.md is the write-up of a run that was misread for exactly this reason, and it
 # was a mismatch of this kind rather than anything about the design.
+#
+# ⚠️ `fill` IS NOT ONLY THE SPAN'S INPUT, so `?span=` does not make it optional. It also decides which
+# conversations the COVERAGE half counts (`maxBilled(conv) >= fillFrac*window`, compactepisode.go) and
+# it is republished verbatim in the panel's own Assumptions block. So an explicit-span call that omits
+# it still answers with coverage counted against a threshold the arm never ran, and states a fill the
+# run did not use — on the call whose output a reader is told to trust. Pass both.
+#
+# (It does NOT gate episode creation: conversationEpisodes takes only the span, so the episode list
+# itself survives a wrong fill. Coverage and Assumptions are what go wrong, which is quieter.)
 scen_panel() {
   local name=$1 port=$2 span=${3:-} fill=${4:-}
   local q="tenant=all&range=all"

@@ -32,8 +32,14 @@ PORT=4213
 # WARM turn as soon as the transcript passes 0.5 of C. Keeping the sleep would invert the arm's own
 # invariant: t0 would move earlier, the 380s gap would land AFTER t0, and the ttl_expiry turn it
 # produces would put money in cold_credit_usd — which this arm asserts is exactly zero. So the sleep
-# is removed rather than retuned, and the arm is now a more direct test of what it always measured:
-# every credit after t0 priced at the cache-READ rate.
+# is removed rather than retuned.
+#
+# ⚠️ AND REMOVING IT MOVED t0 EARLIER, WHICH IS THE COST OF THE CHANGE. With the gate holding, t0 was
+# pinned to the turn after the sleep and the eight tiny w-turns followed it by construction. Now t0
+# lands on whichever g-turn first crosses 0.5 of C — and the remaining g-turns each read a file IN
+# FULL, so they can consume a narrow span before the warm block starts. Two things answer that: the
+# panel is now told the arm's real fill (see scen_panel), which makes the span 1.00 - 0.5 rather than
+# the 0.10 it defaulted to; and the arrangement is ASSERTED below rather than assumed.
 #
 # resummarize_tokens is 200000 in lib.sh, so the checkpoint is replayed rather than re-summarized on
 # every later turn. That is what keeps t0 unique without a gate holding it back.
@@ -52,8 +58,10 @@ scen_turn "$N" g05 continue "Read e.go in full. List every place usage is attrib
 scen_turn "$N" g06 continue "Read f.go in full. Explain how the boundary is computed."
 scen_turn "$N" g07 continue "Read g.go in full. Explain baselineDeltaUSD and repeatRate."
 
-# No sleep: the fire happens on a warm turn at 0.5 of C. This turn is simply the next warm one — kept
-# because more turns after t0 is what gives the read-rate assertion something to sum.
+# No sleep: the fire happens on a warm turn at 0.5 of C. This turn is simply the next warm one, kept
+# because the read-rate assertion needs turns after t0 to sum over — but note that t0 is now BEFORE
+# this line rather than on it, so how many of the turns below fall inside the span is a property of
+# the run, not of the script. The guard below asserts it instead of trusting it.
 scen_turn "$N" f01 continue "In one sentence, what is the most important invariant in a.go?"
 
 # Warm throughout: every turn within seconds of the last.
@@ -67,7 +75,7 @@ scen_tail "$N" 60
 scen_panel "$N" "$PORT" "" 0.5
 # A tiny span too, so the same rows also produce a CLOSED episode: the settled total is the figure a
 # reader trusts, and an arm that only ever reports an open one cannot check it.
-scen_panel "$N" "$PORT" 0.002
+scen_panel "$N" "$PORT" 0.002 0.5
 
 echo
 echo "=== SCENARIO C: the read rate, hand-derived ==="
@@ -137,8 +145,15 @@ if len(sh) < MIN_WARM:
     raise SystemExit(1)
 # And no single turn inside the span may dominate it, which is the same fault one step earlier: a span
 # that technically contains the warm block but is 90% one file read is not measuring warm turns either.
-biggest = max((r[2] for r in span), default=0)
-total = sum(r[2] for r in span) or 1
+# OVER span[1:], THE SAME POPULATION THE VERDICTS USE. Computing this over the whole span included
+# t0, and t0 can legitimately be the largest row: isFreshSummary also matches `fresh_summary`, the
+# SPLICING turn, which carries a large saved_gross — and its INFERRED fallback exists because rows
+# without `summary_started` are a real shape. On such a run the guard would blame an arrangement fault
+# that is not there and abort a paid run for it, which costs the same as a false pass and teaches the
+# wrong lesson.
+rest = span[1:]
+biggest = max((r[2] for r in rest), default=0)
+total = sum(r[2] for r in rest) or 1
 if biggest > 0.6 * total:
     print()
     print("ARRANGEMENT SUSPECT — one turn is %.0f%% of the span's removed tokens." % (100.0 * biggest / total))
