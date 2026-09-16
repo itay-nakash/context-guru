@@ -11,13 +11,16 @@ the count of environments that come off zero, so that is what this prints.
 It parses the "Per-Group Results" block rather than the per-task lines, because that block is the one
 place LOCA states the environment class next to its accuracy.
 """
+import os
 import re
 import sys
 from pathlib import Path
 
-# Constant zero across all 19 iteration-024 passes. Kept identical to readout028.py's list on purpose:
-# if one is edited and the other is not, the same pass yields two different non-degenerate counts.
-DEGENERATE = {"CanvasArrangeExamS2LEnv", "CanvasListTestS2LEnv", "WoocommerceNewWelcomeS2LEnv"}
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import locaterm
+
+# Shared with readout028.py, so the same pass cannot yield two different non-degenerate counts.
+DEGENERATE = locaterm.DEGENERATE
 
 
 def parse(path: Path) -> list[tuple[str, float, float, float]]:

@@ -21,19 +21,47 @@ THE RULE, from PREREGISTRATION.md section 4, restated here so the two cannot dri
 """
 import json, glob, os, re, sys, math, statistics as st
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import locaterm
+
 H = os.path.expanduser("~/cg-loca")
 FUTILITY = -100.0 / 15          # one task, in accuracy points
 MARGIN = 11.0                   # the preregistered confirmatory margin
 SE1 = 12.3                      # measured one-seed difference SE, accuracy points
 # The three environments solved 0 times in 18 iteration-024 passes. Declared in the preregistration
 # BEFORE this run, so the 12-environment secondary is not a post-hoc subgroup.
-DEGENERATE = {"CanvasArrangeExamS2LEnv", "CanvasListTestS2LEnv", "WoocommerceNewWelcomeS2LEnv"}
+# Shared with perenv028.py via locaterm, because the same pass must not yield two different
+# non-degenerate counts depending on which script read it.
+DEGENERATE = locaterm.DEGENERATE
 
 
 def pass_dir(tag):
-    """The outputs directory for a tag, newest wins if a pass was legitimately re-run."""
-    ds = sorted(glob.glob(os.path.join(H, "outputs", "*%s*" % tag)), key=os.path.getmtime)
-    return ds[-1] if ds else None
+    """The outputs directory for a tag, resolved from THAT PASS'S OWN LOG.
+
+    NOT a glob over outputs/. LOCA names its directory after the TASK CONFIG and the agent model --
+    `inf_claude_api_i024-64k-s1_aws-claude-sonnet-5_CTU_<ts>` -- and it carries no trace of the arm tag.
+    So `outputs/*i028-s1-A*` matches nothing, which is exactly how seed 1's first readout announced "No
+    iteration 028 passes on disk yet" while both passes sat there complete, validated and paid for.
+
+    Globbing the TASK CONFIG name instead would be worse than the bug it fixes: `*i024-64k-s1*` matches
+    every pass ever run on that seed -- baseline and arm A, sonnet and haiku, and iteration 024's own
+    five passes on the same instances -- and a newest-wins tiebreak would then silently hand back
+    whichever pass finished last. Both arms would resolve to the SAME directory and the difference would
+    read as an exact zero, with every counter healthy.
+
+    The pass's own log is the only artifact that ties a tag to a directory, because stage022.sh writes it
+    per tag and LOCA prints the path it saved to. Absent or unparseable, this returns None and the caller
+    reports the pass as missing -- it does not fall back to a guess.
+    """
+    log = os.path.join(H, "i022loca-%s.log" % tag)
+    if not os.path.exists(log):
+        return None
+    with open(log, errors="replace") as fh:
+        m = re.search(r"outputs/([^/\s]+)/tasks/", fh.read())
+    if not m:
+        return None
+    d = os.path.join(H, "outputs", m.group(1))
+    return d if os.path.isdir(d) else None
 
 
 def read_pass(tag):
@@ -112,6 +140,25 @@ def main():
             print("  %-9s accuracy %6.3f  steps %6.1f  cost $%7.2f  | acted %4d  verdicts %4d  saved %8d"
                   % (nm, p["accuracy"] or 0, p["steps"] or 0, p["cost"] or 0,
                      p["acted"], p["adjudicated"], p["saved"]))
+        # THE KILL RATE, PER ARM, BEFORE ANY DIFFERENCE IS READ. Accuracy here is close to
+        # `1 - kill_rate`: across iteration 024's ten passes, 63 of 150 episodes ended on a truncated
+        # response and NONE of them scored, while 94% of survivors did. So a kill-rate gap BETWEEN the
+        # arms is an alternative explanation for any accuracy difference, and iteration 024's arms
+        # differed by 37/75 against 26/75 -- 14.7 points, available with no selection effect at all.
+        eps = {}
+        for nm, tag in (("baseline", "i028-s%d-base" % s), ("arm A", "i028-s%d-A" % s)):
+            eps[nm] = locaterm.episodes(tag)
+            line = locaterm.kill_line(tag, eps[nm])
+            if line:
+                print("  %-9s%s" % (nm, line))
+        if eps.get("baseline") and eps.get("arm A"):
+            kb = len(locaterm.kills(eps["baseline"])[0])
+            ka = len(locaterm.kills(eps["arm A"])[0])
+            if kb != ka:
+                print("    !! KILL-RATE GAP: baseline killed %d, arm A killed %d. That is %+.1f accuracy"
+                      % (kb, ka, 100.0 * (kb - ka) / max(len(eps["baseline"]), 1)) +
+                      " points of headroom that owes nothing to content selection.")
+                print("    !! Read the difference below as confounded, not as an effect.")
         for nm, probs in (("baseline", pb), ("arm A", pa)):
             for x in probs:
                 print("    !! %s: %s" % (nm, x))
