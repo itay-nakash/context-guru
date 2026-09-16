@@ -22,12 +22,32 @@ H="$HOME/cg-loca"
 BIN="${CG_I028_BIN:-$HOME/cg-bin/cg-i028-proxy}"
 PORT="${CG_I028_PORT:-6872}"
 # PINNED HERE, not left to the environment, so the preregistration is auditable in the repo rather than
-# in someone's shell history. Built from the tree at commit a9b8586 with
-# `CGO_ENABLED=1 go build -o ~/cg-bin/cg-i028-proxy ./cmd/context-guru-proxy` on 2026-09-15.
-# DO NOT EDIT once a pass has completed: passes already run used this binary, and changing the pin to
-# match a rebuild is the same as comparing two different programs while every counter still looks healthy.
-EXPECT="${CG_I028_SHA:-b9a69b15e8644bb479bead7e537cf7bf}"
-BAND=64
+# in someone's shell history. Built with
+# `CGO_ENABLED=1 go build -o ~/cg-bin/cg-i028-proxy ./cmd/context-guru-proxy`.
+#
+# DO NOT EDIT once a REWARD pass has completed: those passes used this binary, and changing the pin to
+# match a rebuild compares two different programs while every counter still looks healthy.
+#
+# CHANGED ONCE, before any reward pass, and the record matters. b9a69b15e8644bb479bead7e537cf7bf ran the
+# 128k pre-flight's predecessor at 64k and is superseded by the horizon credit in prefixRewriteNet
+# (prefix_econ.go). No seed had been run under the old hash, so nothing is being invalidated -- only the
+# two pre-flight attempts, both of which are kept on disk with their reasons.
+EXPECT="${CG_I028_SHA:-bc3b53b5320e898490c333e61c28bae9}"
+# 128k, NOT the 64k this iteration started with. Iteration 028's own pre-flight is the reason: at a 64k
+# declared band the agent's requests EXCEED the window -- 73,550 tokens measured, pressures of 1.15 and
+# 3.62 -- and `turnsRemainingAfter` returns 0 whenever reqAfter >= window. That zeroes three terms at
+# once: the econ trigger's `have`, the horizon credit, and selectAffordableDrops' S*T. Observed
+# consequence: 339 of 349 candidates declined by the inventory floor, then 8 of the surviving 9 drops
+# pruned, then 105 tokens removed across 64 requests.
+#
+# At 128k the same 73,550-token request sits at 0.57 pressure with a real horizon. This is also, finally,
+# a mechanical account of iteration 024: its window resolved to 1,000,000, so that request sat at 7% and
+# every term was healthy. Its result was not bought by a permissive gate but by a window large enough for
+# the arithmetic to be non-degenerate.
+#
+# The band sets the declared window AND LOCA's clearing threshold together (stage022.sh), and
+# model-window-128k.json is served on :6980 -- verified HTTP 200 before this was changed.
+BAND=128
 STEP="${1:-readout}"
 
 die() { echo "REFUSING: $*" >&2; exit 1; }

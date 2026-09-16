@@ -20,7 +20,7 @@
 # READ THESE FIRST on each pass, in this order, and stop at the first that fails:
 #   1. model_info_unresolved in st-i022-*.json -- 0, or nothing below means anything (this is what
 #      voided iterations 008-024)
-#   2. the resolved ctx_window in the pass output -- 64000, or the same
+#   2. the resolved ctx_window in the pass output -- 128000, or the same
 #   3. sweep_offered and the ask count -- at least five asks, or the pass is invalid rather than
 #      informative. Iteration 026's answer here was ZERO and it cost a full run to find out.
 #   4. the BASELINE pass's `acted` -- must be 0. If the baseline acted, the arms are not what this file
