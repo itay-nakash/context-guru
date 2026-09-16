@@ -95,7 +95,7 @@ done
 echo
 echo "=== SCENARIO B: all rows ==="
 scen_tail "$N" 60
-scen_panel "$N" "$PORT"
+scen_panel "$N" "$PORT" "" 0.5
 
 echo
 echo "=== SCENARIO B: hand-derived against the panel ==="

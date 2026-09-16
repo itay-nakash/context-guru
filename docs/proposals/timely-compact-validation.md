@@ -568,14 +568,19 @@ check.
 > Kept, not deleted, because the reasoning error is the useful part: "declining costs nothing" was
 > true per turn and false per session, and that is what made a rare trigger look free instead of
 > expensive.
+>
+> Retractions below are marked with a **RETRACTED** prefix rather than `~~strikethrough~~` on purpose:
+> `pymdownx.tilde` is not in `mkdocs.yml`'s `markdown_extensions`, so `~~` renders as literal tildes on
+> any built page. Adding the extension is NOT the fix — it also enables subscripts, and several `~$0.22`
+> / `~80k` figures in these proposals would silently become subscript spans.
 
-**~~The base rate of the event this insures against.~~** Arm A measures the firing rate on a
+**RETRACTED — the base rate of the event this insures against.** Arm A measures the firing rate on a
 *continuously active* session and got zero under the withdrawn default — the one population where a
 cold event cannot occur, because an active agent keeps touching its own cache. That was read as "the
 feature rarely fires, which is fine"; it should have been read as "the gate is declining the turns the
 payback argument says to fire on".
 
-~~The structure is cheap insurance with a rare trigger and a large payout.~~ Declining costs nothing
+**RETRACTED — "the structure is cheap insurance with a rare trigger and a large payout".** Declining costs nothing
 *on that turn* — the component splices nothing and spends nothing — and that is exactly the sentence
 that hid the cost. Over a session, declining means every later turn re-reads a prefix that would have
 been three quarters smaller. Firing costs one summarizer call plus a cache write, and pays that back
@@ -583,10 +588,17 @@ in 2-3 turns. Arm B's **$0.15 per prevented rewrite** of ~115,000 tokens still s
 figure; what changed is that it is no longer the only thing on the credit side.
 
 **What genuinely remains unmeasured** is narrower: how much a *compacted* session saves over its
-remaining turns on natural traffic, which is the 14k-per-turn side of the payback arithmetic rather
-than the rare-event side. `dash/kvcache.go` records the per-request idle gap and
-`coverage.no_episode_cold_usd` still sizes what conversations we did not fire on paid to re-create
-expired prefixes. It needs production data, not new code.
+remaining turns on natural traffic — the 14k-per-turn side of the payback arithmetic rather than the
+rare-event side.
+
+**The panel has no field for that question.** `coverage.no_episode_cold_usd` sizes what conversations
+we did *not* fire on paid to re-create expired prefixes, which is the rare-event side — the question
+this section just retracted. Naming it here would hand a reader the old question's instrument for the
+new question. What the arms measure instead is the credit accumulated over a span *after* a fire
+(`read_credit_usd` per episode), which is the right side of the arithmetic but only over forced
+conditions; the open part is its distribution on natural traffic. That needs either a new coverage
+field or a query over `requests` joined to `request_components` per conversation — not a re-reading of
+an existing one.
 
 **A net over a settled span on natural traffic.** Arm B and arm C both force their conditions. A
 forced span that is cut short shows a loss almost by construction, because t0 pays the model call and

@@ -64,7 +64,7 @@ done
 echo
 echo "=== SCENARIO C: all rows ==="
 scen_tail "$N" 60
-scen_panel "$N" "$PORT"
+scen_panel "$N" "$PORT" "" 0.5
 # A tiny span too, so the same rows also produce a CLOSED episode: the settled total is the figure a
 # reader trusts, and an arm that only ever reports an open one cannot check it.
 scen_panel "$N" "$PORT" 0.002
@@ -109,6 +109,42 @@ print("  net_usd          %.8f" % e.get("net_usd", 0))
 turns = int((e.get("turns") or 0))
 span = rows[t0:t0 + turns] if turns else []
 sh = [r for r in span[1:] if r[1] == 'hit']
+
+# THE ARRANGEMENT IS ASSERTED, NOT REASONED ABOUT. This arm's claim is about a block of WARM turns
+# after t0, and t0 is wherever the fill gate first opened — which is not a fact this script controls.
+#
+# It used to be: the cache gate held every warm turn, so t0 was pinned to the turn after the 380s
+# sleep, and the eight tiny w01..w08 turns followed it by construction. With `cache_state: any` the
+# gate no longer holds anything, so t0 lands on whichever g-turn first crosses the fill — and the
+# remaining g-turns are "read this file IN FULL", each of which can write more new tail than a narrow
+# span is wide. If that happens the warm block falls OUTSIDE the population every verdict below is
+# scoped to, and the arm reports on one or two large file reads instead.
+#
+# That is trap 3 in timely-compact-validation.md, which was written up as a property of the design
+# before it was understood as a rig fault. It fails loudly here rather than quietly: the verdicts would
+# go 0 == 0 and read as a pass on an empty population.
+MIN_WARM = 3
+if len(sh) < MIN_WARM:
+    print()
+    print("ARRANGEMENT FAILED — %d warm hit turns inside the span, want >= %d." % (len(sh), MIN_WARM))
+    print("  The span closed before the warm block. t0 is turn %d of %d, the panel counted %d turns,"
+          % (t0, len(rows), turns))
+    print("  and this arm's verdicts are scoped to those. See trap 3 in")
+    print("  docs/proposals/timely-compact-validation.md: bridging turns that read files in full can")
+    print("  consume the whole span before the turns being measured begin.")
+    print("  Fix the ARRANGEMENT (fewer/smaller file reads before the crossing, or a wider span via")
+    print("  scen_panel's fill argument) — do not read the verdicts below.")
+    raise SystemExit(1)
+# And no single turn inside the span may dominate it, which is the same fault one step earlier: a span
+# that technically contains the warm block but is 90% one file read is not measuring warm turns either.
+biggest = max((r[2] for r in span), default=0)
+total = sum(r[2] for r in span) or 1
+if biggest > 0.6 * total:
+    print()
+    print("ARRANGEMENT SUSPECT — one turn is %.0f%% of the span's removed tokens." % (100.0 * biggest / total))
+    print("  The population is dominated by a single turn, so the read-rate check below is really a")
+    print("  check on that one turn. Same cause as trap 3; rearrange before believing the verdicts.")
+    raise SystemExit(1)
 gross, usdsum = sum(r[2] for r in sh), sum(r[3] for r in sh)
 cg = sum(r[5] for r in span)
 READ = float(os.environ.get("CG_SCEN_READ_RATE", "1e-7"))

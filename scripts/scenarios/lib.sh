@@ -198,12 +198,26 @@ scen_sleep() {
   sleep "$1"
 }
 
-# scen_panel <name> <port> [span]
+# scen_panel <name> <port> [span] [fill]
+#
+# ⚠️ PASS `fill` WHENEVER THE ARM'S TRIGGER IS NOT 0.9, OR THE PANEL SCOPES ITS ANSWER TO A SPAN THE
+# ARM NEVER RAN.
+#
+# The panel derives the span it attributes over as `ceiling - fill` (dash/compactepisode.go, spanFor),
+# and it takes `fill` from the QUERY STRING with `defaultFillFrac = 0.90` — it has no way to learn what
+# the arm put in its config. So a call that omits `fill` always gets `1.00 - 0.90 = 0.10` of the window,
+# which is 20,000 tokens on a 200k model, no matter what min_request_frac the proxy is running.
+#
+# For an arm at 0.5 that is wrong in the direction that hides turns: the true span is `1.00 - 0.5`, five
+# times wider, and the narrow one closes after one or two file-reading turns. Trap 3 in
+# timely-compact-validation.md is the write-up of a run that was misread for exactly this reason, and it
+# was a mismatch of this kind rather than anything about the design.
 scen_panel() {
-  local name=$1 port=$2 span=${3:-}
+  local name=$1 port=$2 span=${3:-} fill=${4:-}
   local q="tenant=all&range=all"
   [ -n "$span" ] && q="$q&span=$span"
-  echo "--- panel ($name${span:+, span=$span})"
+  [ -n "$fill" ] && q="$q&fill=$fill"
+  echo "--- panel ($name${span:+, span=$span}${fill:+, fill=$fill})"
   curl -sS "http://127.0.0.1:$port/api/components/compaction-episodes?$q" > "$SCEN_ROOT/$name/panel${span:+-$span}.json" \
     || echo "    (panel fetch failed)"
   wc -c < "$SCEN_ROOT/$name/panel${span:+-$span}.json"
