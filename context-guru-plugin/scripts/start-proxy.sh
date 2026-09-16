@@ -28,13 +28,18 @@
 set -uo pipefail
 
 PORT="${CLAUDE_PLUGIN_OPTION_PORT:-8787}"
-PRESET="${CLAUDE_PLUGIN_OPTION_PRESET:-cache}"
+# `off` is the default preset: the passthrough pipeline, no components. See DEFAULT_PRESET in
+# settings.py for why, and TestThePresetDefaultIsEncodedOnce for the test that keeps these agreeing.
+PRESET="${CLAUDE_PLUGIN_OPTION_PRESET:-off}"
 IDLE_EXIT="${CLAUDE_PLUGIN_OPTION_IDLE_EXIT:-24h}"
 BIN="${CONTEXT_GURU_BIN:-context-guru-proxy}"
 LOG="${TMPDIR:-/tmp}/context-guru-proxy-${PORT}.log"
 # See --emit-facts below. Off by default: the hook path's output is read by a person.
 EMIT_FACTS=0
 HEALTH="http://127.0.0.1:${PORT}/healthz"
+# Our own directory, so this hook can call settings.py. ${CLAUDE_PLUGIN_ROOT} is substituted into a
+# `!`-block command string but is NOT exported to a child process, so it cannot be relied on here.
+HERE="$(unset CDPATH; \cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)" || HERE=""
 
 note() { printf 'context-guru: %s\n' "$*"; }
 
@@ -212,9 +217,115 @@ case "${ANTHROPIC_BASE_URL:-}" in
 esac
 fi
 
-# --- (2) already up? ---------------------------------------------------------------------
+# --- (1b) what configuration do we WANT, and what is running? ----------------------------
+# CONTEXT_GURU_STATE first, like settings.py, reset.sh and check-proxy.sh. S10 in review: this was the
+# ONE script that ignored it, which had two consequences. A user who relocates their state directory
+# got the pidfile written somewhere else, and uninstall looks for it here - one way it loses track of a
+# running proxy. And it defeated the test isolation this PR added: pinning CONTEXT_GURU_STATE does not
+# isolate the hook tests if the hook they spawn does not read it, which is how a `go test` run wrote
+# four pidfiles into a reviewer's real ~/.local/state/context-guru.
+#
+# Resolved HERE, before the idempotence probe, because the probe now has to compare the running
+# proxy's configuration against the one the options ask for - and both the pidfile and the
+# fingerprint live in this directory.
+STATE="${CONTEXT_GURU_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/context-guru}"
+mkdir -p "$STATE" 2>/dev/null || STATE="${TMPDIR:-/tmp}"
+PIDFILE="${STATE}/proxy-${PORT}.pid"
+# What the proxy holding this port was STARTED with. There is no way to ask it: /healthz answers the
+# literal string "ok" (proxy/proxy.go), and nothing else is unauthenticated. So the starter records it.
+FINGERPRINT="${STATE}/proxy-${PORT}.fingerprint"
+
+# The argument wins: it is the only one of these three the install skill can actually rely on, since
+# a Bash tool call sees neither the plugin option nor, necessarily, the session's own env. Moved up
+# with STATE so it can go into the fingerprint below; UPSTREAM_ARGS is still built at launch.
+UPSTREAM="${UPSTREAM_ARG:-${CLAUDE_PLUGIN_OPTION_UPSTREAM:-${ANTHROPIC_UPSTREAM:-}}}"
+
+# Make the strategy config agree with the plugin option BEFORE anything reads it.
+#
+# This is what makes `/plugin configure` work. --config REPLACES --preset rather than layering, so
+# the preset recorded in an armed strategy file used to be in force forever: a user set `housellm`,
+# saw it stick in the config UI, and kept running whatever was recorded when they first armed
+# keep-alive, with nothing anywhere reporting the divergence.
+#
+# Fails open in every direction - an unreadable file, a foreign file, a missing settings.py, no
+# python at all - because this runs on SessionStart and a config we cannot rewrite is never a reason
+# to leave the user without a proxy. `strategy sync` itself refuses to touch anything without our
+# ownership marker.
+SYNC_OUT=""
+if [ -n "$HERE" ] && [ -x "${HERE}/settings.py" ]; then
+  SYNC_OUT=$(CONTEXT_GURU_STATE="$STATE" "${HERE}/settings.py" strategy sync \
+               --port "$PORT" --preset "$PRESET" 2>/dev/null) || SYNC_OUT=""
+fi
+# The strategy NAME as sync saw it, so the fingerprint does not re-derive it from the file and become
+# a second encoding of the ownership rule. Empty when sync could not run or declined to act, and an
+# empty name deliberately makes the fingerprint incomparable - see below.
+SYNC_STRATEGY=$(printf '%s\n' "$SYNC_OUT" | sed -n 's/^strategy=//p' | head -1)
+
+# The configuration we want, as one line. Compared as an opaque string: any field changing means the
+# running proxy was started for a different configuration than this session asks for.
+fingerprint_want() {
+  printf 'preset=%s strategy=%s idle=%s upstream=%s port=%s\n' \
+    "$PRESET" "$SYNC_STRATEGY" "$IDLE_EXIT" "$UPSTREAM" "$PORT"
+}
+
+# Stop the proxy we started, so a new one can come up with the new configuration.
+#
+# PIDFILE FIRST, and never a `pkill` pattern: a pattern matching the word proxy on a shared box has
+# killed the wrong process before (see the --listen comment below), and these boxes are shared with
+# other people and other sessions running as the same unix user.
+#
+# NO PIDFILE means we did not start whatever is holding this port. It may be a colleague's proxy, a
+# hand-started one, or an unrelated service. We do not signal it - we leave it alone and say so.
+# Killing something we cannot prove is ours is the one failure this whole file is written to avoid.
+stop_running_proxy() {
+  local pid deadline
+  pid=$(cat "$PIDFILE" 2>/dev/null)
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  # Plain kill, i.e. SIGTERM, which the proxy handles: main.go arms signal.Notify for SIGINT/SIGTERM
+  # and routes it to http.Server.Shutdown, which closes the listeners and then WAITS for every
+  # in-flight request to return. So a request already being served is not dropped by this.
+  kill "$pid" 2>/dev/null || return 1
+  deadline=$(( $(date +%s) + 10 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.25
+  done
+  return 1
+}
+
+# --- (2) already up, and is it the proxy we want? ----------------------------------------
 if curl -fsS --max-time 2 "$HEALTH" >/dev/null 2>&1; then
-  exit 0
+  fp_have=$(cat "$FINGERPRINT" 2>/dev/null)
+  fp_want=$(fingerprint_want)
+  # Leave it alone unless we can prove a change is needed. Three of these four cases are deliberate
+  # no-ops, because the cost of a wrong restart (interrupting somebody else's session) is higher than
+  # the cost of a stale preset (reported, and fixed by the next cold start).
+  if [ -z "$fp_have" ]; then
+    # A proxy from before fingerprints existed, or one somebody else started. Not ours to replace.
+    :
+  elif [ -z "$SYNC_STRATEGY" ]; then
+    # We could not establish what strategy is in effect, so we cannot say the running one is wrong.
+    :
+  elif [ "$fp_have" = "$fp_want" ]; then
+    :
+  elif ! stop_running_proxy; then
+    note "the proxy on port ${PORT} was started with a different configuration and could not be"
+    note "stopped automatically; it is still running with: ${fp_have}"
+    note "stop it and start a new session, or run /context-guru:status."
+    exit 0
+  else
+    note "configuration changed, restarting the proxy on port ${PORT}."
+    note "  was: ${fp_have}"
+    note "  now: ${fp_want}"
+    rm -f "$FINGERPRINT" 2>/dev/null || true
+  fi
+  # Still up? Then one of the no-op branches above applied and there is nothing to do.
+  if curl -fsS --max-time 2 "$HEALTH" >/dev/null 2>&1; then
+    exit 0
+  fi
 fi
 
 if ! command -v "$BIN" >/dev/null 2>&1 && [ ! -x "$BIN" ]; then
@@ -252,15 +363,8 @@ command -v setsid >/dev/null 2>&1 || STARTER=(nohup)   # macOS has no setsid
 # was a 404. Its default DB path is `./context-guru-dashboard.db` — the current directory, i.e.
 # the user's repository — so the path must be set explicitly or the plugin litters the project it
 # was invited into.
-# CONTEXT_GURU_STATE first, like settings.py, reset.sh and check-proxy.sh. S10 in review: this was the
-# ONE script that ignored it, which had two consequences. A user who relocates their state directory
-# got the pidfile written somewhere else, and uninstall looks for it here — one way it loses track of a
-# running proxy. And it defeated the test isolation this PR added: pinning CONTEXT_GURU_STATE does not
-# isolate the hook tests if the hook they spawn does not read it, which is how a `go test` run wrote
-# four pidfiles into a reviewer's real ~/.local/state/context-guru.
-STATE="${CONTEXT_GURU_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/context-guru}"
-mkdir -p "$STATE" 2>/dev/null || STATE="${TMPDIR:-/tmp}"
-PIDFILE="${STATE}/proxy-${PORT}.pid"
+# STATE, PIDFILE and FINGERPRINT are resolved in section (1b), above the idempotence probe that
+# needs them. Kept there rather than duplicated here.
 
 # --emit-facts: print the paths this script ACTUALLY used, as key=value, for a caller that has to
 # report them. install.sh used to re-derive the pidfile path from the same expression as line 258 -
@@ -288,9 +392,7 @@ fi
 # released v0.1.1 binary: with it set and no flag, requests arrive at the configured upstream). But
 # relying on inheritance alone is fragile — this hook only sees what the session's env block passes
 # it — so pass it EXPLICITLY when it is configured, and let the plugin option name it too.
-# The argument wins: it is the only one of these three the install skill can actually rely on, since
-# a Bash tool call sees neither the plugin option nor, necessarily, the session's own env.
-UPSTREAM="${UPSTREAM_ARG:-${CLAUDE_PLUGIN_OPTION_UPSTREAM:-${ANTHROPIC_UPSTREAM:-}}}"
+# UPSTREAM itself is resolved in section (1b) so it can enter the fingerprint.
 UPSTREAM_ARGS=()
 if [ -n "$UPSTREAM" ]; then
   UPSTREAM_ARGS=(--anthropic-upstream "$UPSTREAM")
@@ -406,6 +508,11 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   # timeout belongs on the idempotence probe above (where a false negative starts a SECOND proxy
   # and overwrites the pidfile with a pid that immediately exits), not on this one.
   if curl -fsS --max-time 1 "$HEALTH" >/dev/null 2>&1; then
+    # Written only once the proxy ANSWERS, so a fingerprint on disk always describes something that
+    # actually came up. Best-effort: a state directory we cannot write is already survivable
+    # everywhere else in this script, and the only cost here is that the next session cannot tell a
+    # configuration change happened.
+    fingerprint_want >"$FINGERPRINT" 2>/dev/null || true
       if [ -n "$UPSTREAM" ]; then
       note "proxy up on 127.0.0.1:${PORT} (preset ${PRESET_NOTE}, cache strategy ${STRATEGY_NOTE}, idle-exit ${IDLE_EXIT}), chained behind ${UPSTREAM}."
       note "dashboard: http://127.0.0.1:${PORT}/dashboard/"

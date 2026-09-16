@@ -1172,17 +1172,49 @@ STRATEGY_MARKER_TAIL = "written by"
 
 DEFAULT_STRATEGY = "5-min-ping"
 
+# The default PRESET, in the one place that decides it. It is `off` - the passthrough pipeline, no
+# components at all - and that is a deliberate product claim rather than a conservative guess:
+#
+#   with the defaults, this plugin does not touch your context. Requests are forwarded
+#   byte-for-byte, and the only thing that happens is that your prompt cache is kept warm.
+#
+# It used to be `cache`, i.e. cachesplit alone, on the strength of a -34.1% figure that came from
+# SWE-bench CLI traffic and does not describe interactive use (#263). The measurements that do:
+# with cachesplit OFF a real session's first request still read 45,805 tokens from cache and only
+# 8,499 more moved when it was on (apply/prefixsplit_test.go), and its production credit over the
+# measured window was $0.03 against keep-alive's +$125. So the component that earns the install is
+# keep-alive, and the pipeline default should not be quietly editing anybody's requests to add 18%
+# to what their client already caches for free.
+#
+# `cache` remains selectable. Only the default changed. Choosing a preset such as `housellm` IS
+# opting into context editing, which is fine - it is a deliberate step rather than a default.
+#
+# FIVE files encoded this default before it moved here (plugin.json, install.sh, start-proxy.sh,
+# check-proxy.sh, and the empty-preset note below). A drift test now fails if they disagree.
+DEFAULT_PRESET = "off"
+
+# Old names for strategies, so a file armed by an earlier version still resolves. `split` was named
+# after `cachesplit`, which stopped being the default: the name then referred to a component that is
+# not running, which is the defect shape #263 is about. `none` says what it is.
+STRATEGY_ALIASES = {"split": "none"}
+
+
+def _canon_strategy(name: str) -> str:
+    """The current name for a strategy, mapping retired names forward."""
+    return STRATEGY_ALIASES.get(name, name)
+
+
 # Each entry: the `cache:` keys it sets, and one line of honest description.
 #
-# `split` writes NO FILE AT ALL, deliberately. --config REPLACES --preset rather than layering over
+# `none` writes NO FILE AT ALL, deliberately. --config REPLACES --preset rather than layering over
 # it, so the way to express "just the preset, nothing else" is the absence of a config, not a
-# config that says keepalive: false. That also means switching to `split` is a removal, which is
+# config that says keepalive: false. That also means switching to `none` is a removal, which is
 # why it cannot be expressed as a dict here.
 STRATEGIES: dict[str, dict] = {
-    "split": {
+    "none": {
         "cache": {},
         "spends": False,
-        "desc": "prompt-cache split only (the preset's cachesplit). No pings, no model calls, "
+        "desc": "no cache strategy: the preset runs and nothing else. No pings, no model calls, "
                 "no spend. Written as the ABSENCE of a config file.",
     },
     DEFAULT_STRATEGY: {
@@ -1197,7 +1229,7 @@ STRATEGIES: dict[str, dict] = {
             "keepalive_min_prefix_tokens": 20000,
         },
         "spends": True,
-        "desc": "split + an idle ping just under the provider's 5-minute TTL (280s, at most 2 per "
+        "desc": "an idle ping just under the provider's 5-minute TTL (280s, at most 2 per "
                 "idle span, >=20k-token prefix, <=$0.25/ping). SPENDS THE CALLER'S CREDENTIAL "
                 "while nobody is at the keyboard.",
     },
@@ -1210,7 +1242,7 @@ STRATEGIES: dict[str, dict] = {
         # strategy that advertises a measurement has to state the threshold that measurement would
         # not have passed, or "verify with Usage.CacheWrite1h" reads zero for an undisclosed second
         # reason and the user concludes the tier was refused.
-        "desc": "split + asks for the 1-hour tier on the tools/system breakpoints, and ONLY on "
+        "desc": "asks for the 1-hour tier on the tools/system breakpoints, and ONLY on "
                 "requests with a >=50k-token prefix (below that it does nothing at all; the "
                 "size gate is what makes it pay, +$48.81 against -$18.34 applied blanket). No "
                 "pings. Measured GRANTED on Haiku 4.5 and SILENTLY DOWNGRADED on Sonnet 5 (zero "
@@ -1253,6 +1285,11 @@ def _render_strategy(name: str, preset: str) -> str:
         "# `preset:` is stated explicitly because --config REPLACES --preset entirely rather than",
         "# layering over it. A config that omitted it would silently turn compaction off at the",
         "# moment a cache strategy was armed - the exact opposite of the intent.",
+        "#",
+        "# It is NOT the source of truth for the preset. `strategy sync` re-renders this line from",
+        "# the plugin option every time a proxy starts, because the file owning it meant a user who",
+        "# changed the option saw it stick in the config UI and kept running the preset that was",
+        "# recorded here when the strategy was first armed - indefinitely, and with no way to tell.",
         f"preset: {preset}",
     ]
     cache = spec["cache"]
@@ -1368,9 +1405,9 @@ def cmd_strategy(args) -> int:
 
     if args.op == "show":
         if not os.path.exists(path):
-            # No file is not "unknown": it is exactly what `split` means.
-            emit(result="ok", strategy="split", file="(none)", port=port,
-                 note="no config for this port, so the preset's cachesplit runs alone")
+            # No file is not "unknown": it is exactly what `none` means.
+            emit(result="ok", strategy="none", file="(none)", port=port,
+                 note="no config for this port, so the preset runs alone and nothing is spent")
             return 0
         try:
             text = open(path, encoding="utf-8").read()
@@ -1381,9 +1418,72 @@ def cmd_strategy(args) -> int:
             emit(result="ok", strategy="(foreign)", file=path, port=port,
                  note="a config exists at our path that we did not write; left alone")
             return 0
-        name = _strategy_name_in(text)
+        name = _canon_strategy(_strategy_name_in(text))
         emit(result="ok", strategy=name or "(unnamed)", file=path, port=port,
              note="" if name else "written before strategies had names; re-set it to name it")
+        return 0
+
+    if args.op == "sync":
+        # Called by start-proxy.sh immediately before it launches a proxy, and this is what makes a
+        # `/plugin configure` preset change take effect on the next session.
+        #
+        # The problem it solves: --config REPLACES --preset, so once a strategy was armed the preset
+        # recorded in its file was in force forever. A user set `housellm`, saw it stick in the config
+        # UI, and kept running whatever was recorded when they first armed keep-alive. There is no way
+        # to interrogate a running proxy about it either - /healthz answers the literal string "ok" -
+        # so nothing anywhere could report the divergence.
+        #
+        # Re-renders from the NAME in the file plus the preset the caller passes, rather than editing
+        # the preset line in place: the name is the durable choice, the preset is the option, and
+        # rendering the pair through the one function that writes these files keeps a synced file
+        # byte-identical to a freshly-set one. Anything else is a second encoding of the same rule.
+        if not args.preset.strip():
+            emit(result="error", reason="empty_preset",
+                 note="sync needs the preset to write; nothing was changed")
+            return 2
+        if not os.path.exists(path):
+            # `none` is the absence of a file, so there is nothing to sync and that is not a failure:
+            # the preset reaches the proxy directly as --preset.
+            emit(result="unchanged", strategy="none", file="(none)", port=port,
+                 note="no config for this port, so --preset reaches the proxy unmediated")
+            return 0
+        try:
+            text = open(path, encoding="utf-8").read()
+        except OSError as exc:
+            # Fails OPEN and reports it. This runs on the SessionStart path: a file we cannot read is
+            # a reason to leave the proxy's own handling alone, never a reason to refuse to start.
+            emit(result="skipped", reason="unreadable", file=path, detail=f"{exc}",
+                 note="left alone; the proxy will load it as it stands")
+            return 0
+        if not _strategy_is_ours(text):
+            emit(result="skipped", reason="not_ours", file=path,
+                 note="a config we did not write is at this path; its preset is its owner's business")
+            return 0
+        name = _canon_strategy(_strategy_name_in(text))
+        if not name:
+            emit(result="skipped", reason="unnamed", file=path,
+                 note="written before strategies had names, so there is no name to re-render from; "
+                      "`strategy set --name <name>` names it")
+            return 0
+        if name not in STRATEGIES:
+            # A file naming a strategy this version does not know. Re-rendering it would silently
+            # change what it does; reporting it is the honest move.
+            emit(result="skipped", reason="unknown_strategy", file=path, requested=name,
+                 known=",".join(STRATEGIES))
+            return 0
+        if name == "none":
+            # A file that names the absence of a file. Contradictory, so do not act on it.
+            emit(result="skipped", reason="none_has_no_file", file=path,
+                 note="this config names `none`, which is expressed as no config at all; "
+                      "`strategy set --name none` removes it")
+            return 0
+        want = _render_strategy(name, args.preset)
+        if want == text:
+            emit(result="unchanged", strategy=name, file=path, port=port, preset=args.preset)
+            return 0
+        _write_atomic(path, want.encode("utf-8"), mode=0o600)
+        emit(result="synced", strategy=name, file=path, port=port, preset=args.preset,
+             note="the config's preset now matches the plugin option")
         return 0
 
     if args.op == "clear":
@@ -1398,7 +1498,7 @@ def cmd_strategy(args) -> int:
         # wrong detail this script is careful about elsewhere.
         where = "(none)" if as_set else path
         if not os.path.exists(path):
-            emit(result=nothing_to_do, strategy="split", file=where, port=port,
+            emit(result=nothing_to_do, strategy="none", file=where, port=port,
                  note="nothing to remove")
             return 0
         # An unreadable file is NOT a file we may delete. This swallowed the OSError, left `text`
@@ -1420,22 +1520,22 @@ def cmd_strategy(args) -> int:
                  note="this config was not written by context-guru; remove it by hand")
             return 2
         os.unlink(path)
-        emit(result=done, strategy="split", file=where, port=port,
+        emit(result=done, strategy="none", file=where, port=port,
              note="takes effect the next time the proxy starts, not now")
         return 0
 
     # op == "set"
-    name = args.name
+    name = _canon_strategy(args.name)
     if name not in STRATEGIES:
-        emit(result="error", reason="unknown_strategy", requested=name,
+        emit(result="error", reason="unknown_strategy", requested=args.name,
              known=",".join(STRATEGIES))
         return 2
-    # `split` writes NO FILE, so it reaches `clear` and never touches the preset - checking the preset
+    # `none` writes NO FILE, so it reaches `clear` and never touches the preset - checking the preset
     # first refused `strategy set --name split` (with no --preset, which the parser does not require)
     # as `empty_preset`, whose note about silently disabling compaction describes a file that would
     # never be written. It also regressed the old keep-alive-off path, which was `rm -f "$CFG"` and
     # required no preset at all. Ordered before the guard for that reason.
-    if name == "split":
+    if name == "none":
         # Expressed as a removal, per the STRATEGIES comment - but reported as a `set`, because that is
         # the operation the caller asked for. See the clear branch.
         return cmd_strategy(argparse.Namespace(op="clear", port=port, as_set=True))
@@ -1445,8 +1545,9 @@ def cmd_strategy(args) -> int:
     # keepalive skill guarded this in shell; it is enforced here so every caller inherits it.
     if not args.preset.strip():
         emit(result="error", reason="empty_preset",
-             note="pass --preset (option_preset= from `settings.py config`, else the plugin.json "
-                  "default `cache`); an empty preset silently disables compaction")
+             note=f"pass --preset (option_preset= from `settings.py config`, else the plugin.json "
+                  f"default `{DEFAULT_PRESET}`); an empty preset is not the same thing as `off` - "
+                  f"it loads a config with no pipeline AND no name for what it is doing")
         return 2
 
     if os.path.exists(path):
@@ -1505,15 +1606,15 @@ def main() -> int:
     cu.add_argument("--url", required=True)
 
     st = sub.add_parser("strategy")
-    st.add_argument("op", choices=("list", "show", "set", "clear"))
+    st.add_argument("op", choices=("list", "show", "set", "clear", "sync"))
     st.add_argument("--name", default="",
                     help="strategy name for `set`; one of " + ", ".join(STRATEGIES))
     st.add_argument("--port", default="",
                     help="the CONFIGURED port. Required for show/set/clear: the config file is "
                          "named after it, so a defaulted port writes a file nothing reads.")
     st.add_argument("--preset", default="",
-                    help="the preset to state in the file. Required for `set`, because --config "
-                         "REPLACES --preset rather than layering over it.")
+                    help="the preset to state in the file. Required for `set` and `sync`, because "
+                         "--config REPLACES --preset rather than layering over it.")
 
     args = ap.parse_args()
     if args.cmd == "add" and not args.url and not args.statusline:

@@ -122,7 +122,7 @@ route_resolve_options() {
   # a line only for keys the user actually configured, so a partial config — port set, preset
   # never touched — reports a real source= and simply omits option_preset=.
   R_PORT=$(kv "$cfg" option_port);            : "${R_PORT:=8787}"
-  R_PRESET=$(kv "$cfg" option_preset);        : "${R_PRESET:=cache}"
+  R_PRESET=$(kv "$cfg" option_preset);        : "${R_PRESET:=off}"
   R_IDLE=$(kv "$cfg" option_idle_exit);       : "${R_IDLE:=24h}"
   [ -z "$R_STRATEGY" ] && R_STRATEGY=$(kv "$cfg" option_cache_strategy)
   : "${R_STRATEGY:=5-min-ping}"
@@ -592,6 +592,9 @@ they say yes. A silent or absent answer is a NO. Never pass it on your own judge
   # start-proxy.sh reads that file only when it STARTS a proxy, so a strategy written afterwards
   # does nothing until something restarts it. Written here, the very first proxy has it.
   local sout
+  # --preset is what gets RECORDED, but it is no longer what stays in force: start-proxy.sh runs
+  # `strategy sync` before every launch, so the plugin option wins from the next session onwards. It
+  # is still passed here so the very first proxy has the right one without waiting for a sync.
   sout=$("$(route_here)/settings.py" strategy set --name "$R_STRATEGY" \
            --port "$R_PORT" --preset "$R_PRESET" 2>&1) || true
   case "$(kv "$sout" result)" in
