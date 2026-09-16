@@ -1,22 +1,32 @@
 #!/usr/bin/env python3
-"""Compile every heredoc the scenario arms feed to python3, whatever tag it uses.
+"""Classify EVERY heredoc in the scenario arms, and compile the ones that feed python3.
 
 `bash -n` treats a heredoc as opaque text, so a syntax error inside one is invisible until the
-interpreter runs it — which, for these arms, is after an hour of gateway time has been spent.
+interpreter runs it — which for these arms is after an hour of paid gateway time.
 
-TWO THINGS THIS DOES THAT A `<<'PY'` GREP DOES NOT, both of them ways the check could quietly stop
-covering something:
+# THE ASSERTION IS OVER THE POPULATION, NOT OVER WHAT THE MATCHER FOUND
 
-  1. IT KEYS ON THE INVOCATION, NOT ON THE TAG. An earlier version matched the literal tag `PY`. Every
-     arm happens to use it today, so the check passed and looked complete — but an arm added later
-     with `<<'EOF' | python3` would have been skipped in silence, which is the failure mode the whole
-     preflight exists to remove rather than relocate.
-  2. IT ASSERTS ITS OWN COVERAGE. If a python3 heredoc is found whose body cannot be extracted, that
-     is a failure, not a skip. A checker that silently finds nothing is indistinguishable from a clean
-     tree, and this repo has paid for that shape more than once.
+This is the third rewrite of this check and the first one built on the right principle. The two before
+it both looked complete and both had a silent hole, for the same reason each time — they counted the
+heredocs their own pattern liked, and reported success on the count:
 
-It lives in its own file rather than inside a heredoc in preflight.sh on purpose: a scanner for
-heredocs, written inside a heredoc, matched its own pattern as if it were one.
+  1. Matched the literal tag `PY`. An arm using `<<'EOF' | python3` was skipped in silence.
+  2. Keyed on the python3 invocation instead, which fixed that instance and left the shape intact:
+     a hyphenated tag (`<<'PY-BODY'`, legal bash) fell out of the tag character class, and a line
+     continuation between `python3` and the `<<` put them on different physical lines. Both dropped
+     6 blocks to 5 and printed it as a success.
+
+`found == 0` cannot see 6 → 5. That is the shape that ships, because everything still says ok.
+
+So this enumerates every heredoc redirection in these files and requires each one to be CLASSIFIED:
+
+  - fed to python3  -> compile it, and a syntax error fails
+  - fed to `cat`    -> a data file (lib.sh writes config.yaml this way); allowed, not compiled
+  - anything else    -> FAILURE, named as unclassified
+
+An unmatched tag, a continuation, a new interpreter, a heredoc nobody thought about: all surface as
+"I could not classify this" rather than as absence. Absence is what the previous two versions
+reported.
 """
 
 import glob
@@ -26,78 +36,130 @@ import re
 import sys
 import tempfile
 
-# A heredoc redirection on a line that also invokes python3. The tag may be quoted ('TAG', "TAG") or
-# bare; `<<-` strips leading tabs from the terminator.
-REDIR = re.compile(r"<<(-?)\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
+# A heredoc redirection. The tag may be quoted or bare; `<<-` strips leading tabs from the terminator.
+# The tag class is deliberately permissive — hyphens and dots are legal, and being narrow here is
+# exactly how version 2 lost a block. `<<<` (herestring) is excluded: it carries no body.
+REDIR = re.compile(r"<<(-?)\s*(?!<)(?:'([^']+)'|\"([^\"]+)\"|([A-Za-z_][\w.-]*))")
 
 
-def blocks(path):
-    """Yield (tag, quoted, body, start_line) for each python3 heredoc in path."""
-    lines = open(path, encoding="utf-8").read().splitlines()
+def logical_lines(lines):
+    """Join backslash continuations, yielding (text, first_physical_index, last_physical_index).
+
+    Version 2 required `python3` and the `<<` on the same PHYSICAL line, so splitting them across a
+    continuation hid the block. These invocation lines are already long enough that wrapping one is
+    the natural next edit.
+    """
     i = 0
     while i < len(lines):
-        line = lines[i]
-        m = REDIR.search(line)
-        if m and "python3" in line:
-            dash, quote, tag = m.group(1), m.group(2), m.group(3)
-            body, j = [], i + 1
+        start = i
+        text = lines[i]
+        while text.endswith("\\") and i + 1 < len(lines):
+            i += 1
+            text = text[:-1] + " " + lines[i]
+        yield text, start, i
+        i += 1
+
+
+def is_comment(text):
+    return text.lstrip().startswith("#")
+
+
+def classify(text):
+    """What does this command feed the heredoc to? None means 'cannot tell'."""
+    if re.search(r"\bpython3?\b", text):
+        return "python"
+    if re.search(r"\bcat\b", text):
+        return "data"
+    return None
+
+
+def heredocs(path):
+    """Yield (kind, tag, body, physical_line, text) for every heredoc in path.
+
+    body is None when the terminator is never found.
+    """
+    lines = open(path, encoding="utf-8").read().splitlines()
+    consumed_to = -1
+    for text, first, last in logical_lines(lines):
+        if last <= consumed_to or is_comment(text):
+            continue
+        for m in REDIR.finditer(text):
+            dash = m.group(1)
+            tag = m.group(2) or m.group(3) or m.group(4)
+            body, j = [], last + 1
+            found_end = False
             while j < len(lines):
                 candidate = lines[j].lstrip("\t") if dash else lines[j]
-                if candidate == tag:
+                if candidate.strip() == tag:
+                    found_end = True
                     break
                 body.append(lines[j])
                 j += 1
-            else:
-                # Ran off the end without finding the terminator: report rather than skip.
-                yield tag, quote, None, i + 1
-                return
-            yield tag, quote, "\n".join(body), i + 1
-            i = j
-        i += 1
+            consumed_to = j
+            yield (classify(text), tag, "\n".join(body) if found_end else None, first + 1, text)
+
+
+def compile_body(body):
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as f:
+            f.write(body)
+            tmp = f.name
+        py_compile.compile(tmp, doraise=True, cfile=tmp + "c")
+        return None
+    except py_compile.PyCompileError as e:
+        return str(e)
+    finally:
+        for p in (tmp, tmp and tmp + "c"):
+            if p and os.path.exists(p):
+                os.unlink(p)
 
 
 def main(root):
     paths = sorted(glob.glob(os.path.join(root, "*.sh")))
     if not paths:
-        print("no .sh files under %s — the checker found nothing to check, which is a failure" % root)
+        print("no .sh files under %s — nothing to check is itself a failure" % root)
         return 1
 
-    found = bad = 0
+    compiled = data = bad = 0
     for path in paths:
         name = os.path.basename(path)
-        for tag, quote, body, line in blocks(path):
-            found += 1
+        for kind, tag, body, line, text in heredocs(path):
             if body is None:
                 print("UNTERMINATED: %s:%d heredoc <<%s never closed" % (name, line, tag))
                 bad += 1
                 continue
-            if not quote:
-                # The shell expands $vars in an unquoted heredoc, so what python receives is not
-                # this text. Still worth compiling, but say so — it is a latent footgun.
-                print("WARNING: %s:%d feeds python3 an UNQUOTED heredoc (<<%s); the shell expands it "
-                      "first, so this check sees different text than python will" % (name, line, tag))
-            tmp = None
-            try:
-                with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False,
-                                                 encoding="utf-8") as f:
-                    f.write(body)
-                    tmp = f.name
-                py_compile.compile(tmp, doraise=True, cfile=tmp + "c")
-            except py_compile.PyCompileError as e:
-                print("SYNTAX (python): %s:%d\n  %s" % (name, line, e))
+            if kind is None:
+                # THE POINT OF THE REWRITE. Not skipped, not counted as fine: named and failed.
+                print("UNCLASSIFIED: %s:%d heredoc <<%s — cannot tell what consumes this body.\n"
+                      "  %s\n"
+                      "  If it is python, make the invocation recognisable; if it is data, pipe it "
+                      "through cat; otherwise teach classify() about it." % (name, line, tag, text.strip()))
                 bad += 1
-            finally:
-                for p in (tmp, tmp and tmp + "c"):
-                    if p and os.path.exists(p):
-                        os.unlink(p)
+                continue
+            if kind == "data":
+                data += 1
+                continue
+            if "'" not in text.split("<<")[1][:2] and '"' not in text.split("<<")[1][:2]:
+                print("WARNING: %s:%d feeds python an UNQUOTED heredoc (<<%s); the shell expands it "
+                      "first, so this check sees different text than python will" % (name, line, tag))
+            err = compile_body(body)
+            if err:
+                print("SYNTAX (python): %s:%d\n  %s" % (name, line, err))
+                bad += 1
+            else:
+                compiled += 1
 
-    # Coverage assertion. These arms are built around reading their own results in python; a tree with
-    # none means either the arms changed shape or the matcher stopped matching, and both need a human.
-    if found == 0:
-        print("NO python3 heredocs found under %s. Every arm reads its results in python, so this "
-              "means the matcher has stopped matching — not that there is nothing to check." % root)
+    total = compiled + data + bad
+    if total == 0:
+        print("NO heredocs found under %s. Every arm reads its results through one, so this means the "
+              "scanner has stopped matching — not that there is nothing to check." % root)
         return 1
-    print("compiled %d python3 heredoc(s) across %d file(s)" % (found, len(paths)))
+    if compiled == 0:
+        print("NO python heredocs found among %d heredoc(s). Every arm reads its results in python, so "
+              "this means classification has broken, not that there is nothing to compile." % total)
+        return 1
+    print("heredocs: %d python compiled, %d data, %d problem(s)" % (compiled, data, bad))
     return 1 if bad else 0
 
 
