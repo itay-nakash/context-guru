@@ -7,6 +7,9 @@
 # how iteration 026 spent a full run to discover a zero.
 #
 #   ./run028.sh preflight    the four conditions from PREREGISTRATION.md section 2. No reward pass, ~$8.
+#   ./run028.sh base 1 [model]   the BASELINE pass of seed 1 only, on an optional agent model. No ask
+#                            spend; with the default model this IS seed 1's baseline and `seed 1`
+#                            will reuse it rather than pay for it twice.
 #   ./run028.sh seed 1       baseline then arm A for seed 1, then STOP.
 #   ./run028.sh readout      the cumulative mean difference and the futility check, over whatever exists.
 #
@@ -125,6 +128,38 @@ preflight)
   echo
   echo "Pre-flight passed. Nothing about reward is known. Next: ./run028.sh seed 1"
   ;;
+base)
+  # BASELINE ONLY, for a question that is not about reward: can the AGENT solve these tasks at all on a
+  # given model. The baseline config leaves the sweep inert, so this pass carries no ask spend and is not
+  # an arm of anything -- it is a capability measurement.
+  #
+  # WHY IT EXISTS AS ITS OWN STEP. The question "would a cheaper agent model still finish these tasks"
+  # cannot be answered from a reward comparison: if the agent solves nothing, both arms score zero and
+  # the run reads as futility rather than as an unusable agent. Iteration 026 spent a full run to learn
+  # a zero it could not attribute.
+  #
+  # THE TAG ENCODES A NON-DEFAULT MODEL. A haiku pass written to the plain `i028-sN-base` tag would be
+  # SKIPPED and silently adopted by `./run028.sh seed N` as arm A's baseline, comparing a haiku baseline
+  # against a sonnet arm A with every counter healthy. The default model keeps the plain tag precisely
+  # because that pass IS seed N's baseline and must be reused rather than paid for twice.
+  S="${2:?usage: run028.sh base N [model]}"
+  M="${3:-aws/claude-sonnet-5}"
+  TC="$H/task-configs/i024-64k-s$S.json"
+  [ -f "$TC" ] || die "no task config $TC -- seed $S must reuse iteration 024's own instances"
+  TAG="i028-s$S-base"
+  case "$M" in
+    aws/claude-sonnet-5) ;;
+    *) TAG="$TAG-$(printf %s "$M" | tr -c 'A-Za-z0-9' '-')" ;;
+  esac
+  export LOCA_MODEL="$M"
+  run_pass "$TAG" "cfg-iter028-baseline.yaml" "baseline" "$TC"
+  echo
+  echo "===== $TAG: per-environment accuracy (model $M) ====="
+  # THE READ IS THE COUNT OF NON-DEGENERATE ENVIRONMENTS, not the mean. Three of these fifteen never
+  # solve on any arm or model; power lives entirely in the other twelve, and a weaker agent buys nothing
+  # by being cheaper if it pushes more of them to a constant zero.
+  python3 "$H/perenv028.py" "$TAG"
+  ;;
 seed)
   S="${2:?usage: run028.sh seed N}"
   TC="$H/task-configs/i024-64k-s$S.json"
@@ -142,5 +177,5 @@ seed)
 readout)
   python3 "$H/readout028.py"
   ;;
-*) die "unknown step '$STEP' (preflight | seed N | readout)" ;;
+*) die "unknown step '$STEP' (preflight | base N [model] | seed N | readout)" ;;
 esac
