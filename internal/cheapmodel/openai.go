@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+
+	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"strings"
 
 	"github.com/rossoctl/context-guru/components"
@@ -53,6 +55,91 @@ func (o OpenAI) CompleteBlocks(ctx context.Context, system []string, prompt stri
 }
 
 func (o OpenAI) CompleteSystem(ctx context.Context, system, prompt string) (string, error) {
+	msgs := []any{}
+	if system != "" {
+		msgs = append(msgs, map[string]any{"role": "system", "content": system})
+	}
+	msgs = append(msgs, map[string]any{"role": "user", "content": prompt})
+	return o.post(ctx, msgs)
+}
+
+// THE MAPPING IS AN EXPLICIT ALLOWLIST, and both halves of that are load-bearing.
+//
+// CONTENT IS PASSED THROUGH AS-IS, not flattened to text. m.Content is a *ChatMessageContent
+// whose MarshalJSON emits either a bare string or the ORIGINAL block array, via MarshalSorted
+// (deterministic key order — non-deterministic serialization is itself a silent cache
+// invalidator). Flattening blocks to a string would change the rendered prompt and forfeit the
+// prefix match this method exists to get.
+//
+// EVERY OTHER FIELD IS NAMED EXPLICITLY, because marshalling the struct whole leaks fields
+// that are not part of an OpenAI chat-completions REQUEST. Measured:
+//
+//	{"role":"assistant","reasoning":"...","tool_calls":[{"index":0,"id":"call_1",
+//	 "function":{"name":null,"arguments":""}}]}
+//
+// Three defects in one line. `reasoning` is not a request field at all (and a thinking model
+// puts one on most assistant turns). `index` is a STREAMING-DELTA field. `"name":null` is
+// invalid where the backend requires a string. ChatAssistantMessage also carries Refusal,
+// Audio, ReasoningDetails and Annotations, and ChatMessage carries Name — all with omitempty,
+// so all silently present the moment they are set.
+//
+// system is prepended only when non-empty. Pass "" to send the messages EXACTLY as given,
+// which is what a cache-reuse caller wants: a leading block the parent request did not have
+// changes the prefix in the costliest position.
+func (o OpenAI) CompleteMessages(ctx context.Context, system string, msgs []bschemas.ChatMessage) (string, error) {
+	wire := make([]any, 0, len(msgs)+1)
+	if system != "" {
+		wire = append(wire, map[string]any{"role": "system", "content": system})
+	}
+	for i := range msgs {
+		m := msgs[i]
+		e := map[string]any{"role": string(m.Role)}
+		// Content verbatim, including block structure. Omitted when absent: an assistant
+		// message that is purely tool calls legitimately has none.
+		if m.Content != nil {
+			e["content"] = m.Content
+		}
+		// `name` is request-legal on OpenAI (bifrost tags it "for chat completions"). Passed through
+		// rather than dropped: if inbound traffic sets it, omitting it makes this request diverge
+		// from the parent's rendered prefix — the exact byte-identity this method exists for.
+		if m.Name != nil && *m.Name != "" {
+			e["name"] = *m.Name
+		}
+		if m.ChatToolMessage != nil && m.ChatToolMessage.ToolCallID != nil {
+			e["tool_call_id"] = *m.ChatToolMessage.ToolCallID
+		}
+		if m.ChatAssistantMessage != nil && len(m.ChatAssistantMessage.ToolCalls) > 0 {
+			calls := make([]any, 0, len(m.ChatAssistantMessage.ToolCalls))
+			for _, tc := range m.ChatAssistantMessage.ToolCalls {
+				fn := map[string]any{"arguments": tc.Function.Arguments}
+				// Only set name when present: "name": null is invalid, and a nil name means
+				// this was a streaming fragment that should never have reached a request.
+				if tc.Function.Name != nil {
+					fn["name"] = *tc.Function.Name
+				}
+				call := map[string]any{"function": fn}
+				if tc.ID != nil {
+					call["id"] = *tc.ID
+				}
+				// type defaults to "function"; the backend requires it.
+				if tc.Type != nil && *tc.Type != "" {
+					call["type"] = *tc.Type
+				} else {
+					call["type"] = "function"
+				}
+				calls = append(calls, call)
+			}
+			e["tool_calls"] = calls
+		}
+		wire = append(wire, e)
+	}
+	return o.post(ctx, wire)
+}
+
+// post is the shared transport: body, auth, status check, usage accounting, first choice.
+// Extracted so CompleteSystem and CompleteMessages cannot drift apart — the second one exists
+// to preserve a cached prefix, and a divergent request builder is exactly how that is lost.
+func (o OpenAI) post(ctx context.Context, msgs []any) (string, error) {
 	base := o.BaseURL
 	if base == "" {
 		base = "https://api.openai.com"
@@ -65,11 +152,6 @@ func (o OpenAI) CompleteSystem(ctx context.Context, system, prompt string) (stri
 	if client == nil {
 		client = http.DefaultClient
 	}
-	msgs := []any{}
-	if system != "" {
-		msgs = append(msgs, map[string]any{"role": "system", "content": system})
-	}
-	msgs = append(msgs, map[string]any{"role": "user", "content": prompt})
 	reqBody, _ := json.Marshal(map[string]any{
 		"model":      o.Model,
 		"max_tokens": maxTok,
