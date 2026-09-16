@@ -2621,7 +2621,7 @@ func TestStrategyListIsTheAuthoritativeSetAndNamesItsDefault(t *testing.T) {
 		t.Errorf("default strategy is %q, want 5-min-ping: this is the value the install writes, and "+
 			"plugin.json's cache_strategy default has to agree with it", facts["default"])
 	}
-	for _, k := range []string{"strategy_split", "strategy_5_min_ping", "strategy_1_hour_head"} {
+	for _, k := range []string{"strategy_none", "strategy_5_min_ping", "strategy_1_hour_head"} {
 		if facts[k] == "" {
 			t.Errorf("`strategy list` does not describe %s; a name the picker offers but list omits "+
 				"cannot be discovered", k)
@@ -2635,7 +2635,7 @@ func TestStrategyListIsTheAuthoritativeSetAndNamesItsDefault(t *testing.T) {
 			"credential, and the install's disclosure is generated from this",
 			facts["spends_5_min_ping"])
 	}
-	for _, k := range []string{"spends_split", "spends_1_hour_head"} {
+	for _, k := range []string{"spends_none", "spends_1_hour_head"} {
 		if facts[k] != "false" {
 			t.Errorf("%s reports spends=%q, want false: neither sends a ping, and claiming they "+
 				"spend would push users off the free strategies for no reason", k, facts[k])
@@ -2684,7 +2684,7 @@ func TestStrategySetWritesTheStatedPresetAndRecordsTheName(t *testing.T) {
 	}
 }
 
-// TestStrategySplitIsTheAbsenceOfAConfig pins the one non-obvious choice in the table: `split` is
+// TestStrategyNoneIsTheAbsenceOfAConfig pins the one non-obvious choice in the table: `none` is
 // expressed by REMOVING the file, never by writing `keepalive: false`. Because --config replaces the
 // preset, a file that said "off" would still hijack preset resolution — so the only faithful way to
 // say "just the preset" is to leave no config at all.
@@ -2695,23 +2695,23 @@ func TestStrategySplitIsTheAbsenceOfAConfig(t *testing.T) {
 		t.Fatal("could not arm the strategy this test then switches away from")
 	}
 	facts, code := settingsIn(t, state, home, "strategy", "set",
-		"--name", "split", "--port", keepalivePort, "--preset", "cache")
+		"--name", "none", "--port", keepalivePort, "--preset", "cache")
 	if code != 0 {
 		t.Fatalf("exit %d: %v", code, facts)
 	}
 	if _, err := os.Stat(strategyCfg(state)); err == nil {
 		b, _ := os.ReadFile(strategyCfg(state))
-		t.Errorf("switching to `split` left a config behind, so --config is still passed and the "+
+		t.Errorf("switching to `none` left a config behind, so --config is still passed and the "+
 			"preset is still overridden:\n%s", b)
 	}
-	if facts["strategy"] != "split" {
-		t.Errorf("reported strategy=%q after switching to split", facts["strategy"])
+	if facts["strategy"] != "none" {
+		t.Errorf("reported strategy=%q after switching to none", facts["strategy"])
 	}
-	// And `show` must call that state `split` rather than "unknown" or "none": it is a real,
-	// selectable strategy, and the install leaves exactly this behind for --cache-strategy split.
+	// And `show` must call that state `none` rather than "unknown" or silence: it is a real,
+	// selectable strategy, and the install leaves exactly this behind for --cache-strategy none.
 	shown, _ := settingsIn(t, state, home, "strategy", "show", "--port", keepalivePort)
-	if shown["strategy"] != "split" {
-		t.Errorf("with no config, show reports strategy=%q; want split", shown["strategy"])
+	if shown["strategy"] != "none" {
+		t.Errorf("with no config, show reports strategy=%q; want none", shown["strategy"])
 	}
 }
 
@@ -2956,7 +2956,10 @@ func isStrategyShaped(tok string) bool {
 			return true
 		}
 	}
-	return tok == "split"
+	// `split` stays in this vocabulary although it is retired: the guard's job is to notice a
+	// strategy-shaped token in prose, and a document still saying `split` is exactly what it should
+	// catch now that the name is wrong.
+	return tok == "split" || tok == "none"
 }
 
 // TestStartProxyPicksUpAKeepaliveConfig proves the wiring between the opt-in toggle above and the
@@ -3552,19 +3555,37 @@ func TestStartProxyReportsThePresetActuallyInEffect(t *testing.T) {
 			// preset at all.
 			name:      "no keepalive config: the plugin option is the truth and is reported",
 			writeCfg:  false,
-			wantIn:    []string{"preset " + optionPreset, "cache strategy split"},
+			wantIn:    []string{"preset " + optionPreset, "cache strategy none"},
 			wantNotIn: []string{"unstated"},
 		},
 		{
 			// The NAME is the whole reason strategies are named: it is the only thing a user can say
 			// back to us. It has to survive from the file into the note, or "switch it back to
 			// 5-min-ping" is not a sentence anybody can act on.
+			//
+			// THE PRESET HALF OF THIS ROW FLIPPED, deliberately. It used to assert that the file's
+			// `preset: house` was reported and the plugin option was NOT — the file being the source
+			// of truth for the preset was the whole point. That is the defect #264 removes: --config
+			// REPLACES --preset, so whatever preset was recorded when the strategy was first armed
+			// stayed in force forever, and a user who changed the option watched it stick in the
+			// config UI while the old one kept running. `strategy sync` now re-renders an OWNED file's
+			// preset from the option before every launch, so the option is what is in effect and
+			// reporting it is correct.
+			//
+			// The invariant this row actually defends is unchanged and is why it still earns its
+			// place: the note must name the preset IN EFFECT rather than one merely configured
+			// somewhere. Only which of the two that is has changed.
+			//
+			// Worth reading with the four rows around it: they carry configs with no marker of ours,
+			// sync declines to touch them, and they still report `preset house`. That contrast is the
+			// ownership gate on sync demonstrating itself — this row is the only one whose behaviour
+			// moved, which is exactly the set of files sync is licensed to rewrite.
 			name:     "the strategy name in the marker is reported",
 			writeCfg: true,
 			cfg: "# context-guru: strategy=1-hour-head written by /context-guru:cache-strategy-picker\n" +
 				"preset: house\ncache:\n  head_ttl_1h: true\n",
-			wantIn:    []string{"cache strategy 1-hour-head", "preset house"},
-			wantNotIn: []string{"cache strategy split", "preset " + optionPreset},
+			wantIn:    []string{"cache strategy 1-hour-head", "preset " + optionPreset},
+			wantNotIn: []string{"cache strategy none", "preset house"},
 		},
 		{
 			// A file we do NOT own whose first line happens to carry `strategy=`. The name read ran the
@@ -3585,7 +3606,7 @@ func TestStartProxyReportsThePresetActuallyInEffect(t *testing.T) {
 			name:     "a config with no strategy marker is unnamed, never guessed",
 			writeCfg: true, cfg: "preset: house\ncache:\n  keepalive: true\n",
 			wantIn:    []string{"cache strategy unnamed"},
-			wantNotIn: []string{"cache strategy 5-min-ping", "cache strategy split"},
+			wantNotIn: []string{"cache strategy 5-min-ping", "cache strategy none"},
 		},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -5294,7 +5315,7 @@ func TestRoutePlanWritesNothing(t *testing.T) {
 func TestRoutePlanResolvesTheConfiguredPortPerOption(t *testing.T) {
 	home, state, proj := t.TempDir(), t.TempDir(), t.TempDir()
 	// Deliberately partial: port and strategy set, preset and idle_exit never touched.
-	writePluginOptions(t, home, map[string]any{"port": 4041, "cache_strategy": "split"})
+	writePluginOptions(t, home, map[string]any{"port": 4041, "cache_strategy": "none"})
 	facts, code := runRoute(t, proj, routeEnv(t, home, state, ""), "--plan", "--scope", "project")
 	if code != 0 {
 		t.Fatalf("exit %d: %v", code, facts)
@@ -5311,13 +5332,15 @@ func TestRoutePlanResolvesTheConfiguredPortPerOption(t *testing.T) {
 		t.Errorf("health_url=%q does not carry the configured port, so the check would prove nothing "+
 			"about the proxy this install actually starts", facts["health_url"])
 	}
-	if facts["cache_strategy"] != "split" {
-		t.Errorf("cache_strategy=%q, want the configured split", facts["cache_strategy"])
+	if facts["cache_strategy"] != "none" {
+		t.Errorf("cache_strategy=%q, want the configured none", facts["cache_strategy"])
 	}
 	// The two the user never set must fall back individually, not be blanked because the file existed.
-	if facts["preset"] != "cache" {
+	if facts["preset"] != "off" {
 		t.Errorf("preset=%q; an unconfigured option must fall back to the plugin.json default on its "+
-			"own, and an EMPTY preset silently disables compaction", facts["preset"])
+			"own. Note `off` and empty are NOT the same thing: `off` is a named, deliberate "+
+			"passthrough, where an empty preset loads a config with no pipeline and no name for what "+
+			"it is doing", facts["preset"])
 	}
 	if facts["idle_exit"] != "24h" {
 		t.Errorf("idle_exit=%q, want the 24h default", facts["idle_exit"])
@@ -5808,7 +5831,7 @@ func TestRouteConfirmCommandCarriesEveryDecision(t *testing.T) {
 	env := append(routeEnv(t, home, state, ""),
 		"ANTHROPIC_BASE_URL=https://gateway.corp.example/v1")
 	facts, code := runRoute(t, proj, env, "--plan", "--scope", "user",
-		"--i-understand-machine-wide", "--on-conflict", "chain", "--cache-strategy", "split",
+		"--i-understand-machine-wide", "--on-conflict", "chain", "--cache-strategy", "none",
 		"--upstream", "https://gw.example/v1", "--health-url", "http://127.0.0.1:9/healthz",
 		"--no-health-check")
 	if code != 0 {
@@ -5826,9 +5849,9 @@ func TestRouteConfirmCommandCarriesEveryDecision(t *testing.T) {
 		"--health-url http://127.0.0.1:9/healthz",
 		"--no-health-check",
 		// The decision that spends the user's money was missing from both the command and this list,
-		// which is how the drop shipped past a suite that otherwise covers this area well. `split` is
+		// which is how the drop shipped past a suite that otherwise covers this area well. `none` is
 		// the value worth pinning: the regression is a user asking NOT to spend and being charged.
-		"--cache-strategy split",
+		"--cache-strategy none",
 		"--i-consent-to-traffic-interception",
 	} {
 		if !strings.Contains(facts["confirm_command"], want) {
@@ -6126,12 +6149,12 @@ func TestRoutePlanCarriesTheConsentQuestionIncludingTheSpend(t *testing.T) {
 	}
 
 	// And with a strategy that does not spend, it must not claim otherwise.
-	facts, code = runRoute(t, proj, env, "--plan", "--scope", "project", "--cache-strategy", "split")
+	facts, code = runRoute(t, proj, env, "--plan", "--scope", "project", "--cache-strategy", "none")
 	if code != 0 {
 		t.Fatalf("plan: exit %d %v", code, facts)
 	}
 	if strings.Contains(facts["consent_question"], "SPENDS") {
-		t.Errorf("`split` spends nothing, so warning about spending is a false statement in the one "+
+		t.Errorf("`none` spends nothing, so warning about spending is a false statement in the one "+
 			"sentence the user is asked to agree to: %q", facts["consent_question"])
 	}
 }
@@ -6241,24 +6264,24 @@ func TestStrategySetSplitAnswersTheOperationTheCallerAsked(t *testing.T) {
 		t.Fatalf("arming a real strategy: exit %d %v", code, facts)
 	}
 
-	facts, code := settingsIn(t, state, home, "strategy", "set", "--name", "split",
+	facts, code := settingsIn(t, state, home, "strategy", "set", "--name", "none",
 		"--port", port, "--preset", "cache")
 	if code != 0 || facts["result"] != "set" {
-		t.Errorf("`strategy set --name split` -> exit %d result=%q; a caller that asked to set is "+
+		t.Errorf("`strategy set --name none` -> exit %d result=%q; a caller that asked to set is "+
 			"answered with the word for what it asked: %v", code, facts["result"], facts)
 	}
-	if facts["strategy"] != "split" {
-		t.Errorf("strategy=%q, want split: %v", facts["strategy"], facts)
+	if facts["strategy"] != "none" {
+		t.Errorf("strategy=%q, want none: %v", facts["strategy"], facts)
 	}
 	// The path deliberately does not exist now, so naming it would be a confidently wrong detail.
 	if facts["file"] != "(none)" {
-		t.Errorf("file=%q; `split` IS the absence of a config, so the report should not name a path "+
+		t.Errorf("file=%q; `none` IS the absence of a config, so the report should not name a path "+
 			"that does not exist: %v", facts["file"], facts)
 	}
 	// Idempotent, and still a `set`.
-	if facts, code := settingsIn(t, state, home, "strategy", "set", "--name", "split",
+	if facts, code := settingsIn(t, state, home, "strategy", "set", "--name", "none",
 		"--port", port, "--preset", "cache"); code != 0 || facts["result"] != "set" {
-		t.Errorf("re-setting split: exit %d %v", code, facts)
+		t.Errorf("re-setting none: exit %d %v", code, facts)
 	}
 
 	// And `clear`, invoked as itself, keeps its own vocabulary — the fix must not have flattened the
@@ -6730,16 +6753,16 @@ func TestStrategyClearRefusesToDeleteAFileItCannotRead(t *testing.T) {
 // also regressed the old keep-alive-off path, which was `rm -f "$CFG"` and needed no preset at all.
 func TestStrategySetSplitNeedsNoPreset(t *testing.T) {
 	state, home := t.TempDir(), t.TempDir()
-	facts, code := settingsIn(t, state, home, "strategy", "set", "--name", "split",
+	facts, code := settingsIn(t, state, home, "strategy", "set", "--name", "none",
 		"--port", keepalivePort)
 	if code != 0 {
-		t.Fatalf("`strategy set --name split` needs no preset and was refused: exit %d %v", code, facts)
+		t.Fatalf("`strategy set --name none` needs no preset and was refused: exit %d %v", code, facts)
 	}
 	if facts["reason"] == "empty_preset" {
 		t.Errorf("still refused for an empty preset on the one strategy that writes no file: %v", facts)
 	}
-	if facts["result"] != "set" || facts["strategy"] != "split" {
-		t.Errorf("result=%q strategy=%q, want set/split: %v", facts["result"], facts["strategy"], facts)
+	if facts["result"] != "set" || facts["strategy"] != "none" {
+		t.Errorf("result=%q strategy=%q, want set/none: %v", facts["result"], facts["strategy"], facts)
 	}
 
 	// The control, because the guard is right where it applies: a strategy that DOES write a file must

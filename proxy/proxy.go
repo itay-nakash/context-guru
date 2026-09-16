@@ -1918,6 +1918,14 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
 	// the description stopped working — which nothing else in this snapshot can reveal.
 	snap.AdjudicateStray = adjudicate.StrayAnswered()
 	snap.FrozenHits, snap.FrozenMisses = offload.FrozenStats()
+	// The configured pipeline, so an empty one is reportable rather than merely empty. Only for the
+	// single-tenant proxy: hosted, /stats aggregates every tenant and h.pipe describes none of them,
+	// so the field stays nil and `pipeline_len` reads 0 for a different reason - which is why the
+	// per-tenant view is the dashboard, not this endpoint.
+	if h.opts.Tenants == nil && h.pipe != nil {
+		snap.Pipeline = h.pipe.Names()
+		snap.PipelineLen = len(snap.Pipeline)
+	}
 	// The expand-induced prefix flip, published beside the freeze-replay counters because it is the
 	// same mechanism seen from the other side: a replay that DIDN'T happen because the agent
 	// expanded content that was compacted before. See metrics.Snapshot.

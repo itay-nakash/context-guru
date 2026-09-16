@@ -1394,7 +1394,14 @@ def cmd_strategy(args) -> int:
         # `names=` is the machine-readable list. The per-strategy keys below mangle `-` to `_` to be
         # valid fact keys, so they cannot be parsed back into names — install.sh needs to validate a
         # `--cache-strategy` value BEFORE it downloads a binary, and this is what it reads.
-        emit(result="ok", default=DEFAULT_STRATEGY, names=",".join(STRATEGIES))
+        # `aliases=` is published for the same reason `names=` is: install.sh validates
+        # --cache-strategy against this output BEFORE downloading a binary, and with only `names=` to
+        # read it refused `--cache-strategy split` outright - so renaming the strategy broke every
+        # saved install command and every line of shell history carrying the old word, which is
+        # precisely what having an alias was supposed to prevent. Retired names belong in the same
+        # machine-readable answer as current ones, or every caller re-derives them.
+        emit(result="ok", default=DEFAULT_STRATEGY, names=",".join(STRATEGIES),
+             aliases=",".join(f"{old}:{new}" for old, new in STRATEGY_ALIASES.items()))
         for name, spec in STRATEGIES.items():
             emit(**{f"strategy_{name.replace('-', '_')}": spec["desc"],
                     f"spends_{name.replace('-', '_')}": "true" if spec["spends"] else "false"})

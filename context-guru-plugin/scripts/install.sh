@@ -449,6 +449,17 @@ $R_STRATEGY was not checked and cache_strategy= in this report may be wrong too.
 plugin install rather than a bad argument: check python3 and $(route_here)/settings.py. Nothing was \
 installed, started or written."
   fi
+  # A RETIRED name resolves forward before it is judged. `split` became `none` when the default
+  # preset became `off` - the old name referred to `cachesplit`, which the default pipeline no longer
+  # contains - and people have that word in saved install commands and in shell history. The mapping
+  # is published by `strategy list` rather than restated here, so there is one owner of it.
+  local aliases canon
+  aliases=$(printf '%s\n' "$slist" | sed -n 's/^aliases=//p')
+  canon=$(printf '%s\n' "$aliases" | tr ',' '\n' | sed -n "s/^${R_STRATEGY}://p" | head -1)
+  if [ -n "$canon" ]; then
+    emit "cache_strategy_renamed=${R_STRATEGY} is now called ${canon}; using ${canon}"
+    R_STRATEGY="$canon"
+  fi
   case ",${names}," in
     *",${R_STRATEGY},"*) : ;;
     *) route_needs "unknown_strategy" "--cache-strategy $R_STRATEGY is not a strategy. Known: \

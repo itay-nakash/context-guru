@@ -419,9 +419,15 @@ KEEPALIVE_CFG="${STATE}/keepalive-${PORT}.yaml"
 PRESET_NOTE="$PRESET"
 # STRATEGY_NOTE is the NAME of the cache strategy in effect. Reported because a name is the only
 # thing a user can say back to us: "put it back on 5-min-ping" has to be a sentence, not an
-# archaeology exercise over four tuning numbers. `split` is the absence of a config, so it is the
+# archaeology exercise over four tuning numbers. `none` is the absence of a config, so it is the
 # correct thing to report when there is no file - not "unknown", and not silence.
-STRATEGY_NOTE="split"
+#
+# It said `split` until the default preset became `off`. That name came from `cachesplit`, which is
+# no longer in the default pipeline, so the startup note was announcing a component that was not
+# running - and it was a SECOND encoding of a name settings.py already owns, which is the defect
+# shape this branch exists to remove. Caught by reading the note in a test run, not by the drift
+# test, which only covered the preset; TestTheStartupNoteUsesTheCurrentStrategyNames covers it now.
+STRATEGY_NOTE="none"
 if [ -f "$KEEPALIVE_CFG" ]; then
   CONFIG_ARGS=(--config "$KEEPALIVE_CFG")
   # Same fail-open discipline as the preset read below: an unreadable or marker-less file must

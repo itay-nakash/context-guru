@@ -652,6 +652,17 @@ type Snapshot struct {
 	// requests). Non-zero is a lost agent turn per count, not a correctness failure.
 	AdjudicateStray int64               `json:"adjudicate_stray"`
 	Components      map[string]compStat `json:"components"`
+	// Pipeline is the CONFIGURED component order, and PipelineLen its length, so a reader can tell
+	// "no components are configured" from "components ran and did nothing". Components alone cannot:
+	// both are an empty map. That distinction stopped being academic when `off` became the plugin's
+	// default preset - the common case is now an empty pipeline, and a dashboard that renders it as
+	// a blank panel says "broken" about something working exactly as configured.
+	//
+	// PipelineLen is emitted even when zero (no omitempty) precisely because zero is the meaningful
+	// value; Pipeline itself is omitted when nil, which is the multi-tenant case where /stats spans
+	// tenants and no single pipeline describes it.
+	Pipeline    []string `json:"pipeline,omitempty"`
+	PipelineLen int      `json:"pipeline_len"`
 	// TopPassthrough names components that ran but never saved a token — dead
 	// weight in the pipeline, candidates to drop from the config.
 	TopPassthrough []string `json:"top_passthrough"`
