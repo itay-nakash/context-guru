@@ -12,6 +12,20 @@ set -uo pipefail
 H="$HOME/cg-loca"
 cd "$H"
 NAME="$1"; BIN="$2"; CFG="$3"; PORT="$4"; TASKCFG="$5"; BAND="${6:-32}"
+# THE AGENT'S MODEL, an env var with the historical default so every existing caller (run022 through
+# run027) is unaffected. It was hardcoded to aws/claude-sonnet-5.
+#
+# NOT A FREE KNOB, and the constraint is worth stating where someone might reach for it: extract_llm_sweep
+# sends its ask to the REQUEST's own model by construction, because the ask carries only an inventory and
+# the outputs are read from that model's prompt cache. So changing this changes the AGENT and the
+# ADJUDICATOR together — a haiku agent gets a haiku adjudicator, and there is no configuration that
+# separates them (`model` is a refused key on that component). Any comparison across this variable moves
+# two things at once.
+#
+# The model-window document must carry an entry for whatever is set here, or the proxy resolves no window
+# and model_info_unresolved goes non-zero — the failure that voided iterations 008-024.
+# model-window-128k.json carries aws/claude-{sonnet-5,haiku-4-5} and their bare forms.
+LOCA_MODEL="${LOCA_MODEL:-aws/claude-sonnet-5}"
 # BAND selects the declared window AND LOCA's clearing threshold together. They must agree:
 # a proxy told 64k while LOCA clears at 32k measures a pressure curve nothing else shares.
 CLEAR_AT=$((BAND*1000)); CLEAR_LEAST=$((BAND*1000/4))
@@ -112,7 +126,7 @@ echo "  shim pid=$SHPID on :$SHIM_PORT"
 
 echo "########## i022 ARM $NAME (${BAND}k) cfg=$(basename "$CFG") ##########"; date -u
 LOCA_ANTHROPIC_BASE_URL="http://localhost:$SHIM_PORT" LOCA_ANTHROPIC_API_KEY="held-by-proxy" \
-timeout 21600 .venv/bin/loca run-claude-api -c "$TASKCFG" -m aws/claude-sonnet-5 \
+timeout 21600 .venv/bin/loca run-claude-api -c "$TASKCFG" -m "$LOCA_MODEL" \
   --max-workers 8 --max-tool-uses 400 \
   --use-clear-tool-uses --clear-trigger-tokens "$CLEAR_AT" --clear-at-least-tokens "$CLEAR_LEAST" \
   > "$H/i022loca-$NAME.log" 2>&1
