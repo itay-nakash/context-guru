@@ -351,6 +351,12 @@ func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 	// loss. A checkpointed session can only reach it by SHRINKING, in which case the covered
 	// hash cannot match either and the provider's prefix is new anyway.
 	if end <= start {
+		// NAMED, because it is a transcript SHAPE the component can never act on however large the
+		// request grows, and it left rep.Skipped with no gate — indistinguishable from "not big enough
+		// yet", which is the healthy steady state. Measured on the iteration 027 probe: requests of
+		// 81,580 tokens sat above the trigger for six consecutive turns and summarize acted on none of
+		// them, with nothing recorded to say which path in this function refused.
+		rep.Gate("summary_span_empty")
 		rep.Skipped = true
 		return nil, nil
 	}
@@ -453,6 +459,11 @@ func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 		if end <= start {
 			// Nothing summarizable is left once expanded content is protected. Declining is the
 			// outcome summarize already has for an empty span, and the safe direction.
+			//
+			// SEPARATE from summary_span_empty above: that one is the transcript's own shape, this one
+			// is the agent having expanded content we then must not re-summarize. Same outcome,
+			// opposite remedies — one is a keep_last question, the other is about expand traffic.
+			rep.Gate("summary_span_empty_after_expand_trim")
 			rep.Skipped = true
 			return nil, nil
 		}
@@ -460,6 +471,11 @@ func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 
 	span := msgs[start:end]
 	if schema.MessagesTokens(&bschemas.BifrostChatRequest{Input: span}) < s.minTokens {
+		// The span cleared the request-level trigger and is still too small to be worth a model call.
+		// Labelled because it is the decline that says "the request is large but its COMPACTABLE part
+		// is not" — the signature of mass concentrated in the protected tail, and unrecoverable from
+		// the request size alone.
+		rep.Gate("summary_span_below_min_tokens")
 		rep.Skipped = true
 		return nil, nil
 	}
@@ -679,14 +695,42 @@ func (s *Summarize) tryReuse(c *components.Ctx, rep *components.Report, msgs []b
 	headCount, start, end int) (out []bschemas.ChatMessage, keys []string, ok, stale bool) {
 	cp, ok := loadCheckpoint(c)
 	if !ok || cp.CoveredCount <= 0 {
+		// No standing checkpoint. The expected state on a session's first eligible turn, and it must be
+		// distinguishable from the ones below, which mean a checkpoint exists and could not be used.
+		rep.Gate("summary_no_checkpoint")
 		return nil, nil, false, false
 	}
 	boundary := start + cp.CoveredCount
 	if boundary > end { // covered prefix would overlap the kept tail — can't reuse
+		rep.Gate("summary_checkpoint_overlaps_tail")
 		return nil, nil, false, false
 	}
 	covered := msgs[start:boundary]
 	if spanHash(covered) != cp.CoveredHash {
+		// COUNTED SEPARATELY because this is the only decline an UPSTREAM COMPONENT can cause. The hash
+		// is over msgs as the rest of the pipeline left them, and `summarize` runs last, so any
+		// component mutating a message inside the checkpointed span lands here. extract_llm_sweep is the
+		// obvious one: it removes deep-history outputs and runs earlier.
+		//
+		// READ THIS AS CHURN, NOT AS COST. It was misread as a cost once and the reasoning is easy to
+		// repeat, so here is why it is not:
+		//
+		//  1. The mutated messages are INSIDE msgs[start:end], which the fresh path collapses into a
+		//     single summary. So the upstream component's marker does not reach the wire at all on this
+		//     turn — its removal and this summary are doing the same job to the same bytes, and the
+		//     summary wins. There is no removal being "paid for twice".
+		//  2. It is a ONE-OFF per upstream change, not a per-turn tax. The fresh path writes a NEW
+		//     checkpoint whose hash covers the mutated content, so once the upstream component is
+		//     replaying a frozen decision — which is what freezing is for — the span hashes identically
+		//     from the next turn on and reuse resumes.
+		//
+		// So ONE firing per upstream removal is expected and harmless. What this counter is actually for
+		// is the other case: firing REPEATEDLY on one session means the checkpoint is not
+		// re-stabilising, i.e. some component above is mutating the span DIFFERENTLY turn to turn rather
+		// than replaying a fixed decision. That is when real money appears — a model call plus a prefix
+		// rewrite on every eligible turn — and it is indistinguishable from healthy operation without
+		// this gate. Compare the count against the session's turns, never against zero.
+		rep.Gate("summary_covered_span_changed")
 		return nil, nil, false, false // prefix diverged (different session / edited) → fresh
 	}
 	// The un-summarized middle since the checkpoint (excludes the kept last-K).
@@ -704,6 +748,14 @@ func (s *Summarize) tryReuse(c *components.Ctx, rep *components.Report, msgs []b
 		// faithful summary of msgs[start:boundary] and re-emitting it produces the same bytes
 		// earlier turns sent. Rolling it forward is merely BETTER, so a fresh attempt that
 		// cannot complete may fall back to it instead of sending the transcript full.
+		//
+		// NAMED FOR THE OUTCOME, not for one of its two reasons. This branch now carries both "the tail
+		// grew past resummarize_tokens" and "resummarize_tokens is 0, so roll forward on every eligible
+		// turn", which `0c21ead` deliberately merged here so that a config carrying 0 still reports a
+		// valid checkpoint rather than replaying nothing. An earlier version of this branch gated those
+		// two separately; one of those gates named a path that no longer exists and was dropped rather
+		// than carried forward as a counter that can never fire.
+		rep.Gate("summary_checkpoint_stale")
 		return nil, nil, false, true
 	}
 	// Refresh the stashed original span so expand keeps resolving it (full-mode

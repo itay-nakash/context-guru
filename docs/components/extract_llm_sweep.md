@@ -182,6 +182,226 @@ guessed TTL would invalidate live prefixes on exactly the deployments whose TTL 
 the codebase's own clock-uncertainty margin for cache expiry. Wider fires more often and invalidates
 more remaining TTL; narrower fires rarely. Nothing measures either side.
 
+### The second trigger, and what it has to pay for
+
+`econ_trigger` fires on **mass** rather than the clock, which is how the sweep reaches a session whose
+cache keeps being refreshed — the long agent run with the most to save, and the one the pre-expiry
+window can never reach. It pays a real cache-write to do it, so it has to clear a break-even first.
+
+That break-even has three terms, and the third one is easy to forget because it is not a property of the
+transcript:
+
+| | |
+|---|---|
+| **benefit** | the mass removed, collected on every remaining turn — and discounted by how much of the inventory the adjudicator actually takes |
+| **cost** | the cache-write the mutation forces, charged once, from the earliest dropped index to the cached boundary |
+| **cost** | **the adjudication itself**, charged whether or not the answer turns out to be "drop something" |
+
+Leaving that last term out is not a rounding error. Measured on iteration 025's pre-flight, it was the
+*whole* cost: 9 asks authorised out of 9, six of which removed nothing, $0.4339 spent for $0.0017 of
+value. The damage concentrated on the case where every candidate already sits past the cached boundary —
+there the cache-write is genuinely free, which used to authorise unconditionally, and which is exactly
+the case where the ask is the only thing being paid for.
+
+Both the ask's price and the approval rate are **measured from this component's own asks** rather than
+configured, for the same reason the rate card is preferred to a constant: a literal approval rate is one
+workload's average wearing a threshold's authority. Two guards keep a self-referential gate from
+strangling itself — a short warm-up, because a single ask can only ever report 0% or 100% of its
+inventory, and a floor under the approval rate, without which one unlucky run of empty asks would
+decline every future one and destroy the evidence that could revise the estimate.
+
+Read `prefix_rewrite_repaid` against `econ_ask_not_repaid` and `prefix_rewrite_not_repaid`: the two
+declines name **different** costs and are raised exclusively, so they sum rather than overlap.
+
+### The terms, and what the component knows about itself
+
+Every turn the sweep may ask the model *"which of these tool outputs are spent?"*. That question costs
+money, so a test decides whether to ask at all. Its vocabulary:
+
+| term | meaning |
+|---|---|
+| **candidate** | one tool output being considered for removal |
+| **inventory** / **batch size** | how many candidates go into a single ask (`offered` in the logs) |
+| **approval** | the fraction of offered tokens the model actually agrees to remove. Offer 10,000, get 3,000 removed, approval is 0.30 |
+| **the ledger** | a running record of what this component's own asks have cost and how much they removed — how approval gets *measured* rather than assumed |
+| **warm-up** | the first three asks, before the ledger can average. Assumed values are used instead: approval 1.0, and a cost estimated from the request's shape |
+| **floor** | the lowest approval the ledger will report, 0.05. A guard so a measured zero cannot drive the expected saving to zero and disable the component outright |
+| **premium** | how much a removed token is believed to be worth relative to the cache read it saves (`reward_premium`, default 1). The only term in the test that is a *belief* rather than a measurement — see [What the break-even cannot price](#what-the-break-even-cannot-price) |
+
+The ledger holds four running totals — asks, dollars spent, tokens offered, tokens actually removed — and
+derives two predictions for the next ask: cost as `dollars / asks`, and approval as `removed / offered`.
+
+**So approval answers "is the question worth asking?"** — when this component pays to ask, how much does
+it get back? A poor track record predicts a poor next ask, and the price stops being justified. It is the
+component observing its own history.
+
+Two things that vocabulary hides and that matter:
+
+- **The thing being asked is the ADJUDICATOR, not the agent.** It is a second call to the same model,
+  judging which outputs are spent. The agent doing the task never sees it. A low approval means the
+  *judge* kept the outputs, not that the agent did anything.
+- **A low approval is not automatically a failure.** It means the judge found those outputs still
+  load-bearing, and that may be correct. If they genuinely are not spent, declining to pay for the
+  question is the right answer.
+
+**Which is exactly what makes the estimator dangerous: it is self-referential.** It predicts its own
+future from its own past, and its predictions determine what evidence it receives. Predict low, do not
+ask, learn nothing, keep predicting low — defensible at every individual step and permanently wrong if the
+early samples were unrepresentative.
+
+That is not hypothetical. On the iteration 026 probe the first three asks all carried **three** candidates,
+a batch size this repo had already measured as one where the model does not act (about 94% kept when shown
+a single output, against 58% dropped at ~15). One drop out of nine candidates, approval measured near
+zero, clamped to the 0.05 floor — and because approval sits in the DENOMINATOR of the break-even, 0.05
+multiplies the turns-to-repay by twenty. A real decision at `need=36, have=7` was declined that would have
+read `need≈2` at approval 1.0. After that no ask cleared the bar, so no new sample arrived, and the
+estimate stayed floored.
+
+**The floor prevents approval reaching zero. It does not prevent the estimator getting STUCK**, which is
+the failure that actually occurred, and the deeper defect is one of shape rather than value: approval is a
+CURVE in batch size and the code stores a single point on it. One scalar cannot express "a batch of three
+will not yield but a batch of eight will", and that sentence is both true and necessary. Tracked in the
+issue on the approval estimate.
+
+### When the trigger declines — and why it is usually *not* "no turns left"
+
+The condition is `need > have`:
+
+```
+have = estimated turns before the request fills the window
+need = turns of saving required to repay the one-time costs
+     = ceil( (11.5 × rewritten  +  askUSD / cache_read_rate)
+             ─────────────────────────────────────────────── )
+                        offered × approval
+```
+
+Which gives **three** routes to a decline, not one:
+
+| route | meaning |
+|---|---|
+| `have` falls | near the window ceiling, few turns left to collect on — this is the "no turns left" case |
+| numerator rises | the question got expensive (more uncached prefix to read), or the rewrite reaches deeper |
+| denominator falls | less mass on offer, or a measured approval rate saying the model will not take much of it |
+
+**In the iteration 025 pre-flight only the last two fired.** `have` actually *rose* over the run, 27 → 120,
+and the trigger declined anyway:
+
+| | first ask | at the first decline |
+|---|---|---|
+| `offered` | 11,011 | 6,014 (÷1.8) |
+| `approval` | 1.00 | 0.328 (÷3.1) |
+| `askUSD` | $0.0161 | $0.0498 (×3.1) |
+| **`need`** | **8** | **127** |
+| `have` | 27 | 120 |
+
+The numerator tripled as the ledger learned what an ask really costs; the denominator fell 5.6x as the
+inventory thinned and the approval rate came in. **17x on `need`, while the turns available got better.**
+So the decline meant *"the question now costs what it really costs, and what is left to ask about cannot
+repay it"* — not *"we are running out of runway"*.
+
+That is the shape to expect, because **the sweep eats its own lunch.** The first asks remove the large,
+obviously-spent outputs (13,122 and 1,676 tokens here); what remains is smaller, while the ask's price
+holds or climbs as the uncached prefix grows. The profitable sweeps happen and then the trigger shuts
+itself off, which is why there is no call cap — it is self-limiting.
+
+There is a second-order effect worth noticing in that table: `have` jumped from ~25 to ~120 immediately
+after those first two removals. Taking 15k tokens out shrank the request, so more turns fit before the
+window fills — **the sweep's own success bought it more runway**, which then part-funded the later asks.
+
+### Why there is no context-pressure floor
+
+A natural-looking economy is "do not even evaluate the trigger until the context is, say, 70% full — that
+saves paying for asks early in a conversation". **This component deliberately has no such floor, and on
+the measured workload it would disable it completely.** Every ask in the pre-flight fired between
+**13.9% and 29.3%** of the 64k window:
+
+| ask | pressure | tokens removed |
+|---|---|---|
+| 1 | 29.3% | **13,122** |
+| 2 | 13.9% | 1,676 |
+| 3–9 | 18.3% – 23.5% | 0 – 1,194 each |
+| 10 | 25.4% | **5,978** |
+
+A 70% floor blocks all ten, and the two asks doing most of the work — 19,100 of 26,528 tokens between
+them — are the *first* and the *last*, both under 30%.
+
+Two reasons this is structural rather than a quirk of one run:
+
+- **A pressure floor is also a HORIZON CAP.** The horizon is `turns x (1/p - 1)`, so a floor at pressure
+  `p` puts a ceiling on the very term that authorises firing: 9x`turns` at 10%, 1x at 50%, **0.43x at
+  70%**, 0.11x at 90%. At a 70% floor a transcript needs twelve assistant turns just to show a horizon
+  of five. And the floor does not merely cap the multiplier, it *selects* for low turn counts — the
+  requests that reach 70% fastest are the ones with few enormous tool outputs, which is precisely the
+  shape this component exists to act on. Both factors fall together.
+- **A pressure gate on a component that relieves pressure cannot fire once the component works.** The
+  request stays at 20% *because* outputs are being removed. Requiring high pressure first is requiring
+  the fever before the medicine that prevents it.
+
+**Measured on iteration 024, whose firings are the only large sample that exists.** Counting only the
+firings that still repay once priced against a correct window (74 of its 203):
+
+| floor | firings kept | removal value lost |
+|---|---|---|
+| 10% | 57 of 74 | 8% |
+| 20% | 51 of 74 | 12% |
+| 30% | 48 of 74 | 21% |
+| 50% | 39 of 74 | 37% |
+| **70%** | **4 of 74** | **67%** |
+
+So a floor is defensible at **10–20%** and destructive above about 30%. `min_pressure` exists for the
+narrower job its own entry describes — keeping the ask ledger's warm-up samples off transcripts where
+nothing has been superseded yet — and 0.70, tried in iteration 026, blocked 127 of iteration 024's 203
+firings on its own and left the component firing zero times in a $65 run.
+
+A free part of the same economy is `min_inventory`, which declines before any model call and raised
+`sweep_inventory_below_min` **38 times** against 20 econ decisions in one run. It is not a substitute:
+iteration 024's firings commonly carried **three** candidates, so a floor of 7 blocks a further quarter
+of them.
+
+### What the break-even cannot price
+
+`S x T > 11.5 x W` values a removal at **the cache reads it saves**. On the one iteration where this
+component demonstrably helped, that is not what it was paid in.
+
+| iteration 024, arm B | |
+|---|---|
+| sweep spend | **$20.26** |
+| cache savings it banked | **$0.72** |
+| ratio | **28:1 against** |
+| task accuracy | 0.486 → **0.608**, 8 tasks better, 0 worse, clustered p = 0.0078 |
+| cost per task | $2.808 → $3.419 (**+21.8%**) |
+| steps per task | 24.3 → **29.0** (+19.4%) |
+| cost per **step** | $0.1156 → $0.1179 (**+2%**) |
+
+Read the last two rows together: the sweep's own overhead was 2%; the entire cost increase was **more
+steps**. And the accuracy gains land exactly where the steps do — the 8 tasks that improved took +10.2
+steps on average, the 7 that did not took −1.2. **The mechanism is trajectory headroom, not token
+savings**, and headroom appears nowhere in the break-even.
+
+`reward_premium` is where that gap is stated, in config, falsifiably: it multiplies the benefit, so a
+premium of 20 says a removed token delivers twenty times the read it avoids. Priced at face value the
+break-even authorises **19%** of the removal value that produced iteration 024's result; at a premium of
+20 it reaches about **53%**. Two independent routes — sizing the premium to reproduce those firings, and
+dividing that run's spend by its banked savings — both land near **28**.
+
+**It cannot rescue a zero horizon.** `ceil(need/premium) >= 1 > 0`, so a request with no turns left
+refuses at any premium. That is what the next section is about, and the two changes only work together.
+
+### The horizon is measured on the request the removal will leave behind
+
+`T` used to be computed from the request **as it arrived** — which asks "how many turns remain if we do
+nothing" and then charges the removal against that answer. At high pressure the two differ by everything:
+a 90k request against a 64k window has no turns remaining and returns 0, so no benefit can ever repay it,
+while the same request with 52k removed sits at 60% of the window with real turns ahead.
+
+On iteration 024's own decisions the horizon was **exactly zero on 51 of 203 firings (25%)**, and a zero
+refuses unconditionally. The growth *rate* still comes from the pre-removal request, because the rate is a
+fact about history that already happened; only the *room left* is a fact about the future.
+
+Note the asymmetry with `coref`, which shares this file's break-even but keeps the uncredited form: its
+drop selection was calibrated against that expression, and moving the objective a measured component
+optimises would invalidate those measurements rather than improve them.
+
 ## When the cache read does not happen
 
 `PrefixUsage` is returned rather than merely recorded, so the component gates on it. A read of zero is
@@ -242,7 +462,12 @@ net; the model does not get to hear about it.
 | key | default | what it does |
 |---|---|---|
 | `min_tokens` | 1000 | Per-output floor for naming a candidate in the inventory. Every line is paid fresh, and a small output's removal cannot repay the marker it leaves behind. At 3000 this produced **zero** extractions across 3,437 production requests. |
+| `reward_premium` | 1 | How much a removed token is worth relative to the cache read it saves — the only term in the break-even that is a belief rather than a measurement. 1 is the unadjusted arithmetic. Values below 1 are refused (they assert a removal is worth less than the read it saves, tightening a gate that is already the restrictive term); above 100 is refused as a typo. See [What the break-even cannot price](#what-the-break-even-cannot-price) for the 28:1 measurement behind any value above 1, and read `premium` on `cg.sweep.econ` to re-price a run's declines without re-running it. |
+| `min_inventory` | 10 | Fewest candidates worth asking about; below it the sweep declines without asking. The model's judgement is a function of how many candidates it **compares**: shown one output it scored 6% live-kept, ~15 together reached 58% at the lowest cost per output. Below the floor a removal is a guess, and a wrong removal costs content the agent still needs while a wrong keep costs one turn's tokens. |
 | `pre_expiry_seconds` | 60 | Width of the pre-expiry window. The component's one unmeasured number. |
+| `evidence` | `false` | Add the co-reference index's record to each inventory line. It is **evidence the model weighs, never a filter** over the candidates — a pre-filter left about one candidate per request, collapsing a bulk arm into the per-output shape refuted at 6% live-kept. Also adds a paragraph teaching how to read the counters; counters with no explanation invite an invented reading. |
+| `econ_trigger` | `false` | Add the **economic** trigger alongside the pre-expiry window, so a live cached prefix can be swept when the saving outruns the cache-write it forces. The two are OR'd and neither contains the other: pre-expiry fires on the clock and cannot reach a session whose cache keeps being refreshed — the long run with the most to save — while econ fires on mass and cannot know how much time is left. |
+| `econ_ignore_ask_cost` | `false` | Restore the econ trigger's original break-even, which charged the cache-write and **not** the adjudication that reads it. Left out, that authorised 9 asks in 9 on iteration 025's pre-flight, six of which removed nothing: $0.4339 spent against $0.0017 of value. Set true only to attribute a run's difference to the change. |
 | `block_fallback` | `false` | Decline instead of falling back to a content-carrying completion when the cache read did not happen. |
 | `marker_mode` | `full` | `full` is the only mode that keeps a removal recoverable. |
 
@@ -277,7 +502,98 @@ unparseable: raise the budget, not the prompt), `sweep_verdict_unusable`,
 `sweep_no_prefix`, `sweep_ask_failed`, `sweep_inventory_of_one`, `sweep_kept_everything`,
 `sweep_unparseable`, `sweep_reply_truncated`, `sweep_verdict_unusable`, `sweep_verdict_unknown_label`,
 `sweep_verdict_duplicate_label`, `sweep_verdict_missing`, `sweep_drop_would_not_shrink`,
-`not_in_pre_expiry_window`.
+`not_in_pre_expiry_window`, `sweep_inventory_below_min`, `drop_unaffordable_pruned`,
+`prefix_rewrite_not_repaid`, `econ_ask_not_repaid`.
+
+The last two are raised **exclusively**, and reading them as one number loses the finding:
+`prefix_rewrite_not_repaid` means the cache-write does not earn itself back, `econ_ask_not_repaid` means
+the batch cannot repay the price of *asking* about it. `prefix_rewrite_repaid` is the matching event when
+the trigger does fire — and it says the batch was worth asking about, never that a saving was banked.
+
+## Enabling it on real traffic
+
+This component has never been measured on a workload independent of the one its thresholds were tuned
+on. Every corpus behind `min_inventory`, `min_tokens`, `min_later_turns` and the 6%-vs-58% live-kept
+curve is LOCA-derived (see [LOCA iteration 028](../experiments/loca/iter028/results.md#5-why-the-iteration-was-stopped-the-workload-cannot-price-this-feature)),
+and on LOCA the cache arithmetic came out at 11.0 against a break-even of 11.5 — with `S` and `T` both
+structurally thin there. So the first real deployment is a **measurement**, not a rollout, and it should
+be configured to be readable rather than aggressive.
+
+### The two keys that turn it on
+
+```yaml
+extract_llm_sweep:
+  econ_trigger: true    # without this it will almost never fire under load
+  evidence: true        # co-reference index into the inventory line
+```
+
+`econ_trigger` is not optional in practice. The pre-expiry trigger fires on an idle clock, and any
+concurrently-served deployment keeps refreshing the cached prefix — `not_in_pre_expiry_window` was
+286/286 requests on LOCA, 378/378 on iteration 024 and 18/18 on iteration 022. Ship without
+`econ_trigger` and you will measure a component that never ran.
+
+Leave `reward_premium` at its default of 1 for a first deployment. Above 1 it asserts a removed token is
+worth more than the cache read it saves, which is a belief about headroom value — and the one instrument
+that could have priced it (the harness's own context clearing) has never fired, so nothing has tested it.
+
+### Whether it *can* pay, before asking whether it did
+
+The gate is `S·T > 11.5·W`: mass removed, times turns remaining, against the cache-write it forces. Three
+properties of the traffic decide it, and all three are readable before enabling anything:
+
+| property | why it matters | what to look for |
+|---|---|---|
+| **candidates per request** | the model's judgement is a function of how many it compares; below `min_inventory` the component declines without asking | ≥10 settled, undecided tool outputs over `min_tokens`. LOCA supplied **1.5** and asked on 5% of requests |
+| **session length** | `T` is turns *remaining*; a short session has nothing for a removal to pay back over | long-running sessions. LOCA's 10–30 step tasks are close to the worst case |
+| **output size** | the rewrite cost is set by the **shallowest** removal, so mass per invalidation is what clears the break-even | large tool results, ideally several at similar depth. `min_tokens: 100` excluded 1,008 candidate-instances on LOCA |
+
+A deployment that cannot supply ~10 candidates per request will produce a component that declines
+correctly and teaches you nothing. Check that first.
+
+### What to read, in order
+
+**1. Did it fire at all?** `acted`, `sweep_prefix_cache_read_ok`, `sweep_adjudicated`. If `acted` is 0,
+read the gates before touching a threshold — `not_in_pre_expiry_window` (needs `econ_trigger`),
+`sweep_below_min_pressure`, `sweep_inventory_below_min`. Note that `sweep_inventory_below_min` is raised
+with `GateN(len(cands))`, so it counts **candidates, not requests**; dividing it by request count is a
+misreading.
+
+**2. Did it lose anything?** This is the question that decides whether to continue.
+
+- `expand_unresolved_missing` **must stay 0.** It is the direct measure of a removal the agent then asked
+  for and could not get back. It was 0 → 0 across iteration 028's arms with 105 drops performed.
+- `sweep_drop_refused_obligation` — the model tried to remove an output it had just said was still
+  needed. The removal did not happen, but a non-zero rate means the contract is not holding.
+- `sweep_quote_fabricated` — the model cited transcript text that is not in the transcript. On this
+  design it is the only signal that says the model is inventing.
+
+**3. Did it pay?** Not from the dollar total — on LOCA the pass-level dollar difference was +4% and
+paired per environment it was `+$0.077 ± $0.80`, i.e. noise. Compute the ratio instead, which is exact:
+
+```
+saved_tokens                     (component counter)
+incremental cache creation       (arm with the sweep − arm without, or before/after enabling)
+ratio = saved_tokens / incremental_cache_creation
+```
+
+**A ratio above 11.5 means the removals paid for the cache writes they forced; below it they did not.**
+11.5 is `(2.50 − 0.20) / 0.20` — the incremental price of writing a token to cache rather than reading
+it. LOCA realised **11.0**. Because the rewrite span is fixed by the shallowest removal, the lever is
+**drops per invalidation** (`sweep_dropped / acted`; LOCA managed 8.75), not the number of asks.
+
+**4. Is the ask worth its own price?** `econ_ask_not_repaid` and `prefix_rewrite_not_repaid` are raised
+**exclusively** and must not be summed: the first means the batch cannot repay the price of *asking*, the
+second that the cache-write does not earn itself back.
+
+### A first deployment that answers the question
+
+- **Enable for a subset of sessions**, ideally long-running ones with large tool results — that is where
+  `S·T` is largest and where a null result would be informative rather than structural.
+- **Record the ratio, not the dollar delta.** The ratio is arithmetic on counters and needs no control
+  arm; the dollar delta needs one and is dominated by step-count variance.
+- **Treat any non-zero `expand_unresolved_missing` as a stop**, not as a rate to tune.
+- **Expect it to decline often.** On LOCA it asked 15 times in 286 requests and that was correct
+  behaviour, not a fault. `sweep_kept_everything` is likewise a deliberate keep-all.
 
 ## What is not measured
 

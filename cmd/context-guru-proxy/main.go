@@ -1188,10 +1188,32 @@ func modelWindows() modelinfo.Resolver {
 		}
 		return chain
 	}
-	return append(chain,
-		modelinfo.NewLiteLLM(os.Getenv("MODEL_INFO_URL"), nil, 0),
-		modelinfo.DefaultStatic(),
-	)
+	url := strings.TrimSpace(os.Getenv("MODEL_INFO_URL"))
+	live := modelinfo.NewLiteLLM(url, nil, 0)
+	if url == "" {
+		// The public map. A fetch failure here is a network inconvenience, not a misconfiguration, so
+		// the embedded table remains the right answer and the chain keeps its fallback.
+		return append(chain, live, modelinfo.DefaultStatic())
+	}
+	// AN EXPLICIT MODEL_INFO_URL IS AN AUTHORITY THE OPERATOR NAMED, and guessing past it is wrong for
+	// the same reason MODEL_PRICES is fatal rather than skipped a few lines up: a silently-absent
+	// document is indistinguishable from one that says something different, and every fraction-based
+	// threshold in the pipeline would then be evaluated against a window nobody chose. Probed
+	// SYNCHRONOUSLY here because the resolver's own fetch is a background refresh — by the time it
+	// fails, requests are already being served against DefaultStatic's 1,000,000 for a claude model.
+	//
+	// This is the check that would have stopped iteration 024. Its rig passed a correct 64k document on
+	// a URL the proxy could not reach; the proxy resolved 1,000,000 on all 2,207 requests, summarize's
+	// 0.78 trigger became 780,000 and never fired once in either arm, the econ trigger's horizon came
+	// out 16x too long and authorised 626 asks, and the run completed with every counter healthy. Six
+	// hours of benchmark time and $207 per arm bought numbers that described no configuration.
+	if err := live.Load(context.Background()); err != nil {
+		log.Fatalf("MODEL_INFO_URL %s: no context window could be resolved from it (%v). Refusing to "+
+			"start: every fraction-based trigger would be evaluated against a built-in default instead "+
+			"of the document you configured, and nothing downstream can tell the difference.", url, err)
+	}
+	// The fallback stays BEHIND the probed document, for models the document does not list.
+	return append(chain, live, modelinfo.DefaultStatic())
 }
 
 // cheapModelFromEnv builds the static "config"-source LLM client for NeedsModel

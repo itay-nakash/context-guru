@@ -93,6 +93,13 @@ var statsGoldenTopLevel = []string{
 	"llm_truncated",
 
 	"mode",
+	// WHETHER THE THRESHOLDS IN THIS RUN MEANT ANYTHING. Non-zero says the configured model-window
+	// document never loaded, so every fraction-based trigger was evaluated against a built-in default
+	// window instead. Added to the reviewed contract because the harness in deploy/harbor reads this
+	// payload for every published result and had no way to detect the condition: iteration 024 ran ten
+	// passes at a resolved 1,000,000 against a configured 64,000, summarize never fired once in either
+	// arm, and every other field in this document looked healthy.
+	"model_info_unresolved",
 	"observe_hypothetical_requests",
 	"output_tokens",
 	"potential_overhead_ms_avg",

@@ -26,6 +26,75 @@ byte-identical so the prefix stays KV-cache stable) until the un-summarized tail
 `resummarize_tokens`, when the checkpoint rolls forward with a fresh summary. This is what stops it
 re-summarizing every turn.
 
+### Why reuse is load-bearing rather than an optimisation
+
+The trigger gates the component completely — below it `summarize` returns immediately and does nothing.
+**And the trigger reads the request as the REST OF THE PIPELINE LEFT IT**, because one `req` pointer is
+threaded through the components in order, each mutating it in place, and `summarize` runs last. So
+upstream compaction decides whether this component fires at all: the system is self-limiting, and
+measured it fires on 0–28% of requests (13.5% and 27.9% on iteration 025's two arms, 25.8% and 0% on the
+iteration 026 probes) rather than on every turn.
+
+That is also the deferral mechanism, stated without hand-waving: anything upstream that shrinks the
+post-pipeline request below the threshold stops `summarize` running, and `acted / runs` against a
+baseline arm is how you see it.
+
+On a turn where it does fire, one of two paths is taken:
+
+| path | when | cost |
+|---|---|---|
+| **reuse** | tail since the checkpoint < `resummarize_tokens` | **free** — no model call, summary byte-identical, cached prefix survives |
+| **roll forward** | tail ≥ `resummarize_tokens` | a model call **plus a prefix rewrite from the summary onward**, i.e. a cache write |
+
+`resummarize_tokens` is therefore a **refresh interval**, not a size limit: it is how much new content the
+component will carry verbatim before paying to re-summarise. Larger means fewer model calls and fewer
+cache writes, paid for by a bigger request each turn; smaller means a tighter request and a cache write
+more often. Zero disables reuse, so every eligible turn re-summarises.
+
+Read that against a cache write costing roughly 11.5x a cache read per token in this codebase's own
+arithmetic and reuse is worth real money on the turns it applies — though at a 14–28% firing rate it is an
+optimisation rather than, as an earlier draft of this section claimed, the only thing making per-turn
+operation viable. Operation is not per-turn.
+
+### The interaction to watch: an upstream component can defeat it
+
+Reuse requires the covered span to be **byte-unchanged**, and the hash is taken over the messages *as
+earlier components in the pipeline left them*. So any component that mutates a message inside the
+checkpointed span invalidates the checkpoint and forces the paid path, even when the tail is small.
+
+`extract_llm_sweep` is the obvious candidate, since it removes deep-history outputs and runs before
+`summarize`. **But read `summary_covered_span_changed` as churn, not as cost**, for two reasons that are
+easy to miss:
+
+- The mutated messages sit inside the span the fresh path **collapses into a single summary**, so the
+  upstream marker never reaches the wire on that turn. The removal and the summary are doing the same job
+  to the same bytes; nothing is paid for twice.
+- It is a **one-off per upstream change**. The fresh path writes a new checkpoint whose hash covers the
+  mutated content, so once the upstream component is replaying a frozen decision the span hashes
+  identically from the next turn and reuse resumes.
+
+So one firing per removal is expected and harmless. The counter earns its place on the *other* case:
+firing **repeatedly within one session** means the checkpoint is not re-stabilising — something upstream is
+mutating the span differently turn to turn instead of replaying a fixed decision — and only then is there a
+model call plus a prefix rewrite on every eligible turn. Compare the count against the session's turns,
+never against zero.
+
+Note also what an upstream removal cannot do: because the trigger gates everything, it can never *cause* a
+summarize run.
+
+**And it can now be checked from a run.** An earlier version of this paragraph said the opposite — that the
+reuse path recorded no gate and no event, so `acted_replay` read 0 whether reuse fired on every turn or
+none. `0c21ead` closed that independently while this branch was open: the reuse paths now file
+`reused_checkpoint`, `awaited_checkpoint` and `gated_replayed_checkpoint` through `Report.Replay`, which
+increments `Replays` with them. So `acted_replay` distinguishes a free byte-identical re-emission from a
+model call plus a prefix rewrite, and a zero there now means *never* rather than *unmeasured*.
+
+The declines on that path are named too, so a run says which one refused: `summary_no_checkpoint` (none
+standing yet — the expected first-turn state), `summary_checkpoint_overlaps_tail`,
+`summary_covered_span_changed` (above) and `summary_checkpoint_stale` (the tail outgrew
+`resummarize_tokens`, **or** `resummarize_tokens` is 0 and every eligible turn rolls forward — one branch
+carries both, so read it as "a valid checkpoint exists but was not re-emitted as-is").
+
 Run it **alone** (its own preset) — it restructures the whole transcript.
 
 ## Before → After
