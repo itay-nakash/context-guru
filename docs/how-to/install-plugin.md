@@ -247,12 +247,12 @@ So on a hosted agent, an unattended install cannot complete, by design. Either a
 run both commands yourself with `!`, or add a rule covering the plugin's `scripts/` directory — one rule
 covers both, since both are that directory's scripts.
 
-**And on a hosted agent, check whether the trial can show you anything before doing any of it.** The
-`cache` preset works by moving a cache breakpoint inside the environment snapshot Claude Code appends
-to its system prompt. **Outside a git repository there is no such snapshot**, so `cachesplit` reports
-`verdict: skipped` and the saving is exactly zero — a structural zero, not a warm-up. A pod whose
-working directory is not a repo will measure nothing no matter how long you leave it. `/context-guru:status`
-says so explicitly; believe it rather than waiting for numbers to appear.
+**And on a hosted agent, check whether the trial can show you anything before doing any of it.** Under
+the default preset (`off`) the only mechanism running is the `5-min-ping` cache strategy — see
+[What it does to your requests](#what-it-does-to-your-requests) below — and it only has something
+to show once a session sits idle past the 5-minute cache TTL. A pod that is cycled quickly, or that never
+goes idle, will measure nothing no matter how long you leave it. `/context-guru:status` says so
+explicitly; believe it rather than waiting for numbers to appear.
 
 ## You do not need an API key
 
@@ -297,18 +297,23 @@ ships its own `env` block, and a `--global` install needs no per-repo caveat.
 
 ## What it does to your requests
 
-The default preset is `cache`: [`cachesplit`](../components/cachesplit.md) and nothing else.
+The default preset is `off`: an empty pipeline. Nothing in the request body is touched — no
+content dropped, no summarising, no `<<cg:HASH>>` markers, no extra tool added, no model call on
+the request path. You can check that claim in one line of `config/config.go`.
 
-- No content dropped, no summarising, no `<<cg:HASH>>` markers.
-- No extra tool added to your requests, and no model calls.
-- One oversized system block is split into two adjacent text blocks whose concatenation is
-  byte-identical, so the model sees exactly the prompt your agent sent. The cache breakpoint
-  moves onto the half that does not churn.
+Under the default preset the only thing the plugin actually does is keep-alive: the `5-min-ping`
+cache strategy (`/plugin configure` → Cache strategy, above) pings just under the provider's
+5-minute cache TTL so an idle session's prompt cache does not expire between turns. That **spends
+your own quota**, and `/context-guru:cache-strategy-picker` is where you name it or turn it off
+(`none`).
 
-You can check that claim in one line of `config/config.go`. That is the point of the preset.
+**Opting into `cache` adds [`cachesplit`](../components/cachesplit.md)** on top of that: one
+oversized system block is split into two adjacent text blocks whose concatenation is
+byte-identical, so the model sees exactly the prompt your agent sent. The cache breakpoint moves
+onto the half that does not churn — still no content dropped, no markers, no model calls.
 
-**When it will save you nothing, which a first run often is.** All three of these are silent — the
-numbers are simply zero:
+**When `cache` will save you nothing, which a first run often is.** All three of these are
+silent — the numbers are simply zero:
 
 | Condition | Why |
 |---|---|
@@ -321,7 +326,7 @@ a benchmark harness running tasks back-to-back inside the provider's 5-minute ca
 project's own interactive traffic the measured figure is **$0.0298 across 1,127 sessions** — because
 Claude Code captures the environment snapshot once per session, and 1,105 of 1,127 session starts
 found the previous prefix already expired. The mechanism needs a second session inside five
-minutes; humans mostly do not work that way.
+minutes; humans mostly do not work that way. This is the gap keep-alive exists to close.
 
 **Anthropic-family only.** `cachesplit` is a no-op against implicit prefix-cache backends
 (vLLM, llm-d), which stop at the divergence by themselves.
