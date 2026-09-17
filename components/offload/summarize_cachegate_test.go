@@ -3,6 +3,7 @@ package offload
 import (
 	"context"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -90,7 +91,13 @@ func sumTranscript(n int) []bschemas.ChatMessage {
 // returns ok=FALSE there, carrying `stale` as the only signal that re-emitting is still correct.
 func TestSummarizeReplaysItsCheckpointOnATurnTheTriggerDeclines(t *testing.T) {
 	model := &countingModel{out: "SUMMARY: explored the handler, 3 tests fail."}
-	s := newCacheGatedSummarize(t, "")
+	// cache_state IS WRITTEN NOW RATHER THAN INHERITED, and that is the whole adaptation this test
+	// needed when the default became `any`. The property under test is "a turn the trigger declines
+	// must still replay its checkpoint", which requires a trigger that DECLINES — so the test has to
+	// configure one instead of relying on the shipped default being restrictive. `pre_expiry` is the
+	// one remaining state that can shut, and it shuts on a warm turn, which is exactly the shape
+	// turn 2 below builds.
+	s := newCacheGatedSummarize(t, "  cache_state: pre_expiry\n")
 	s.modelClient = model
 	st := store.NewMemory(store.Options{MaxEntries: 400})
 
@@ -360,9 +367,12 @@ func newCacheGatedSummarizeWithFrac(t *testing.T, trigger string) *Summarize {
 	return c.(*Summarize)
 }
 
-// The defaults have to be SAYABLE and the opt-out has to work, because the whole compatibility
-// story for this change is "an operator whose client does not cap the context sets cache_state:
-// any". If that sentence is not true the change is a regression for those deployments.
+// The defaults have to be SAYABLE, and `pre_expiry` — the one restrictive state left — has to be
+// reachable, because it is what cache_aware_summarizer's whole design rests on.
+//
+// THE DEFAULT CACHE STATE IS `any`, AND THAT IS THE RETRACTION. It was pre_expiry_or_cold for one
+// release; the evidence that retired it is on summarizeDefaultCacheState. The consequence for this
+// test file is that a warm turn at 0.9 now FIRES rather than filing cache_state_declined_warm.
 //
 // min_request_frac: 0 is the subtle half. It is a float64 whose zero means "no constraint", so an
 // explicitly written 0 is indistinguishable from an absent key after decoding — a constructor that
@@ -371,9 +381,9 @@ func newCacheGatedSummarizeWithFrac(t *testing.T, trigger string) *Summarize {
 func TestSummarizeTriggerDefaultsAndTheirOptOut(t *testing.T) {
 	t.Run("an absent key takes the shipped default", func(t *testing.T) {
 		s := newCacheGatedSummarizeWithFrac(t, "")
-		if s.trigger.CacheState != components.CacheStatePreExpiryOrCold {
+		if s.trigger.CacheState != components.CacheStateAny {
 			t.Errorf("cache_state defaulted to %q, want %q", s.trigger.CacheState,
-				components.CacheStatePreExpiryOrCold)
+				components.CacheStateAny)
 		}
 		if s.trigger.MinRequestFrac != summarizeDefaultRequestFrac {
 			t.Errorf("min_request_frac defaulted to %v, want %v", s.trigger.MinRequestFrac, summarizeDefaultRequestFrac)
@@ -387,11 +397,44 @@ func TestSummarizeTriggerDefaultsAndTheirOptOut(t *testing.T) {
 				s.trigger.MinRequestFrac)
 		}
 	})
-	t.Run("cache_state any restores the size-only behaviour", func(t *testing.T) {
-		s := newCacheGatedSummarizeWithFrac(t, "trigger:\n  cache_state: any\n")
-		if !s.trigger.CacheAllows(nil, components.CachePhaseWarm) {
-			t.Error("cache_state: any refused a warm turn, so the documented opt-out for a client " +
-				"that does not cap its own context does not actually opt out")
+	t.Run("the default imposes no cache constraint", func(t *testing.T) {
+		s := newCacheGatedSummarizeWithFrac(t, "")
+		for _, p := range []components.CachePhase{
+			components.CachePhaseWarm, components.CachePhasePreExpiry,
+			components.CachePhaseCold, components.CachePhaseUnknown,
+		} {
+			if !s.trigger.CacheAllows(nil, p) {
+				t.Errorf("the shipped default declined phase %s. It is `any`: compaction at 0.9 is "+
+					"worth doing whatever the cache is doing, and gating it on the cache being free "+
+					"to invalidate cost more than it saved", p)
+			}
+		}
+	})
+	t.Run("pre_expiry is still reachable, and restricts", func(t *testing.T) {
+		s := newCacheGatedSummarizeWithFrac(t, "trigger:\n  cache_state: pre_expiry\n")
+		if s.trigger.CacheAllows(nil, components.CachePhaseWarm) {
+			t.Error("cache_state: pre_expiry permitted a warm turn; the one surviving restrictive " +
+				"state must still restrict, or cache_aware_summarizer has no way to ask for a live " +
+				"prefix")
+		}
+		if !s.trigger.CacheAllows(nil, components.CachePhasePreExpiry) {
+			t.Error("cache_state: pre_expiry declined a PRE-EXPIRY turn, which is the only phase it " +
+				"exists to permit")
+		}
+	})
+	t.Run("a withdrawn cache_state is refused with the replacement named", func(t *testing.T) {
+		for _, state := range []string{"cold", "pre_expiry_or_cold"} {
+			_, err := newSummarize([]byte("trigger:\n  cache_state: " + state + "\n"))
+			if err == nil {
+				t.Fatalf("%s was accepted; it no longer has a behaviour, so a config carrying it "+
+					"must be refused rather than silently migrated", state)
+			}
+			// The message has to be ACTIONABLE. This operator's config worked yesterday and they
+			// did not make a typo, so an enum list alone tells them nothing about what to write
+			// instead — which is the difference between a withdrawal and a trap.
+			if !strings.Contains(err.Error(), "any") || !strings.Contains(err.Error(), "pre_expiry") {
+				t.Errorf("%s: the error names no replacement: %v", state, err)
+			}
 		}
 	})
 	t.Run("an unrecognised cache_state is refused, not read as any", func(t *testing.T) {
@@ -407,7 +450,7 @@ func TestSummarizeTriggerDefaultsAndTheirOptOut(t *testing.T) {
 		// unset value — so a wrong one here does not merely mislabel the settings page, it
 		// persists a cache_state summarize never chose.
 		want := map[string]any{
-			"trigger.cache_state":      components.CacheStatePreExpiryOrCold,
+			"trigger.cache_state":      components.CacheStateAny,
 			"trigger.min_request_frac": summarizeDefaultRequestFrac,
 		}
 		seen := map[string]bool{}

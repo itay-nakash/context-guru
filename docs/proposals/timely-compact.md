@@ -1,6 +1,29 @@
 # `timely-compact` — compacting a nearly-full context while the cache is still worth something
 
-**Status:** proposal. Nothing here is implemented. Two of its three claims are already measured
+> ## ⛔ SHIPPED, THEN PARTLY RETRACTED — read this before the "Status" line below
+>
+> This proposal was implemented, and its **cache-state half was then withdrawn**. Step 2 below asks for
+> `Trigger.CacheState` with four values (`any | pre_expiry | cold | pre_expiry_or_cold`) and step 3
+> configures `summarize` with `cache_state: pre_expiry`; today the key has **two** values, `any` and
+> `pre_expiry`, and `summarize` defaults to `any`.
+>
+> The premise in the paragraph below — *"when the prompt cache is about to go cold, compact"* — is the
+> part that did not survive. Compaction at 0.9 fill is worth doing whatever the cache is doing: the
+> corpus cost of firing warm and being wrong was **−$0.84 in total**, the payback for firing warm is
+> **2-3 turns**, and a cold-gated compactor pays the **first** full rewrite anyway because the turn
+> that observes a cold cache forwards untouched. See `summarizeDefaultCacheState` and
+> `docs/reference/config.md`.
+>
+> **What shipped and stands** is the fill half, done more carefully than proposed: the fraction resolves
+> against the provider's billed input rather than our own token count, and against **C** — the client's
+> own compaction point — rather than the raw window. Step 1 (one shared `CachePhase` predicate so the
+> sweep and the compactor cannot drift) also shipped and stands.
+>
+> Kept unedited below as the record of how the withdrawn half was reasoned to, in the same way
+> `pre-expiry-summary-gate.md` is.
+
+**Status:** proposal, superseded — see the banner above. Nothing in the original text is implemented
+as written. Two of its three claims are already measured
 elsewhere in this repo; the third — how often the trigger would fire — is not, and is measurable
 today without shipping anything.
 
