@@ -203,11 +203,14 @@ func newSummarize(raw []byte) (components.Component, error) {
 // than schema.MessagesTokens, and against C (the client's own compaction point) rather than the
 // raw window. Those are what made "0.9" denote anything. The gate on top of them did not.
 //
-// `pre_expiry` IS STILL THE RIGHT ANSWER FOR A DIFFERENT QUESTION, and that is why the value
-// survives. A summarizer whose model call reuses the conversation's own prefix — see
-// cache_aware_summarizer — needs a LIVE prefix for that call to hit, which is the opposite
-// concern to this one and genuinely phase-dependent. This component flattens its prompt into one
-// string and shares no prefix with anything, so no cache phase changes what its call costs.
+// `pre_expiry` IS STILL THE RIGHT ANSWER FOR A DIFFERENT QUESTION, which is why the value survives —
+// but NOTHING ASKS THAT QUESTION YET, and the docstring should not imply otherwise. A summarizer
+// whose model call reuses the conversation's own prefix needs that prefix LIVE, the opposite concern
+// to this one and genuinely phase-dependent. THIS component is not one: it flattens its prompt into a
+// single string and shares no prefix with anything, so `pre_expiry` here is honoured and buys nothing
+// but a lower firing rate. cache_aware_summarizer IS the prefix-reusing one and consults neither
+// CacheAllows nor CachePhase, so the key is silently inert there — the same defect as #247. Kept
+// because no surviving value can express "is there a live prefix to hit", not because it pays today.
 //
 // WHAT STOPS A SESSION THAT NEVER ENTERS THE WINDOW: nothing here, deliberately. The ceiling is
 // the CLIENT's — Claude Code runs its own compaction as it approaches C, and Fires now measures

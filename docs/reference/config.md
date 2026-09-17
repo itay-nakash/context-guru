@@ -124,11 +124,15 @@ Three things retired it:
 billed input rather than our own token count, and against C rather than the raw context window. Those
 are what made "0.9" denote anything at all. The gate on top of them did not.
 
-**`pre_expiry` survives, for a different question.** A summarizer whose model call reuses the
-conversation's own prefix — see [`cache_aware_summarizer`](../components/cache_aware_summarizer.md) —
-needs a **live** prefix for that call to hit, which is genuinely phase-dependent. `summarize` flattens
-its prompt into a single string and shares no prefix with anything, so no cache phase changes what its
-call costs. `cold` and `pre_expiry_or_cold` are **withdrawn**: a config carrying either is refused at
+**`pre_expiry` survives, for a different question — and nothing asks it yet.** A summarizer whose model
+call reuses the conversation's own prefix needs that prefix **live**, which is genuinely
+phase-dependent. `summarize` is not such a summarizer: it flattens its prompt into a single string and
+shares no prefix with anything, so setting `pre_expiry` here is honoured but only makes it fire less.
+The prefix-reusing component is
+[`cache_aware_summarizer`](../components/cache_aware_summarizer.md), and it consults neither
+`CacheAllows` nor `CachePhase` — so the key is **silently inert** there today (the same defect as #247).
+The value is kept for when that is wired up, because no other value can express "is there a live prefix
+to hit". `cold` and `pre_expiry_or_cold` are **withdrawn**: a config carrying either is refused at
 startup with the replacement named, rather than silently migrated to a value that fires at a different
 moment.
 
