@@ -292,6 +292,30 @@ fingerprint_want() {
 #
 # The port being free is also exactly the precondition the caller needs, because that is what lets a
 # new proxy bind - so this now waits for the condition that matters rather than a proxy for it.
+# Which pid is LISTENING on our port, or "" if that cannot be established here.
+#
+# This exists because "is my child alive?" and "did my child get the port?" are different questions,
+# and the second is the one that decides whether a fingerprint may be written. Reported by
+# review-pr-249-250 with a timeline: the post-launch poll was satisfied 22 ms BEFORE the new proxy
+# even exec'd, and its bind attempt was 150 ms further out - so `kill -0` on the recorded pid was
+# necessarily true, and the false fingerprint was written anyway. The predicate was right and
+# evaluated too early.
+#
+# No timing assumption: it asks who holds the socket. `ss` on Linux, `lsof` on macOS, and "" when
+# neither is available - the caller treats that as "cannot tell" rather than as either answer.
+port_owner_pid() {
+  local out
+  if command -v ss >/dev/null 2>&1; then
+    out=$(ss -ltnHp "sport = :${PORT}" 2>/dev/null | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1)
+    [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    out=$(lsof -nP -iTCP:"${PORT}" -sTCP:LISTEN -t 2>/dev/null | head -1)
+    [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+  fi
+  return 1
+}
+
 stop_running_proxy() {
   local pid deadline
   pid=$(cat "$PIDFILE" 2>/dev/null)
@@ -505,6 +529,26 @@ if [ -f "$KEEPALIVE_CFG" ]; then
   fi
 fi
 
+# LAST-MOMENT re-probe, because the idempotence probe at section (2) ran a while ago and a single
+# transient failure of it is what set up the whole reported defect: the port was occupied the entire
+# time, one probe blipped, and this script launched into a port it could never bind. Re-asking here
+# removes the CAUSE rather than only detecting the consequence, and it is free.
+#
+# Anything answering now is not ours - we have not started yet - so this is the already-up case
+# arriving late. Take the same no-op decision section (2) takes when it cannot prove a change is
+# needed: say nothing, touch nothing.
+if curl -fsS --max-time 2 "$HEALTH" >/dev/null 2>&1; then
+  printf '%s something is already answering on port %s; not starting a second proxy\n' \
+    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$PORT" >>"$LOG" 2>/dev/null
+  # On STDOUT, not only in the log, unlike the gate in section (1). Reaching this line means section
+  # (2) already decided a proxy was needed - it was either absent or due for replacement - so a port
+  # that answers NOW is unexpected, and staying quiet would leave a user whose configuration change
+  # did not apply with nothing to go on.
+  note "something else is answering on port ${PORT}, so no proxy was started and nothing was recorded."
+  note "if you changed a setting, it is NOT in effect; check with /context-guru:status."
+  exit 0
+fi
+
 PRESET="$PRESET" \
   "${STARTER[@]}" "$BIN" \
   --listen "127.0.0.1:${PORT}" \
@@ -565,7 +609,26 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
     #
     # So: the pid we recorded is the authority on whether OUR proxy is up. If it is gone, something
     # else is serving this port and we say so instead of persisting a claim about it.
-    if kill -0 "$started" 2>/dev/null; then
+    # WHO HOLDS THE SOCKET, not "is my child alive". `kill -0` alone was true 22 ms before the new
+    # proxy had even exec'd (review timeline), so it could not distinguish "mine bound the port" from
+    # "mine is still starting while somebody else answers". Ask the kernel instead.
+    #
+    # Three outcomes, and the middle one is the finding:
+    #   owner == started        ours. Record it.
+    #   owner is another pid    not ours. Say so, record nothing.
+    #   owner unknown           no ss and no lsof. Fall back to the liveness check, which is weaker
+    #                           but still catches the common case of a proxy that exited outright.
+    owner=$(port_owner_pid) || owner=""
+    if [ -n "$owner" ] && [ "$owner" != "$started" ]; then
+      ours=0
+    elif [ -n "$owner" ]; then
+      ours=1
+    elif kill -0 "$started" 2>/dev/null; then
+      ours=1
+    else
+      ours=0
+    fi
+    if [ "$ours" = 1 ]; then
       # Best-effort write: a state directory we cannot write is survivable everywhere else in this
       # script, and the only cost is that the next session cannot tell a configuration change happened.
       fingerprint_want >"$FINGERPRINT" 2>/dev/null || true

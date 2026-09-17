@@ -649,12 +649,23 @@ func TestStartProxyDoesNotRecordAConfigurationItFailedToStart(t *testing.T) {
 	defer srv.Close()
 	port := fmt.Sprint(ln.Addr().(*net.TCPAddr).Port)
 
-	// A "proxy" that exits immediately, standing in for one that cannot bind.
+	// A "proxy" that STAYS ALIVE and never binds, which is what a real one looks like while it starts.
+	//
+	// The earlier stand-in exited immediately, and that made this test pass for the wrong reason: the
+	// liveness check was false because the process was already gone, not because the check could tell
+	// whose proxy answered. Review supplied the timeline that exposed it — the post-launch poll was
+	// satisfied 22 ms BEFORE the real binary exec'd, with its bind attempt 150 ms further out, so on
+	// real timings the recorded pid is necessarily alive and the check is not a check.
+	//
+	// This is the same vacuity shape as the first version of this test, one layer down: `probes >= 2`
+	// proves the launch path ran, and nothing proved the launched thing lived long enough for the
+	// ownership question to be asked at all. Sleeping past the whole health budget is what asks it.
 	cannotBind := filepath.Join(dir, "cannot-bind")
 	if err := os.WriteFile(cannotBind,
-		[]byte("#!/usr/bin/env bash\necho 'bind: address already in use' >&2\nexit 1\n"), 0o755); err != nil {
+		[]byte("#!/usr/bin/env bash\necho 'bind: address already in use' >&2\nsleep 30\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { stopByPidfile(filepath.Join(state, "proxy-"+port+".pid")) })
 
 	out, code := startProxyIn(t, state, cannotBind, port, "TMPDIR="+dir,
 		"CLAUDE_PLUGIN_OPTION_PRESET=housellm")
@@ -667,6 +678,17 @@ func TestStartProxyDoesNotRecordAConfigurationItFailedToStart(t *testing.T) {
 	if got := probes.Load(); got < 2 {
 		t.Fatalf("only %d health probe(s) reached the listener, so the launch path was never entered "+
 			"and this test proves nothing about the fingerprint", got)
+	}
+	// Second guard, for the second vacuity: the launched process must still have been ALIVE, or the
+	// decision was taken on liveness rather than on ownership and this test would pass against the
+	// version review showed to be wrong.
+	if b, err := os.ReadFile(filepath.Join(state, "proxy-"+port+".pid")); err == nil {
+		if pid := strings.TrimSpace(string(b)); pid != "" {
+			if exec.Command("kill", "-0", pid).Run() != nil {
+				t.Fatalf("the launched stand-in (pid %s) was already dead when the hook decided, so "+
+					"this test exercises the liveness check rather than the ownership check", pid)
+			}
+		}
 	}
 
 	// The whole point: nothing may be recorded about a configuration that never ran.
