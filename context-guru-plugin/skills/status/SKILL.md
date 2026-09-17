@@ -60,9 +60,12 @@ curl -fsS "http://127.0.0.1:${PORT}/stats"
 
 Lead with the **billed token tiers** (`cache_read`, `cache_creation`, input, output). Those come
 from the provider's own usage block, so they are the numbers the user can check against their
-own bill or usage page. Under the `cache` preset the whole story is tokens moving from the
-cache-creation tier to the cache-read tier — creation is billed at a premium, reads at a
-discount, so that shift *is* the saving.
+own bill or usage page. Under the `cache` *preset* — a pipeline component (`cachesplit`), not the
+`cache_strategy` option below — the whole story is tokens moving from the cache-creation tier to
+the cache-read tier — creation is billed at a premium, reads at a discount, so that shift *is* the
+saving. **Under the default preset (`off`), that same tier shift can still happen with no
+`cachesplit` involved at all**: a `5-min-ping` keep-alive refreshing the cache moves tokens the
+identical way. Attribute the shift to whichever mechanism is actually configured — see below.
 
 Then, if they are non-zero: `requests`, `saved_tokens`, `savings_pct`, and the keep-alive block
 (`pings`, `spend_usd`, `wrote_instead_of_read`).
@@ -103,8 +106,11 @@ delivers by itself.
 
 - **Check the preset before explaining a zero prefix-cache saving at all.** The default preset is
   `off`, which runs no components, so `cachesplit` is not in the pipeline and a zero saving there is
-  the expected state rather than a symptom. Only if a preset containing `cachesplit` was chosen does
-  the next paragraph apply.
+  the expected state rather than a symptom — that is a statement about the request-body pipeline
+  only, not about whether anything is running: `cache_strategy` is a separate option, defaults to
+  `5-min-ping`, and is almost always what is actually spending and moving tokens between tiers. Only
+  if a preset containing `cachesplit` was chosen does the next paragraph apply; otherwise look at the
+  keep-alive block instead.
 - **Then check whether this is even a git repository.** The split works on the environment snapshot
   Claude Code appends to its system prompt, and outside a git repo there is no snapshot to split —
   `cachesplit` reports `verdict: skipped`, `mutated: 0`, and the saving is exactly zero. This is the common case for a casual first trial, and telling
