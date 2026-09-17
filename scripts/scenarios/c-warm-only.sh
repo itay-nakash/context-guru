@@ -14,22 +14,39 @@ set -u
 
 N=warmonly
 PORT=4213
-# THE GAP MUST EXCEED THE TTL PLUS THE CLOCK-SKEW MARGIN, not just the TTL.
+
+# ⚠️ THIS ARM NO LONGER FORCES A COLD TURN, AND THAT IS THE POINT OF THE CHANGE.
 #
-# 310s looked right — past a 5-minute entry — and the gate declined every time. The provider HAD
-# already dropped the entry (the turn billed a full 183,660-token rewrite with zero cache read), but
-# components.CertainlyColdByClock requires ColdMargin (60s) PAST nominal expiry before it will make
-# the positive claim that an entry is gone, mirroring apply.cacheIsCold over the same timestamps. At
-# 310s idle the arithmetic says "-10s remaining", which is inside the allowance, so the gate refuses.
+# It used to sleep GAP=380s to open a `pre_expiry_or_cold` gate, because a warm turn could not fire.
+# Two things followed from that, and both are now gone:
 #
-# That is the intended conservatism — forgoing an opportunity beats rewriting a prefix that may still
-# be live — and it is worth knowing it costs real firing opportunities: a session that returns between
-# 300s and 360s of idle finds the entry gone AND the gate shut.
-GAP=380   # > TTL (300) + components.ColdMargin (60)
+#   - the gap was 380 rather than 310 because the strict cold test required a 60s clock-skew margin
+#     PAST nominal expiry. 310s looked right — the provider HAD dropped the entry, the turn billed a
+#     full 183,660-token rewrite with zero cache read — and the gate still refused, because the
+#     arithmetic read "-10s remaining", inside the allowance. That conservatism cost real firing
+#     opportunities: a session returning between 300s and 360s of idle found the entry gone AND the
+#     gate shut.
+#   - the forced fire was the arm's t0, so every later turn was warm by construction.
+#
+# The cold-gated cache states were withdrawn and the default is `any`, so the fire now happens on a
+# WARM turn as soon as the transcript passes 0.5 of C. Keeping the sleep would invert the arm's own
+# invariant: t0 would move earlier, the 380s gap would land AFTER t0, and the ttl_expiry turn it
+# produces would put money in cold_credit_usd — which this arm asserts is exactly zero. So the sleep
+# is removed rather than retuned.
+#
+# ⚠️ AND REMOVING IT MOVED t0 EARLIER, WHICH IS THE COST OF THE CHANGE. With the gate holding, t0 was
+# pinned to the turn after the sleep and the eight tiny w-turns followed it by construction. Now t0
+# lands on whichever g-turn first crosses 0.5 of C — and the remaining g-turns each read a file IN
+# FULL, so they can consume a narrow span before the warm block starts. Two things answer that: the
+# panel is now told the arm's real fill (see scen_panel), which makes the span 1.00 - 0.5 rather than
+# the 0.10 it defaulted to; and the arrangement is ASSERTED below rather than assumed.
+#
+# resummarize_tokens is 200000 in lib.sh, so the checkpoint is replayed rather than re-summarized on
+# every later turn. That is what keeps t0 unique without a gate holding it back.
 
 echo "=== SCENARIO C: warm turns only after the summary (the read rate) ==="
 scen_build
-scen_start  "$N" "$PORT" 0.5 pre_expiry_or_cold
+scen_start  "$N" "$PORT" 0.5
 scen_home   "$N" "$PORT"
 scen_work   "$N"
 
@@ -41,10 +58,13 @@ scen_turn "$N" g05 continue "Read e.go in full. List every place usage is attrib
 scen_turn "$N" g06 continue "Read f.go in full. Explain how the boundary is computed."
 scen_turn "$N" g07 continue "Read g.go in full. Explain baselineDeltaUSD and repeatRate."
 
-scen_sleep "$GAP" "past the TTL so the gate fires"
+# No sleep: the fire happens on a warm turn at 0.5 of C. This turn is simply the next warm one, kept
+# because the read-rate assertion needs turns after t0 to sum over — but note that t0 is now BEFORE
+# this line rather than on it, so how many of the turns below fall inside the span is a property of
+# the run, not of the script. The guard below asserts it instead of trusting it.
 scen_turn "$N" f01 continue "In one sentence, what is the most important invariant in a.go?"
 
-# Warm from here on: every turn within seconds of the last.
+# Warm throughout: every turn within seconds of the last.
 for k in 01 02 03 04 05 06 07 08; do
   scen_turn "$N" "w$k" continue "In one sentence, name one thing h.go decides."
 done
@@ -52,10 +72,10 @@ done
 echo
 echo "=== SCENARIO C: all rows ==="
 scen_tail "$N" 60
-scen_panel "$N" "$PORT"
+scen_panel "$N" "$PORT" "" 0.5
 # A tiny span too, so the same rows also produce a CLOSED episode: the settled total is the figure a
 # reader trusts, and an arm that only ever reports an open one cannot check it.
-scen_panel "$N" "$PORT" 0.002
+scen_panel "$N" "$PORT" 0.002 0.5
 
 echo
 echo "=== SCENARIO C: the read rate, hand-derived ==="
@@ -97,6 +117,49 @@ print("  net_usd          %.8f" % e.get("net_usd", 0))
 turns = int((e.get("turns") or 0))
 span = rows[t0:t0 + turns] if turns else []
 sh = [r for r in span[1:] if r[1] == 'hit']
+
+# THE ARRANGEMENT IS ASSERTED, NOT REASONED ABOUT. This arm's claim is about a block of WARM turns
+# after t0, and t0 is wherever the fill gate first opened — which is not a fact this script controls.
+#
+# It used to be: the cache gate held every warm turn, so t0 was pinned to the turn after the 380s
+# sleep, and the eight tiny w01..w08 turns followed it by construction. With `cache_state: any` the
+# gate no longer holds anything, so t0 lands on whichever g-turn first crosses the fill — and the
+# remaining g-turns are "read this file IN FULL", each of which can write more new tail than a narrow
+# span is wide. If that happens the warm block falls OUTSIDE the population every verdict below is
+# scoped to, and the arm reports on one or two large file reads instead.
+#
+# That is trap 3 in timely-compact-validation.md, which was written up as a property of the design
+# before it was understood as a rig fault. It fails loudly here rather than quietly: the verdicts would
+# go 0 == 0 and read as a pass on an empty population.
+MIN_WARM = 3
+if len(sh) < MIN_WARM:
+    print()
+    print("ARRANGEMENT FAILED — %d warm hit turns inside the span, want >= %d." % (len(sh), MIN_WARM))
+    print("  The span closed before the warm block. t0 is turn %d of %d, the panel counted %d turns,"
+          % (t0, len(rows), turns))
+    print("  and this arm's verdicts are scoped to those. See trap 3 in")
+    print("  docs/proposals/timely-compact-validation.md: bridging turns that read files in full can")
+    print("  consume the whole span before the turns being measured begin.")
+    print("  Fix the ARRANGEMENT (fewer/smaller file reads before the crossing, or a wider span via")
+    print("  scen_panel's fill argument) — do not read the verdicts below.")
+    raise SystemExit(1)
+# And no single turn inside the span may dominate it, which is the same fault one step earlier: a span
+# that technically contains the warm block but is 90% one file read is not measuring warm turns either.
+# OVER span[1:], THE SAME POPULATION THE VERDICTS USE. Computing this over the whole span included
+# t0, and t0 can legitimately be the largest row: isFreshSummary also matches `fresh_summary`, the
+# SPLICING turn, which carries a large saved_gross — and its INFERRED fallback exists because rows
+# without `summary_started` are a real shape. On such a run the guard would blame an arrangement fault
+# that is not there and abort a paid run for it, which costs the same as a false pass and teaches the
+# wrong lesson.
+rest = span[1:]
+biggest = max((r[2] for r in rest), default=0)
+total = sum(r[2] for r in rest) or 1
+if biggest > 0.6 * total:
+    print()
+    print("ARRANGEMENT SUSPECT — one turn is %.0f%% of the span's removed tokens." % (100.0 * biggest / total))
+    print("  The population is dominated by a single turn, so the read-rate check below is really a")
+    print("  check on that one turn. Same cause as trap 3; rearrange before believing the verdicts.")
+    raise SystemExit(1)
 gross, usdsum = sum(r[2] for r in sh), sum(r[3] for r in sh)
 cg = sum(r[5] for r in span)
 READ = float(os.environ.get("CG_SCEN_READ_RATE", "1e-7"))

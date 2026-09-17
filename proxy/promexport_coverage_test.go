@@ -77,6 +77,16 @@ var notExportedWhy = map[string]string{
 	// Prometheus label must never be.
 	"ModelInfoLastError": "not a metric — free-text; the count is cg_model_info_unresolved_total",
 
+	// The CONFIGURED pipeline, not a measurement. Pipeline is a list of names, which is label data
+	// rather than a series; PipelineLen never changes for the life of the process, so a gauge would
+	// be a constant that only ever restates the command line. Both exist for one reason: to let a
+	// reader of /stats tell "no components are configured" from "components ran and did nothing",
+	// which Components alone cannot express because both are an empty map. That question is asked
+	// when reading one proxy's stats, not when alerting across a fleet - and `off` became the
+	// plugin's default preset, so the empty case is now the common one and has to be legible.
+	"Pipeline":    "configured component order, not a measurement; label data, not a series",
+	"PipelineLen": "static for the process lifetime; a gauge would restate the command line",
+
 	// Derived: PromQL computes these from series that ARE exported, and a second series
 	// would be a number that can disagree with its own inputs.
 	"AdjustedSaved":  "cg_saved_tokens_total - cg_wasted_tokens_total",
@@ -170,6 +180,7 @@ var notExportedWhy = map[string]string{
 	"CacheAwareSummarizerUnverifiedSystem": "NOT EXPORTED YET — declined because instruction_role was pinned to `system` for a model no registry profile verifies",
 	"CacheAwareSummarizerRefusedStash":     "NOT EXPORTED YET — a summary was abandoned because the store would not accept the span",
 	"CacheAwareSummarizerTooLarge":         "NOT EXPORTED YET — declined because the outbound request would exceed max_request_tokens",
+	"CacheAwareSummarizerProfileFallbacks": "NOT EXPORTED YET — the profiles_path override could not be read and the embedded registry was used instead, so the roles this arm resolved are not the ones the deployment pinned",
 	"CacheAwareSummarizerAsyncStarted":     "NOT EXPORTED YET — detached summaries commissioned",
 	"CacheAwareSummarizerAsyncCommitted":   "NOT EXPORTED YET — detached summaries that reached a checkpoint. The PAIR is the signal: started without committed is a summary paid for and lost",
 	"SummarizeTimeouts":                    "NOT EXPORTED YET — summarize's fail-open path is invisible in Prometheus",

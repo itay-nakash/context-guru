@@ -21,7 +21,7 @@
     "port": {
       "type": "number",
       "title": "Proxy port",
-      "description": "Local port the proxy listens on. The port must be FIXED rather than negotiated: the ANTHROPIC_BASE_URL written into your settings and the session hook that starts the proxy have to agree, and a URL cannot be renegotiated after it is written. Default 8787 \u2014 deliberately not 4000, which collides with litellm.",
+      "description": "Local port the proxy listens on. The port must be FIXED rather than negotiated: the ANTHROPIC_BASE_URL written into your settings and the session hook that starts the proxy have to agree, and a URL cannot be renegotiated after it is written. Default 8787 — deliberately not 4000, which collides with litellm.",
       "default": 8787,
       "min": 1024,
       "max": 65535
@@ -29,8 +29,14 @@
     "preset": {
       "type": "string",
       "title": "Preset",
-      "description": "Compaction pipeline. `cache` (the default) runs the prompt-cache split and NOTHING else: no content dropped, no markers, no extra tool, no model calls. `codesmart` adds the offloaders once you want them.",
-      "default": "cache"
+      "description": "Compaction PIPELINE - what happens to the request body. `off` (the default) is passthrough: no components run at all, so your requests are forwarded byte-for-byte. Nothing is dropped, no markers are written, no tool is injected and no model is called - not as a promise, but because there is nothing in the pipeline to do any of it. `cache` adds the prompt-cache split; `house` and `codesmart` add the offloaders; `housellm` adds a compaction-model pass that SPENDS on its own. Choosing any of those is opting into context editing, which is fine - it is a deliberate step rather than a default. This option does not decide whether idle keep-alive pings are sent: that is `cache_strategy`, and the default one DOES make model calls.",
+      "default": "off"
+    },
+    "cache_strategy": {
+      "type": "string",
+      "title": "Cache strategy",
+      "description": "Which cache mechanism runs, by NAME, so switching back is one word rather than four tuning numbers. `5-min-ping` (the default) pings just under the provider's 5-minute cache TTL - at most 2 per idle span, only on prefixes over 20k tokens, capped at $0.25 a ping - and it SPENDS YOUR OWN CREDENTIAL while nobody is at the keyboard, which is the whole point: it is what keeps the cache warm across a gap, and it is the one component of this plugin aimed at a cost that was actually measured: idle cache misses were 3.7% of requests and 23.6% of ALL spend over the measured window, at an 8.5x penalty per request. Whether it nets positive on YOUR traffic is a different question, answered by keepalive_net_usd rather than assumed - a negative net is possible, and the picker says so and offers `none`. `none` turns it off: no pings, no spend. `1-hour-head` asks for the 1-hour tier on the tools/system breakpoints instead, and only on requests with a >=50k -token prefix - under that it does nothing at all. Measured GRANTED on Haiku 4.5 and silently DOWNGRADED on Sonnet 5, so on Opus/Sonnet expect $0 until Usage.CacheWrite1h says otherwise; both of those measurements were on prefixes under the 50k gate. `/context-guru:cache-strategy-picker` names each one and what it costs.",
+      "default": "5-min-ping"
     },
     "idle_exit": {
       "type": "string",
@@ -42,7 +48,7 @@
       "title": "Upstream base URL",
       "type": "string",
       "default": "",
-      "description": "Forward to this Anthropic-compatible base URL instead of api.anthropic.com. Set it when something else is already the gateway \u2014 a hosted agent pod, a corporate gateway \u2014 so the proxy CHAINS behind it rather than replacing it. That gateway keeps holding the credential and, on at least one pod, rewriting model names: bypassing it sends model ids the real API has never heard of and every request fails. Empty means go straight to Anthropic."
+      "description": "Forward to this Anthropic-compatible base URL instead of api.anthropic.com. Set it when something else is already the gateway — a hosted agent pod, a corporate gateway — so the proxy CHAINS behind it rather than replacing it. That gateway keeps holding the credential and, on at least one pod, rewriting model names: bypassing it sends model ids the real API has never heard of and every request fails. Empty means go straight to Anthropic."
     }
   }
 }

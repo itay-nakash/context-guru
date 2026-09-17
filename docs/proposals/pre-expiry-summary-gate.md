@@ -1,5 +1,34 @@
 # The pre-expiry summary gate
 
+> ## ⛔ RETRACTED IN PART — the *when* half did not survive its own evidence
+>
+> This document proposed, and shipped, `cache_state: pre_expiry_or_cold` as `summarize`'s default:
+> compact only at a moment when the cache write it costs was going to be paid anyway. **That default
+> is withdrawn**, along with the `cold` and `pre_expiry_or_cold` values themselves. The default is now
+> `any` — compaction at 0.9 fill is worth doing whatever the cache is doing.
+>
+> Three things retired it, none of which required new data:
+>
+> 1. **The downside it avoided is −$0.84** across the whole corpus, for every session that crossed 90%
+>    and then ended. It was insuring a rounding error against a $531 upside.
+> 2. **Firing warm pays back in 2-3 turns.** The compacting turn costs ~32k base-equivalents more than
+>    the read it replaces; every later turn saves ~14k. Rate-independent.
+> 3. **A cold gate cannot prevent the first cold rewrite** — which follows from *this document's own*
+>    second half. Compaction is two-turn, so the turn that observes a cold cache forwards the full
+>    transcript and pays that rewrite in full. Waiting for cold pays the first of the median 7 and
+>    prevents the rest; compacting warm prevents all 7. The two halves proposed here were in conflict
+>    and it went unnoticed for a release.
+>
+> **What stands:** the whole *how* half below — the async two-turn design, and the finding that a
+> synchronous summarizer turns its own best case into its worst. Also standing, and the real value of
+> this line of work: `Fires` measuring fill on the provider's billed input rather than our own token
+> count, and against C rather than the raw context window.
+>
+> **`pre_expiry` still exists** for a different question — a summarizer whose model call reuses the
+> conversation's own prefix needs that prefix *live*, which is genuinely phase-dependent. See
+> `cache_aware_summarizer`. Everything below is kept as the record of how the withdrawn default was
+> reached, not as current guidance.
+
 How `summarize` decides to compact, and how that work is executed. The gate has two halves: **when**
 to compact — only at a moment when the cache write it costs was going to be paid anyway — and **how**
 to run it so that deciding to compact cannot itself become the expensive outcome.

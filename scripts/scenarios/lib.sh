@@ -55,11 +55,36 @@ scen_build() {
   echo "built $(ls -la "$SCEN_ROOT/cg-scen" | awk '{print $5}') bytes"
 }
 
-# scen_start <name> <port> <frac> <cache_state>
+# scen_start <name> <port> <frac> [cache_state]
+#
+# cache_state is OPTIONAL and omitting it is meaningful: the key then does not appear in the config at
+# all, so the arm runs whatever summarize's shipped default is. That is the only faithful way to write
+# a "shipped defaults" arm, and writing the current default's value by hand is not the same thing — it
+# would keep passing unchanged through exactly the kind of default change that already happened here.
+#
+# `cold` and `pre_expiry_or_cold` are REFUSED by the proxy since the cold-gated states were withdrawn.
+# An arm passing either does not produce a wrong measurement, it produces a proxy that will not start
+# and a run with no rows — which is the failure shape this directory's own trap list is made of, so
+# the value is checked here rather than discovered in an empty summary.
+#
+# ⚠️ IT IS `exit`, NOT `return`, AND THAT IS THE DIFFERENCE BETWEEN A GUARD AND A COMMENT. No arm sets
+# `set -e` — they are all `set -u` only — so a `return 2` here prints two lines to stderr and then
+# lets scen_home, scen_work and every scen_turn run against a directory with no config.yaml and no
+# proxy. That is precisely the silently-empty run this guard exists to prevent, reached through a
+# different door, and the only caller who can ever trip it is the person the message is written for.
 scen_start() {
-  local name=$1 port=$2 frac=$3 state=$4
+  local name=$1 port=$2 frac=$3 state=${4:-}
+  case "$state" in
+    cold|pre_expiry_or_cold)
+      echo "scen_start: cache_state '$state' was withdrawn; the proxy refuses it and this run would" >&2
+      echo "  produce no rows. Use '' (shipped default) or 'pre_expiry'." >&2
+      exit 2
+      ;;
+  esac
   local d="$SCEN_ROOT/$name"
   mkdir -p "$d"
+  local stateline=""
+  [ -n "$state" ] && stateline="      cache_state: $state"
   cat > "$d/config.yaml" <<YAML
 pipeline: [summarize]
 components:
@@ -69,7 +94,7 @@ components:
     resummarize_tokens: 200000
     trigger:
       min_request_frac: $frac
-      cache_state: $state
+$stateline
       pre_expiry_seconds: 60
     summary_wait_seconds: 120
 YAML
@@ -173,12 +198,35 @@ scen_sleep() {
   sleep "$1"
 }
 
-# scen_panel <name> <port> [span]
+# scen_panel <name> <port> [span] [fill]
+#
+# ⚠️ PASS `fill` WHENEVER THE ARM'S TRIGGER IS NOT 0.9, OR THE PANEL SCOPES ITS ANSWER TO A SPAN THE
+# ARM NEVER RAN.
+#
+# The panel derives the span it attributes over as `ceiling - fill` (dash/compactepisode.go, spanFor),
+# and it takes `fill` from the QUERY STRING with `defaultFillFrac = 0.90` — it has no way to learn what
+# the arm put in its config. So a call that omits `fill` always gets `1.00 - 0.90 = 0.10` of the window,
+# which is 20,000 tokens on a 200k model, no matter what min_request_frac the proxy is running.
+#
+# For an arm at 0.5 that is wrong in the direction that hides turns: the true span is `1.00 - 0.5`, five
+# times wider, and the narrow one closes after one or two file-reading turns. Trap 3 in
+# timely-compact-validation.md is the write-up of a run that was misread for exactly this reason, and it
+# was a mismatch of this kind rather than anything about the design.
+#
+# ⚠️ `fill` IS NOT ONLY THE SPAN'S INPUT, so `?span=` does not make it optional. It also decides which
+# conversations the COVERAGE half counts (`maxBilled(conv) >= fillFrac*window`, compactepisode.go) and
+# it is republished verbatim in the panel's own Assumptions block. So an explicit-span call that omits
+# it still answers with coverage counted against a threshold the arm never ran, and states a fill the
+# run did not use — on the call whose output a reader is told to trust. Pass both.
+#
+# (It does NOT gate episode creation: conversationEpisodes takes only the span, so the episode list
+# itself survives a wrong fill. Coverage and Assumptions are what go wrong, which is quieter.)
 scen_panel() {
-  local name=$1 port=$2 span=${3:-}
+  local name=$1 port=$2 span=${3:-} fill=${4:-}
   local q="tenant=all&range=all"
   [ -n "$span" ] && q="$q&span=$span"
-  echo "--- panel ($name${span:+, span=$span})"
+  [ -n "$fill" ] && q="$q&fill=$fill"
+  echo "--- panel ($name${span:+, span=$span}${fill:+, fill=$fill})"
   curl -sS "http://127.0.0.1:$port/api/components/compaction-episodes?$q" > "$SCEN_ROOT/$name/panel${span:+-$span}.json" \
     || echo "    (panel fetch failed)"
   wc -c < "$SCEN_ROOT/$name/panel${span:+-$span}.json"

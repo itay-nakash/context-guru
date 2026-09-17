@@ -1031,11 +1031,17 @@ func aliasSeen(st store.Store, alias string, nowMs int64) int64 {
 // bound while the provider held the entry alive, and every reader of Ctx.IdleMs concluded the cache
 // was long dead.
 //
-// For summarize's gate that conclusion is expensive in the one direction that matters:
-// CertainlyColdByClock returned true, `cache_state: cold` and the shipped `pre_expiry_or_cold`
-// permitted a rewrite, and the component compacted a LIVE prefix — on exactly the sessions someone is
-// paying pings to protect. coldByArithmetic's own docstring exists to avoid that outcome via
-// Ctx.ColdCache and then reproduced it through the timestamp underneath. Issue #243.
+// For summarize's gate that conclusion was expensive in the one direction that matters: a strict
+// clock test returned "certainly cold", the then-shipped `cache_state: pre_expiry_or_cold` permitted
+// a rewrite, and the component compacted a LIVE prefix — on exactly the sessions someone is paying
+// pings to protect. The gate's own docstring existed to avoid that outcome via Ctx.ColdCache, and
+// then reproduced it through the timestamp underneath. Issue #243.
+//
+// THAT PARTICULAR CONSUMER IS GONE: the cold-gated cache states were withdrawn, and summarize's
+// default no longer consults the cache at all. This clock is not therefore decorative — a component
+// asking "is this prefix LIVE?" reads it, which is `cache_state: pre_expiry` today and
+// cache_aware_summarizer's whole premise tomorrow, and it would be wrong in the same direction
+// without the touch below.
 //
 // # And why this is NOT the dashboard's session-recency map
 //

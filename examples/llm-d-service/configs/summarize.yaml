@@ -19,16 +19,19 @@ components:
       min_request_tokens: 40000   # …or small ones
       # OPTING OUT OF THE SHIPPED DEFAULT, and this is the configuration that has to.
       #
-      # By default summarize fires only when the transcript is >= 0.9 of the model's context
-      # window AND the prompt cache is about to expire — because compacting a warm prefix
-      # invalidates it and costs a full-suffix cache-write. That default assumes something
-      # else caps the context: Claude Code runs its own compaction as it nears its budget.
+      # By default summarize fires when the transcript reaches 0.9 of C — the point at which the
+      # client's own compaction would act. That default assumes there IS such a client: Claude
+      # Code runs its own compaction as it nears its budget.
       #
-      # This config drives a raw endpoint, so nothing else will. Without `cache_state: any`
-      # a busy session stays warm indefinitely, this component declines on every turn, and
-      # the transcript grows until the provider rejects it. `min_request_frac: 0` restores
-      # the size gates above as the only ones (0.9 of the window would dwarf 40000).
-      cache_state: any
+      # This config drives a raw endpoint, so nothing else caps the context and 0.9 of a window
+      # we may be guessing at is not a threshold worth trusting. `min_request_frac: 0` drops the
+      # fraction and leaves the absolute size gates above as the only ones (0.9 of the window
+      # would dwarf 40000 anyway).
+      #
+      # `cache_state` is not set: it defaults to `any`, which is what this deployment wants. It
+      # used to be written here as an opt-out, back when the default waited for the prompt cache
+      # to be near expiry or already expired. That default was withdrawn — the wait cost more
+      # than it saved — so the opt-out is now the default and the line is gone.
       min_request_frac: 0
     model:
       source: config

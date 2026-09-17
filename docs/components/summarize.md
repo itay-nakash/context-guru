@@ -140,22 +140,24 @@ messages, and Anthropic accepts it — an alternation rule would reject correct 
 legality on the wire (`role:"tool"` never reaching Anthropic) is a property of the *bytes*, not
 of the normalized list, so it is asserted on the raw body instead (`apply/toolrole_wire_test.go`).
 
-> **This gate is insurance, not a per-turn saving.** It fires only when the transcript is nearly full
-> **and** the prompt cache is about to expire or already has. On a continuously active session the
-> second condition is never true — measured at 0 fires in 53 turns, with the cache warm on 51 of them —
-> because an agent sending a message every few seconds keeps refreshing its own entry. What it insures
-> against is a session going idle past its TTL with a nearly-full context, which is also when a
-> full-prefix rewrite costs the most (~$0.15 per event at haiku rates on a 175k prefix). Skipping costs
-> nothing, so a low firing rate is the mechanism working, not failing.
+> **This gate fires on FILL, not on cache state — and that reverses a shipped default.** For one
+> release `trigger.cache_state` defaulted to `pre_expiry_or_cold`, so a turn fired only when the prompt
+> cache was near expiry or already past it, and that was defended here as insurance. It was measured at
+> **0 fires in 53 turns** with the cache warm on 51 — and the case for it does not survive: the corpus
+> cost of firing warm and being wrong was **−$0.84 in total**, firing warm pays back in **2-3 turns**,
+> and a cold-gated component pays the **first** full rewrite regardless, because the turn that sees a
+> cold cache commissions the summary and forwards untouched. The default is now `any`. See
+> [config reference](../reference/config.md) for the arithmetic and `summarizeDefaultCacheState` for
+> the primary sources.
 
-> **Keep-alive and this gate now agree.** A keep-alive ping READS the cached prefix, which resets the
-> entry's TTL — so after a ping the cache is warm again. The gate is told: a successful cache-reading
-> ping records the refresh against the same content-derived clock the request path reads
-> (`apply.RecordCacheTouch`). Before that, a kept-alive session's idle time grew without bound while the
-> provider held the entry alive, and this gate compacted a **live** prefix on exactly the sessions the
-> pings were paying to protect. The dashboard's idle-gap statistics deliberately do **not** count pings,
-> because "is the provider holding this prefix?" and "how long was the user away?" are different
-> questions — two clocks, one for each.
+> **Keep-alive and the cache phase agree.** A keep-alive ping READS the cached prefix, which resets the
+> entry's TTL — so after a ping the cache is warm again, and a successful cache-reading ping records
+> that refresh against the same content-derived clock the request path reads
+> (`apply.RecordCacheTouch`). This no longer changes when `summarize` fires, because its default no
+> longer consults the phase; it still matters for `cache_state: pre_expiry`, where a stale clock would
+> report a kept-alive entry as long dead. The dashboard's idle-gap statistics deliberately do **not**
+> count pings, because "is the provider holding this prefix?" and "how long was the user away?" are
+> different questions — two clocks, one for each.
 
 > **Testing this component.** The gate is timing-dependent and three of its defects were only
 > reachable on live traffic, so the scenarios that matter are written down rather than rediscovered:
@@ -182,7 +184,7 @@ of the normalized list, so it is asserted on the raw body instead (`apply/toolro
 | `model.api_key` | *the process env key* | **Credential** for the pinned endpoint; empty falls back to the provider env key, which a hosted deployment refuses. Write-only on the settings page. |
 | `model.auth` | `x-api-key` | Anthropic only: `x-api-key` \| `bearer`. |
 | `trigger.min_request_frac` | **0.9** | Summarize only once the session has been billed at least this fraction of the model's context window. Measured from the provider's own input count for the previous turn — see below. |
-| `trigger.cache_state` | **`pre_expiry_or_cold`** | Summarize only when the prompt cache is about to expire **or has already expired** — the two moments when the cache write it costs was going to be paid anyway. `any` removes the constraint. See below. |
+| `trigger.cache_state` | **`any`** | No cache constraint: at 0.9 fill, compaction is worth doing whatever the cache is doing. `pre_expiry` restricts firing to a turn whose cached prefix is within `pre_expiry_seconds` of expiring — useful only for a summarizer whose model call reuses that prefix, which this one does not. `cold` and `pre_expiry_or_cold` are **withdrawn** and refused at config time. See below. |
 | `trigger.pre_expiry_seconds` | 60 | How wide "about to expire" is. Must stay below the shortest prompt-cache lifetime (300s) or every warm turn counts as pre-expiry; refused at config time above that. |
 | `trigger` (rest) | — | `min_request_tokens`, `min_messages`, `min_output_tokens`, `min_output_frac`, `huge_output_frac`. |
 | `summary_wait_seconds` | 120 | The summary is produced **off the hot path**; a turn that arrives while one is still running waits this long for it. When the wait expires the turn proceeds regardless. See below. |
@@ -206,12 +208,22 @@ There are two moments when that costs nothing, and the default permits both:
 | **near expiry** | a cheap read now, a full rewrite later if the next turn is late | a small write now, cheap reads after | better, *given* an assumption about the next turn |
 | **already expired** | a **full** rewrite — the entry is gone, this turn pays a write regardless | a **small** write | strictly better, unconditionally |
 
-The expired case is the reliable one: on such a turn there is nothing left to invalidate, and the
-only question is whether the write is the whole transcript or the summary. It is also the one you
-can count on seeing — a near-expiry turn needs a request to land inside a 60-second slice of a
-5-minute lifetime, while any gap longer than the TTL produces an expired turn on the next request.
-A session that only ever went fully cold would, under `pre_expiry` alone, never compact at all and
-grow until the provider rejected it.
+**The "harmful" warm row is where the default now fires, and the table above understates it by
+looking at one turn.** On the compacting turn alone, warm really is the worst of the three — a live
+entry destroyed for a write. Across the turns that follow, it is positive: at 0.9 of 200k the write
+costs about 32k base-equivalents more than the read it replaces, and every later turn then saves
+about 14k, so the break-even is **2-3 turns**. A session at 0.9 has far more than that left.
+
+Worse for the expired row, it is not reachable in the way it looks. Compaction is two-turn — the
+turn that fires commissions a summary and forwards **untouched** — so the turn that first observes an
+expired entry is carrying the full transcript and pays that rewrite in full. Waiting for expiry pays
+the first rewrite and prevents the rest; compacting warm prevents all of them. And a near-expiry turn
+needs a request to land inside a 60-second slice of a 5-minute lifetime, which a measured session
+never once did in 53 turns.
+
+That is why `cache_state` defaults to `any`, and why `cold` and `pre_expiry_or_cold` no longer exist.
+The table remains here because it is the right way to think about a *cache-reusing* summarizer, whose
+call needs a live prefix to hit — the opposite concern.
 
 "Expired" is decided by the **clock** (a known TTL and idle time), never by the cold-cache flag
 alone: that flag reads cold on a keep-alive'd session whose entry is very much alive, and acting on
@@ -285,15 +297,17 @@ the agent. Claude Code runs its own compaction as it approaches its context budg
 component's job is to get ahead of the expensive rewrites below that ceiling, not to be the ceiling.
 
 **If your client does not compact its own context** — anything driving a raw API, a custom harness,
-a benchmark runner — nothing will stop the transcript growing until the provider rejects it. Those
-deployments must opt out:
+a benchmark runner — nothing will stop the transcript growing until the provider rejects it. The
+cache state is no longer what stands in the way (it defaults to `any`), but the **fill** gate still
+resolves against a window those deployments may not have a trustworthy figure for, so give it an
+absolute threshold:
 
 ```yaml
 components:
   summarize:
     trigger:
-      cache_state: any        # summarize whenever the size gates are met
-      min_request_frac: 0     # …and let min_request_tokens be the size gate
+      min_request_frac: 0        # do not gate on a fraction of a window we may be guessing
+      min_request_tokens: 1500   # …gate on an absolute size instead
 ```
 
 Both shipped example configs under `examples/llm-d-service/` do exactly this, because they drive a
@@ -347,8 +361,8 @@ Three things about that panel are worth knowing before reading a number off it.
 **It reports coverage, not just savings.** Beside the table is the count of conversations that
 reached the fill threshold and produced **no** summary at all, and what their expired-cache
 rewrites cost. Without that line the panel would only ever describe sessions this component fired
-on, which is survivorship and always looks positive. That count is also the number that says
-whether `pre_expiry_seconds` should be widened.
+on, which is survivorship and always looks positive. That count is also the number that says whether
+`min_request_frac` is set too high.
 
 **`recorded` and `inferred` are separate rows and are never added.** `recorded` means the component
 said so on that turn. `inferred` means an older row acted and carried no replay marker, so it must
@@ -385,10 +399,10 @@ context window.
 
 ## When it's inert
 
-The cache state does not permit it (`cache_state_declined_warm`, or `…_cold` / `…_unknown` under a
-non-default `cache_state`), transcript below `trigger` (`below_request_trigger`), context window
-unknown or guessed (`window_not_exact`), span below `min_tokens`, or no model available
-(`no_model`).
+Transcript below `trigger` (`below_request_trigger`), context window unknown or guessed
+(`window_not_exact`), span below `min_tokens`, or no model available (`no_model`). Under the shipped
+default the cache state never declines; set `cache_state: pre_expiry` and it files
+`cache_state_declined_warm` / `…_cold` / `…_unknown` on the turns it shuts.
 
 The full design — the run that motivated it, why an expired cache is the reliable case rather than
 the merely-safe one, why there is no keep-alive ping, and how the saving is accounted — is in

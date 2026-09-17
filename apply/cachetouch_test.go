@@ -19,11 +19,15 @@ import (
 // though, so on a kept-alive session the idle time grew without bound while the entry stayed alive —
 // and summarize's gate concluded the cache was long dead.
 //
-// THE CONSEQUENCE WAS THE EXPENSIVE ONE. CertainlyColdByClock returned true, the shipped
+// THE CONSEQUENCE WAS THE EXPENSIVE ONE. A strict clock test said "certainly cold", the then-shipped
 // `cache_state: pre_expiry_or_cold` permitted a rewrite, and the component compacted a LIVE prefix on
-// exactly the sessions someone is paying pings to protect. coldByArithmetic's own docstring exists to
-// avoid that outcome via Ctx.ColdCache, and then reproduced it through the timestamp underneath.
-// Issue #243.
+// exactly the sessions someone is paying pings to protect. The gate's own docstring existed to avoid
+// that outcome via Ctx.ColdCache, and then reproduced it through the timestamp underneath. Issue #243.
+//
+// THE TEST OUTLIVES THAT CONSUMER DELIBERATELY. The cold-gated cache states were withdrawn, so no
+// shipped default reads this clock today — but `cache_state: pre_expiry` does, asking the opposite
+// question ("is this prefix still LIVE?"), and it is wrong in the same direction if a ping goes
+// unrecorded. Deleting this with the states would leave the write below unasserted.
 func TestAPingRefreshesTheCacheLivenessClock(t *testing.T) {
 	st := store.NewMemory(store.Options{})
 	body := []byte(`{"model":"m","messages":[` +

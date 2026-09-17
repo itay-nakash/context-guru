@@ -108,28 +108,47 @@ docker build -t context-guru:local .
 
 ## Quickstart (60 seconds)
 
-**Claude Code users — install once per machine, route once per repo; no toolchain, and no API key
-needed on a Pro/Max subscription** ([details](docs/how-to/install-plugin.md)):
+**Claude Code** — install once per machine, route once per repo. No toolchain, and no API key on a
+Pro/Max subscription ([details](docs/how-to/install-plugin.md)).
 
 ```
 /plugin marketplace add rossoctl/context-guru
 /plugin install context-guru@context-guru
-/reload-plugins
+/reload-plugins     # REQUIRED — without it the next lines answer "Unknown command"
+/permissions        # allow  Bash(/Users/you/.claude/plugins/cache/context-guru/**)
+                    #   absolute path only; `~` is not expanded in permission rules
 /context-guru:install
 ```
 
-**If it ever breaks and Claude cannot fix it:** `~/.local/state/context-guru/context-guru-reset`
-undoes the routing from a plain terminal — no working Claude session, no proxy, no network. Routing
-every request through a local proxy means a failure there fails every request, including the ones the
-uninstall skill would need, so the way out cannot itself be a skill.
+Change what it does:
 
-`/reload-plugins` is what makes the `/context-guru:*` skills exist in this session; without it the
-last line answers `Unknown command`. A new session does the same thing.
+```
+/plugin configure   # context-guru → Preset → housellm          opt into context editing
+/plugin configure   # context-guru → Cache strategy → none      stop the keep-alive pings
+/context-guru:cache-strategy-picker   # names each strategy and what it costs
+/context-guru:status                  # what is running, and whether it matches your options
+/context-guru:uninstall               # undo the routing, restoring any base URL it replaced
+```
 
-That installs a statically-linked binary (no Go, no C compiler), routes **this project only** by
-default, starts the proxy on demand and lets it exit when idle. `/context-guru:uninstall` undoes it,
-restoring any base URL it replaced. The plugin installs with `--preset cache` — the prompt-cache
-split and nothing else. (The proxy's own default is `house`; `--preset` is how you change it.)
+A changed option takes effect on your **next session**: the session hook stops the running proxy and
+starts it with the new configuration.
+
+| Option | Default | What it does |
+|---|---|---|
+| `preset` | `off` | The pipeline. `off` is passthrough — requests are forwarded byte-for-byte, nothing dropped, no marker written, no tool injected, no model called, because nothing is in the pipeline to do it. `cache`, `house`, `housellm` opt into context editing. |
+| `cache_strategy` | `5-min-ping` | Keep-alive. Pings under the provider's 5-minute cache TTL so an idle session's cache is still live — this **spends your own quota** while nobody is at the keyboard. `none` turns it off; `1-hour-head` asks for the 1-hour tier instead. |
+| `port` | `8787` | Port the proxy listens on. |
+| `idle_exit` | `24h` | Exit after this long with no requests. |
+| `upstream` | — | Chain behind an existing gateway instead of going straight to Anthropic. |
+
+Keep-alive targets a measured cost, not an assumed one: idle cache misses were 3.7% of requests and
+**23.6% of all spend** over the measured window, at an 8.5x penalty each. Whether it nets positive on
+*your* traffic is reported by `keepalive_net_usd` — a negative net is possible, and `none` is a
+legitimate answer.
+
+**If it breaks and Claude cannot fix it:** `~/.local/state/context-guru/context-guru-reset` undoes the
+routing from a plain terminal — no session, no proxy, no network needed. A dead proxy fails every
+request, including the ones an uninstall skill would need, so the way out cannot itself be a skill.
 
 Or by hand — a release binary is statically linked, **no Go and no C compiler needed** — or build
 from source:

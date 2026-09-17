@@ -100,9 +100,10 @@ func (c *Ctx) CacheRemaining() (time.Duration, bool) {
 // It is NOT a safety check, and an earlier version of this comment implied it was ("one cheap
 // agreement check costs nothing next to a wrongly invalidated prefix"). Checking ColdCache first can
 // only make this classifier MORE willing to say cold, never less, so it cannot protect a live
-// prefix. The reachable disagreement was the opposite one — the arithmetic calling an entry cold
-// while apply called it warm — and that is answered by CertainlyColdByClock's margin, not by this
-// line.
+// prefix. The reachable disagreement was the opposite one — the arithmetic below calling an entry cold
+// while apply called it warm — and that was answered by a stricter cold test carrying a clock-skew
+// margin, not by this line. That test went away with the cold-gated cache states (see the note above
+// the phase constants); apply's ColdCache, checked here, is now the only margin-bearing verdict.
 func (c *Ctx) CachePhase(preExpiry time.Duration) CachePhase {
 	if c == nil {
 		return CachePhaseUnknown
@@ -123,46 +124,26 @@ func (c *Ctx) CachePhase(preExpiry time.Duration) CachePhase {
 	return CachePhaseWarm
 }
 
-// ColdMargin is the clock-skew allowance required PAST the believed expiry before this package will
-// make the positive claim that an entry is GONE. It mirrors apply.coldMargin, which applies the same
-// allowance to the same two timestamps when it computes Ctx.ColdCache.
+// COLD HERE MEANS "MIGHT BE GONE", NOT "CERTAINLY GONE", and the distinction outlived the code that
+// used to encode it.
 //
-// Duplicated as a constant rather than exported from apply because components must not import apply —
-// apply imports components. The number is small, documented on both sides, and it exists for the same
-// reason in both places: the gap between when a request was recorded here and when the provider last
-// touched the entry, plus skew between this box's clock and the provider's.
-const ColdMargin = time.Minute
-
-// CertainlyColdByClock is the STRICT cold test: the entry's lifetime has run out by more than the
-// clock-skew allowance, so rewriting its prefix destroys nothing.
+// This package once carried a second, STRICTER cold test — CertainlyColdByClock, which required the
+// entry to be past nominal expiry by a clock-skew allowance before claiming it was gone. Two callers
+// wanted opposite safe errors:
 //
-// # Why this is not the same test as CachePhase == CachePhaseCold, deliberately
+//   - extract_llm_sweep needs an entry that STILL EXISTS, because its prefix ask reads one. Wrongly
+//     believing the entry is alive makes the ask pay fresh for the whole transcript, so the safe
+//     error is to assume it is already gone — which the threshold above delivers by calling nominal
+//     expiry Cold.
+//   - a compaction gate needed an entry that was CERTAINLY GONE, because rewriting deep history on a
+//     live prefix pays a cache-write of the whole suffix at 1.25x. The safe error ran the other way.
 //
-// The two readers of "is the cache cold" in this package answer DIFFERENT QUESTIONS, and the safe
-// error runs in opposite directions for each. Collapsing them into one threshold makes one of the
-// two callers less safe, which a test caught:
-//
-//   - extract_llm_sweep needs an entry that STILL EXISTS, because its prefix ask reads one. If it is
-//     wrong about the entry being alive, the ask pays fresh for the whole transcript. So the safe
-//     error is to assume the entry is already gone, and CachePhase calls nominal expiry Cold — which
-//     makes the sweep stand down at exactly the right moment.
-//   - summarize's gate needs an entry that is CERTAINLY GONE, because it rewrites deep history. If it
-//     is wrong about the entry being dead, it invalidates a live prefix and pays a cache-write of the
-//     whole suffix at 1.25x fresh. So the safe error is the opposite: assume the entry may still be
-//     alive, and require the skew allowance before claiming otherwise.
-//
-// A REVIEW FOUND THE COMPACTION SIDE MISSING THIS. Trigger.coldByArithmetic required only
-// `remaining <= 0` — the sweep's threshold — so for a full minute of every session's expiry it said
-// cold and permitted a rewrite while apply still called the same entry warm and the rest of the
-// pipeline treated its prefix as live. That converts the case summarize's design calls "strictly
-// better, unconditionally" into the harmful one, on a window that recurs in every long session.
-//
-// The gap between the two thresholds is therefore a deliberate DEAD ZONE for compaction: an entry at
-// or just past nominal expiry is neither PreExpiry (CachePhase calls it Cold) nor certainly cold
-// (this returns false), so `cache_state: cold` and `pre_expiry_or_cold` both decline. That is the
-// correct outcome for the one honest description of that window — we cannot tell whether this entry
-// is alive or dead, so we must not rewrite it.
-func CertainlyColdByClock(remaining time.Duration) bool { return remaining <= -ColdMargin }
+// The strict test went away with the `cold` and `pre_expiry_or_cold` cache states it existed to
+// serve (see components.CacheStates). What remains true, and is why this note stays: the Cold verdict
+// below is the SWEEP's threshold, and nothing should read it as proof that a prefix is safe to
+// destroy. apply computes Ctx.ColdCache with its own skew margin (apply.coldMargin) and that flag is
+// checked first, so a caller wanting the conservative answer should reach for the flag rather than
+// re-deriving one here.
 
 // FillDenominator is what a fill FRACTION is a fraction OF: C, the point at which the conversation's
 // own compaction mechanism acts, falling back to the model's context window when C is unknown.

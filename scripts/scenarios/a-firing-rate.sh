@@ -1,10 +1,16 @@
 #!/bin/bash
 # SCENARIO A — SHIPPED DEFAULTS, NATURAL TRAFFIC. Measures the FIRING RATE.
 #
-# This is the arm a review ran and the arm my own acceptance run never had: shipped
-# min_request_frac (0.9) and cache_state (pre_expiry_or_cold), a real Claude Code session, and NO
-# injected idle gaps. The question is not "does the mechanism work" — the forced arms answer that —
-# it is "how often do both gates open on traffic nobody arranged".
+# This is the arm a review ran and the arm my own acceptance run never had: shipped defaults, a real
+# Claude Code session, and NO injected idle gaps. The question is not "does the mechanism work" — the
+# forced arms answer that — it is "how often does the gate open on traffic nobody arranged".
+#
+# ⚠️ WHAT THIS ARM MEASURED, AND WHY IT NO LONGER MEASURES THE SAME THING. When it was written the
+# shipped cache_state was `pre_expiry_or_cold`, and this arm returned 0 fires in 53 turns with
+# `cache_state_declined_warm` on 51. That result is what withdrew the cold-gated states: the default
+# is now `any`, so the FILL gate is the only gate and a firing rate near zero now means the session
+# never reached 0.9 of C, not that the cache stayed warm. cache_state is deliberately not written
+# below, so this arm keeps tracking the shipped default rather than a value frozen into the script.
 #
 # It also records the one number that decides whether 0.9 is reachable at all on this client: where
 # Claude Code runs its OWN compaction. If the client caps the transcript below 0.9 of the model
@@ -18,7 +24,7 @@ PORT=4211
 
 echo "=== SCENARIO A: shipped defaults, natural traffic (firing rate) ==="
 scen_build
-scen_start  "$N" "$PORT" 0.9 pre_expiry_or_cold
+scen_start  "$N" "$PORT" 0.9
 scen_home   "$N" "$PORT"
 scen_work   "$N"
 
