@@ -152,8 +152,9 @@ starts it with the new configuration.
 
 Keep-alive targets a measured cost, not an assumed one: idle cache misses were 3.7% of requests and
 **23.6% of all spend** over the measured window, at an 8.5x penalty each. Whether it nets positive on
-*your* traffic is reported by `keepalive_net_usd` — a negative net is possible, and `none` is a
-legitimate answer.
+*your* traffic is reported by `keepalive_net_usd` — on the dashboard or `/api/stats`, not the plain
+`/stats` endpoint above, which only has the raw ping/spend ledger, not a net figure. A negative net
+is possible, and `none` is a legitimate answer.
 
 **If it breaks and Claude cannot fix it:** `~/.local/state/context-guru/context-guru-reset` undoes the
 routing from a plain terminal — no session, no proxy, no network needed. A dead proxy fails every
