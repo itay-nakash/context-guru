@@ -130,11 +130,13 @@ Change what it does:
 /context-guru:uninstall               # undo the routing, restoring any base URL it replaced
 ```
 
-`/context-guru:status` is the command — it reads the same `/stats` endpoint the standalone proxy
-exposes, just on the plugin's own port (`8787` by default, not `4000`):
+**`/context-guru:status` is the one command for this — it takes no parameters.** There is no
+separate `/stats` slash command: `/stats` is the proxy's own HTTP endpoint, and `/context-guru:status`
+is what curls it (on the plugin's port, `8787` by default) and reports it back to you in Claude
+Code. Hit the endpoint directly only if you want the raw JSON instead:
 
 ```sh
-curl -s localhost:8787/stats | jq                 # same endpoint, plugin's default port
+curl -s localhost:8787/stats | jq                 # same endpoint /context-guru:status reads
 ```
 
 A changed option takes effect on your **next session**: the session hook stops the running proxy and
