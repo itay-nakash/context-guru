@@ -638,6 +638,20 @@ func main() {
 		kaAttrs = append(kaAttrs,
 			"keepalive_idle_seconds", ka.KeepAliveIdleSeconds,
 			"keepalive_max_pings", ka.KeepAliveMaxPings)
+		// `keepalive=true` says what the CONFIG asks for and nothing about whether anything can be
+		// held, and the difference is not academic: arrive() retires every entry when there is no
+		// recorder ("NO AUDIT SINK, NO RETENTION", keepalive.go:585), so without --dashboard nothing
+		// is held, nothing pings, no counters move and no message is printed - indistinguishable from
+		// keep-alive being off.
+		//
+		// That cost three review rounds on #274 to resolve, in exactly that way: two sessions ran
+		// proxies without --dashboard, saw no pings, and could not tell "not wired" from "never
+		// fired". So the startup line now reports the precondition rather than only the intent. The
+		// plugin always passes --dashboard, so this is for everyone running the binary directly.
+		if !*dashOn {
+			kaAttrs = append(kaAttrs, "keepalive_retention", "IMPOSSIBLE: no recorder (pass --dashboard); "+
+				"entries are retired on arrival, so nothing will be held and no ping will be sent")
+		}
 	}
 	ln, err := listenAndAnnounce(addr, append([]any{"pipeline", cfg.Pipeline, "mode", mode,
 		"logs", sink}, kaAttrs...)...)

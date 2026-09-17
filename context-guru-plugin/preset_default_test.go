@@ -731,3 +731,80 @@ func TestStrategySyncLeavesAnUnnamedConfigAlone(t *testing.T) {
 		t.Errorf("rewrote a config with no name to re-render from.\nwas:\n%s\nnow:\n%s", ours, got)
 	}
 }
+
+// TestStartProxyDoesNotRecordWhenAnotherProcessOwnsThePort closes the coverage gap I flagged on the
+// round-3 fix: the `owner != started` branch of the ownership check.
+//
+// The recipe is review-pr-249-250's, and it is better than what I could see. Do not try to arrange a
+// foreign process taking the port between two probes - that makes the test's own timing an
+// assumption, which is the defect it would be testing for. Construct the PREDICATE's condition
+// directly: a stand-in that hands the socket to a GRANDCHILD and then stays alive.
+//
+// Why that is the honest version. The branch's claim is "the pid I recorded is not the one holding the
+// socket", and this produces exactly that: the bind SUCCEEDS, health PASSES, and $started is ALIVE -
+// so the liveness fallback cannot catch it and only the ownership comparison can. No race, no probe
+// counting, no dependence on how fast anything starts. It is also a realistic shape rather than a
+// contrivance: a proxy that daemonised itself would look precisely like this.
+func TestStartProxyDoesNotRecordWhenAnotherProcessOwnsThePort(t *testing.T) {
+	// Needs a way to ask who holds the socket. Without one the code documents a fallback to the
+	// weaker liveness check, which this test cannot distinguish - so skip rather than assert, the same
+	// discipline as the check-url guard.
+	if _, errSS := exec.LookPath("ss"); errSS != nil {
+		if _, errLsof := exec.LookPath("lsof"); errLsof != nil {
+			t.Skip("neither ss nor lsof is available, so start-proxy.sh falls back to a liveness " +
+				"check and the ownership branch under test cannot fire")
+		}
+	}
+	requireTool(t, "python3")
+	dir, state := t.TempDir(), t.TempDir()
+	port := freePort(t)
+
+	// The grandchild: binds the port and serves /healthz.
+	helper := filepath.Join(dir, "helper.py")
+	if err := os.WriteFile(helper, []byte(
+		"import sys, http.server\n"+
+			"H = type(\"H\", (http.server.BaseHTTPRequestHandler,), {\n"+
+			"    \"do_GET\": lambda s: (s.send_response(200), s.end_headers(), s.wfile.write(b\"ok\")),\n"+
+			"    \"log_message\": lambda s, *a: None})\n"+
+			"http.server.HTTPServer((\"127.0.0.1\", int(sys.argv[1])), H).serve_forever()\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The stand-in: launches the grandchild, then stays alive WITHOUT owning the socket.
+	daemonising := filepath.Join(dir, "daemonising-proxy")
+	body := "#!/usr/bin/env bash\n" +
+		"nohup python3 " + helper + " " + port + " >/dev/null 2>&1 &\n" +
+		"exec sleep 300\n"
+	if err := os.WriteFile(daemonising, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	out, code := startProxyIn(t, state, daemonising, port, "TMPDIR="+dir)
+	pidfile := filepath.Join(state, "proxy-"+port+".pid")
+	t.Cleanup(func() { stopByPidfile(pidfile) })
+	t.Cleanup(func() { exec.Command("pkill", "-f", helper).Run() }) //nolint:errcheck // bracketed by full path
+	if code != 0 {
+		t.Errorf("exit %d - must never fail the session: %s", code, out)
+	}
+
+	// The precondition that makes this a test of OWNERSHIP and not of liveness: the recorded pid has
+	// to still be alive. If it is not, the weaker check would have caught it and this proves nothing.
+	pid := strings.TrimSpace(readFileString(t, pidfile))
+	if pid == "" {
+		t.Fatal("no pid was recorded, so the launch path did not run")
+	}
+	if exec.Command("kill", "-0", pid).Run() != nil {
+		t.Fatalf("the recorded pid %s is not alive, so the liveness fallback could have decided this "+
+			"and the ownership branch was not exercised:\n%s", pid, out)
+	}
+
+	// And nothing may be recorded, because our proxy never held the port.
+	if b, err := os.ReadFile(filepath.Join(state, "proxy-"+port+".fingerprint")); err == nil {
+		t.Errorf("recorded %q while another process owned the port. The next session would read it, "+
+			"match it, and no-op - believing a configuration to be in effect that never was:\n%s",
+			strings.TrimSpace(string(b)), out)
+	}
+	if !strings.Contains(out, "something") {
+		t.Errorf("said nothing about another process holding the port:\n%s", out)
+	}
+}

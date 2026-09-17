@@ -624,6 +624,13 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
     elif [ -n "$owner" ]; then
       ours=1
     elif kill -0 "$started" 2>/dev/null; then
+      # The FALLBACK fired: neither ss nor lsof was on PATH, so this is the weaker liveness check and
+      # not the ownership one. Logged because it is invisible otherwise, and it is reachable in
+      # practice - a hook does not always run with a login shell's PATH, and macOS keeps lsof in
+      # /usr/sbin. Review lost a run to exactly that and could not see which check had answered.
+      printf '%s ownership of port %s could not be determined (no ss, no lsof); fell back to a \
+liveness check on pid %s, which cannot tell a proxy that bound from one that is merely alive\n' \
+        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$PORT" "$started" >>"$LOG" 2>/dev/null
       ours=1
     else
       ours=0
