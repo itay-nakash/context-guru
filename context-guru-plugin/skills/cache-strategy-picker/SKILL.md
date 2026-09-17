@@ -1,6 +1,6 @@
 ---
 name: cache-strategy-picker
-description: Show which named cache strategy is in effect and switch between them - `split`, `5-min-ping` (the default, which spends the caller's own credential on idle pings) and `1-hour-head`. Use when the user asks which cache strategy is running, to change it, to turn idle keep-alive pings on or off, to stop spending money between turns, or to keep the cache warm.
+description: Show which named cache strategy is in effect and switch between them - `none`, `5-min-ping` (the default, which spends the caller's own credential on idle pings) and `1-hour-head`. Use when the user asks which cache strategy is running, to change it, to turn idle keep-alive pings on or off, to stop spending money between turns, or to keep the cache warm.
 allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/scripts/settings.py)
 ---
 
@@ -39,8 +39,8 @@ that one alone (port 8787, preset `cache`, cache strategy `5-min-ping`).
 "${CLAUDE_PLUGIN_ROOT}/scripts/settings.py" strategy show --port <port>
 ```
 
-- `strategy=split` with `file=(none)` — no config for this port. That is not a fault or an
-  "unknown": it is exactly what `split` means, and it is what a `--cache-strategy split` install
+- `strategy=none` with `file=(none)` — no config for this port. That is not a fault or an
+  "unknown": it is exactly what `none` means, and it is what a `--cache-strategy none` install
   leaves behind.
 - `strategy=(unnamed)` — armed before strategies had names (a config written by the older
   `/context-guru:keepalive`). Re-setting it with a name is safe and is what gives them the word
@@ -66,9 +66,9 @@ curl -fsS --max-time 3 "http://127.0.0.1:<port>/api/stats" | \
 
 | Name | What it does | Cost |
 |---|---|---|
-| `split` | the preset's `cachesplit` alone. Written as the ABSENCE of a config | free — no model calls |
-| `5-min-ping` | split **+** an idle ping at 280 s (just under the provider's 5-minute TTL), ≤2 per idle span, ≥20k-token prefix, ≤$0.25/ping | **spends the caller's own credential between turns** |
-| `1-hour-head` | split **+** the 1-hour tier on the `tools`/`system` breakpoints | free, and often $0 of benefit — see below |
+| `none` | no cache strategy: the preset runs and nothing else. Written as the ABSENCE of a config | free — no model calls |
+| `5-min-ping` | an idle ping at 280 s (just under the provider's 5-minute TTL), ≤2 per idle span, ≥20k-token prefix, ≤$0.25/ping | **spends the caller's own credential between turns** |
+| `1-hour-head` | the 1-hour tier on the `tools`/`system` breakpoints, **only on >=50k-token prefixes** | free, and often $0 of benefit — see below |
 
 **Say the cost before switching TO `5-min-ping`, once, in one line.** It spends the caller's money
 (or usage-limit budget) while nobody is at the keyboard, and it applies to every session routed
@@ -81,6 +81,15 @@ downgraded on `claude-sonnet-5`** (0 of 48,212, with an otherwise normal 200). Z
 in 19,805 production requests. So on the Opus/Sonnet models most users run, the honest projection is
 **$0**, and `Usage.CacheWrite1h` is the only thing that says otherwise. Offer it as a measurement,
 not an upgrade.
+
+**And say the gate out loud when you offer it.** This strategy ships `head_ttl_min_tokens: 50000`, so
+it does nothing whatever on a prefix under 50k tokens. That threshold is what makes it pay at all
+(+$48.81, against −$18.34 applied blanket), so it is not a flaw — but **both measurements above are
+below it**: 36,574 tokens on Haiku, 48,212 on Sonnet. A user who arms this on Haiku 4.5, the one model
+where the tier was granted, and then checks a request the size of the one that was measured, sees no 1h
+label — and would reasonably conclude the tier was refused when in fact the request was too small to
+ask. If they are watching `Usage.CacheWrite1h` for zero, tell them which of the two reasons they are
+looking at.
 
 **Never turn a strategy on from a display path.** The status line renders on every keystroke; if it
 could arm this, a display hook would double as an unbounded traffic generator. Arming is always
@@ -111,7 +120,7 @@ recorded and takes effect at the next session's start.
 
 - `keepalive_ping_usd` is what the pings spent; `keepalive_saved_usd` is the prefix re-creations
   they avoided; `keepalive_net_usd` is the difference. **A negative net means the strategy is
-  costing more than it saves on this traffic** — say that plainly and offer `split`, rather than
+  costing more than it saves on this traffic** — say that plainly and offer `none`, rather than
   reporting a ping count as if it were a win.
 - The status line (`/context-guru:statusline`) shows `ka Np` once pings have actually happened —
   never before, and it never triggers one itself.

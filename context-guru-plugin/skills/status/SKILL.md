@@ -79,10 +79,35 @@ These caveats are not hedging; each one is a way a confident reading would be wr
 - **A fresh install shows almost nothing, and that is expected.** The cache effect appears on
   the *second and later* turns of a session; the first request of a session is nearly always
   cold — measured, 1,105 of 1,127 session starts.
-- **Check whether this is even a git repository, before offering any other explanation.** The
-  split works on the environment snapshot Claude Code appends to its system prompt, and outside a
-  git repo there is no snapshot to split — `cachesplit` reports `verdict: skipped`, `mutated: 0`,
-  and the saving is exactly zero. This is the common case for a casual first trial, and telling
+### Is a configuration change still pending?
+
+`start-proxy.sh` records what the running proxy was started with, in
+`$CONTEXT_GURU_STATE/proxy-<port>.fingerprint`. Compare it against what the options ask for now:
+
+```
+preset=<x> strategy=<y> idle=<z> upstream=<u> port=<p>
+```
+
+If they differ, the user changed something — most often `/plugin configure` — and **the running proxy
+predates it**. Say which field differs and that a new session applies it; the SessionStart hook stops
+and restarts the proxy when it sees the difference. Do not restart it from here: this skill runs inside
+a session that is routed through that proxy.
+
+If the fingerprint is **absent** while a proxy is running, it was started before this was recorded (or
+by something else). That is not an error and not a pending change — say so rather than guessing, and
+note that the next cold start records it.
+
+This is where a pending switch is reported, deliberately, and not from the `UserPromptSubmit` hook: a
+python invocation on the critical path of every prompt is a poor price for news that the next session
+delivers by itself.
+
+- **Check the preset before explaining a zero prefix-cache saving at all.** The default preset is
+  `off`, which runs no components, so `cachesplit` is not in the pipeline and a zero saving there is
+  the expected state rather than a symptom. Only if a preset containing `cachesplit` was chosen does
+  the next paragraph apply.
+- **Then check whether this is even a git repository.** The split works on the environment snapshot
+  Claude Code appends to its system prompt, and outside a git repo there is no snapshot to split —
+  `cachesplit` reports `verdict: skipped`, `mutated: 0`, and the saving is exactly zero. This is the common case for a casual first trial, and telling
   such a user "the cache warms up on later turns" is true in general and wrong here:
 
   ```bash

@@ -652,6 +652,20 @@ type Snapshot struct {
 	// requests). Non-zero is a lost agent turn per count, not a correctness failure.
 	AdjudicateStray int64               `json:"adjudicate_stray"`
 	Components      map[string]compStat `json:"components"`
+	// Pipeline is the CONFIGURED component order, and PipelineLen its length, so a reader can tell
+	// "no components are configured" from "components ran and did nothing". Components alone cannot:
+	// both are an empty map. That distinction stopped being academic when `off` became the plugin's
+	// default preset - the common case is now an empty pipeline, and a dashboard that renders it as
+	// a blank panel says "broken" about something working exactly as configured.
+	//
+	// NEITHER carries omitempty, and Pipeline's absence of it is the load-bearing part. With
+	// `omitempty` an EMPTY slice is omitted exactly like a nil one - so single-tenant `off`, which is
+	// now the plugin's default and the whole case these fields exist to describe, emitted no
+	// `pipeline` key at all and was indistinguishable from the multi-tenant case that both comments
+	// said absence meant. Without it the two are distinct on the wire: `[]` is "configured with no
+	// components", `null` is "no single pipeline describes this endpoint". Caught in review.
+	Pipeline    []string `json:"pipeline"`
+	PipelineLen int      `json:"pipeline_len"`
 	// TopPassthrough names components that ran but never saved a token — dead
 	// weight in the pipeline, candidates to drop from the config.
 	TopPassthrough []string `json:"top_passthrough"`
