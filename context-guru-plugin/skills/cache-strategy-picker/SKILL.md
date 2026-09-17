@@ -41,8 +41,7 @@ that one alone (port 8787, preset `cache`, cache strategy `5-min-ping`).
 
 - `strategy=none` with `file=(none)` — no config for this port. That is not a fault or an
   "unknown": it is exactly what `none` means, and it is what a `--cache-strategy none` install
-  leaves behind. The retired spelling `split` still resolves to it, so an older install reports
-  the current name rather than a name that no longer describes anything.
+  leaves behind.
 - `strategy=(unnamed)` — armed before strategies had names (a config written by the older
   `/context-guru:keepalive`). Re-setting it with a name is safe and is what gives them the word
   back.

@@ -19,12 +19,13 @@ import (
 // Adding a field here alongside the new key is the intended way to change it.
 var statsGoldenTopLevel = []string{
 	"actual_baseline_tokens",
-	// pipeline_len is how a reader tells "no components are configured" from "components ran and did
-	// nothing" - Components is an empty map in both cases. Emitted even when zero, because zero is
-	// the meaningful value: `off` is the plugin's default preset, so an empty pipeline is the common
-	// state and a dashboard that renders it as blank says "broken" about something working exactly as
-	// configured. (`pipeline` itself is omitempty and absent from this fixture, which aggregates
-	// tenants and so has no single pipeline to describe.)
+	// pipeline and pipeline_len are how a reader tells "no components are configured" from
+	// "components ran and did nothing" - Components is an empty map in both cases. Always emitted,
+	// never omitempty, because the EMPTY value is the meaningful one: `off` is the plugin's default
+	// preset, so an empty pipeline is the common state, and a dashboard that renders it as blank says
+	// "broken" about something working exactly as configured. On the wire `[]` means "configured with
+	// no components" and `null` means "no single pipeline describes this endpoint" (multi-tenant).
+	"pipeline",
 	"pipeline_len",
 	// Stray calls the agent made to the proxy-injected adjudication tool. Added to the reviewed
 	// contract rather than loosening the assertion, per the rule above: it is the only figure that

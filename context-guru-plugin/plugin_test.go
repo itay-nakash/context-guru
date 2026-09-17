@@ -2956,9 +2956,9 @@ func isStrategyShaped(tok string) bool {
 			return true
 		}
 	}
-	// `split` stays in this vocabulary although it is retired: the guard's job is to notice a
-	// strategy-shaped token in prose, and a document still saying `split` is exactly what it should
-	// catch now that the name is wrong.
+	// `split` stays in this vocabulary although it was REMOVED, and that is the point: the guard's
+	// job is to notice a strategy-shaped token in prose, and a document still saying `split` names
+	// something that no longer exists — exactly what it should catch.
 	return tok == "split" || tok == "none"
 }
 
@@ -6169,7 +6169,7 @@ func TestRouteHonoursTheStrategyThroughThePrintedCommand(t *testing.T) {
 	env := routeEnv(t, home, state, fakeProxyDir(t, port, true))
 	t.Cleanup(func() { stopFakeProxy(t, state, port) })
 
-	plan, code := runRoute(t, proj, env, "--plan", "--scope", "project", "--cache-strategy", "split")
+	plan, code := runRoute(t, proj, env, "--plan", "--scope", "project", "--cache-strategy", "none")
 	if code != 0 {
 		t.Fatalf("plan: exit %d %v", code, plan)
 	}
@@ -6886,8 +6886,11 @@ func TestMissingFlagValueRefusesOnStdout(t *testing.T) {
 		})
 	}
 
-	// Control: the flags still take values.
-	facts, code := runRoute(t, proj, env, "--plan", "--scope", "project", "--cache-strategy", "split")
+	// Control: the flags still take values. Uses a strategy that EXISTS, deliberately — the point of
+	// this control is that a flag carrying a value is accepted, so a value that is itself refused
+	// (`split` was removed, not aliased) would make the control fail for the wrong reason and say
+	// nothing about the parsing this test is about.
+	facts, code := runRoute(t, proj, env, "--plan", "--scope", "project", "--cache-strategy", "none")
 	if code != 0 || facts["result"] != "planned" {
 		t.Errorf("a flag WITH a value must still be accepted: exit %d %v", code, facts)
 	}

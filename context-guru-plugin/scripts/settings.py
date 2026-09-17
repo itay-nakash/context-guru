@@ -1193,17 +1193,12 @@ DEFAULT_STRATEGY = "5-min-ping"
 # check-proxy.sh, and the empty-preset note below). A drift test now fails if they disagree.
 DEFAULT_PRESET = "off"
 
-# Old names for strategies, so a file armed by an earlier version still resolves. `split` was named
-# after `cachesplit`, which stopped being the default: the name then referred to a component that is
-# not running, which is the defect shape #263 is about. `none` says what it is.
-STRATEGY_ALIASES = {"split": "none"}
-
-
-def _canon_strategy(name: str) -> str:
-    """The current name for a strategy, mapping retired names forward."""
-    return STRATEGY_ALIASES.get(name, name)
-
-
+# `split` was the old name for `none`. It was named after `cachesplit`, which stopped being the
+# default, so the name referred to a component that is not running - the defect shape #263 is about.
+# Renamed outright rather than aliased: the plugin is unreleased, so there is no install in the wild
+# to keep working, and an alias would be a second name for one thing living in the code forever to
+# serve nobody. A file can never carry `strategy=split` either, because `split` WAS the absence of a
+# file - so there is no stored state to migrate.
 # Each entry: the `cache:` keys it sets, and one line of honest description.
 #
 # `none` writes NO FILE AT ALL, deliberately. --config REPLACES --preset rather than layering over
@@ -1394,14 +1389,7 @@ def cmd_strategy(args) -> int:
         # `names=` is the machine-readable list. The per-strategy keys below mangle `-` to `_` to be
         # valid fact keys, so they cannot be parsed back into names — install.sh needs to validate a
         # `--cache-strategy` value BEFORE it downloads a binary, and this is what it reads.
-        # `aliases=` is published for the same reason `names=` is: install.sh validates
-        # --cache-strategy against this output BEFORE downloading a binary, and with only `names=` to
-        # read it refused `--cache-strategy split` outright - so renaming the strategy broke every
-        # saved install command and every line of shell history carrying the old word, which is
-        # precisely what having an alias was supposed to prevent. Retired names belong in the same
-        # machine-readable answer as current ones, or every caller re-derives them.
-        emit(result="ok", default=DEFAULT_STRATEGY, names=",".join(STRATEGIES),
-             aliases=",".join(f"{old}:{new}" for old, new in STRATEGY_ALIASES.items()))
+        emit(result="ok", default=DEFAULT_STRATEGY, names=",".join(STRATEGIES))
         for name, spec in STRATEGIES.items():
             emit(**{f"strategy_{name.replace('-', '_')}": spec["desc"],
                     f"spends_{name.replace('-', '_')}": "true" if spec["spends"] else "false"})
@@ -1425,7 +1413,19 @@ def cmd_strategy(args) -> int:
             emit(result="ok", strategy="(foreign)", file=path, port=port,
                  note="a config exists at our path that we did not write; left alone")
             return 0
-        name = _canon_strategy(_strategy_name_in(text))
+        name = _strategy_name_in(text)
+        # A name we do not recognise is reported AS RECORDED, with a note saying so. Two wrong
+        # answers were available here and both were worse: mapping it to a current name would claim
+        # the file does something it does not, and reporting "(unnamed)" would hide that the file
+        # names a strategy at all. `split` is the realistic case - it was removed rather than
+        # aliased, so a hand-written file can still carry it - and the file EXISTS and arms pings,
+        # which is exactly what the reader needs to know.
+        if name and name not in STRATEGIES:
+            emit(result="ok", strategy=name, file=path, port=port,
+                 note=f"this config names `{name}`, which is not a strategy this version knows "
+                      f"({','.join(STRATEGIES)}). The file is still what the proxy loads; re-set it "
+                      f"with `strategy set --name <known>` to bring it back under a name")
+            return 0
         emit(result="ok", strategy=name or "(unnamed)", file=path, port=port,
              note="" if name else "written before strategies had names; re-set it to name it")
         return 0
@@ -1466,7 +1466,7 @@ def cmd_strategy(args) -> int:
             emit(result="skipped", reason="not_ours", file=path,
                  note="a config we did not write is at this path; its preset is its owner's business")
             return 0
-        name = _canon_strategy(_strategy_name_in(text))
+        name = _strategy_name_in(text)
         if not name:
             emit(result="skipped", reason="unnamed", file=path,
                  note="written before strategies had names, so there is no name to re-render from; "
@@ -1532,9 +1532,9 @@ def cmd_strategy(args) -> int:
         return 0
 
     # op == "set"
-    name = _canon_strategy(args.name)
+    name = args.name
     if name not in STRATEGIES:
-        emit(result="error", reason="unknown_strategy", requested=args.name,
+        emit(result="error", reason="unknown_strategy", requested=name,
              known=",".join(STRATEGIES))
         return 2
     # `none` writes NO FILE, so it reaches `clear` and never touches the preset - checking the preset

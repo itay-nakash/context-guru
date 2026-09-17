@@ -57,6 +57,13 @@ func TestThePresetDefaultIsEncodedOnce(t *testing.T) {
 			"offer one default while every script assumed the other", got, want)
 	}
 
+	// NOT included, deliberately: cmd/context-guru-proxy/main.go defaults --preset to `house`. That
+	// is a SIXTH encoding of a default and it is meant to differ, because it is a default for a
+	// different product - the standalone proxy binary, whose service default is `house`
+	// (tenant.DefaultConfigYAML is that pipeline). The plugin never relies on it: every path that
+	// launches a proxy passes --preset explicitly, so the binary's default is unreachable from here.
+	// Pinned in prose rather than in an assertion so nobody "fixes" the two into agreement and
+	// silently changes what the bare binary does. Raised in review as worth stating.
 	for _, c := range []struct{ file, marker string }{
 		{"install.sh", `: "${R_PRESET:=`},
 		{"start-proxy.sh", `PRESET="${CLAUDE_PLUGIN_OPTION_PRESET:-`},
@@ -193,20 +200,24 @@ func TestStrategySyncOnAnAbsentConfigIsNotAFailure(t *testing.T) {
 	}
 }
 
-// TestRetiredStrategyNameStillResolves. `split` was named after `cachesplit`, which stopped being
-// the default — so the name referred to a component that is not running. It is `none` now, and the
-// old spelling has to keep working: it is in install commands people saved and in shell history.
-func TestRetiredStrategyNameStillResolves(t *testing.T) {
+// TestTheRemovedStrategyNameIsRefused. `split` was renamed to `none`, not aliased to it: the plugin
+// is unreleased, so no install in the wild needs the old word, and an alias would be a second name
+// for one thing living in the code forever to serve nobody. The name is therefore simply unknown —
+// asserted here so a REAPPEARANCE of it is a failure rather than a silent revival, and so the
+// refusal names what is actually available instead of only saying no.
+func TestTheRemovedStrategyNameIsRefused(t *testing.T) {
 	facts, code := settings(t, "strategy", "set", "--name", "split", "--port", "8787")
-	if code != 0 {
-		t.Fatalf("the retired name `split` was refused (exit %d): %v", code, facts)
+	if code == 0 {
+		t.Fatalf("`split` was accepted; it was removed, not aliased: %v", facts)
 	}
-	if facts["strategy"] != "none" {
-		t.Errorf("strategy=%q, want none — a retired name must report the CURRENT name, or the "+
-			"user learns a word that no longer describes anything", facts["strategy"])
+	if facts["reason"] != "unknown_strategy" {
+		t.Errorf("reason=%q, want unknown_strategy: %v", facts["reason"], facts)
 	}
-	if facts["result"] != "set" {
-		t.Errorf("result=%q, want set (the caller asked to set something)", facts["result"])
+	// The refusal has to carry the alternatives, or a caller who typed the old name is told only
+	// that they are wrong. `known=` is that list, and it comes from STRATEGIES rather than prose.
+	if !strings.Contains(facts["known"], "none") {
+		t.Errorf("known=%q does not offer `none`, so the refusal does not say what to type instead",
+			facts["known"])
 	}
 }
 
@@ -515,5 +526,77 @@ func TestTheStartupNoteUsesAStrategyNameSettingsKnows(t *testing.T) {
 		t.Errorf("start-proxy.sh reports the no-config case as cache strategy %q, which settings.py "+
 			"does not list (%s). The startup note would name a strategy the user cannot ask for",
 			got, facts["names"])
+	}
+}
+
+// TestStartProxyReplacesAProxyThatReleasedItsPortButHasNotExited.
+//
+// Reported in review, and the failure it guards is the worst kind this file can produce: a session
+// routed at a port with nothing listening, told the opposite.
+//
+// main.go handles SIGTERM through http.Server.Shutdown, which closes the LISTENERS FIRST and only
+// then drains in-flight requests, for up to 25 s. So a proxy routinely spends time having released
+// the port while still running - a streaming completion easily runs past ten seconds, and on a
+// shared port it is somebody else's turn holding the drain open.
+//
+// stop_running_proxy used to wait on the PID for 10 s and treat that window as failure. The hook then
+// printed "it is still running with <old fingerprint>" and exited 0, having started nothing. The
+// message pointed the reader away from the one thing that was wrong: the port was dead.
+//
+// The fake here drains exactly that way - on SIGTERM it closes its listener and keeps running - so
+// this fails against the pid-waiting version and passes against the port-waiting one.
+func TestStartProxyReplacesAProxyThatReleasedItsPortButHasNotExited(t *testing.T) {
+	dir, state := t.TempDir(), t.TempDir()
+	port := freePort(t)
+	requireTool(t, "python3")
+
+	// Serves /healthz; on SIGTERM closes the socket and keeps running rather than exiting.
+	draining := filepath.Join(dir, "draining-proxy")
+	body := "#!/usr/bin/env bash\nexec python3 -c '\n" +
+		"import signal, sys, threading, http.server\n" +
+		"H = type(\"H\", (http.server.BaseHTTPRequestHandler,), {\n" +
+		"    \"do_GET\": lambda s: (s.send_response(200), s.end_headers(), s.wfile.write(b\"ok\")),\n" +
+		"    \"log_message\": lambda s, *a: None})\n" +
+		"srv = http.server.HTTPServer((\"127.0.0.1\", int(sys.argv[1])), H)\n" +
+		"def drain(sig, frm):\n" +
+		"    threading.Thread(target=srv.shutdown, daemon=True).start()\n" +
+		"signal.signal(signal.SIGTERM, drain)\n" +
+		"srv.serve_forever()\n" +
+		"srv.server_close()\n" +
+		"while True: signal.pause()\n" +
+		"' " + port + "\n"
+	if err := os.WriteFile(draining, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if out, code := startProxyIn(t, state, draining, port, "TMPDIR="+dir); code != 0 {
+		t.Fatalf("first start failed: exit %d %s", code, out)
+	}
+	pidfile := filepath.Join(state, "proxy-"+port+".pid")
+	t.Cleanup(func() { stopByPidfile(pidfile) })
+	first := strings.TrimSpace(readFileString(t, pidfile))
+
+	// A normal proxy for the replacement, and a changed preset so the restart path runs.
+	fresh := servingProxy(t, dir, port, filepath.Join(dir, "started"))
+	out, code := startProxyIn(t, state, fresh, port, "TMPDIR="+dir,
+		"CLAUDE_PLUGIN_OPTION_PRESET=housellm")
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, out)
+	}
+
+	// The claim that matters: something is listening when this returns.
+	resp, err := http.Get("http://127.0.0.1:" + port + "/healthz")
+	if err != nil {
+		t.Fatalf("nothing is listening on %s after the hook returned, so this session is routed at a "+
+			"dead port - the reported defect:\n%s", port, out)
+	}
+	resp.Body.Close()
+
+	if got := strings.TrimSpace(readFileString(t, pidfile)); got == first {
+		t.Errorf("the pidfile still names the drained proxy (%s); a later stop would signal the wrong "+
+			"process, or none", first)
+	}
+	if strings.Contains(out, "STILL ANSWERING") {
+		t.Errorf("reported the old proxy as still answering, but its port was already released:\n%s", out)
 	}
 }

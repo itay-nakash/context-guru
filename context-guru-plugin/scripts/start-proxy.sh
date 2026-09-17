@@ -277,6 +277,21 @@ fingerprint_want() {
 # NO PIDFILE means we did not start whatever is holding this port. It may be a colleague's proxy, a
 # hand-started one, or an unrelated service. We do not signal it - we leave it alone and say so.
 # Killing something we cannot prove is ours is the one failure this whole file is written to avoid.
+# Waits for the PORT to be free, not for the process to exit, and that distinction is the whole
+# correctness of this function.
+#
+# main.go handles SIGTERM through http.Server.Shutdown, which closes the LISTENERS FIRST and only
+# then drains in-flight requests, for up to 25 s. So there is a window - and a routine one, since a
+# streaming completion easily runs past ten seconds, and on a shared port it is somebody else's turn
+# holding the drain open - where the old proxy has released the port but has not exited.
+#
+# Waiting on the pid treated that window as failure. The caller then reported "it is still running
+# with <old fingerprint>" and exited 0, which is wrong in the direction that stops anyone looking:
+# nothing was listening, so the session was routed at a dead port and the message said the opposite.
+# Reported by review-pr-249-250 and reproduced with a fake proxy that drains the way main.go does.
+#
+# The port being free is also exactly the precondition the caller needs, because that is what lets a
+# new proxy bind - so this now waits for the condition that matters rather than a proxy for it.
 stop_running_proxy() {
   local pid deadline
   pid=$(cat "$PIDFILE" 2>/dev/null)
@@ -284,13 +299,17 @@ stop_running_proxy() {
     ''|*[!0-9]*) return 1 ;;
   esac
   kill -0 "$pid" 2>/dev/null || return 1
-  # Plain kill, i.e. SIGTERM, which the proxy handles: main.go arms signal.Notify for SIGINT/SIGTERM
-  # and routes it to http.Server.Shutdown, which closes the listeners and then WAITS for every
-  # in-flight request to return. So a request already being served is not dropped by this.
+  # Plain kill, i.e. SIGTERM, which the proxy handles gracefully: a request already being served is
+  # not dropped by this.
   kill "$pid" 2>/dev/null || return 1
-  deadline=$(( $(date +%s) + 10 ))
+  # 30s covers main.go's 25s Shutdown ceiling. In practice the listeners close in milliseconds
+  # (measured 15 ms with no dashboard viewer), so this loop almost always ends on its first probe.
+  deadline=$(( $(date +%s) + 30 ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
+    # EITHER condition is success: the process is gone, or it has released the port and is merely
+    # draining. Both mean a new proxy can bind.
     kill -0 "$pid" 2>/dev/null || return 0
+    curl -fsS --max-time 1 "$HEALTH" >/dev/null 2>&1 || return 0
     sleep 0.25
   done
   return 1
@@ -312,10 +331,20 @@ if curl -fsS --max-time 2 "$HEALTH" >/dev/null 2>&1; then
   elif [ "$fp_have" = "$fp_want" ]; then
     :
   elif ! stop_running_proxy; then
-    note "the proxy on port ${PORT} was started with a different configuration and could not be"
-    note "stopped automatically; it is still running with: ${fp_have}"
-    note "stop it and start a new session, or run /context-guru:status."
-    exit 0
+    # The wait expired. Re-probe before choosing words: "could not stop it" and "it is still
+    # serving" are different claims, and only the second one justifies leaving the port alone.
+    # Asserting the second from the first is how this branch reported a healthy port about a dead
+    # one. The probe is the authority, not the kill.
+    if curl -fsS --max-time 2 "$HEALTH" >/dev/null 2>&1; then
+      note "the proxy on port ${PORT} was started with a different configuration and could not be"
+      note "stopped automatically; it is STILL ANSWERING with: ${fp_have}"
+      note "stop it and start a new session, or run /context-guru:status."
+      exit 0
+    fi
+    # Not answering: the port is free even though the old process has not exited. Fall through and
+    # start the new one, or the session is left routed at a port nothing is listening on.
+    note "the old proxy on port ${PORT} stopped answering but has not exited yet; starting the new one."
+    rm -f "$FINGERPRINT" 2>/dev/null || true
   else
     note "configuration changed, restarting the proxy on port ${PORT}."
     note "  was: ${fp_have}"
@@ -426,7 +455,8 @@ PRESET_NOTE="$PRESET"
 # no longer in the default pipeline, so the startup note was announcing a component that was not
 # running - and it was a SECOND encoding of a name settings.py already owns, which is the defect
 # shape this branch exists to remove. Caught by reading the note in a test run, not by the drift
-# test, which only covered the preset; TestTheStartupNoteUsesTheCurrentStrategyNames covers it now.
+# test, which only covered the preset. TestTheStartupNoteUsesAStrategyNameSettingsKnows covers it now
+# (the earlier spelling of that name in this comment was of a test that never existed).
 STRATEGY_NOTE="none"
 if [ -f "$KEEPALIVE_CFG" ]; then
   CONFIG_ARGS=(--config "$KEEPALIVE_CFG")

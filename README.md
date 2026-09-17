@@ -139,7 +139,10 @@ editing, which is a deliberate step rather than a default.
 **What it does do is keep your prompt cache warm.** `cache_strategy=5-min-ping` pings just under the
 provider's 5-minute cache TTL so the cache is still live when you come back to an idle session. That
 **spends a little of your own quota** while nobody is at the keyboard — the mechanism, not a side
-effect — and it is the one part of this plugin with a measured net saving.
+effect. It is aimed at a cost that was measured rather than assumed: idle cache misses were 3.7% of
+requests and **23.6% of all spend** over the measured window, at an 8.5x penalty each. Whether it pays
+on *your* traffic is reported by `keepalive_net_usd` — a negative net is possible, and the picker says
+so and offers `none`.
 `/context-guru:cache-strategy-picker` names the alternatives and what each costs; `none` turns it off.
 
 **If it ever breaks and Claude cannot fix it:** `~/.local/state/context-guru/context-guru-reset` undoes

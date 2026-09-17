@@ -658,10 +658,13 @@ type Snapshot struct {
 	// default preset - the common case is now an empty pipeline, and a dashboard that renders it as
 	// a blank panel says "broken" about something working exactly as configured.
 	//
-	// PipelineLen is emitted even when zero (no omitempty) precisely because zero is the meaningful
-	// value; Pipeline itself is omitted when nil, which is the multi-tenant case where /stats spans
-	// tenants and no single pipeline describes it.
-	Pipeline    []string `json:"pipeline,omitempty"`
+	// NEITHER carries omitempty, and Pipeline's absence of it is the load-bearing part. With
+	// `omitempty` an EMPTY slice is omitted exactly like a nil one - so single-tenant `off`, which is
+	// now the plugin's default and the whole case these fields exist to describe, emitted no
+	// `pipeline` key at all and was indistinguishable from the multi-tenant case that both comments
+	// said absence meant. Without it the two are distinct on the wire: `[]` is "configured with no
+	// components", `null` is "no single pipeline describes this endpoint". Caught in review.
+	Pipeline    []string `json:"pipeline"`
 	PipelineLen int      `json:"pipeline_len"`
 	// TopPassthrough names components that ran but never saved a token — dead
 	// weight in the pipeline, candidates to drop from the config.
