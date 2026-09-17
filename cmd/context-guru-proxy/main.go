@@ -620,7 +620,27 @@ func main() {
 	}
 	// The sink last, so it is the line just above the traffic: "where are the logs and
 	// what level am I getting" is the first question when something looks quiet.
-	ln, err := listenAndAnnounce(addr, "pipeline", cfg.Pipeline, "mode", mode, "logs", sink)
+	// `keepalive` joins this line because the pipeline alone stopped describing what the proxy does.
+	// Raised in review: with the plugin's new default preset of `off` the line read `pipeline=[]` and
+	// nothing else, so the ONE thing running - the idle keep-alive, which spends the caller's own
+	// credential - was invisible at startup, and /stats cannot fill the gap because its keepalive
+	// block is gated on counters that are zero until after the first ping. A mechanism that spends
+	// money while nobody is at the keyboard has to be visible before it has spent any.
+	//
+	// Only the enablement and the two figures that bound the spend, not the whole block: this is a
+	// startup line, and `cache:` is a document the config endpoint already serves in full.
+	kaAttrs := []any{"keepalive", cfg.Cache.KeepAlive}
+	if cfg.Cache.KeepAlive {
+		// Resolved() so the line reports the figures IN EFFECT rather than the zeros a config gets to
+		// leave unset - reporting 0 for an interval that is actually 280 is the class of confidently
+		// wrong detail this repo keeps removing.
+		ka := cfg.Cache.Resolved()
+		kaAttrs = append(kaAttrs,
+			"keepalive_idle_seconds", ka.KeepAliveIdleSeconds,
+			"keepalive_max_pings", ka.KeepAliveMaxPings)
+	}
+	ln, err := listenAndAnnounce(addr, append([]any{"pipeline", cfg.Pipeline, "mode", mode,
+		"logs", sink}, kaAttrs...)...)
 	if err != nil {
 		log.Fatalf("listen: %v", err)
 	}

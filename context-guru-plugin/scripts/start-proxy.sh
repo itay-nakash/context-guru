@@ -544,12 +544,42 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   # timeout belongs on the idempotence probe above (where a false negative starts a SECOND proxy
   # and overwrites the pidfile with a pid that immediately exits), not on this one.
   if curl -fsS --max-time 1 "$HEALTH" >/dev/null 2>&1; then
-    # Written only once the proxy ANSWERS, so a fingerprint on disk always describes something that
-    # actually came up. Best-effort: a state directory we cannot write is already survivable
-    # everywhere else in this script, and the only cost here is that the next session cannot tell a
-    # configuration change happened.
-    fingerprint_want >"$FINGERPRINT" 2>/dev/null || true
-      if [ -n "$UPSTREAM" ]; then
+    # WHOSE PROXY ANSWERED? The health poll cannot tell "the process I just launched" from "something
+    # else already on this port", and writing the fingerprint on the strength of it recreated the
+    # exact defect this branch exists to remove - via the mechanism meant to remove it.
+    #
+    # The sequence, reported by review-pr-249-250 and reproduced: one transient failure of the
+    # idempotence probe above skips the whole already-up block; this launch then fails to BIND
+    # because the port is occupied; the OLD proxy answers this poll; and the fingerprint is written
+    # describing a configuration that never ran. The next two sessions then no-op, because
+    # fp_have == fp_want. Ground truth in the reproduction: only the original preset ever bound.
+    #
+    # That is strictly worse than before this branch, and the reason is the shape of the change: each
+    # session used to re-derive the answer, so a stale reading corrected itself next time, and a
+    # PERSISTED false claim suppresses the correction instead. A cache of a decision has to be at
+    # least as trustworthy as re-deciding, or it is not a cache but a way to make one bad reading
+    # permanent.
+    #
+    # The trigger is not exotic, and this branch's own drain fix makes it more ordinary rather than
+    # less: a proxy whose listener has closed while it drains is exactly a failed probe.
+    #
+    # So: the pid we recorded is the authority on whether OUR proxy is up. If it is gone, something
+    # else is serving this port and we say so instead of persisting a claim about it.
+    if kill -0 "$started" 2>/dev/null; then
+      # Best-effort write: a state directory we cannot write is survivable everywhere else in this
+      # script, and the only cost is that the next session cannot tell a configuration change happened.
+      fingerprint_want >"$FINGERPRINT" 2>/dev/null || true
+    else
+      # Deliberately REMOVED rather than left stale: a fingerprint describing the configuration we
+      # failed to start would make the next session believe it is already running.
+      rm -f "$FINGERPRINT" 2>/dev/null || true
+      note "port ${PORT} is answering, but the proxy this hook started is not running - so something"
+      note "else holds the port and this session's requests go there, not through the configuration"
+      note "you asked for. Nothing was recorded. Log: ${LOG}"
+      note "check with /context-guru:status before assuming the new settings are in effect."
+      exit 0
+    fi
+    if [ -n "$UPSTREAM" ]; then
       note "proxy up on 127.0.0.1:${PORT} (preset ${PRESET_NOTE}, cache strategy ${STRATEGY_NOTE}, idle-exit ${IDLE_EXIT}), chained behind ${UPSTREAM}."
       note "dashboard: http://127.0.0.1:${PORT}/dashboard/"
       exit 0

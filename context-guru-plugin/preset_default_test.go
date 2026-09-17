@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -598,5 +599,113 @@ func TestStartProxyReplacesAProxyThatReleasedItsPortButHasNotExited(t *testing.T
 	}
 	if strings.Contains(out, "STILL ANSWERING") {
 		t.Errorf("reported the old proxy as still answering, but its port was already released:\n%s", out)
+	}
+}
+
+// TestStartProxyDoesNotRecordAConfigurationItFailedToStart.
+//
+// Reported in review, and the sharpest finding on this branch: the mechanism meant to remove the
+// "changing the option does nothing" defect recreated it.
+//
+// The fingerprint used to be written on the strength of the post-launch health poll, which cannot
+// tell "the process I just launched" from "something else already on this port". One transient
+// failure of the idempotence probe skips the already-up block; this launch then fails to BIND because
+// the port is occupied; the OLD proxy answers the poll; and a fingerprint is persisted describing a
+// configuration that never ran. The next sessions no-op because fp_have == fp_want.
+//
+// Strictly worse than before the branch, and the reason is the shape of the change: sessions used to
+// re-derive the answer, so a stale reading corrected itself, and a persisted false claim suppresses
+// the correction instead.
+//
+// Simulated here by occupying the port with a listener that is NOT ours and giving the hook a binary
+// that cannot bind, which is the same observable state.
+func TestStartProxyDoesNotRecordAConfigurationItFailedToStart(t *testing.T) {
+	dir, state := t.TempDir(), t.TempDir()
+
+	// Somebody else's listener on the port we want, which fails its FIRST health check and answers
+	// every one after it. That transient failure is the reported trigger and it has to be simulated
+	// rather than assumed: a listener that simply answers is caught by the idempotence probe in
+	// section (2), the launch path never runs, and "no fingerprint was written" is then trivially
+	// true — a test that passes while proving nothing. (It did, on the first attempt.)
+	//
+	// One 503 makes `curl -fsS` fail, so the already-up block is skipped exactly as it would be on a
+	// blip or on a proxy whose listener is closed while it drains; the post-launch poll then succeeds
+	// against this same foreign listener, which is the state the fix has to see through.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var probes atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		if probes.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Write([]byte("ok")) //nolint:errcheck
+	})
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	go srv.Serve(ln) //nolint:errcheck
+	defer srv.Close()
+	port := fmt.Sprint(ln.Addr().(*net.TCPAddr).Port)
+
+	// A "proxy" that exits immediately, standing in for one that cannot bind.
+	cannotBind := filepath.Join(dir, "cannot-bind")
+	if err := os.WriteFile(cannotBind,
+		[]byte("#!/usr/bin/env bash\necho 'bind: address already in use' >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	out, code := startProxyIn(t, state, cannotBind, port, "TMPDIR="+dir,
+		"CLAUDE_PLUGIN_OPTION_PRESET=housellm")
+	if code != 0 {
+		t.Errorf("exit %d - must never fail the session: %s", code, out)
+	}
+
+	// Guard against the vacuous version of this test: the already-up block must have been SKIPPED and
+	// a launch attempted, or "nothing was recorded" says nothing about the fix.
+	if got := probes.Load(); got < 2 {
+		t.Fatalf("only %d health probe(s) reached the listener, so the launch path was never entered "+
+			"and this test proves nothing about the fingerprint", got)
+	}
+
+	// The whole point: nothing may be recorded about a configuration that never ran.
+	fp := filepath.Join(state, "proxy-"+port+".fingerprint")
+	if b, err := os.ReadFile(fp); err == nil {
+		t.Errorf("recorded %q for a proxy that never bound. The next session reads this, finds it "+
+			"matches what the options ask for, and no-ops - so the configuration is permanently "+
+			"believed to be in effect while something else serves the port:\n%s", strings.TrimSpace(string(b)), out)
+	}
+	// And it has to SAY so, or the user is told the new settings are live.
+	if !strings.Contains(out, "something") {
+		t.Errorf("said nothing about the port being held by another process:\n%s", out)
+	}
+}
+
+// TestStrategySyncLeavesAnUnnamedConfigAlone. The one sub-case of the sync checklist with no test,
+// noticed in review.
+//
+// A config we own but that predates named strategies has no name to re-render FROM, so sync has
+// nothing to do and must say that rather than guess. Guessing the default would be the worst answer:
+// it would rewrite a file that may set anything, under a name the user never chose.
+func TestStrategySyncLeavesAnUnnamedConfigAlone(t *testing.T) {
+	state, home := t.TempDir(), t.TempDir()
+	port := "8787"
+	cfg := filepath.Join(state, "keepalive-"+port+".yaml")
+	// Our marker, deliberately with no strategy= in it: the shape the old keepalive skill wrote.
+	ours := "# context-guru: written by /context-guru:keepalive\npreset: cache\ncache:\n  keepalive: true\n"
+	if err := os.WriteFile(cfg, []byte(ours), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	facts, code := settingsIn(t, state, home, "strategy", "sync", "--port", port, "--preset", "housellm")
+	if code != 0 {
+		t.Errorf("exit %d - an unnamed config must not fail the SessionStart path: %v", code, facts)
+	}
+	if facts["result"] != "skipped" || facts["reason"] != "unnamed" {
+		t.Errorf("result=%q reason=%q, want skipped/unnamed: %v", facts["result"], facts["reason"], facts)
+	}
+	if got := readFileString(t, cfg); got != ours {
+		t.Errorf("rewrote a config with no name to re-render from.\nwas:\n%s\nnow:\n%s", ours, got)
 	}
 }
