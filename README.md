@@ -130,6 +130,13 @@ Change what it does:
 /context-guru:uninstall               # undo the routing, restoring any base URL it replaced
 ```
 
+`/context-guru:status` is the command — it reads the same `/stats` endpoint the standalone proxy
+exposes, just on the plugin's own port (`8787` by default, not `4000`):
+
+```sh
+curl -s localhost:8787/stats | jq                 # same endpoint, plugin's default port
+```
+
 A changed option takes effect on your **next session**: the session hook stops the running proxy and
 starts it with the new configuration.
 
