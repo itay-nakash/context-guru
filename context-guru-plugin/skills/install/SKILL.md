@@ -1,6 +1,6 @@
 ---
 name: install
-description: Install a local context-guru proxy and route this project's Claude Code sessions through it, so long sessions stop paying to re-create the prompt cache. Use when the user asks to install, set up, enable, try or start context-guru, or to route Claude Code through it. Accepts --global to route every project on the machine instead of just this one.
+description: Install a local context-guru proxy and route this project's Claude Code sessions through it, so long sessions stop paying to re-create the prompt cache. Use when the user asks to install, set up, enable, try or start context-guru, or to route Claude Code through it. Accepts --global to route every project on the machine instead of just this one, and --cache-strategy <split|5-min-ping|1-hour-head> to override the default cache strategy (5-min-ping, which sends idle keep-alive pings).
 ---
 
 # Install context-guru for Claude Code
@@ -27,6 +27,16 @@ something:
    chain behind it rather than to ask.
 
 Everything else: act, then say what you did.
+
+**Ask ONCE, in one sentence, and let the permission prompt be the second half of the consent.**
+Three things need the user's agreement — the scope, what to do about a base URL that is already set,
+and that `5-min-ping` spends a little of their own quota on idle turns — and they are one decision
+about one install, not three interviews. State all of it in a single line, get one answer, then run
+the commands that carry those decisions as ARGUMENTS. The approval prompt on the command that
+redirects traffic then shows the user the actual thing they agreed to, which is why it is not a
+second question: a command that names its own scope and upstream is the consent, rather than a copy
+of it. Never split this into a question per parameter, and never ask again for something the same
+answer already covered.
 
 ## What to say before you start
 
@@ -107,8 +117,10 @@ The values are on disk, so read them:
 "${CLAUDE_PLUGIN_ROOT}/scripts/settings.py" config
 ```
 
-- `option_port=…` / `option_preset=…` / `option_idle_exit=…` / `option_upstream=…` — use these
-- `source=(none)` — nothing configured; the `plugin.json` defaults apply (port 8787, preset `cache`)
+- `option_port=…` / `option_preset=…` / `option_idle_exit=…` / `option_upstream=…` /
+  `option_cache_strategy=…` — use these
+- `source=(none)` — nothing configured; the `plugin.json` defaults apply (port 8787, preset `cache`,
+  cache strategy `5-min-ping`)
 - **an option with no line of its own is unconfigured**, whatever `source=` says. Only keys the user
   actually set are printed, so a partial config — the port set and the preset never touched, say —
   reports a real `source=` and simply omits `option_preset=`. Take the `plugin.json` default for each
@@ -190,6 +202,40 @@ lets their gateway keep authenticating. Two places have to know about it, for di
 
 Say what you are doing and why in one line, then continue. Replacing a platform-provided gateway
 outright will usually break that agent's authentication, so do not offer it as the default.
+
+### 4b. Write the cache strategy, BEFORE the proxy starts
+
+The order matters and it is the opposite of intuition: `start-proxy.sh` reads this file only when it
+STARTS a proxy, so a strategy written afterwards does nothing until something restarts it. Write it
+now and the very first proxy has it.
+
+```bash
+"${CLAUDE_PLUGIN_ROOT}/scripts/settings.py" strategy set \
+  --name <cache strategy> --port <port> --preset <preset>
+```
+
+The default is **`5-min-ping`**, and it is the one thing in this install that spends money: an idle
+ping just under the provider's 5-minute TTL, at most 2 per idle span, only on prefixes over 20k
+tokens, capped at $0.25 a ping. Bounded, not free. **Say so in one line** — it belongs in the same
+sentence as everything else you are about to do, not in a separate interrogation:
+
+> Keep-alive will be on as `5-min-ping`, which spends a little of your own quota on idle turns to
+> hold the cache warm. `/context-guru:cache-strategy-picker` switches it to `split` if you would
+> rather it did not.
+
+- `result=set` with `spends=true` — report the strategy NAME in your summary. The name is what lets
+  them switch back later without remembering four tuning numbers.
+- `result=cleared` — they asked for `split`, which is the ABSENCE of a config rather than a config
+  saying "off". Correct, and nothing further is needed.
+- `result=conflict reason=not_ours` — something we did not write is at that path. Leave it, say so,
+  and continue the install: a missing strategy is not a reason to abandon a working proxy.
+- `result=error reason=unknown_strategy` — you invented a name. `settings.py strategy list` is the
+  authoritative set.
+- `reason=empty_preset` — you did not substitute the preset from step 2. Do not retry with a guess;
+  an empty preset silently turns compaction off.
+
+If the user asked for a specific strategy (`/context-guru:install --cache-strategy split`), pass that
+instead of the configured default, and say which one you used.
 
 ### 5. START THE PROXY FIRST, before writing any settings
 
@@ -408,7 +454,11 @@ purpose — exiting clears in-memory cache state. If they want a shorter one, th
 - The proxy exits by itself after `--idle-exit` of no use, so nothing is left running.
 - Dashboard: `http://127.0.0.1:<port>/dashboard/` — the four billed token tiers are where the
   cache effect is visible.
-- `/context-guru:status` for the numbers, `/context-guru:uninstall` to undo.
+- **Name the cache strategy in effect**, because a name is the only thing they can say back to you.
+  `start-proxy.sh` prints it too (`cache strategy 5-min-ping`), so the two cannot disagree. If it is
+  `5-min-ping`, one clause on what it spends; if it is `split`, one clause saying nothing is spent
+  between turns.
+- `/context-guru:status` for the numbers, `/context-guru:cache-strategy-picker` to change or turn off the cache strategy, `/context-guru:uninstall` to undo.
 - The escape hatch from step 6, once more, as the last line of your summary. A user who has to
   find it will be looking at this transcript with a session that cannot answer questions.
 

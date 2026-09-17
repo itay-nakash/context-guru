@@ -33,6 +33,7 @@ import datetime as _dt
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -1119,6 +1120,206 @@ def cmd_config(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Named cache strategies
+# ---------------------------------------------------------------------------
+#
+# The proxy has three distinct cache mechanisms and, until this table existed, only one of them
+# had a name a user could say back to us. `/context-guru:keepalive` armed the middle one by
+# writing four tuning numbers into a YAML file from a heredoc embedded in a skill; switching back
+# meant remembering what those numbers had been. A NAME is the whole point: "put it back on
+# 5-min-ping" has to be a sentence, not an archaeology exercise.
+#
+# The names are deliberately the same names the hosted control plane uses for
+# tenant.Strategy.Name, so a strategy means the same thing on a laptop and on a gateway
+# deployment. If these two vocabularies drift, the naming has bought nothing.
+#
+# WHY THIS LIVES IN settings.py rather than in the skill that calls it: this file is the one place
+# that already writes user-visible files carefully — atomically, with an ownership marker, and
+# refusing to clobber anything it did not write. A heredoc in a skill body had to re-derive all of
+# that in prose, and prose is what the surrounding design document is about.
+
+# The marker's FIRST line carries the strategy name, so `strategy show` can report the name rather
+# than reverse-engineering it from the parameters. Ownership is decided by the `# context-guru:`
+# prefix plus `written by`, which keeps files written by the OLD keepalive skill recognisable as
+# ours - they exist in the wild, and refusing to touch them would strand anyone who armed
+# keep-alive before this change.
+STRATEGY_MARKER_PREFIX = "# context-guru:"
+STRATEGY_MARKER_TAIL = "written by"
+
+DEFAULT_STRATEGY = "5-min-ping"
+
+# Each entry: the `cache:` keys it sets, and one line of honest description.
+#
+# `split` writes NO FILE AT ALL, deliberately. --config REPLACES --preset rather than layering over
+# it, so the way to express "just the preset, nothing else" is the absence of a config, not a
+# config that says keepalive: false. That also means switching to `split` is a removal, which is
+# why it cannot be expressed as a dict here.
+STRATEGIES: dict[str, dict] = {
+    "split": {
+        "cache": {},
+        "spends": False,
+        "desc": "prompt-cache split only (the preset's cachesplit). No pings, no model calls, "
+                "no spend. Written as the ABSENCE of a config file.",
+    },
+    DEFAULT_STRATEGY: {
+        # Explicit rather than relying on the library defaults, for two reasons: the file becomes
+        # self-documenting for anyone who opens it, and a later change to a default in config.go
+        # cannot silently re-tune an already-armed install.
+        "cache": {
+            "keepalive": True,
+            "keepalive_idle_seconds": 280,
+            "keepalive_max_pings": 2,
+            "keepalive_max_usd_per_ping": 0.25,
+            "keepalive_min_prefix_tokens": 20000,
+        },
+        "spends": True,
+        "desc": "split + an idle ping just under the provider's 5-minute TTL (280s, at most 2 per "
+                "idle span, >=20k-token prefix, <=$0.25/ping). SPENDS THE CALLER'S CREDENTIAL "
+                "while nobody is at the keyboard.",
+    },
+    "1-hour-head": {
+        "cache": {"head_ttl_1h": True, "head_ttl_min_tokens": 50000},
+        "spends": False,
+        "desc": "split + asks for the 1-hour tier on the tools/system breakpoints. No pings. "
+                "Measured GRANTED on Haiku 4.5 and SILENTLY DOWNGRADED on Sonnet 5 (zero 1h "
+                "writes in 19,805 production requests), so on Opus/Sonnet the honest projection "
+                "is $0 - verify with Usage.CacheWrite1h before believing otherwise.",
+    },
+}
+
+
+def strategy_path(port: str) -> str:
+    """The config file start-proxy.sh looks for, named after the PORT.
+
+    Named after the port because the file has to be findable by a proxy that was started for a
+    particular port, and because two proxies on one machine must not share one strategy.
+    """
+    return os.path.join(state_dir(), f"keepalive-{port}.yaml")
+
+
+def _strategy_is_ours(text: str) -> bool:
+    first = text.splitlines()[0] if text.splitlines() else ""
+    return first.startswith(STRATEGY_MARKER_PREFIX) and STRATEGY_MARKER_TAIL in first
+
+
+def _strategy_name_in(text: str) -> str:
+    """The name recorded in the marker, or "" for a file that predates named strategies."""
+    first = text.splitlines()[0] if text.splitlines() else ""
+    m = re.search(r"strategy=([A-Za-z0-9._-]+)", first)
+    return m.group(1) if m else ""
+
+
+def _render_strategy(name: str, preset: str) -> str:
+    spec = STRATEGIES[name]
+    lines = [
+        f"{STRATEGY_MARKER_PREFIX} strategy={name} {STRATEGY_MARKER_TAIL} "
+        f"/context-guru:cache-strategy-picker",
+        "# Do not hand-edit: the picker refuses to touch a file whose first line is not this one,",
+        "# so an edit that removes the marker also removes your ability to switch back with a name.",
+        "#",
+        "# `preset:` is stated explicitly because --config REPLACES --preset entirely rather than",
+        "# layering over it. A config that omitted it would silently turn compaction off at the",
+        "# moment a cache strategy was armed - the exact opposite of the intent.",
+        f"preset: {preset}",
+    ]
+    cache = spec["cache"]
+    if cache:
+        lines.append("cache:")
+        for k, v in cache.items():
+            lines.append(f"  {k}: {json.dumps(v)}")
+    return "\n".join(lines) + "\n"
+
+
+def cmd_strategy(args) -> int:
+    if args.op == "list":
+        emit(result="ok", default=DEFAULT_STRATEGY)
+        for name, spec in STRATEGIES.items():
+            emit(**{f"strategy_{name.replace('-', '_')}": spec["desc"],
+                    f"spends_{name.replace('-', '_')}": "true" if spec["spends"] else "false"})
+        return 0
+
+    port = args.port
+    path = strategy_path(port)
+
+    if args.op == "show":
+        if not os.path.exists(path):
+            # No file is not "unknown": it is exactly what `split` means.
+            emit(result="ok", strategy="split", file="(none)", port=port,
+                 note="no config for this port, so the preset's cachesplit runs alone")
+            return 0
+        try:
+            text = open(path, encoding="utf-8").read()
+        except OSError as exc:
+            emit(result="error", reason="unreadable", file=path, detail=f"{exc}")
+            return 3
+        if not _strategy_is_ours(text):
+            emit(result="ok", strategy="(foreign)", file=path, port=port,
+                 note="a config exists at our path that we did not write; left alone")
+            return 0
+        name = _strategy_name_in(text)
+        emit(result="ok", strategy=name or "(unnamed)", file=path, port=port,
+             note="" if name else "written before strategies had names; re-set it to name it")
+        return 0
+
+    if args.op == "clear":
+        if not os.path.exists(path):
+            emit(result="unchanged", strategy="split", file=path, port=port,
+                 note="nothing to remove")
+            return 0
+        text = ""
+        try:
+            text = open(path, encoding="utf-8").read()
+        except OSError:
+            pass
+        if text and not _strategy_is_ours(text):
+            emit(result="conflict", reason="not_ours", file=path,
+                 note="this config was not written by context-guru; remove it by hand")
+            return 2
+        os.unlink(path)
+        emit(result="cleared", strategy="split", file=path, port=port,
+             note="takes effect the next time the proxy starts, not now")
+        return 0
+
+    # op == "set"
+    name = args.name
+    if name not in STRATEGIES:
+        emit(result="error", reason="unknown_strategy", requested=name,
+             known=",".join(STRATEGIES))
+        return 2
+    # An unresolved preset is NOT a harmless default: written empty, the proxy loads a config with
+    # no pipeline and reports success, so compaction is off while a strategy keeps running. The old
+    # keepalive skill guarded this in shell; it is enforced here so every caller inherits it.
+    if not args.preset.strip():
+        emit(result="error", reason="empty_preset",
+             note="pass --preset (option_preset= from `settings.py config`, else the plugin.json "
+                  "default `cache`); an empty preset silently disables compaction")
+        return 2
+
+    if name == "split":
+        # Expressed as a removal, per the STRATEGIES comment.
+        return cmd_strategy(argparse.Namespace(op="clear", port=port))
+
+    if os.path.exists(path):
+        try:
+            existing = open(path, encoding="utf-8").read()
+        except OSError as exc:
+            emit(result="error", reason="unreadable", file=path, detail=f"{exc}")
+            return 3
+        if not _strategy_is_ours(existing):
+            emit(result="conflict", reason="not_ours", file=path,
+                 note="a config we did not write is already at this path; edit or remove it by hand")
+            return 2
+
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    _write_atomic(path, _render_strategy(name, args.preset).encode("utf-8"), mode=0o600)
+    emit(result="set", strategy=name, file=path, port=port, preset=args.preset,
+         spends="true" if STRATEGIES[name]["spends"] else "false",
+         note="takes effect the next time the proxy starts; a proxy already running keeps its "
+              "current config until it is stopped and started again")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1145,11 +1346,30 @@ def main() -> int:
     cfg = sub.add_parser("config")
     cfg.add_argument("--plugin", default="context-guru@context-guru")
 
+    # `strategy` is the named-cache-strategy surface: the one place that decides what a name means,
+    # so the skills that use it carry a NAME rather than four tuning numbers in a heredoc.
+    st = sub.add_parser("strategy")
+    st.add_argument("op", choices=("list", "show", "set", "clear"))
+    st.add_argument("--name", default="",
+                    help="strategy name for `set`; one of " + ", ".join(STRATEGIES))
+    st.add_argument("--port", default="",
+                    help="the CONFIGURED port. Required for show/set/clear: the config file is "
+                         "named after it, so a defaulted port writes a file nothing reads.")
+    st.add_argument("--preset", default="",
+                    help="the preset to state in the file. Required for `set`, because --config "
+                         "REPLACES --preset rather than layering over it.")
+
     args = ap.parse_args()
     if args.cmd == "add" and not args.url and not args.statusline:
         ap.error("add needs --url, or --statusline on its own for a statusline-only call")
+    if args.cmd == "strategy":
+        if args.op != "list" and not args.port:
+            ap.error("strategy " + args.op + " needs --port: the config file is named after the "
+                     "port, so a defaulted one writes a file nothing ever reads")
+        if args.op == "set" and not args.name:
+            ap.error("strategy set needs --name; one of " + ", ".join(STRATEGIES))
     rc = {"add": cmd_add, "remove": cmd_remove, "show": cmd_show,
-          "config": cmd_config}[args.cmd](args)
+          "config": cmd_config, "strategy": cmd_strategy}[args.cmd](args)
 
     # The hatch facts are printed HERE rather than from inside save(), so the `result=` line the
     # caller keys on stays first, and so every writing path reports them without six call sites
