@@ -49,14 +49,17 @@ that one alone (port 8787, preset `cache`, cache strategy `5-min-ping`).
   do not offer to overwrite it.
 
 If the user asks whether pings are actually happening, that is a different question from which
-strategy is armed — read the live counters:
+strategy is armed — read the live counters straight off the proxy, no dashboard query needed:
 
 ```bash
-curl -fsS --max-time 3 "http://127.0.0.1:<port>/api/stats" | \
-  python3 -c 'import json,sys; d=json.load(sys.stdin); print({k: d[k] for k in d if k.startswith("keepalive_")})'
+curl -fsS --max-time 3 "http://127.0.0.1:<port>/stats" | \
+  python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("keepalive"), d.get("savings"))'
 ```
 
-`keepalive_pings: 0` on a freshly-started proxy is expected — nothing has gone idle yet.
+`keepalive` is the always-on in-memory ping ledger (`pings: 0` on a freshly-started proxy is
+expected — nothing has gone idle yet). `savings` is present only with `--dashboard`, and each of
+its scopes (`current`/`live`/`all`) carries the reconciled `keepalive_net_usd` — whether the pings
+actually paid for themselves, not just that they fired.
 
 ## 3. Switch
 

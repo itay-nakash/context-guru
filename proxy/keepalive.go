@@ -1257,3 +1257,20 @@ func (k *keeper) Stats() KeepAliveStats {
 		Failed: k.failed.Load(), Wrote: k.wrote.Load(),
 		SpentUSD: math.Float64frombits(k.spentUSD.Load())}
 }
+
+// LiveSessionKeys returns the session ids the keeper currently considers live — a copy,
+// so mutating the result never touches k.live. k.live is keyed by tenant:session, but
+// each entry carries its own raw session id (kaEntry.session), which is what
+// dash.Filter.Session expects.
+func (k *keeper) LiveSessionKeys() []string {
+	if k == nil {
+		return nil
+	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	keys := make([]string, 0, len(k.live))
+	for _, e := range k.live {
+		keys = append(keys, e.session)
+	}
+	return keys
+}

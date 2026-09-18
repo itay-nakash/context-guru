@@ -152,9 +152,9 @@ starts it with the new configuration.
 
 Keep-alive targets a measured cost, not an assumed one: idle cache misses were 3.7% of requests and
 **23.6% of all spend** over the measured window, at an 8.5x penalty each. Whether it nets positive on
-*your* traffic is reported by `keepalive_net_usd` — on the dashboard or `/api/stats`, not the plain
-`/stats` endpoint above, which only has the raw ping/spend ledger, not a net figure. A negative net
-is possible, and `none` is a legitimate answer.
+*your* traffic is reported by `keepalive_net_usd`, in `/stats`' own `savings` block (see below,
+`--dashboard` required) — no need to open the dashboard for this one number. A negative net is
+possible, and `none` is a legitimate answer.
 
 **If it breaks and Claude cannot fix it:** `~/.local/state/context-guru/context-guru-reset` undoes the
 routing from a plain terminal — no session, no proxy, no network needed. A dead proxy fails every
@@ -174,6 +174,58 @@ claude                                            # e.g. Claude Code
 
 # 3 — watch the savings add up
 curl -s localhost:4000/stats | jq                 # token-weighted savings rollup
+```
+
+Real output from a live session (two turns, one keep-alive ping landed in between) —
+`savings` reports the same shape for all three scopes (`current`, `live`, `all`), so a
+session mid-flight and the lifetime total are directly comparable:
+
+```json
+{
+  "keepalive": {
+    "live_sessions": 1,
+    "pings": 1,
+    "skipped": 3,
+    "failed": 0,
+    "wrote_instead_of_read": 0,
+    "spend_usd": 0.0033540999999999996
+  },
+  "savings": {
+    "current": {
+      "cost_usd": 0.023350649999999997,
+      "baseline_cost_usd": 0.023350649999999997,
+      "cg_llm_cost_usd": 0,
+      "net_saved_usd": 0,
+      "cachesplit_saved_usd": 0,
+      "keepalive_ping_usd": 0.0033540999999999996,
+      "keepalive_saved_usd": 0.03845715,
+      "keepalive_net_usd": 0.035103050000000004,
+      "total_saved_usd": 0.035103050000000004
+    },
+    "live": {
+      "cost_usd": 0.023350649999999997,
+      "baseline_cost_usd": 0.023350649999999997,
+      "cg_llm_cost_usd": 0,
+      "net_saved_usd": 0,
+      "cachesplit_saved_usd": 0,
+      "keepalive_ping_usd": 0.0033540999999999996,
+      "keepalive_saved_usd": 0.03845715,
+      "keepalive_net_usd": 0.035103050000000004,
+      "total_saved_usd": 0.035103050000000004
+    },
+    "all": {
+      "cost_usd": 0.21221960000000004,
+      "baseline_cost_usd": 0.21221960000000004,
+      "cg_llm_cost_usd": 0,
+      "net_saved_usd": 0,
+      "cachesplit_saved_usd": 0,
+      "keepalive_ping_usd": 0.0033540999999999996,
+      "keepalive_saved_usd": 0.03845715,
+      "keepalive_net_usd": 0.035103050000000004,
+      "total_saved_usd": 0.035103050000000004
+    }
+  }
+}
 ```
 
 Or drive it directly with an Anthropic-style request (this is exactly how the quickstart is tested — see

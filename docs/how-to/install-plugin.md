@@ -127,7 +127,7 @@ setting, and only in one situation.
 |---|---|---|
 | **Proxy port** | `8787` | something already holds 8787. Deliberately not 4000, which collides with litellm |
 | **Preset** | `off` | you want context editing at all. `off` is passthrough: no components, so nothing is dropped, no marker is written, no tool is injected and no model is called — a property of an empty pipeline rather than a promise about a full one. `house` and `codesmart` add the offloaders; `housellm` adds a compaction-model pass that spends on its own. Whether *anything* is spent under the default is decided by the cache strategy below, not here |
-| **Cache strategy** | `5-min-ping` | you do not want keep-alive: this default holds the cache warm across idle gaps by pinging just under the provider's 5-minute TTL, and that **spends a little of your own quota** while nobody is at the keyboard. Under the default preset it is the *only* thing this plugin does. It targets a measured cost - idle cache misses were 23.6% of all spend over the measured window - but whether it nets positive on your traffic is what `keepalive_net_usd` reports (dashboard or `/api/stats` — the plain `/stats` endpoint has only the ping/spend ledger, no net figure), not something to assume. `none` turns it off; `/context-guru:cache-strategy-picker` names each strategy and what it costs |
+| **Cache strategy** | `5-min-ping` | you do not want keep-alive: this default holds the cache warm across idle gaps by pinging just under the provider's 5-minute TTL, and that **spends a little of your own quota** while nobody is at the keyboard. Under the default preset it is the *only* thing this plugin does. It targets a measured cost - idle cache misses were 23.6% of all spend over the measured window - but whether it nets positive on your traffic is what `keepalive_net_usd` reports, in `/stats`' own `savings` block (`--dashboard` required) — no need to open the dashboard for this one number. Not something to assume. `none` turns it off; `/context-guru:cache-strategy-picker` names each strategy and what it costs |
 | **Idle exit** | `24h` | rarely. The floor is `max(2 × store.ttl_seconds, 1h)`; below it the proxy refuses to start rather than silently discarding cache state |
 | **Upstream base URL** | *(empty)* | **something else is already the gateway** — see below |
 
@@ -337,7 +337,9 @@ repo. That is correct behaviour, but it means "clone and go" is really "clone, a
 
 ## Then
 
-- `/context-guru:status` — is it routed, is it up, and what has it saved. Reads `/stats`.
+- `/context-guru:status` — is it routed, is it up, and what has it saved. Reads `/stats`, including
+  its `savings.{current,live,all}` block (with `--dashboard` on) — the same reconciled
+  `keepalive_net_usd`/`total_saved_usd` the dashboard shows, without opening it.
 - Dashboard: `http://127.0.0.1:8787/dashboard/`. The four billed token tiers are where the cache
   effect shows: tokens moving out of the premium cache-**creation** tier into the discounted
   cache-**read** tier. Its database lives in `~/.local/state/context-guru/`, deliberately not in
