@@ -126,8 +126,17 @@ Change what it does:
 /plugin configure   # context-guru → Preset → housellm          opt into context editing
 /plugin configure   # context-guru → Cache strategy → none      stop the keep-alive pings
 /context-guru:cache-strategy-picker   # names each strategy and what it costs
-/context-guru:status                  # what is running, and whether it matches your options
+/context-guru:status                  # what is running, and what it saved (reads /stats)
 /context-guru:uninstall               # undo the routing, restoring any base URL it replaced
+```
+
+**`/context-guru:status` is the one command for this — it takes no parameters.** There is no
+separate `/stats` slash command: `/stats` is the proxy's own HTTP endpoint, and `/context-guru:status`
+is what curls it (on the plugin's port, `8787` by default) and reports it back to you in Claude
+Code. Hit the endpoint directly only if you want the raw JSON instead:
+
+```sh
+curl -s localhost:8787/stats | jq                 # same endpoint /context-guru:status reads
 ```
 
 A changed option takes effect on your **next session**: the session hook stops the running proxy and
@@ -135,16 +144,17 @@ starts it with the new configuration.
 
 | Option | Default | What it does |
 |---|---|---|
-| `preset` | `off` | The pipeline. `off` is passthrough — requests are forwarded byte-for-byte, nothing dropped, no marker written, no tool injected, no model called, because nothing is in the pipeline to do it. `cache`, `house`, `housellm` opt into context editing. |
-| `cache_strategy` | `5-min-ping` | Keep-alive. Pings under the provider's 5-minute cache TTL so an idle session's cache is still live — this **spends your own quota** while nobody is at the keyboard. `none` turns it off; `1-hour-head` asks for the 1-hour tier instead. |
+| `preset` | `off` | The compaction PIPELINE — what happens to the request *body*. `off` is passthrough: nothing dropped, no marker written, no tool injected, no pipeline-triggered model call, because nothing is in the pipeline to do it. `house` and `housellm` opt into context editing. This does **not** mean the plugin is idle by default — see `cache_strategy` below, which is on out of the box. |
+| `cache_strategy` | `5-min-ping` | Keep-alive, a.k.a. "cache" in casual use — separate from the `cache` *preset* above. **On by default**: it pings under the provider's 5-minute cache TTL so an idle session's cache is still live, which **spends your own quota** while nobody is at the keyboard. Under the default `off` preset this is the only thing context-guru actually does. `none` turns it off; `1-hour-head` asks for the 1-hour tier instead. |
 | `port` | `8787` | Port the proxy listens on. |
 | `idle_exit` | `24h` | Exit after this long with no requests. |
 | `upstream` | — | Chain behind an existing gateway instead of going straight to Anthropic. |
 
 Keep-alive targets a measured cost, not an assumed one: idle cache misses were 3.7% of requests and
 **23.6% of all spend** over the measured window, at an 8.5x penalty each. Whether it nets positive on
-*your* traffic is reported by `keepalive_net_usd` — a negative net is possible, and `none` is a
-legitimate answer.
+*your* traffic is reported by `keepalive_net_usd`, in `/stats`' own `savings` block (see below,
+`--dashboard` required) — no need to open the dashboard for this one number. A negative net is
+possible, and `none` is a legitimate answer.
 
 **If it breaks and Claude cannot fix it:** `~/.local/state/context-guru/context-guru-reset` undoes the
 routing from a plain terminal — no session, no proxy, no network needed. A dead proxy fails every
