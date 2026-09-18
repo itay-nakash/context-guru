@@ -65,9 +65,18 @@ cache-creation tier to the cache-read tier — creation is billed at a premium, 
 discount, so that shift *is* the saving.
 
 Then, if they are non-zero: `requests`, `saved_tokens`, `savings_pct`, and the keep-alive block
-(`pings`, `spend_usd`, `wrote_instead_of_read`).
+(`pings`, `spend_usd`, `wrote_instead_of_read`) — that block is the in-memory ping ledger, always
+present, cheap, and reset on restart.
 
-The dashboard shows the same thing over time: `http://127.0.0.1:<port>/dashboard/`.
+If `--dashboard` is enabled, `/stats` also carries a `savings` object with up to three scopes —
+`current` (the session that most recently sent a real request), `live` (every session the keeper
+still considers active, summed), and `all` (process lifetime). Each scope reports the SAME
+reconciled figure the dashboard does — `keepalive_net_usd` (did the pings pay for themselves) and
+`total_saved_usd` (every mechanism combined) — computed once in `dash` and shared, so `/stats` and
+the dashboard can never disagree. A scope is *absent*, not zeroed, when there is nothing to report
+yet (fresh proxy: no `current`; no `--dashboard`: no `savings` at all).
+
+The dashboard shows the same numbers over time, plus a UI: `http://127.0.0.1:<port>/dashboard/`.
 
 ## Be honest about the numbers
 

@@ -21,6 +21,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -260,6 +261,15 @@ type Handler struct {
 	// metricsInflight collapses every concurrent cache-miss into the one render already
 	// running — see metricsHandler.
 	metricsInflight singleflight.Group
+
+	// lastSessionMu guards lastSession/lastSessionAt.
+	lastSessionMu sync.Mutex
+	// lastSession is the session id of the most recent REAL (non-ping) request this
+	// handler served — /stats' "current" scope. Set only on the request path (chat),
+	// never on the keep-alive ping path, so a ping can never make itself "current".
+	// Empty until the first real request arrives.
+	lastSession   string
+	lastSessionAt time.Time
 }
 
 // upstreamTransport is the default upstream client's transport, and the reason there is no
@@ -1150,6 +1160,7 @@ func (h *Handler) chat(provider bschemas.ModelProvider, static upstream, pick fu
 			// refreshed are inputs to a dollar figure, not just a label.
 			kaPings, kaRefreshed, kaStrategy := h.keeper.arrive(tn.ID, tr.Session)
 			cp.noteKeepAlive(kaPings, kaRefreshed, kaStrategy)
+			h.setLastSession(tr.Session)
 			if h.agg != nil && !bypassed {
 				h.agg.RecordAddedLatency(addedMs)
 				h.agg.RecordEligibility(tr.AttemptedTokens, tr.FrozenTokens)
@@ -2114,6 +2125,9 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
 	}
 	xs := metrics.ExtractSnapshot(cost, perSavedTok, cacheWrite, cacheRead)
 	snap.Extract = &xs
+	if s := h.savingsStats(); s != nil && (s.Current != nil || s.Live != nil || s.All != nil) {
+		snap.Savings = s
+	}
 	json.NewEncoder(w).Encode(snap)
 }
 

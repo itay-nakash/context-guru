@@ -26,6 +26,8 @@ deliberate rather than automatic:
   nobody is at the keyboard, for every session routed through the proxy. It is the default because
   holding the cache warm across an idle gap is what most people install this for — not because it
   is free. `keepalive_net_usd` is what says whether it is paying for itself on real traffic; a
-  negative net means say so and offer `none`.
+  negative net means say so and offer `none`. Read it straight off `/stats`' `savings` block
+  (`current`/`live`/`all` scopes, present when `--dashboard` is on) — no need to open the dashboard
+  for this one number.
 - **Nothing on a render path may ever arm it.** The status line draws on every keystroke; if a
   display hook could turn this on, it would double as an unbounded traffic generator.

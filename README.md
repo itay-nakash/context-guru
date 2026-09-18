@@ -166,6 +166,58 @@ claude                                            # e.g. Claude Code
 curl -s localhost:4000/stats | jq                 # token-weighted savings rollup
 ```
 
+Real output from a live session (two turns, one keep-alive ping landed in between) —
+`savings` reports the same shape for all three scopes (`current`, `live`, `all`), so a
+session mid-flight and the lifetime total are directly comparable:
+
+```json
+{
+  "keepalive": {
+    "live_sessions": 1,
+    "pings": 1,
+    "skipped": 3,
+    "failed": 0,
+    "wrote_instead_of_read": 0,
+    "spend_usd": 0.0033540999999999996
+  },
+  "savings": {
+    "current": {
+      "cost_usd": 0.023350649999999997,
+      "baseline_cost_usd": 0.023350649999999997,
+      "cg_llm_cost_usd": 0,
+      "net_saved_usd": 0,
+      "cachesplit_saved_usd": 0,
+      "keepalive_ping_usd": 0.0033540999999999996,
+      "keepalive_saved_usd": 0.03845715,
+      "keepalive_net_usd": 0.035103050000000004,
+      "total_saved_usd": 0.035103050000000004
+    },
+    "live": {
+      "cost_usd": 0.023350649999999997,
+      "baseline_cost_usd": 0.023350649999999997,
+      "cg_llm_cost_usd": 0,
+      "net_saved_usd": 0,
+      "cachesplit_saved_usd": 0,
+      "keepalive_ping_usd": 0.0033540999999999996,
+      "keepalive_saved_usd": 0.03845715,
+      "keepalive_net_usd": 0.035103050000000004,
+      "total_saved_usd": 0.035103050000000004
+    },
+    "all": {
+      "cost_usd": 0.21221960000000004,
+      "baseline_cost_usd": 0.21221960000000004,
+      "cg_llm_cost_usd": 0,
+      "net_saved_usd": 0,
+      "cachesplit_saved_usd": 0,
+      "keepalive_ping_usd": 0.0033540999999999996,
+      "keepalive_saved_usd": 0.03845715,
+      "keepalive_net_usd": 0.035103050000000004,
+      "total_saved_usd": 0.035103050000000004
+    }
+  }
+}
+```
+
 Or drive it directly with an Anthropic-style request (this is exactly how the quickstart is tested — see
 [docs/get-started/quickstart-proxy.md](docs/get-started/quickstart-proxy.md)):
 

@@ -993,6 +993,12 @@ type Snapshot struct {
 	// it shows no field rather than a row of zeroes.
 	KeepAlive any `json:"keepalive,omitempty"`
 
+	// Savings is /stats' reconciled, DB-backed savings figure — dash.SavingsTotals summed
+	// three ways (current session / live sessions / all-time), filled by the host (the
+	// query lives in `dash`, which sits above this package). Omitted entirely on a hosted
+	// deployment or a proxy with no dashboard, same reasoning as KeepAlive above.
+	Savings any `json:"savings,omitempty"`
+
 	// Provider-billed token tiers (W8), summed from response usage. ADDITIVE: the
 	// benchmark harnesses parse this payload, so fields are only ever added here,
 	// never renamed or removed (see the golden shape test).
