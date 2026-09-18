@@ -59,10 +59,10 @@ curl -fsS "http://127.0.0.1:${PORT}/stats"
 ```
 
 Lead with the **billed token tiers** (`cache_read`, `cache_creation`, input, output). Those come
-from the provider's own usage block, so they are the numbers the user can check against their
-own bill or usage page. Under the `cache` preset the whole story is tokens moving from the
-cache-creation tier to the cache-read tier — creation is billed at a premium, reads at a
-discount, so that shift *is* the saving.
+from the provider's own usage block, so they are the numbers the user can check against their own
+bill or usage page. Under the default preset (`off`), the whole story is the keep-alive block: a
+ping moves tokens from the premium cache-creation tier to the discounted cache-read tier by
+refreshing the cache before it expires, and that shift *is* the saving.
 
 Then, if they are non-zero: `requests`, `saved_tokens`, `savings_pct`, and the keep-alive block
 (`pings`, `spend_usd`, `wrote_instead_of_read`).
@@ -101,29 +101,16 @@ This is where a pending switch is reported, deliberately, and not from the `User
 python invocation on the critical path of every prompt is a poor price for news that the next session
 delivers by itself.
 
-- **Check the preset before explaining a zero prefix-cache saving at all.** The default preset is
-  `off`, which runs no components, so `cachesplit` is not in the pipeline and a zero saving there is
-  the expected state rather than a symptom. Only if a preset containing `cachesplit` was chosen does
-  the next paragraph apply.
-- **Then check whether this is even a git repository.** The split works on the environment snapshot
-  Claude Code appends to its system prompt, and outside a git repo there is no snapshot to split —
-  `cachesplit` reports `verdict: skipped`, `mutated: 0`, and the saving is exactly zero. This is the common case for a casual first trial, and telling
-  such a user "the cache warms up on later turns" is true in general and wrong here:
-
-  ```bash
-  git rev-parse --is-inside-work-tree 2>/dev/null || echo "NOT a git repo — cachesplit cannot act"
-  ```
-- **`acted: 0` and `saved_tokens: 0` are not evidence of failure for this preset.** Those count
-  components that removed content; `cachesplit` relocates a cache breakpoint and removes nothing.
-  The signals that move are `components.cachesplit.verdict` (`moved` vs `skipped`), its `mutated`
-  count, and the billed tiers. Lead with the tiers, and do not quote `savings_pct` as the verdict
-  on a cache-only pipeline.
+- **Check the preset before explaining a zero pipeline saving at all.** The default preset is
+  `off`, which runs no components, so `acted: 0` and `saved_tokens: 0` are the expected state, not
+  a symptom. Look at the keep-alive block instead — that is what actually runs and spends by
+  default.
 - **`wrote_instead_of_read` above zero is a bug signal, not a saving.** It means a keep-alive
   ping created a cache entry instead of refreshing one, which costs money for nothing. Report it
   as a problem.
-- **On non-Anthropic backends the `cache` preset does nothing at all** (vLLM, llm-d and similar
-  match an implicit longest prefix on their own). Zero saving there is correct behaviour, not a
-  failure.
+- **On non-Anthropic backends keep-alive still spends, but a chosen pipeline preset may not
+  save anything** (vLLM, llm-d and similar match an implicit longest prefix on their own). Zero
+  pipeline saving there is correct behaviour, not a failure.
 - **`/stats` is process-wide**, not per-project: if they route several projects to one proxy,
   these totals cover all of them.
 

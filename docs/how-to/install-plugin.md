@@ -126,8 +126,8 @@ setting, and only in one situation.
 | Option | Default | Change it when |
 |---|---|---|
 | **Proxy port** | `8787` | something already holds 8787. Deliberately not 4000, which collides with litellm |
-| **Preset** | `off` | you want context editing at all. `off` is passthrough: no components, so nothing is dropped, no marker is written, no tool is injected and no model is called — a property of an empty pipeline rather than a promise about a full one. `cache` adds the prompt-cache split; `house` and `codesmart` add the offloaders; `housellm` adds a compaction-model pass that spends on its own. Whether *anything* is spent under the default is decided by the cache strategy below, not here |
-| **Cache strategy** | `5-min-ping` | you do not want keep-alive: this default holds the cache warm across idle gaps by pinging just under the provider's 5-minute TTL, and that **spends a little of your own quota** while nobody is at the keyboard. Under the default preset it is the *only* thing this plugin does. It targets a measured cost - idle cache misses were 23.6% of all spend over the measured window - but whether it nets positive on your traffic is what `keepalive_net_usd` reports, not something to assume. `none` turns it off; `/context-guru:cache-strategy-picker` names each strategy and what it costs |
+| **Preset** | `off` | you want context editing at all. `off` is passthrough: no components, so nothing is dropped, no marker is written, no tool is injected and no model is called — a property of an empty pipeline rather than a promise about a full one. `house` and `codesmart` add the offloaders; `housellm` adds a compaction-model pass that spends on its own. Whether *anything* is spent under the default is decided by the cache strategy below, not here |
+| **Cache strategy** | `5-min-ping` | you do not want keep-alive: this default holds the cache warm across idle gaps by pinging just under the provider's 5-minute TTL, and that **spends a little of your own quota** while nobody is at the keyboard. Under the default preset it is the *only* thing this plugin does. It targets a measured cost - idle cache misses were 23.6% of all spend over the measured window - but whether it nets positive on your traffic is what `keepalive_net_usd` reports (dashboard or `/api/stats` — the plain `/stats` endpoint has only the ping/spend ledger, no net figure), not something to assume. `none` turns it off; `/context-guru:cache-strategy-picker` names each strategy and what it costs |
 | **Idle exit** | `24h` | rarely. The floor is `max(2 × store.ttl_seconds, 1h)`; below it the proxy refuses to start rather than silently discarding cache state |
 | **Upstream base URL** | *(empty)* | **something else is already the gateway** — see below |
 
@@ -247,12 +247,12 @@ So on a hosted agent, an unattended install cannot complete, by design. Either a
 run both commands yourself with `!`, or add a rule covering the plugin's `scripts/` directory — one rule
 covers both, since both are that directory's scripts.
 
-**And on a hosted agent, check whether the trial can show you anything before doing any of it.** The
-`cache` preset works by moving a cache breakpoint inside the environment snapshot Claude Code appends
-to its system prompt. **Outside a git repository there is no such snapshot**, so `cachesplit` reports
-`verdict: skipped` and the saving is exactly zero — a structural zero, not a warm-up. A pod whose
-working directory is not a repo will measure nothing no matter how long you leave it. `/context-guru:status`
-says so explicitly; believe it rather than waiting for numbers to appear.
+**And on a hosted agent, check whether the trial can show you anything before doing any of it.** Under
+the default preset (`off`) the only mechanism running is the `5-min-ping` cache strategy — see
+[What it does to your requests](#what-it-does-to-your-requests) below — and it only has something
+to show once a session sits idle past the 5-minute cache TTL. A pod that is cycled quickly, or that never
+goes idle, will measure nothing no matter how long you leave it. `/context-guru:status` says so
+explicitly; believe it rather than waiting for numbers to appear.
 
 ## You do not need an API key
 
@@ -297,34 +297,23 @@ ships its own `env` block, and a `--global` install needs no per-repo caveat.
 
 ## What it does to your requests
 
-The default preset is `cache`: [`cachesplit`](../components/cachesplit.md) and nothing else.
+The default preset is `off`: an empty pipeline. Nothing in the request body is touched — no
+content dropped, no summarising, no `<<cg:HASH>>` markers, no extra tool added, no model call on
+the request path. You can check that claim in one line of `config/config.go`.
 
-- No content dropped, no summarising, no `<<cg:HASH>>` markers.
-- No extra tool added to your requests, and no model calls.
-- One oversized system block is split into two adjacent text blocks whose concatenation is
-  byte-identical, so the model sees exactly the prompt your agent sent. The cache breakpoint
-  moves onto the half that does not churn.
+Under the default preset the only thing the plugin actually does is keep-alive: the `5-min-ping`
+cache strategy (`/plugin configure` → Cache strategy, above) pings just under the provider's
+5-minute cache TTL so an idle session's prompt cache does not expire between turns. That **spends
+your own quota**, and `/context-guru:cache-strategy-picker` is where you name it or turn it off
+(`none`).
 
-You can check that claim in one line of `config/config.go`. That is the point of the preset.
+**When it will save you nothing, which a first run often is:** a fresh session has no idle gap to
+keep warm yet, so the first request of any session reads zero — measured, 1,105 of 1,127 session
+starts. `/context-guru:status` explains this rather than leaving you to wait for a number that
+isn't coming.
 
-**When it will save you nothing, which a first run often is.** All three of these are silent — the
-numbers are simply zero:
-
-| Condition | Why |
-|---|---|
-| **You are not in a git repository** | Claude Code emits no environment snapshot, so there is no volatile tail to split. This is the common case for a casual trial, and `/context-guru:status` checks for it. |
-| Your system prompt is under ~1,024 tokens | Below `minSplitTokens` the split is refused: the extra breakpoint slot costs more optionality than it recovers. |
-| A non-Anthropic backend (vLLM, llm-d) | They match an implicit longest prefix and stop at the divergence by themselves. |
-
-And even in the good case, be calibrated about the size: the headline **−34.1%** figure comes from
-a benchmark harness running tasks back-to-back inside the provider's 5-minute cache TTL. On this
-project's own interactive traffic the measured figure is **$0.0298 across 1,127 sessions** — because
-Claude Code captures the environment snapshot once per session, and 1,105 of 1,127 session starts
-found the previous prefix already expired. The mechanism needs a second session inside five
-minutes; humans mostly do not work that way.
-
-**Anthropic-family only.** `cachesplit` is a no-op against implicit prefix-cache backends
-(vLLM, llm-d), which stop at the divergence by themselves.
+Other presets (`cache`, `house`, `codesmart`, `housellm`) add components that also edit the request
+body — see [docs/reference/presets.md](../reference/presets.md) if you opt into one of those.
 
 ## Lifecycle
 
@@ -354,9 +343,9 @@ repo. That is correct behaviour, but it means "clone and go" is really "clone, a
   cache-**read** tier. Its database lives in `~/.local/state/context-guru/`, deliberately not in
   your repository — the proxy's own default would write `./context-guru-dashboard.db` into whatever
   directory it started in.
-- Note `/stats` reports `acted: 0` and `saved_tokens: 0` even on a turn where the split worked:
-  `acted` counts components that removed content, and this one relocates a cache breakpoint. The
-  signals that do move are `components.cachesplit.verdict` and the billed tiers.
+- Note `/stats` reports `acted: 0` and `saved_tokens: 0` under the default preset — those count
+  components that removed content, and none are running. The billed tiers and the keep-alive block
+  are the signals that move.
 - `/context-guru:uninstall` — removes the one settings key (with a backup) and stops the proxy.
 
 ## Status line
