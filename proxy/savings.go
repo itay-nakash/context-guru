@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"log/slog"
-	"time"
 
 	"github.com/rossoctl/context-guru/dash"
 )
@@ -57,7 +56,7 @@ func (h *Handler) setLastSession(session string) {
 		return
 	}
 	h.lastSessionMu.Lock()
-	h.lastSession, h.lastSessionAt = session, time.Now()
+	h.lastSession = session
 	h.lastSessionMu.Unlock()
 }
 
@@ -83,27 +82,12 @@ func (h *Handler) savingsStats() *SavingsStats {
 		slog.Default().Warn("cg.stats_savings_all_failed", "err", err)
 	}
 	if live := h.keeper.LiveSessionKeys(); len(live) > 0 {
-		sum := &dash.SavingsTotals{}
-		ok := true
-		for _, key := range live {
-			t, err := db.SavingsTotals(dash.Filter{TenantAll: true, Session: key})
-			if err != nil {
-				slog.Default().Warn("cg.stats_savings_live_failed", "err", err)
-				ok = false
-				break
-			}
-			sum.CostUSD += t.CostUSD
-			sum.BaselineCostUSD += t.BaselineCostUSD
-			sum.CGLLMCostUSD += t.CGLLMCostUSD
-			sum.NetSavedUSD += t.NetSavedUSD
-			sum.CachesplitSavedUSD += t.CachesplitSavedUSD
-			sum.KeepAlivePingUSD += t.KeepAlivePingUSD
-			sum.KeepAliveSavedUSD += t.KeepAliveSavedUSD
-			sum.KeepAliveNetUSD += t.KeepAliveNetUSD
-			sum.TotalSavedUSD += t.TotalSavedUSD
-		}
-		if ok {
+		// One grouped query for every live session (Filter.SessionIn), not one query per
+		// session — at maxKeepAliveSessions that would be up to 1024 sequential round trips.
+		if sum, err := db.SavingsTotals(dash.Filter{TenantAll: true, SessionIn: live}); err == nil {
 			out.Live = savingsScope(sum)
+		} else {
+			slog.Default().Warn("cg.stats_savings_live_failed", "err", err)
 		}
 	}
 	if session := h.getLastSession(); session != "" {

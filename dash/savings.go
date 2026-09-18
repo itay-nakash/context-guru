@@ -24,7 +24,9 @@ type SavingsTotals struct {
 // queries (agent traffic, then ping cost — see Filter.WithKeepAlive for why those
 // cannot be one query) rather than Overview's sixteen. Cheap enough to run
 // synchronously per request on a single-tenant deployment's own DB, which is the shape
-// proxy.Handler.stats() runs against.
+// proxy.Handler.stats() runs against. A caller summing several sessions (e.g. every
+// live keep-alive session) should pass Filter.SessionIn rather than looping — the two
+// queries above already aggregate across however many session ids the IN-clause names.
 func (d *DB) SavingsTotals(f Filter) (*SavingsTotals, error) {
 	cond, args := f.where()
 	s := &SavingsTotals{}

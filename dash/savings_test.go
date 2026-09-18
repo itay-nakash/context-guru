@@ -88,6 +88,34 @@ func TestSavingsTotalsScopesBySession(t *testing.T) {
 	}
 }
 
+// TestSavingsTotalsSessionInSumsAcrossSessionsInOneQuery pins the point of SessionIn: a
+// caller summing several sessions (/stats' "live" scope, for every keep-alive-tracked
+// session) gets one grouped query rather than one SavingsTotals call per session — the
+// result must equal a's and b's totals added together, and must exclude session c.
+func TestSavingsTotalsSessionInSumsAcrossSessionsInOneQuery(t *testing.T) {
+	db := openTestDB(t)
+	evs := []*Event{
+		{TS: 1, SessionID: "a", Model: "m", TokensBefore: 100, TokensAfter: 90,
+			CostUSD: 0.01, BaselineCostUSD: 0.02},
+		{TS: 2, SessionID: "b", Model: "m", TokensBefore: 100, TokensAfter: 80,
+			CostUSD: 0.01, BaselineCostUSD: 0.03},
+		{TS: 3, SessionID: "c", Model: "m", TokensBefore: 100, TokensAfter: 70,
+			CostUSD: 0.01, BaselineCostUSD: 0.05},
+	}
+	if err := db.insertBatch(evs); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := db.SavingsTotals(Filter{TenantAll: true, SessionIn: []string{"a", "b"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(got.NetSavedUSD-0.03) > 1e-12 {
+		t.Errorf("session_id IN (a,b): net_saved_usd = %.10f, want 0.03 (a's 0.01 + b's 0.02)",
+			got.NetSavedUSD)
+	}
+}
+
 // TestSavingsTotalsEmptyIsZeroNotError pins the fail-open shape callers depend on: an
 // empty (or non-matching) filter is a valid, zero-valued result, never an error.
 func TestSavingsTotalsEmptyIsZeroNotError(t *testing.T) {

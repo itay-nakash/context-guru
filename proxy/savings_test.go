@@ -129,15 +129,14 @@ func TestStatsSavingsThreeScopesAgreeWithOverview(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantA, err := rec.DB().SavingsTotals(dash.Filter{TenantAll: true, Session: "a"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantB, err := rec.DB().SavingsTotals(dash.Filter{TenantAll: true, Session: "b"})
-	if err != nil {
-		t.Fatal(err)
-	}
 	wantAll, err := rec.DB().SavingsTotals(dash.Filter{TenantAll: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The same grouped query /stats' "live" scope itself runs (Filter.SessionIn) — summing
+	// two independently-computed per-session queries in Go can legitimately land on a
+	// different last float64 bit than one SQL SUM over both sessions' rows together.
+	wantLive, err := rec.DB().SavingsTotals(dash.Filter{TenantAll: true, SessionIn: []string{"a", "b"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,8 +145,9 @@ func TestStatsSavingsThreeScopesAgreeWithOverview(t *testing.T) {
 		t.Errorf("current.total_saved_usd = %v, want session b's own %v",
 			got.Savings.Current.TotalSavedUSD, wantCurrent.TotalSavedUSD)
 	}
-	if want := wantA.TotalSavedUSD + wantB.TotalSavedUSD; got.Savings.Live.TotalSavedUSD != want {
-		t.Errorf("live.total_saved_usd = %v, want a+b = %v", got.Savings.Live.TotalSavedUSD, want)
+	if got.Savings.Live.TotalSavedUSD != wantLive.TotalSavedUSD {
+		t.Errorf("live.total_saved_usd = %v, want a+b grouped = %v",
+			got.Savings.Live.TotalSavedUSD, wantLive.TotalSavedUSD)
 	}
 	if got.Savings.All.TotalSavedUSD != wantAll.TotalSavedUSD {
 		t.Errorf("all.total_saved_usd = %v, want the whole DB's %v",
@@ -273,4 +273,3 @@ func TestLiveSessionKeysIsACopy(t *testing.T) {
 		t.Errorf("mutating the returned slice reached the keeper's own state: %v", again)
 	}
 }
-

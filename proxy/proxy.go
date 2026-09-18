@@ -262,14 +262,13 @@ type Handler struct {
 	// running — see metricsHandler.
 	metricsInflight singleflight.Group
 
-	// lastSessionMu guards lastSession/lastSessionAt.
+	// lastSessionMu guards lastSession.
 	lastSessionMu sync.Mutex
 	// lastSession is the session id of the most recent REAL (non-ping) request this
 	// handler served — /stats' "current" scope. Set only on the request path (chat),
 	// never on the keep-alive ping path, so a ping can never make itself "current".
 	// Empty until the first real request arrives.
-	lastSession   string
-	lastSessionAt time.Time
+	lastSession string
 }
 
 // upstreamTransport is the default upstream client's transport, and the reason there is no
