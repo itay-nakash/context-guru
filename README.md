@@ -21,6 +21,8 @@ context-guru cuts the token cost of your agent's traffic in two ways: **carry le
 the system prompt so the rest stays cacheable). Paying less is the **default** — it's on out of
 the box, before you opt into anything that trims content.
 
+Full docs: **[rossoctl.github.io/context-guru](https://rossoctl.github.io/context-guru/)**.
+
 <p align="center">
 <img src="docs/img/context-guru-savings.png" alt="context-guru saves 5–15% of your API cost in four ways" width="720" />
 </p>
@@ -56,7 +58,7 @@ If you want to also carry less, not just pay less, opt into content trimming:
 ```
 
 Everything else — architecture, the full benchmark, every component, the proxy/gateway path,
-config reference — is in **[docs/more.md](docs/more.md)**, or the [full docs site](https://rossoctl.github.io/context-guru/).
+config reference — is in **[docs/more.md](docs/more.md)**.
 
 ## License
 
