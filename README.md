@@ -41,9 +41,13 @@ the box, before you opt into anything that trims content.
 
 Check what it's saving:
 
-```sh
-curl -s localhost:8787/stats | jq
 ```
+/context-guru:status
+```
+
+It reports the preset and cache strategy running, and the dollars saved so far — keep-alive
+savings, any content-trimming savings, and the net. Sample output and the raw `/stats` endpoint
+it reads: [docs/more.md](docs/more.md#claude-code-plugin-advanced-options).
 
 If you want to also carry less, not just pay less, opt into content trimming:
 
