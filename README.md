@@ -60,6 +60,19 @@ If you want to also carry less, not just pay less, opt into content trimming:
 Everything else — architecture, the full benchmark, every component, the proxy/gateway path,
 config reference — is in **[docs/more.md](docs/more.md)**.
 
+## Updating
+
+Claude Code checks the marketplace for updates in the background and prompts you to
+`/reload-plugins` when one lands — or update on demand:
+
+```
+/plugin marketplace update rossoctl/context-guru
+/reload-plugins
+```
+
+The plugin's version tracks each proxy release, so an update to the proxy is always an update
+you get prompted for. More: [docs/how-to/install-plugin.md](docs/how-to/install-plugin.md#upgrading).
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE). A [Rossoctl](https://github.com/rossoctl) platform component.
