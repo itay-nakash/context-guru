@@ -45,7 +45,8 @@ Key behaviors (`proxy/proxy.go`):
   (`event-stream`) responses skip the loop and pass through with flushing.
 - `x-context-guru-*` headers are stripped before forwarding upstream.
 
-Run it: see the [flag table in docs/more.md](more.md#proxy-gateway-run-it-yourself) and [setup.md](setup.md).
+Run it: see [Quickstart: proxy](get-started/quickstart-proxy.md) to get it running, and the
+[flag table](reference/reference.md) for every `--flag` / env var.
 
 ## Option B — external in-process plugin
 

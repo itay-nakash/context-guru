@@ -90,7 +90,7 @@ The deep dive lives in [Architecture](../design.md).
     Every registered component: how it works, before → after, lossiness,
     config, best use.
 
-- :material-book-open-variant: **[How-to Guides](../how-to/choose-a-preset.md)**
+- :material-book-open-variant: **[How-to Guides](../reference/presets.md)**
 
     Choose a preset, integrate as a plugin, recover offloaded context, measure
     savings.

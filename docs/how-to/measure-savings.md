@@ -102,7 +102,7 @@ guard that turned each candidate away, which separates three different situation
   LLM call would lose money here).
 - **A gap worth closing** — `cmdfilter: {no_filter_match: N}` means nothing matched.
   Cross-check `cmdfilter_selector_misses`, which ranks the output shapes no filter claimed
-  and tells you which filter to [write next](custom-dsl-filter.md).
+  and tells you which filter to [write next](../components/dsl.md).
 
 `top_passthrough` lists components that ran and changed nothing. `cachesplit` always lands
 there because its win is a provider-side cache hit, invisible to content-token counts; a

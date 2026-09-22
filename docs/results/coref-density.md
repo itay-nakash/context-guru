@@ -310,4 +310,4 @@ rate as the precision inner loop, and only then the scored benchmarks.
 
 See also: the proposal (`docs/proposals/coref-compaction.md`) · [the held-out selection
 experiment](coref-selection-experiment.md) · [the component](../components/coref.md) ·
-[glossary / cheat sheet](../reference/coref-glossary.md) · [improvement plan](improvement-plan.md)
+[glossary / cheat sheet](../components/coref.md#glossary) · [improvement plan](improvement-plan.md)

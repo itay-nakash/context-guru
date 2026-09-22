@@ -3,7 +3,7 @@
 !!! warning "Offload — lossy, reversible (LLM-written filter). **Spends money to save money.**"
     A cheap model writes a small program that projects a large tool output down to what the agent
     actually needs, deletes the rest, and stashes the original. The powerful, relevance-aware
-    counterpart to the deterministic [`extract`](extract.md) — and the only component whose
+    counterpart to the deterministic [`extract`](offload-reducers.md#extract) — and the only component whose
     savings can be **net negative**. Read [Economics](#economics) before enabling it.
 
 ## The honest verdict
@@ -680,7 +680,7 @@ questions at a flat rate.
 
 !!! danger "These are NOT this component's figures. Read `extract.by_component`."
     The block's top-level keys are the **sum across every extraction component** — this one and
-    [`extract_llm_sweep`](extract_llm_sweep.md), which both write the same counters. The two have
+    [`extract_llm_sweep`](advanced-offload.md#extract_llm_sweep), which both write the same counters. The two have
     opposite economics: per-output calls on a cheap model here, one call on the request's own
     frontier model there.
 
@@ -873,4 +873,4 @@ Output below the derived floor, low context pressure, **suppressed by the econom
 common case on a caching backend), throttled out this turn, result served from the global cache,
 projection not smaller, or no model available.
 
-See also: [`extract`](extract.md) · [Components overview](../components.md) · [Choose a preset](../how-to/choose-a-preset.md)
+See also: [`extract`](offload-reducers.md#extract) · [Components overview](../components.md) · [Choose a preset](../reference/presets.md)

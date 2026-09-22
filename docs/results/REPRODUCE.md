@@ -362,10 +362,7 @@ name will kill each other's proxy — this happened twice during the study and i
 
 ## 8. Result docs
 
-- [`baseline.md`](baseline.md) — SWE-bench baseline (`off`) full results.
-- [`context-guru.md`](context-guru.md) — context-guru `codesmart` full results.
-- [`headroom.md`](headroom.md) — headroom full results.
-- [`rtk.md`](rtk.md) — rtk (Rust Token Killer) full results.
+- [`swebench-arms.md`](swebench-arms.md) — SWE-bench per-arm full results: [baseline](swebench-arms.md#full-results-baseline-off-swe-bench-verified-50-tasks) · [context-guru](swebench-arms.md#full-results-context-guru-codesmart-final-swe-bench-verified-50-tasks) · [headroom](swebench-arms.md#full-results-headroom-hd-cache-swe-bench-verified-50-tasks) · [rtk](swebench-arms.md#full-results-rtk-rust-token-killer-swe-bench-verified-50-tasks).
 - [`comparison.md`](comparison.md) — the four-way SWE-bench comparison across all metrics.
 - [`terminal-bench-comparison.md`](terminal-bench-comparison.md) — the four-way **Terminal-Bench 2.0** comparison.
-- [`terminal-bench-baseline.md`](terminal-bench-baseline.md) · [`-context-guru`](terminal-bench-context-guru.md) · [`-headroom`](terminal-bench-headroom.md) · [`-rtk`](terminal-bench-rtk.md) — TB per-arm full results.
+- [`terminal-bench-arms.md`](terminal-bench-arms.md) — TB per-arm full results: [baseline](terminal-bench-arms.md#full-results-baseline-terminal-bench-20-89-tasks) · [context-guru](terminal-bench-arms.md#full-results-context-guru-codesmart-terminal-bench-20-89-tasks) · [headroom](terminal-bench-arms.md#full-results-headroom-hd-cache-terminal-bench-20-89-tasks) · [rtk](terminal-bench-arms.md#full-results-rtk-terminal-bench-20-89-tasks).

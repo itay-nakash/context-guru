@@ -147,7 +147,7 @@ of the normalized list, so it is asserted on the raw body instead (`apply/toolro
 > cost of firing warm and being wrong was **−$0.84 in total**, firing warm pays back in **2-3 turns**,
 > and a cold-gated component pays the **first** full rewrite regardless, because the turn that sees a
 > cold cache commissions the summary and forwards untouched. The default is now `any`. See
-> [config reference](../reference/config.md) for the arithmetic and `summarizeDefaultCacheState` for
+> [config reference](../reference/reference.md) for the arithmetic and `summarizeDefaultCacheState` for
 > the primary sources.
 
 > **Keep-alive and the cache phase agree.** A keep-alive ping READS the cached prefix, which resets the
@@ -416,4 +416,4 @@ summarized message and force the very cache-write the trigger exists to avoid. T
 counted as `reused_checkpoint` / `gated_replayed_checkpoint` replays rather than as acts, so `/stats`
 distinguishes a component amortizing old work from one paying for new work.
 
-See also: [Components overview](../components.md) · [Choose a preset](../how-to/choose-a-preset.md)
+See also: [Components overview](../components.md) · [Choose a preset](../reference/presets.md)
