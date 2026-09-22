@@ -26,7 +26,7 @@ wrong suggestion instead of asking for approval.
    `/context-guru:install` prints if you're unsure):
 
    ```
-   Bash(/Users/you/.claude/plugins/cache/context-guru/**)
+   Bash(/Users/{you}/.claude/plugins/cache/context-guru/**)
    ```
 
 3. Save it to **Project settings (local)** (`.claude/settings.local.json`, gitignored).
@@ -56,13 +56,15 @@ decides which sessions' traffic actually goes through the proxy (table below).
 ### `/plugin configure` — five options, all with working defaults
 
 Open it, press **Save configuration**, and nothing changes. Only one of these usually needs
-setting, and only in one situation:
+setting, and only in one situation. The Preset and Cache strategy rows have their own pickers —
+`/context-guru:preset-picker` and `/context-guru:cache-strategy-picker` — since the raw configure
+form has no explanation of what each choice does; use those for the two rows that need judgment.
 
 | Option | Default | Change it when |
 |---|---|---|
 | **Proxy port** | `8787` | something already holds 8787 (not 4000 — that collides with litellm) |
-| **Preset** | `off` | you want context editing at all. `off` is passthrough: nothing dropped, no model called |
-| **Cache strategy** | `5-min-ping` | you don't want keep-alive pings that spend a little of your own quota to keep the cache warm. `none` turns it off |
+| **Preset** | `off` | you want context editing at all. `off` is passthrough: nothing dropped, no model called. `/context-guru:preset-picker` explains each one |
+| **Cache strategy** | `5-min-ping` | you don't want keep-alive pings that spend a little of your own quota to keep the cache warm. `none` turns it off. `/context-guru:cache-strategy-picker` explains whether it's paying for itself on `keepalive_net_usd` |
 | **Idle exit** | `24h` | rarely — floor is `max(2 × store.ttl_seconds, 1h)` |
 | **Upstream base URL** | *(empty)* | something else is already the gateway (a corporate proxy, a hosted-agent pod) — set it to whatever `ANTHROPIC_BASE_URL` already contains so context-guru chains behind it instead of replacing it |
 
