@@ -95,6 +95,7 @@ exclude_docs: |
 # (Integrations). Every page under docs/ appears exactly once.
 nav:
   - Home: index.md
+  - Everything else (README overflow): more.md
   - Get started:
       - Technical overview: get-started/overview.md
       - Connect to the IBM service: get-started/connect-ibm-service.md

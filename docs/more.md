@@ -1,6 +1,6 @@
 # context-guru: everything else
 
-The [README](../README.md) covers the Claude Code plugin quickstart. This page has the rest:
+The [README](https://github.com/rossoctl/context-guru/blob/main/README.md) covers the Claude Code plugin quickstart. This page has the rest:
 the safety guarantees, the benchmark, the architecture, the proxy/gateway path, every
 component, the dashboard, operating modes, and how to integrate the core into your own service.
 
