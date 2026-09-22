@@ -35,7 +35,7 @@
     "cache_strategy": {
       "type": "string",
       "title": "Cache strategy",
-      "description": "Which cache mechanism runs, by name. `5-min-ping` (the default) pings your idle session so the cache doesn't go cold, spending a little of your own credential to do it. `none` turns that off. `1-hour-head` asks the provider for a longer-lived cache instead of pinging, only on prefixes >=50k tokens, and usually buys nothing on today's models. `/context-guru:cache-strategy-picker` explains each one and whether it's paying for itself.",
+      "description": "Which cache mechanism runs, by name. `5-min-ping` (the default) pings your idle session so the cache doesn't go cold — it SPENDS your own credential to do it. `none` turns that off. `1-hour-head` asks the provider for a longer-lived cache instead of pinging, only on prefixes >=50k tokens, and usually buys nothing on today's models. `/context-guru:cache-strategy-picker` explains each one and whether it's paying for itself.",
       "default": "5-min-ping"
     },
     "idle_exit": {
