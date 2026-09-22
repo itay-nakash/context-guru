@@ -49,8 +49,7 @@ Check what it's saving:
 
 It reports the preset and cache strategy running, and the dollars saved so far — keep-alive
 savings, any content-trimming savings, and the net. Want the raw numbers instead of the reading of
-them? `/context-guru:status --stats` prints the `/stats` endpoint verbatim. Sample output:
-[docs/more.md](docs/more.md#claude-code-plugin-advanced-options).
+them? `/context-guru:status --stats` prints the `/stats` endpoint verbatim.
 
 If you want to also carry less, not just pay less, opt into content trimming:
 
@@ -58,8 +57,24 @@ If you want to also carry less, not just pay less, opt into content trimming:
 /context-guru:preset-picker   # → house, the safe first step into trimming
 ```
 
+### Status line
+
+A terminal status line is installed **on by default** alongside the plugin — no separate step. It
+shows the context-window bar, this session's running savings against its own running cost, the
+proxy/upstream latency split, and a least-used-tool hint, and it renders nothing at all in a
+project that isn't routed through context-guru, so it's safe even before you run
+`/context-guru:install` anywhere. Turn it off any time with:
+
+```
+"${CLAUDE_PLUGIN_ROOT}/scripts/settings.py" off --file ~/.claude/settings.json
+```
+
+More: [docs/how-to/install-plugin.md](docs/how-to/install-plugin.md), or ask
+`/context-guru:statusline` to enable an extra segment or turn it back on.
+
 Everything else — architecture, the full benchmark, every component, the proxy/gateway path,
-config reference — is in **[docs/more.md](docs/more.md)**.
+config reference — is in **[docs/design.md](docs/design.md)** and
+**[docs/get-started/how-it-saves.md](docs/get-started/how-it-saves.md)**.
 
 ## Updating
 

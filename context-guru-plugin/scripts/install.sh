@@ -63,7 +63,7 @@ route_here() { CDPATH= cd -- "$(dirname -- "$0")" && pwd -P; }
 # Every fact the plan and the confirm both report. Kept in one place so `--plan` cannot describe a
 # different install from the one `--confirm` performs.
 R_MODE=local R_SCOPE=project R_ONCONFLICT= R_BASEURL= R_HEALTHURL= R_NOHEALTH=0
-R_STRATEGY= R_UPSTREAM= R_USERSCOPE=0 R_PLAN=0 R_CONFIRM=0
+R_STRATEGY= R_UPSTREAM= R_USERSCOPE=0 R_PLAN=0 R_CONFIRM=0 R_NOSTATUSLINE=0
 R_PORT= R_PRESET= R_IDLE= R_BIN= R_ONPATH= R_FILE= R_EXISTING= R_CHAINED=false
 R_ALREADY=false R_CONSENT=0 R_OURS= R_FROMENV=0 R_SPENDS= R_PIDFILE= R_PROXYLOG=
 
@@ -693,7 +693,30 @@ a routed one with no proxy is a broken one."
   emit "backup=$(kv "$aout" backup)"
   emit "reset_hatch=$(kv "$aout" reset_hatch)"
   emit "replaced=$(kv "$aout" replaced)"
+  route_install_statusline
   route_report
+}
+
+# ---- statusline, on by default -------------------------------------------------------------
+# A savings-focused install with nothing showing the savings is a worse first impression than a
+# status line that turns out to be unwanted, and unwanted is one command away (--no-statusline
+# here, or `settings.py off` any time after). User scope, always: a status line is a property of
+# the terminal, not of one repository, and it renders nothing in a project that is not routed
+# (see skills/statusline/SKILL.md), so writing it at user scope is safe regardless of which
+# projects get routed later. Never fatal — a statusline write failing is not a routing failure,
+# it is reported as its own fact and nothing about `result=routed` above changes.
+route_install_statusline() {
+  [ "$R_NOSTATUSLINE" = 1 ] && { emit "statusline=skipped"; return 0; }
+  local sl_file="$HOME/.claude/settings.json"
+  local sout scode=0
+  sout=$("$(route_here)/settings.py" add --file "$sl_file" \
+    --statusline "python3 \"\${CLAUDE_PLUGIN_ROOT}/scripts/statusline.py\"" 2>&1) || scode=$?
+  local sres; sres=$(kv "$sout" result)
+  case "$sres" in
+    added|unchanged) emit "statusline=on" ;;
+    conflict) emit "statusline=skipped"; emit "statusline_reason=$(kv "$sout" reason)" ;;
+    *) emit "statusline=skipped"; emit "statusline_reason=write_failed"; emit "statusline_exit=$scode" ;;
+  esac
 }
 
 # --- argument parsing. Unknown flags are refused rather than ignored: a silently dropped --scope
@@ -712,6 +735,7 @@ if [ "${1:-}" = --route ]; then
       --health-url) route_need_value --health-url "${2:-}"; R_HEALTHURL="$2"; shift ;;
       --upstream) route_need_value --upstream "${2:-}"; R_UPSTREAM="$2"; shift ;;
       --no-health-check) R_NOHEALTH=1 ;;
+      --no-statusline) R_NOSTATUSLINE=1 ;;
       --i-understand-machine-wide) R_USERSCOPE=1 ;;
       --i-consent-to-traffic-interception) R_CONSENT=1 ;;
       *) emit "result=error"; emit "reason=unknown_flag"; emit "flag=$1"

@@ -1,6 +1,6 @@
 ---
 name: install
-description: Install a local context-guru proxy and route this project's Claude Code sessions through it, so long sessions stop paying to re-create the prompt cache. Use when the user asks to install, set up, enable, try or start context-guru, or to route Claude Code through it. Accepts --global to route every project on the machine instead of just this one, --cache-strategy <none|5-min-ping|1-hour-head> to override the default cache strategy, and --attach <url> to point at a proxy that already exists (a gateway or shared pod) instead of starting one.
+description: Install a local context-guru proxy and route this project's Claude Code sessions through it, so long sessions stop paying to re-create the prompt cache. Also installs the terminal status line, at user scope, on by default. Use when the user asks to install, set up, enable, try or start context-guru, or to route Claude Code through it. Accepts --global to route every project on the machine instead of just this one, --cache-strategy <none|5-min-ping|1-hour-head> to override the default cache strategy, --attach <url> to point at a proxy that already exists (a gateway or shared pod) instead of starting one, and --no-statusline to skip the automatic status line install.
 ---
 
 # Install context-guru for Claude Code
@@ -36,6 +36,9 @@ If `cache_strategy=5-min-ping` (the default), one more clause: keep-alive is on,
 of their own quota on idle turns to hold the cache warm, and `/context-guru:cache-strategy-picker`
 names the alternatives and what each costs. Do not recommend one — they differ in what they spend, and
 that is the user's call.
+
+One more, always: a terminal status line showing savings goes on too, at user scope — it only reads,
+never pings, and renders nothing in an unrouted project. `--no-statusline` skips it; `/context-guru:statusline off` any time after does the same.
 
 Fuller detail is in `docs/how-to/install-plugin.md`. Point at it; do not recite it.
 
@@ -157,6 +160,9 @@ not reword the command to look like less than it is, and never write routing whi
   they spend the user's quota.
 - `strategy_warning=` — the strategy could not be written even though the name was valid (usually a
   config at that path we did not write). The proxy is fine; mention it and move on.
+- `statusline=on` — the status line was also installed, at user scope, in the same run. `skipped`
+  means it wasn't (a conflict with something already at that key, or `--no-statusline` was passed)
+  — not a failure of the install itself; `statusline_reason=` says why if you need it.
 
 ## 4. Then tell them
 
@@ -169,6 +175,8 @@ not reword the command to look like less than it is, and never write routing whi
 - If `port` is not 8787, say so; a non-default port is the kind of thing people forget they set.
 - `/context-guru:status` for numbers, `/context-guru:cache-strategy-picker` to change the strategy,
   `/context-guru:uninstall` to undo.
+- If `statusline=on`, mention it once: a status line showing savings just started showing up (new
+  session to see it) — `/context-guru:statusline` explains it and turns it off if unwanted.
 - **`reset_hatch=` verbatim, on its own line, as your last line.** This is the only moment the user
   is certain to be able to read it: the failure it exists for is "every request through the proxy
   fails", and in that state no skill can run — including uninstall. It happened to a colleague.

@@ -49,12 +49,20 @@ on the installed command — see "Turn an extra on" below. Neither is shown unti
 **It never sends a keep-alive ping, and never will.** It only reads. Turning the keep-alive
 mechanism on is a separate, explicit action — see `/context-guru:cache-strategy-picker`.
 
+**It is on by default.** `/context-guru:install`'s own orchestrator (`install.sh --route`)
+installs it at user scope in the same run it routes a project, right after routing succeeds —
+no separate step, and it never fails the install if it can't (a write conflict just leaves it
+skipped, reported as `statusline=skipped` in the install's own output). This skill is for what
+that automatic install doesn't cover: turning an extra on, moving it to a different scope, or
+putting it back after `off` — or installing it by hand in the rare case someone passed
+`--no-statusline` and changed their mind.
+
 ## Where to install it
 
-Default to **user scope** (`~/.claude/settings.json`), unlike `/context-guru:install`'s
-project-first default: a status line is a property of the terminal, not of one repository, and
-because the script renders nothing in unrouted projects, installing it once at user scope is safe
-regardless of which projects you later route. Ask before a different scope only if the user
+Default to **user scope** (`~/.claude/settings.json`), matching what `/context-guru:install`
+already did automatically: a status line is a property of the terminal, not of one repository,
+and because the script renders nothing in unrouted projects, installing it once at user scope is
+safe regardless of which projects you later route. Ask before a different scope only if the user
 names one.
 
 ## 1. Look before you write
@@ -118,13 +126,20 @@ updates it in place, no `--force` needed:
 Re-run step 2's bare command (no flags) to return to savings-only. New session to see it take
 effect, same as turning one on.
 
-## 4. Remove it entirely
+## 4. Turn it off entirely
 
 ```bash
-"${CLAUDE_PLUGIN_ROOT}/scripts/settings.py" remove --file ~/.claude/settings.json
+"${CLAUDE_PLUGIN_ROOT}/scripts/settings.py" off --file ~/.claude/settings.json
 ```
 
-Restores whatever `statusLine` (if anything) was there before, exactly like base-URL removal —
-never just deletes and leaves the user with nothing. If routing was ALSO configured in the same
-file, this same call removes both; if only the status line was ever installed there, it is the
-only thing this touches.
+**Use `off`, not `remove`, unless the user means to uninstall routing too.** Since the status
+line installs automatically alongside routing now, the two commonly live in the same settings
+file — `remove` takes back *everything* `/context-guru:install` wrote there (routing included),
+while `off` touches only the `statusLine` key and leaves routing exactly as it was. Restores
+whatever `statusLine` (if anything) was there before, exactly like base-URL removal — never just
+deletes and leaves the user with nothing.
+
+`remove` still works too, and still does the right thing: if only the status line was ever
+installed in a given file (no routing there), it takes back just that; if both were installed
+together, it takes back both — that combined behavior is the uninstall path, not the "I just want
+the status line gone" path `off` is for.

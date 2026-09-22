@@ -1981,6 +1981,49 @@ func TestSettingsStatuslineOnlyInstallTouchesNoRouting(t *testing.T) {
 	}
 }
 
+// TestSettingsOffLeavesRoutingUntouched: `off` is the one-word undo for a statusline installed
+// alongside routing (the shape `install.sh --route` now always leaves behind) — the case `remove`
+// cannot serve, since `remove` takes back routing too. Covers the case that actually matters:
+// both keys present, `off` must take only its own.
+func TestSettingsOffLeavesRoutingUntouched(t *testing.T) {
+	const cmdPath = "/opt/cg/statusline.py"
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings.json")
+	writeJSON(t, path, map[string]any{"theme": "dark"})
+
+	if _, code := settings(t, "add", "--file", path, "--url", "http://127.0.0.1:8787/anthropic",
+		"--statusline", cmdPath); code != 0 {
+		t.Fatal("combined routing+statusline add failed")
+	}
+
+	facts, code := settings(t, "off", "--file", path)
+	if code != 0 || facts["result"] != "removed" {
+		t.Fatalf("off failed: exit %d, %v", code, facts)
+	}
+	got := readJSON(t, path)
+	if _, still := got["statusLine"]; still {
+		t.Error("the statusLine key survived `off`")
+	}
+	env, _ := got["env"].(map[string]any)
+	if env["ANTHROPIC_BASE_URL"] != "http://127.0.0.1:8787/anthropic" {
+		t.Errorf("off touched routing, want it untouched: env = %v", got["env"])
+	}
+	if got["theme"] != "dark" {
+		t.Error("off took more than its own key")
+	}
+
+	// Re-running once nothing is installed is a no-op, not an error.
+	if facts, code := settings(t, "off", "--file", path); code != 0 || facts["result"] != "unchanged" {
+		t.Fatalf("off on an already-off statusline: exit %d, %v", code, facts)
+	}
+
+	// A file that has never existed is also a no-op, not an error.
+	missing := filepath.Join(dir, "does-not-exist.json")
+	if facts, code := settings(t, "off", "--file", missing); code != 0 || facts["result"] != "unchanged" {
+		t.Fatalf("off on a missing file: exit %d, %v", code, facts)
+	}
+}
+
 // TestSettingsAddRequiresUrlOrStatusline: with neither flag, `add` has nothing to do and must
 // say so rather than silently writing an empty ANTHROPIC_BASE_URL.
 func TestSettingsAddRequiresUrlOrStatusline(t *testing.T) {
@@ -5581,6 +5624,104 @@ func TestRouteWritesRoutingOnlyAfterSomethingAnswers(t *testing.T) {
 			b, _ := os.ReadFile(filepath.Join(proj, ".claude", "settings.local.json"))
 			t.Errorf("routing was written with nothing answering — a routed project with no proxy is "+
 				"the hang state this ordering exists to prevent:\n%s", b)
+		}
+	})
+}
+
+// TestRouteInstallsStatuslineByDefault: the status line install now rides along with a successful
+// route, at user scope, and --no-statusline is the opt-out. Also covers that a statusline write
+// failure never turns a successful route into a reported failure — `statusline=skipped` alongside
+// `result=routed`, not `result=error`.
+func TestRouteInstallsStatuslineByDefault(t *testing.T) {
+	t.Run("a healthy proxy: the status line is installed at user scope", func(t *testing.T) {
+		home, state, proj := t.TempDir(), t.TempDir(), t.TempDir()
+		port := freePort(t)
+		writePluginOptions(t, home, map[string]any{"port": port})
+		env := routeEnv(t, home, state, fakeProxyDir(t, port, true))
+		facts, code := runRoute(t, proj, env, consentOK()...)
+		t.Cleanup(func() {
+			if b, e := os.ReadFile(filepath.Join(state, "context-guru", "proxy-"+port+".pid")); e == nil {
+				exec.Command("kill", strings.TrimSpace(string(b))).Run() //nolint:errcheck
+			}
+		})
+		if code != 0 || facts["result"] != "routed" {
+			t.Fatalf("exit %d result=%q: %v", code, facts["result"], facts)
+		}
+		if facts["statusline"] != "on" {
+			t.Fatalf("statusline=%q, want on: %v", facts["statusline"], facts)
+		}
+		got := readJSON(t, filepath.Join(home, ".claude", "settings.json"))
+		sl, _ := got["statusLine"].(map[string]any)
+		want := `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/statusline.py"`
+		if sl["command"] != want {
+			// The literal ${CLAUDE_PLUGIN_ROOT} must survive un-expanded: install.sh cannot read that
+			// var from its own environment (it is substituted into the invoking `!`-block's command
+			// STRING by Claude Code, never exported to the child process — see skills/install/SKILL.md's
+			// own note on this), so the command written here has to carry the placeholder for Claude
+			// Code to expand later, at render time, the same way the statusline SKILL's own manual
+			// install command does.
+			t.Errorf("statusLine.command = %v, want %q", got["statusLine"], want)
+		}
+		// It went to user scope (home), not the project's routing file.
+		if _, err := os.Stat(filepath.Join(proj, ".claude", "settings.local.json")); err == nil {
+			b, _ := os.ReadFile(filepath.Join(proj, ".claude", "settings.local.json"))
+			if strings.Contains(string(b), "statusLine") {
+				t.Errorf("statusLine leaked into the project-scope routing file:\n%s", b)
+			}
+		}
+	})
+
+	t.Run("--no-statusline: routing succeeds, nothing is written to statusLine", func(t *testing.T) {
+		home, state, proj := t.TempDir(), t.TempDir(), t.TempDir()
+		port := freePort(t)
+		writePluginOptions(t, home, map[string]any{"port": port})
+		env := routeEnv(t, home, state, fakeProxyDir(t, port, true))
+		facts, code := runRoute(t, proj, env, consentOK("--no-statusline")...)
+		t.Cleanup(func() {
+			if b, e := os.ReadFile(filepath.Join(state, "context-guru", "proxy-"+port+".pid")); e == nil {
+				exec.Command("kill", strings.TrimSpace(string(b))).Run() //nolint:errcheck
+			}
+		})
+		if code != 0 || facts["result"] != "routed" {
+			t.Fatalf("exit %d result=%q: %v", code, facts["result"], facts)
+		}
+		if facts["statusline"] != "skipped" {
+			t.Fatalf("statusline=%q, want skipped: %v", facts["statusline"], facts)
+		}
+		if _, err := os.Stat(filepath.Join(home, ".claude", "settings.json")); err == nil {
+			got := readJSON(t, filepath.Join(home, ".claude", "settings.json"))
+			if _, has := got["statusLine"]; has {
+				t.Error("--no-statusline was passed but statusLine was written anyway")
+			}
+		}
+	})
+
+	t.Run("a pre-existing foreign statusLine: routing still succeeds, statusline is reported skipped", func(t *testing.T) {
+		home, state, proj := t.TempDir(), t.TempDir(), t.TempDir()
+		port := freePort(t)
+		writePluginOptions(t, home, map[string]any{"port": port})
+		settingsPath := filepath.Join(home, ".claude", "settings.json")
+		existing := readJSON(t, settingsPath)
+		existing["statusLine"] = map[string]any{"type": "command", "command": "my-own-thing"}
+		writeJSON(t, settingsPath, existing)
+		env := routeEnv(t, home, state, fakeProxyDir(t, port, true))
+		facts, code := runRoute(t, proj, env, consentOK()...)
+		t.Cleanup(func() {
+			if b, e := os.ReadFile(filepath.Join(state, "context-guru", "proxy-"+port+".pid")); e == nil {
+				exec.Command("kill", strings.TrimSpace(string(b))).Run() //nolint:errcheck
+			}
+		})
+		if code != 0 || facts["result"] != "routed" {
+			t.Fatalf("a foreign statusLine must not fail the route itself: exit %d result=%q: %v",
+				code, facts["result"], facts)
+		}
+		if facts["statusline"] != "skipped" {
+			t.Fatalf("statusline=%q, want skipped: %v", facts["statusline"], facts)
+		}
+		got := readJSON(t, filepath.Join(home, ".claude", "settings.json"))
+		sl, _ := got["statusLine"].(map[string]any)
+		if sl["command"] != "my-own-thing" {
+			t.Errorf("the user's own statusLine was overwritten: %v", got["statusLine"])
 		}
 	})
 }

@@ -113,6 +113,27 @@ def apply_statusline(data: dict, command: str) -> None:
     meta[STATUSLINE_META] = command
 
 
+def remove_statusline_only(data: dict) -> tuple[bool, str]:
+    """Undo exactly what apply_statusline wrote, and nothing else — never touches `env`/routing.
+    Returns (changed, restored_json). Shared by `off` (always this, regardless of whether routing
+    is also present) and `remove`'s no-routing branch (statusline was the only thing installed).
+    """
+    meta = data.get(META)
+    recorded = meta.get(STATUSLINE_META) if isinstance(meta, dict) else None
+    if not recorded or data.get(STATUSLINE_KEY) != {"type": "command", "command": recorded}:
+        return False, ""
+    restored = ""
+    del data[STATUSLINE_KEY]
+    if meta.get(STATUSLINE_PREV_META):
+        data[STATUSLINE_KEY] = meta[STATUSLINE_PREV_META]
+        restored = json.dumps(meta[STATUSLINE_PREV_META], sort_keys=True)
+    meta.pop(STATUSLINE_META, None)
+    meta.pop(STATUSLINE_PREV_META, None)
+    if not meta:
+        data.pop(META, None)
+    return True, restored
+
+
 # Values that are URLs get their credentials taken out before they are printed. S4 in review, and
 # pre-existing rather than introduced here — but it contradicts the principle this PR spent three
 # rounds enforcing in reset.sh, and the leak is the same: `replaced=`, `previous=`, `was=`, `restored=`
@@ -988,6 +1009,25 @@ def cmd_add(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_off(args: argparse.Namespace) -> int:
+    """Turn the status line off, and only the status line — unlike `remove`, this never touches
+    `env`/routing even when both were installed together. Ships alongside statusline being on by
+    default so there is a one-word undo that does not also require uninstalling the proxy.
+    """
+    data, existed = load(args.file)
+    if not existed:
+        emit(result="unchanged", file=args.file, note="no such file")
+        return 0
+    changed, restored_sl = remove_statusline_only(data)
+    if not changed:
+        emit(result="unchanged", file=args.file, note="no context-guru statusline installed here")
+        return 0
+    saved = backup(args.file)
+    save(args.file, data)
+    emit(result="removed", file=args.file, backup=saved, statusline_restored=restored_sl)
+    return 0
+
+
 def cmd_remove(args: argparse.Namespace) -> int:
     data, existed = load(args.file)
     if not existed:
@@ -998,19 +1038,9 @@ def cmd_remove(args: argparse.Namespace) -> int:
         # No routing to remove here — but a STATUSLINE-ONLY install (the /context-guru:statusline
         # skill's `add --statusline` with no --url) never touches env at all, so it must not be
         # missed just because there is no base_url in this file to key off.
-        meta0 = data.get(META)
-        recorded_sl0 = meta0.get(STATUSLINE_META) if isinstance(meta0, dict) else None
-        if recorded_sl0 and data.get(STATUSLINE_KEY) == {"type": "command", "command": recorded_sl0}:
+        changed, restored_sl = remove_statusline_only(data)
+        if changed:
             saved = backup(args.file)
-            restored_sl = ""
-            del data[STATUSLINE_KEY]
-            if meta0.get(STATUSLINE_PREV_META):
-                data[STATUSLINE_KEY] = meta0[STATUSLINE_PREV_META]
-                restored_sl = json.dumps(meta0[STATUSLINE_PREV_META], sort_keys=True)
-            meta0.pop(STATUSLINE_META, None)
-            meta0.pop(STATUSLINE_PREV_META, None)
-            if not meta0:
-                data.pop(META, None)
             save(args.file, data)
             emit(result="removed", file=args.file, backup=saved, statusline_restored=restored_sl,
                  note="statusline-only removal; no routing was present to touch")
@@ -1703,6 +1733,12 @@ def main() -> int:
                             "\"command\", \"command\": <this value>}), refusing to replace one "
                             "that is not ours unless --force. on remove: taken back only if it "
                             "is exactly what a previous --statusline install recorded writing.")
+    off = sub.add_parser("off",
+        help="turn the status line off without touching routing — the counterpart to `add "
+             "--statusline`, for when both were installed together and only the statusline "
+             "should come back off")
+    off.add_argument("--file", required=True)
+
     cfg = sub.add_parser("config")
     cfg.add_argument("--plugin", default="context-guru@context-guru")
 
@@ -1748,7 +1784,7 @@ def main() -> int:
             ap.error("strategy set needs --name; one of " + ", ".join(STRATEGIES))
     if args.cmd == "preset" and args.op == "set" and not args.name:
         ap.error("preset set needs --name; one of " + ", ".join(PRESETS))
-    rc = {"add": cmd_add, "remove": cmd_remove, "show": cmd_show,
+    rc = {"add": cmd_add, "remove": cmd_remove, "off": cmd_off, "show": cmd_show,
           "config": cmd_config, "strategy": cmd_strategy, "preset": cmd_preset,
           "check-url": cmd_check_url}[args.cmd](args)
 
