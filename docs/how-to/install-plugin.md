@@ -138,8 +138,8 @@ setting, and only in one situation.
 | Option | Default | Change it when |
 |---|---|---|
 | **Proxy port** | `8787` | something already holds 8787. Deliberately not 4000, which collides with litellm |
-| **Preset** | `off` | you want context editing at all. `off` is passthrough: no components, so nothing is dropped, no marker is written, no tool is injected and no model is called — a property of an empty pipeline rather than a promise about a full one. `house` and `codesmart` add the offloaders; `housellm` adds a compaction-model pass that spends on its own. Whether *anything* is spent under the default is decided by the cache strategy below, not here |
-| **Cache strategy** | `5-min-ping` | you do not want keep-alive: this default holds the cache warm across idle gaps by pinging just under the provider's 5-minute TTL, and that **spends a little of your own quota** while nobody is at the keyboard. Under the default preset it is the *only* thing this plugin does. It targets a measured cost - idle cache misses were 23.6% of all spend over the measured window - but whether it nets positive on your traffic is what `keepalive_net_usd` reports, in `/stats`' own `savings` block (`--dashboard` required) — no need to open the dashboard for this one number. Not something to assume. `none` turns it off; `/context-guru:cache-strategy-picker` names each strategy and what it costs |
+| **Preset** | `off` | you want it to actually edit your context. `off` just forwards requests untouched; `house`/`codesmart` trim tool output; `housellm` also uses a cheap model to compact |
+| **Cache strategy** | `5-min-ping` | you don't want keep-alive. By default it pings your session every few minutes so the cache never goes cold — using a little of your own quota to do it. `none` turns that off. `/context-guru:cache-strategy-picker` explains each option and whether it's paying for itself on `keepalive_net_usd` |
 | **Idle exit** | `24h` | rarely. The floor is `max(2 × store.ttl_seconds, 1h)`; below it the proxy refuses to start rather than silently discarding cache state |
 | **Upstream base URL** | *(empty)* | **something else is already the gateway** — see below |
 
@@ -413,10 +413,9 @@ keep-alive ping is a separate, explicit action, whether or not its counter is sh
 
 `/context-guru:cache-strategy-picker` reports which named cache strategy is in effect and switches
 between them. Idle keep-alive is the strategy named `5-min-ping`, and **it is now the install
-default** — so the proxy will spend your own credential on idle turns, between sessions, to keep the
-cache warm. That is what holds the cache across a gap, and it is bounded (at most 2 pings per idle
-span, only on prefixes over 20k tokens, capped at $0.25 a ping) but it is not free. `split` is the
-strategy that sends no pings at all, and switching to it is one word.
+default** — it spends a little of your own credential between turns to keep the cache warm, and
+it's bounded so it can't run away on you. `none` sends no pings at all, and switching to it is one
+word.
 
 One nuance worth having straight: once keep-alive is on, `cache cold` in the status line (once
 you have turned that segment on) no longer means the provider's own cached entry is actually

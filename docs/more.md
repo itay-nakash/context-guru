@@ -98,16 +98,14 @@ starts it with the new configuration.
 
 | Option | Default | What it does |
 |---|---|---|
-| `preset` | `off` | The compaction PIPELINE — what happens to the request *body*. `off` is passthrough: nothing dropped, no marker written, no tool injected, no pipeline-triggered model call, because nothing is in the pipeline to do it. `house` and `housellm` opt into context editing. This does **not** mean the plugin is idle by default — see `cache_strategy` below, which is on out of the box. |
-| `cache_strategy` | `5-min-ping` | Keep-alive, a.k.a. "cache" in casual use — separate from the `cache` *preset* above. **On by default**: it pings under the provider's 5-minute cache TTL so an idle session's cache is still live, which **spends your own quota** while nobody is at the keyboard. Under the default `off` preset this is the only thing context-guru actually does. `none` turns it off; `1-hour-head` asks for the 1-hour tier instead. |
+| `preset` | `off` | What happens to the request body. `off` leaves it untouched; `house`/`housellm` start trimming and summarizing it. |
+| `cache_strategy` | `5-min-ping` | Keep-alive. On by default, it pings your idle session so the cache doesn't go cold — spending a little of your own quota to do it. `none` turns that off; `1-hour-head` asks the provider for a longer-lived cache instead. |
 | `port` | `8787` | Port the proxy listens on. |
 | `idle_exit` | `24h` | Exit after this long with no requests. |
 | `upstream` | — | Chain behind an existing gateway instead of going straight to Anthropic. |
 
-Keep-alive targets a measured cost, not an assumed one: idle cache misses were 3.7% of requests and
-**23.6% of all spend** over the measured window, at an 8.5x penalty each. Whether it nets positive on
-*your* traffic is reported by `keepalive_net_usd`, in `/stats`' own `savings` block (see below,
-`--dashboard` required) — no need to open the dashboard for this one number. A negative net is
+Whether keep-alive is actually paying for itself on your traffic is reported by
+`keepalive_net_usd` in `/stats`' `savings` block (`--dashboard` required) — a negative net is
 possible, and `none` is a legitimate answer.
 
 **If it breaks and Claude cannot fix it:** `~/.local/state/context-guru/context-guru-reset` undoes the
