@@ -310,4 +310,4 @@ read, grep output), an elision that would not re-parse, a body below `min_tokens
 message inside the provider's cached prefix, a store that cannot persist, and whenever
 the skeleton plus its marker would not be smaller than the original.
 
-See also: [Components overview](../components.md) · [mask](mask.md) · [summarize](summarize.md)
+See also: [Components overview](../components.md) · [mask](offload-reducers.md#mask) · [summarize](summarize.md)

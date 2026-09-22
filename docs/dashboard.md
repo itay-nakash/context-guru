@@ -11,7 +11,7 @@ context-guru-proxy --preset general --dashboard
 ```
 
 It is **off by default**. Turning it on adds `/dashboard/` and `/api/*`; every existing
-route, including [`/stats`](reference/routes.md), is byte-for-byte unchanged.
+route, including [`/stats`](reference/reference.md), is byte-for-byte unchanged.
 
 !!! info "No CDN, no build step, no network"
     The whole UI is three files (`index.html`, `style.css`, `app.js`) embedded in the
@@ -29,8 +29,8 @@ route, including [`/stats`](reference/routes.md), is byte-for-byte unchanged.
 - **Savings** — where the money went: usage over time, per-account campaigns, and the
   benchmark evidence behind the headline numbers.
 - **Behaviour** — what the proxy actually did to your traffic: per-component economics
-  (which ones earn their place), the [tool inventory](tool-inventory.md), keep-alive,
-  and KV-cache behavior.
+  (which ones earn their place), the [tool inventory](#tool-inventory-panel), keep-alive,
+  and [KV-cache behavior](#kv-cache-panel).
 - **Traffic** — per-session and per-request detail, including a git-style diff of
   exactly what was rewritten on the wire.
 - **Admin** — configuration, tenants, and the capture pipeline's own health.
@@ -77,6 +77,110 @@ SQLite (pure Go, no C toolchain), in WAL mode. Retention is bounded by both **ag
 blow past the limit and a quiet week can't erase itself. `--dashboard-db :memory:`
 runs with no persistence at all.
 
+## Tool inventory panel
+
+*How much of what your agent carries in every request does it actually use?*
+
+An agent declares its whole toolbox — every tool, every MCP server, every skill — on
+**every** request, inside the cached prefix. The panel scans the request's `tools` array
+and system-prompt skills listing (never the conversation itself), records the token
+weight of each declaration, and tracks which ones actually got called. On real Claude
+Code traffic, roughly 80% of declared tokens are typically never invoked in a session.
+
+Reading it: `GET /api/tools` for the rollup, `GET /api/prompt` for one session's actual
+prefix text. See [Config & routes reference](reference/reference.md) for both routes.
+
+Top to bottom, the panel shows:
+
+- **Headline tiles and gauge** — declared vs. invoked tokens, over the *controllable*
+  set only (your MCP tools and skills); the agent's own built-in tools are shown
+  separately at the bottom and are never included in this ratio, since removing them
+  isn't an option.
+- **Who owns your system prompt** — a part-to-whole bar of the whole prefix, colored by
+  whether that region is yours to change.
+- **Your system prompt, and what shares it** — the prompt broken into its own sections
+  (by markdown heading), each measured and readable.
+- **Carried by every request, never once called** — the actionable list, grouped by
+  what one action removes (a whole MCP server, or a single tool/skill), each group with
+  the exact command to run.
+- **Realized by your removals** — what a removal *actually* avoided on requests really
+  sent, kept separate from the projected savings above it.
+- **Full declaration table and MCP/skills rollups** — sortable, per-server and
+  per-skill detail.
+
+To act on it: add the dead weight to [`toolfilter`](components/reformat.md#toolfilter)'s
+`remove:` list — it never removes a name you didn't list. The opt-out checkbox in the
+UI does the same thing without editing config, and it's reversible, but toggling it has
+a one-time cost: declarations sit at the very front of the cached prompt, so changing
+the set changes the prefix, and every live session's next turn pays a full cache-miss
+write instead of a cache read. Switch off everything you mean to switch off in one pass.
+
+Declaration **names and token weights** are gated on tenant scoping only. The **text**
+of a declaration (the schema itself, the skill listing, the system prompt) is
+transcript-class data and needs the same operator + tenant consent that gates any other
+captured content — see [Access](#access) above. Without that consent the measurement
+still works; only the text is withheld.
+
+## KV-cache panel
+
+*How long your conversations actually stay idle, what the prompt cache is costing you
+at that idle profile, and what a different TTL policy would have cost on the same
+history.*
+
+The tab sits next to **Keep-alive** — both answer "what is the prompt cache doing to my
+bill." It respects the shared filter bar (time range, model, agent, account), plus
+three narrowings that exist only here because they're derived rather than stored
+columns: time-of-day band, observed TTL tier, and whether a request has a successor at
+all.
+
+Top to bottom:
+
+- **Coverage statement** — what the analysis could *not* answer: rows with no recorded
+  TTL, rows with no cost, conversations with a single request.
+- **Summary tiles** — requests, conversations, median/mean idle time, 5-minute and
+  1-hour reuse probability, cache-hit rate as billed, requests with no successor.
+- **Idle histogram and survival curve** — how long until the next request, and the
+  cumulative share of conversations that had returned by each elapsed time.
+- **Breakdowns** — the same measurements grouped by observed TTL, user, model, and
+  time-of-day (UTC only — there is no per-user timezone in the store).
+- **Prices** — every rate the simulation uses, editable, priced against this window's
+  own median cached prefix.
+- **Strategies** — pick a TTL policy from the server's registry and compare its cost
+  against a baseline. Each cell reads `$X cheaper` or `$X MORE` rather than a bare
+  signed number, and `optimal` (the ceiling — reads the true next-request time in
+  hindsight) can never be selected as a baseline.
+- **Every request in the analysis** — the derived dataset, sortable, linking back to
+  the request drawer.
+
+A few gotchas worth knowing when reading this page:
+
+- A request with **no next request** in its conversation has no idle time and is
+  excluded from every average rather than counted as an instant return.
+- A blank `cache_ttl` on an older row means *not recorded*, not "no cache used" — the
+  two are distinguished by whether the request billed at the 1-hour tier or cached
+  anything at all, and reported as **unknown** rather than assumed.
+- The hit rate is shown because operators ask for it, but the page doesn't sort or
+  color by it: on real traffic, holding every prefix for an hour gives the best hit
+  rate while costing more overall than a 5-minute TTL, because it pays a larger write
+  cost than the reads it saves.
+- A conversation is keyed by `(account, session, model)` — a cache entry doesn't
+  transfer between models, so two requests in one session on different models are
+  never treated as each other's successor.
+
+Cost model (every rate is per-provider/model and editable in the page):
+
+```text
+uncached input        input_tokens   × input_rate
+cache read             cache_read     × cache_read_rate      (default 0.1× input)
+cache write, 5m        written_tokens × write_5m_rate         (default 1.25× input)
+cache write, 1h        written_tokens × write_1h_rate         (default 2.0× input)
+cache premium          total_cost − uncached_cost   (negative = the cache paid for itself)
+```
+
+The 1-hour write rate is derived (no provider publishes one) as a multiplier over base
+input; both the multiplier and the resulting rate are shown on the page. Routes: four,
+all `GET`, all tenant-scoped — see [Config & routes reference](reference/reference.md).
+
 ## Verifying it yourself
 
 ```sh
@@ -84,5 +188,5 @@ CGO_ENABLED=1 go test ./dash/ ./proxy/           # unit + integration
 curl -s localhost:4000/api/stats | jq '.denominators[] | {label, percent, available}'
 ```
 
-See [Config & environment](reference/config.md) for every dashboard flag, and
-[Routes & headers](reference/routes.md) for the full `/api/*` surface.
+See [Config & routes reference](reference/reference.md) for every dashboard flag and
+the full `/api/*` surface.

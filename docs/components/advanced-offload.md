@@ -1,4 +1,15 @@
-# `extract_llm_sweep` — the cold-sweep adjudicator
+# Advanced & experimental Offload components
+
+Three Offload (LLM) components that are off-by-default, experimental, or reproduce a baseline
+rather than recommending a preset: **extract_llm_sweep**, **agentdiet**, and
+**cache_aware_summarizer**. Read the relevant section before turning one of these on — each has
+sharp edges (cache-write economics, message-count restructuring, model-availability
+requirements) that the deterministic components in
+[Offload: deterministic reducers](offload-reducers.md) don't have.
+
+---
+
+## extract_llm_sweep
 
 **Kind:** Offload. **Reversible:** yes (`marker_mode: full`, the default). **In presets:** `housellm`.
 
@@ -6,7 +17,7 @@ On a turn whose prompt cache has expired, this component asks a cheap model — 
 outputs at a time — which of them the agent still needs, and **removes** the ones it does not,
 leaving a short shape descriptor plus a resolvable `<<cg:HASH>>` marker. It never rewrites anything.
 
-## Why it is separate from `extract_llm`
+### Why it is separate from `extract_llm`
 
 `extract_llm` does the right thing on a **warm** turn: a cheap model trims one recent tool output
 down to what the agent needs next. The output is recent, the agent may still want most of it, and a
@@ -22,7 +33,7 @@ Until the split these were one component behind a `per_output` / `cold_cache.ena
 switches. They are two components now, and "is the sweep on" is its presence in the pipeline, like
 every other component. The old keys are refused with an error naming their replacement.
 
-## Why the cold turn is worth its own component
+### Why the cold turn is worth its own component
 
 Measured on this deployment over 1.4 days: turns whose prompt cache had expired were **4% of
 requests and 31% of spend** ($360 of $1,173, ~$1.64 each against $0.144 warm), because all 56.7M of
@@ -34,7 +45,7 @@ Two things are true only there, and both are load-bearing:
   against cache-read at 0.1x);
 - acting at depth is **free**, because there is no live cached prefix left to invalidate.
 
-## The contract
+### The contract
 
 The model returns a **verdict**, never content:
 
@@ -55,7 +66,7 @@ identical criterion differed only in whether the model had to name and quote the
 arm that had to emit it **halved the false-drop rate** (4/4 → 2/4). Stating the criterion alone
 measured inert.
 
-## One call, to the request's own model, over its cached transcript
+### One call, to the request's own model, over its cached transcript
 
 The question goes to the **request's own model**, appended as a trailing user message to the exact body
 this session forwarded on the previous turn, so the provider reads the prompt cache those bytes
@@ -96,7 +107,7 @@ Two construction facts, each measured and each a test: `tools` **are** in the ca
 them reads a different, smaller entry; and the route rejects assistant prefill, which an appended user
 message satisfies by construction.
 
-### `tool_choice`, and why the answer is a declared tool rather than a suppressed one
+#### `tool_choice`, and why the answer is a declared tool rather than a suppressed one
 
 This page previously stated the inverse of what is now measured — that forcing `tool_choice: none` was
 "free, and **necessary**, or the prefix's tools make the model answer with a `tool_use`". The second
@@ -135,7 +146,7 @@ even though `none` does not. Omitting it entirely is what reads the prefix for f
 The residual 9.1% in arm C is dominated by a reply with a `thinking` block and no answer at all. That
 is a separate defect, present in every arm, and it is tracked apart from this component's contract.
 
-### The verdict tool is advertised only where it can be used
+#### The verdict tool is advertised only where it can be used
 
 `context_guru_adjudicate` is appended to the `tools` array of every request on the **Anthropic** route
 whose pipeline **contains `extract_llm_sweep`** — and nowhere else. It costs a measured 946 bytes at the
@@ -160,7 +171,7 @@ other `tool_use` only the client can execute, so it hands that round over whole 
 `adjudicate.AnswerStrayCalls` repairs it on the next request: the agent pays one turn, the session is
 fine. `/stats` publishes `adjudicate_stray` either way — measured 0 across all three passes of arm C.
 
-## The trigger: pre-expiry, not cold
+### The trigger: pre-expiry, not cold
 
 The two halves of this component want **opposite** cache states:
 
@@ -182,7 +193,7 @@ guessed TTL would invalidate live prefixes on exactly the deployments whose TTL 
 the codebase's own clock-uncertainty margin for cache expiry. Wider fires more often and invalidates
 more remaining TTL; narrower fires rarely. Nothing measures either side.
 
-### The second trigger, and what it has to pay for
+#### The second trigger, and what it has to pay for
 
 `econ_trigger` fires on **mass** rather than the clock, which is how the sweep reaches a session whose
 cache keeps being refreshed — the long agent run with the most to save, and the one the pre-expiry
@@ -213,7 +224,7 @@ decline every future one and destroy the evidence that could revise the estimate
 Read `prefix_rewrite_repaid` against `econ_ask_not_repaid` and `prefix_rewrite_not_repaid`: the two
 declines name **different** costs and are raised exclusively, so they sum rather than overlap.
 
-### The terms, and what the component knows about itself
+#### The terms, and what the component knows about itself
 
 Every turn the sweep may ask the model *"which of these tool outputs are spent?"*. That question costs
 money, so a test decides whether to ask at all. Its vocabulary:
@@ -263,7 +274,7 @@ CURVE in batch size and the code stores a single point on it. One scalar cannot 
 will not yield but a batch of eight will", and that sentence is both true and necessary. Tracked in the
 issue on the approval estimate.
 
-### When the trigger declines — and why it is usually *not* "no turns left"
+#### When the trigger declines — and why it is usually *not* "no turns left"
 
 The condition is `need > have`:
 
@@ -308,7 +319,7 @@ There is a second-order effect worth noticing in that table: `have` jumped from 
 after those first two removals. Taking 15k tokens out shrank the request, so more turns fit before the
 window fills — **the sweep's own success bought it more runway**, which then part-funded the later asks.
 
-### Why there is no context-pressure floor
+#### Why there is no context-pressure floor
 
 A natural-looking economy is "do not even evaluate the trigger until the context is, say, 70% full — that
 saves paying for asks early in a conversation". **This component deliberately has no such floor, and on
@@ -358,7 +369,7 @@ A free part of the same economy is `min_inventory`, which declines before any mo
 iteration 024's firings commonly carried **three** candidates, so a floor of 7 blocks a further quarter
 of them.
 
-### What the break-even cannot price
+#### What the break-even cannot price
 
 `S x T > 11.5 x W` values a removal at **the cache reads it saves**. On the one iteration where this
 component demonstrably helped, that is not what it was paid in.
@@ -387,7 +398,7 @@ dividing that run's spend by its banked savings — both land near **28**.
 **It cannot rescue a zero horizon.** `ceil(need/premium) >= 1 > 0`, so a request with no turns left
 refuses at any premium. That is what the next section is about, and the two changes only work together.
 
-### The horizon is measured on the request the removal will leave behind
+#### The horizon is measured on the request the removal will leave behind
 
 `T` used to be computed from the request **as it arrived** — which asks "how many turns remain if we do
 nothing" and then charges the removal against that answer. At high pressure the two differ by everything:
@@ -398,11 +409,11 @@ On iteration 024's own decisions the horizon was **exactly zero on 51 of 203 fir
 refuses unconditionally. The growth *rate* still comes from the pre-removal request, because the rate is a
 fact about history that already happened; only the *room left* is a fact about the future.
 
-Note the asymmetry with `coref`, which shares this file's break-even but keeps the uncredited form: its
+Note the asymmetry with `coref`, which shares this break-even but keeps the uncredited form: its
 drop selection was calibrated against that expression, and moving the objective a measured component
 optimises would invalidate those measurements rather than improve them.
 
-## When the cache read does not happen
+### When the cache read does not happen
 
 `PrefixUsage` is returned rather than merely recorded, so the component gates on it. A read of zero is
 **always counted** (`sweep_prefix_cache_read_ZERO`) — a silent miss looks identical to a working call
@@ -421,7 +432,7 @@ faithful quoting, not caching.
 Note what neither mode can undo: the fresh read that already happened on the call that missed. The
 counter is what tells an operator the window is mistimed.
 
-## The model is not a free choice here
+### The model is not a free choice here
 
 Unlike `extract_llm`, this component cannot compact with any model you name — and the asymmetry is
 structural rather than an oversight. `extract_llm`'s prompt **carries** the output it is compacting, so
@@ -432,7 +443,7 @@ So `model.source: config` is not a cheaper configuration of this component, it i
 would read nothing and degrade to paying fresh for the entire transcript. A `model` block is therefore
 **refused** with an error naming that reason, rather than accepted and silently corrected.
 
-## Safety
+### Safety
 
 Every failure path resolves toward **keep**. A wrong keep costs tokens on one turn; a wrong drop is a
 silent, permanent loss the agent does not notice and cannot ask about.
@@ -457,7 +468,7 @@ reassuring the model that removals "stay recoverable on request" produced 91% re
 live-kept. Telling a model its mistakes are cheap makes it careless. The operator gets the safety
 net; the model does not get to hear about it.
 
-## Configuration
+### Configuration
 
 | key | default | what it does |
 |---|---|---|
@@ -478,7 +489,7 @@ being rewritten. `model` because only the request's model has the cache (above).
 `context_messages` because the conversation *is* the cached prefix. `max_calls` because one ask covers
 every candidate. `economic_gate` because it prices a per-output cheap-model call, which this is not.
 
-## Counters
+### Counters
 
 `sweep_offered`, `sweep_adjudicated`, `sweep_dropped`, `sweep_kept`,
 `sweep_drop_refused_obligation`, `sweep_quote_fabricated`, `sweep_criterion_missing`.
@@ -510,7 +521,7 @@ The last two are raised **exclusively**, and reading them as one number loses th
 the batch cannot repay the price of *asking* about it. `prefix_rewrite_repaid` is the matching event when
 the trigger does fire — and it says the batch was worth asking about, never that a saving was banked.
 
-## Enabling it on real traffic
+### Enabling it on real traffic
 
 This component has never been measured on a workload independent of the one its thresholds were tuned
 on. Every corpus behind `min_inventory`, `min_tokens`, `min_later_turns` and the 6%-vs-58% live-kept
@@ -519,7 +530,7 @@ and on LOCA the cache arithmetic came out at 11.0 against a break-even of 11.5 �
 structurally thin there. So the first real deployment is a **measurement**, not a rollout, and it should
 be configured to be readable rather than aggressive.
 
-### The two keys that turn it on
+#### The two keys that turn it on
 
 ```yaml
 extract_llm_sweep:
@@ -536,7 +547,7 @@ Leave `reward_premium` at its default of 1 for a first deployment. Above 1 it as
 worth more than the cache read it saves, which is a belief about headroom value — and the one instrument
 that could have priced it (the harness's own context clearing) has never fired, so nothing has tested it.
 
-### Whether it *can* pay, before asking whether it did
+#### Whether it *can* pay, before asking whether it did
 
 The gate is `S·T > 11.5·W`: mass removed, times turns remaining, against the cache-write it forces. Three
 properties of the traffic decide it, and all three are readable before enabling anything:
@@ -550,7 +561,7 @@ properties of the traffic decide it, and all three are readable before enabling 
 A deployment that cannot supply ~10 candidates per request will produce a component that declines
 correctly and teaches you nothing. Check that first.
 
-### What to read, in order
+#### What to read, in order
 
 **1. Did it fire at all?** `acted`, `sweep_prefix_cache_read_ok`, `sweep_adjudicated`. If `acted` is 0,
 read the gates before touching a threshold — `not_in_pre_expiry_window` (needs `econ_trigger`),
@@ -585,7 +596,7 @@ it. LOCA realised **11.0**. Because the rewrite span is fixed by the shallowest 
 **exclusively** and must not be summed: the first means the batch cannot repay the price of *asking*, the
 second that the cache-write does not earn itself back.
 
-### A first deployment that answers the question
+#### A first deployment that answers the question
 
 - **Enable for a subset of sessions**, ideally long-running ones with large tool results — that is where
   `S·T` is largest and where a null result would be informative rather than structural.
@@ -595,7 +606,7 @@ second that the cache-write does not earn itself back.
 - **Expect it to decline often.** On LOCA it asked 15 times in 286 requests and that was correct
   behaviour, not a fault. `sweep_kept_everything` is likewise a deliberate keep-all.
 
-## What is not measured
+### What is not measured
 
 Three questions the design records rather than answers. The full argument, including which
 measurements refuted earlier versions of this design, is in `docs/proposals/sweep-adjudicator.md` in
@@ -617,3 +628,291 @@ next rather than to whoever runs it.
    is the seam it will arrive through.
 5. How often `sweep_prefix_cache_read_ZERO` fires in practice. That number decides whether the
    fallback default is right, and it is the first thing to look at after this ships.
+
+---
+
+## agentdiet
+
+!!! info "Offload (LLM) — lossy, reversible"
+    A baseline reproduction of the published **AgentDiet** trajectory-reduction method: one
+    cheap-model reflection per turn, on the step that has just aged past a fixed delay.
+
+### Why it exists
+
+`agentdiet` is a **comparable baseline**, not a recommendation. It reproduces the method from
+*"Reducing Cost of LLM Agents with Trajectory Reduction"* (Xiao, Gao, Peng, Xiong — FSE 2026,
+[arXiv:2509.23586](https://arxiv.org/abs/2509.23586)), which the authors call AgentDiet, so the
+published approach can be A/B'd against context-guru's own reducers on the same traffic, agent and
+benchmark. The paper reports **−39.9%…−59.7% input tokens** and **−21.1%…−35.9% total cost** at
+unchanged task success on SWE-bench Verified and Multi-SWE-bench Flash.
+
+### How it works
+
+Its unit is the **step** — one assistant message plus the tool results that answered it — not one
+tool output. Four things follow from that, and together they are what distinguishes it from
+[`extract_llm`](extract_llm.md):
+
+1. **A fixed age chooses the target, not size or economics.** When the agent has completed step
+   `s`, only step `s − a` is eligible (`delay_steps`, a=2). The most recent `a` steps are never
+   touched, so a bad reduction cannot corrupt what the agent is working on right now — the paper's
+   protection against a malfunctioning reflection model.
+2. **The model gets a sliding window of neighbouring steps**, serialized as XML
+   (`context_steps`, b=1 ⇒ steps `[s−a−b … s]`). This is the part `extract_llm` structurally cannot
+   do: seeing the steps around the target is what lets the model call content *redundant* (already
+   stated nearby) or *expired* (mattered only to a finished sub-goal) rather than merely verbose.
+3. **Two thresholds bound the spend.** A step below `min_step_tokens` (θ=500) never earns a call;
+   and a reduction that comes back is applied only if it clears `min_saved_tokens` **or**
+   `max_keep_ratio`, so a marginal rewrite does not pay a cache-write for a handful of tokens.
+4. **A reduction is made once, then frozen.** Later turns replay the same bytes, so the request
+   prefix stays stable and reductions accumulate over the session — which is what the paper gets
+   for free by editing the agent's own trajectory in place.
+
+The window is serialized in the shape the reflection prompt describes:
+
+```xml
+<step id="7">
+<think>The fix works. Now run the existing suite to check nothing broke.</think>
+<call tool="bash">{"command":"python -m pytest testing/test_collection.py -v"}</call>
+<result id="0">… 74 collected, per-test PASSED lines, summary …</result>
+</step>
+```
+
+### Before → After
+
+```
+before:  <result id="0">  … 74 individual "PASSED" lines … 73 passed, 1 xfailed in 4.48s
+after:   ... (individual test lines omitted; mostly PASSED)
+         ======= 73 passed, 1 xfailed in 4.48s  <<cg:…>> [full output: call context_guru_expand]
+```
+
+### Lossiness
+
+Lossy but reversible — each reduced tool result is stashed under its own `<<cg:…>>` marker and
+recovered via `context_guru_expand` / `GET /expand`.
+
+### Configuration
+
+| Key | Default | Meaning |
+|---|---|---|
+| `delay_steps` | 2 | *a* — steps of protection; only the step this far back is eligible. `0` is accepted for an ablation, but it targets the step the agent has just completed and so gives up the protection described above. |
+| `context_steps` | 1 | *b* — steps of leading context in the window (`[s−a−b … s]`). |
+| `min_step_tokens` | 500 | *θ* — a step below this is not worth a reflection call. |
+| `min_saved_tokens` | 400 | Apply the reduction if it saves at least this many tokens… |
+| `max_keep_ratio` | 0.8 | …or if it keeps less than this fraction of the step. |
+| `model.source` | `incoming` | LLM source: `incoming` or `config` (the cheap model). The preset uses `config`. |
+| `model.model` | *the source's own model* | The reflection model, on that source's endpoint and credential. The method's economics depend on it being much cheaper than the agent's. |
+| `model.provider` | `anthropic` | Wire dialect for a config-pinned endpoint: `anthropic` \| `openai`. |
+| `model.base_url` | *the provider's public API* | Pin a dedicated endpoint as a full URL. |
+| `model.api_key` | *the process env key* | **Credential** for the pinned endpoint; empty falls back to the provider env key, which a hosted deployment refuses. Write-only on the settings page. |
+| `model.auth` | `x-api-key` | Anthropic only: `x-api-key` \| `bearer`. |
+| `marker_mode` | `full` | `full` (reversible) \| `summary` \| `off`. |
+| `cache_tail_only` | `false` | Restrict new reductions to the uncached tail. See the warning below. |
+
+`CONTEXT_GURU_AGENTDIET_TIMEOUT` (default `90s`) bounds one reflection call; `/stats` reports
+`agentdiet_timeouts`, `agentdiet_errors` and `agentdiet_call_timeout_ms` beside it. A non-zero
+timeout count means the budget is too small for the server's load, and that arm's savings are an
+**undercount rather than a measurement**.
+
+!!! warning "`cache_tail_only` defaults to `false`, unlike every other age-based offloader"
+    The target step is chosen by age, so with `a ≥ 1` it is **always** inside the provider's cached
+    prefix. A tail restriction would therefore make this component a silent no-op on every caching
+    backend. The paper accepts one cache-write of the suffix per reduced step and counts it in its
+    cost figures; because the decision is then frozen and replayed byte-identically, that write
+    happens **once per step, not once per turn**. Set `true` only if you would rather keep the cache
+    pristine and reduce nothing.
+
+### Faithfulness to the paper
+
+Defaults are the paper's tuned values (`a=2`, `b=1`, `θ=500`). `min_saved_tokens` (400) and
+`max_keep_ratio` (0.8) come from the authors' artifact, whose apply-gate is
+`saved >= 400 || keep < 0.8`; Algorithm 1 in the paper states this more simply as
+`l_orig − l_reduced > θ`. The artifact's form is the default because it is what produced the
+published numbers — set `min_saved_tokens: 500` and `max_keep_ratio: 0` to reproduce the paper's
+stated gate exactly.
+
+Three deviations, all forced by where context-guru sits:
+
+- **The reduction is written in place**, into the step's tool-result messages. The paper's reflection
+  module replaces the whole step with one assistant message; here only
+  [`summarize`](summarize.md) changes the message count, and it must run alone for that reason.
+  Tool results are where **63%** of trajectory tokens live by the paper's own accounting
+  (30.4K of 48.4K).
+- **Tool-call arguments are not reduced.** On Anthropic traffic bifrost's schema does not model
+  `tool_use` blocks, so their name and input are not visible to any component here and the assistant
+  message is not even rewritable. That forgoes the paper's `str_replace_editor` redundancy case
+  (~25% of trajectory tokens) and is the main reason to expect a smaller reduction here than the
+  published 39.9%–59.7%.
+- **The prompt is written from the paper's description** of its four parts (job, format, the three
+  waste categories with the examples the paper names, and the anti-loss guidelines) rather than
+  copied from the authors' artifact. `components.Model` is one prompt in / text out, so the paper's
+  system + user + assistant-prefill + `</step>` stop sequence is folded into a single prompt and the
+  reply is parsed defensively instead (prose, code fences and a missing close tag are all tolerated;
+  an unparseable reply reduces nothing). One case is declined rather than guessed: a `<result>` block
+  whose `id` is missing or unparseable is used only when the step has a single result. On a step with
+  parallel tool calls it is dropped, because placing it at `id 0` would put one tool's compressed
+  output into another tool's message — smaller, so the never-worse check would pass it, and then
+  frozen and replayed for the rest of the session.
+
+### When it shines
+
+Long agentic coding sessions with verbose tool output — test runs, build logs, directory listings —
+where the same step is re-sent on every subsequent turn. Its `expired` category is the one signal no
+other component here computes.
+
+### When it's inert
+
+Fewer than `b + a` completed steps; a target step below `min_step_tokens`; a reduction that fails the
+apply-gate; no model available (it then replays what it already froze and reduces nothing new); or a
+trajectory whose tool outputs are all small — GAIA-shaped traffic, where the median text tool output
+is well under θ.
+
+### Run it alone
+
+The preset is `[format, agentdiet, cachesplit]` on purpose. The method's claim is what **one**
+age-targeted reflection achieves; stacking context-guru's own offloaders beside it would reduce the
+same tool outputs first, and there would be nothing left to attribute.
+
+---
+
+## cache_aware_summarizer
+
+Offload (LLM). Replaces the middle of a long transcript with one model-written summary — the same
+output shape as [`summarize`](summarize.md) — but builds the **summarization call** differently, so
+that call can reuse a prefix the backend already holds instead of paying fresh prefill for tokens
+it has already seen.
+
+Run it **alone**: it changes the message count, and `apply`'s count-change rebuild re-emits each
+retained message's original raw bytes by matching them exactly, so a message another component
+edited in place fails to match and is re-marshalled instead.
+
+### Why the call shape matters
+
+`summarize` builds a fresh prompt — a preamble plus the rendered transcript as one user message.
+That prompt shares no prefix with the conversation it describes, so the call is a cache miss on
+every token.
+
+This component sends **`[the conversation, verbatim and in order] + [one appended instruction]`**.
+The rendered prefix is the one the agent's own request produced, so a prefix-caching backend can
+charge prefill only on the appended suffix.
+
+### How far the reuse actually goes
+
+The prefix that gets hit is one the **backend** has seen, and the backend only ever receives what
+this proxy forwards. The agent keeps sending its full uncompacted history, but from the first
+triggering turn onward the backend has received **compacted** requests — so there is no
+full-history prefix upstream to match, and the shared prefix is roughly the pinned head.
+
+Two consequences, both worth measuring rather than assuming:
+
+- the saving is largest on the **first** compaction and smaller afterwards;
+- sending the full growing history as a side call can **evict** the compacted prefix the forwarded
+  request needs.
+
+Judge this component on the backend's own telemetry — `vllm:prefix_cache_hits_total`, or
+`usage.cache_read_input_tokens`, which the OpenAI client records — never on a savings percentage.
+
+### Where the instruction goes, and why it is per model
+
+The appended instruction is an **operator** instruction, so `role: system` is the correct channel
+where it exists: it is non-spoofable, and a trailing user turn on a long trajectory reads to the
+model as more trajectory and gets summarized instead of followed.
+
+But a system message at the **end** of the messages array is not universally accepted, and the
+constraint lives in two different places — on Anthropic the **server** decides, on vLLM the model's
+**chat template** decides (vLLM validates only that `role` is a string).
+
+The two failure modes are not equally visible:
+
+| | |
+|---|---|
+| **loud** | the provider returns `400 role 'system' is not supported on this model` |
+| **silent** | a template **drops** or **hoists** the message. The model continues the task, and its next turn is recorded as the summary. |
+
+`instruction_role: auto` resolves per model from
+[`summarizer_model_profiles.yaml`](https://github.com/rossoctl/context-guru/blob/main/components/offload/summarizer_model_profiles.yaml).
+That file has two parts: `system_models`, an allow-list of match strings that take the instruction as
+`role: system`, and `profiles`, a provenance record that grants nothing and only says what was
+established about each model. A pinned `instruction_role: system` for a model the allow-list does not
+name **declines** at request time and increments `cache_aware_summarizer_unverified_system`, rather
+than risking the silent case.
+
+**`system_models` is empty, so every model resolves to `user` today.** The reason is that a profile
+described a *model*, while what has to accept a trailing system message is the whole *path* to it.
+The component requires a `components.MessagesModel` and only the OpenAI-shaped client implements one,
+so every reachable deployment sends OpenAI-shaped requests — and a gateway translating those to a
+native provider API may lift a mid-array system message into that API's top-level `system` field.
+Measured against a LiteLLM gateway fronting Bedrock: `aws/claude-opus-5` with a trailing `role: system`
+returned `400 … the conversation must end with a user message` on every call (the instruction had been
+removed from `messages[]`), while the same request with `role: user` returned 200. End to end, the
+`claude-opus-5` arm compacted nothing and reported only `cache_aware_summarizer_errors`; the
+`claude-sonnet-5` arm, which resolved to `user`, cut 2228 tokens to 876.
+
+To promote a model, verify the **path** — probe through the same endpoint and credential production
+uses and confirm the instruction arrives last — then add its match string to `system_models`, or ship
+a `profiles_path` override so the promotion needs no rebuild.
+
+### The call is detached, so compaction takes two turns
+
+A summary here covers most of the transcript, so the call is large by construction and its budget is
+300 s. Running that inline would stall the triggering turn by minutes, billed against the agent's own
+timeout — `summarize_async.go` exists because that was already found too expensive on the request
+path.
+
+So the control flow is the same two-turn shape `summarize` uses: **the turn that triggers commissions
+a summary and forwards untouched; the next eligible turn finds the checkpoint and splices.** The
+detached goroutine reuses the shared flight registry and the global concurrency bound, so a saturated
+proxy sheds compaction (`cache_aware_summarizer_async_refused`) rather than queueing a call nobody is
+waiting for.
+
+Read the `async_started` / `async_committed` **pair**: started without committed is a summary that was
+paid for and lost, which no other counter would reveal.
+
+### Two gates, two different quantities
+
+`min_tokens` asks *is the span worth a call*. `max_request_tokens` asks *can we afford the call* — and
+they differ because the request carries the **whole conversation**, not the span.
+
+`max_request_tokens` is a **refusal, never a truncation**. Truncating the conversation to fit is not
+available: the appended-suffix shape is the entire mechanism, and a truncated conversation is a
+different prefix that matches nothing. An over-large session declines and says so
+(`cache_aware_summarizer_too_large`).
+
+### Reversibility and reuse
+
+`marker_mode: full` (default) stashes the replaced span through `commitMark`, so a store that
+**refuses** the payload causes the compaction to be skipped rather than leaving a `<<cg:HASH>>`
+marker pointing at nothing. `StashRoom` is checked before the model call, so a summary is not paid
+for and then thrown away.
+
+`resummarize_tokens` (default 6000) keeps a checkpoint: the spliced summary is re-emitted
+**byte-identically** on later turns until the untouched tail passes that threshold. Without it the
+forwarded prefix would change at the head on every turn and the component would invalidate the
+cache it exists to protect. The checkpoint namespace is shared with `summarize` — safe because both
+must run alone, and `CoveredHash` rejects a checkpoint whose covered prefix has changed.
+
+The model's reply is treated as **untrusted**: `sanitizeSummary` strips forged expand markers (both
+spellings), the summary sentinel and a premature `</summary>` before the text is framed as
+trustworthy earlier context. The whole trajectory reaches the summarizer, so planted text in any
+tool output gets a long run at it.
+
+### Counters at `/stats`
+
+| field | means |
+|---|---|
+| `cache_aware_summarizer_calls` | summarization passes paid for; this method's cost is per compacted turn |
+| `cache_aware_summarizer_declined` | ⭐ no `MessagesModel` was available. **A declining arm compacts nothing and is byte-identical to `off` on every other metric** — read this before believing any delta |
+| `cache_aware_summarizer_empty` | a call was paid for and returned nothing usable — the signature of a dropped or hoisted instruction |
+| `cache_aware_summarizer_unverified_system` | declined a pinned `system` role for a model no profile verifies |
+| `cache_aware_summarizer_refused_stash` | the store would not accept the span, so the compaction was skipped |
+| `cache_aware_summarizer_profile_fallbacks` | `profiles_path` was unreadable, so the embedded registry was used |
+| `cache_aware_summarizer_too_large` | declined because the outbound request would exceed `max_request_tokens` |
+| `cache_aware_summarizer_async_started` / `_committed` | the **pair** is the signal — started without committed is a summary paid for and lost |
+| `cache_aware_summarizer_timeouts` / `_errors` | fail-open paths; a timeout means the budget is too small for this load, an error means the route is wrong |
+
+### Not yet measured
+
+The prefix-cache-hit improvement this design predicts is **unverified** — there is no live run
+behind it yet. The counters and the backend telemetry above are how to establish it.
+
+See also: [Components overview](../components.md) · [extract_llm](extract_llm.md) ·
+[summarize](summarize.md) · [Choose a preset](../reference/presets.md)

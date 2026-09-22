@@ -1,13 +1,112 @@
-# cacheinject
+# Caching components
+
+Two components touch the provider's prompt cache: **cachesplit** (in every caching preset) and
+**cacheinject** (in none). Both are Reformat components whose real work happens body-level in
+`apply`, not in the pipeline's per-message rewrite.
+
+## Split is measured, placement isn't
+
+Claude Code appends a live environment snapshot to the **end** of its main system block:
+
+```
+Current branch: main
+...
+Recent commits:
+0898367954 SWE-bench
+```
+
+Measured across 50 SWE-bench tasks that block is ~7,017 tokens, of which the first
+**6,921 (98.4%)** are byte-identical across sessions — but a cache entry hashes **everything
+before** its breakpoint, and no breakpoint position can exclude part of a single content block.
+So the churning tail is one cacheable unit with its breakpoint at the end, and the shared 98.4%
+is re-written every session regardless of where a breakpoint is *placed* inside it.
+
+The tail is real content: it cannot be moved or dropped without lying to the model about the
+repo state. It can be **split** — `[stable][volatile]` as two text blocks with the same
+concatenated text, breakpoint on the first. Adjacent text blocks concatenate, so the model sees
+a byte-identical prompt while the provider gains a hash boundary that excludes the churn. This is
+what `cachesplit` enables, and it is measured: **−34.1% mean cost on one Terminal-Bench task
+measured three times**, and 0% → 96.7% cache hit in an isolated live A/B.
+
+Breakpoint **placement** (`cacheinject`) is a different question — *given* a cache boundary,
+where should the (up to 4) breakpoints go? — and it has never been shown to help: the one live
+measurement is n=1 and mildly negative, with no mechanism established. `cachesplit` and
+`cacheinject` are separate config entries because their evidence is not comparable, and keeping
+them apart is what stops disabling placement from silently disabling the split too. Every preset
+that touches caching carries `cachesplit`, never `cacheinject`.
+
+**Explicit-breakpoint providers only** (Anthropic, Bedrock, Vertex). Under an implicit
+longest-prefix cache (OpenAI, Gemini) the match already ends at the divergence, so neither
+component buys anything there.
+
+---
+
+## cachesplit
+
+!!! info "Reformat — lossless, and a marker component"
+    Enables the **volatile-tail split**: the top-level `system` array's churning tail is
+    separated from its stable head so the provider's cache boundary excludes the churn.
+    The model sees byte-identical text.
+
+`cachesplit` is in the default presets. It carries no logic of its own: the component's
+`Reformat` always reports `Skipped`, and the actual rewrite is body-level — it edits the
+top-level `system` array, which components never see — and lives in `apply/prefixsplit.go`,
+gated on this name being present in the pipeline. `apply` still honours `cacheinject` as a gate
+for the split, so an existing pipeline naming only `cacheinject` keeps working.
+
+### What the split does
+
+`[stable][volatile]` as two text blocks with the same concatenated text, breakpoint on the first.
+Adjacent text blocks concatenate, so the model sees a **byte-identical** prompt while the provider
+gains a hash boundary that excludes the churn. Asserted by `TestSplitIsConcatenationIdentical`.
+
+### What it is worth
+
+The full four-way measurement (structural target, mechanical verification, isolated live A/B,
+end-to-end agent run) is under [What the split is worth](#what-the-split-is-worth) below,
+because that is where the work was done. The headline: **−34.1% mean cost on one Terminal-Bench
+task measured three times**, and `$0.0205` saved per warm session on Sonnet 5 in the isolated A/B.
+A second Terminal-Bench task was within noise and its numbers are not quoted.
+
+### Configuration
+
+None. It is a name in the pipeline:
+
+```yaml
+pipeline: [format, dedup, failed_run, cmdfilter, cachesplit]
+```
+
+A `components.cachesplit:` block is an **error**, not a no-op. The constructor used to take
+its raw block and discard it, so a document saying `cachesplit: {ttl: 1h}` looked configured
+and was not; it now decodes strictly like every other component and refuses the block.
+
+### When it shines
+
+Anthropic-family agents whose system prompt carries a volatile tail (an environment
+snapshot, a timestamp, a git status) in front of a cache breakpoint.
+
+### When it's inert
+
+**Explicit-breakpoint providers only** (Anthropic, Bedrock, Vertex). Under an implicit
+longest-prefix cache (OpenAI, Gemini) the match already ends at the divergence, so a block
+boundary buys nothing. It is also inert when the system block has no separable volatile
+tail.
+
+Because the component itself always skips, `/stats` lists it under `top_passthrough` — that
+is expected, not dead weight. The split's saving is a provider-side cache effect, invisible
+to content-token counts.
+
+---
+
+## cacheinject
 
 !!! info "Reformat — lossless. **In no preset: opt in explicitly.**"
     Places Anthropic `cache_control` breakpoints at the positions that minimise billed input
     cost, so the provider KV cache is read rather than re-processed. Placement has never been
-    shown to help, so no shipped preset enables it — the presets carry
-    [`cachesplit`](cachesplit.md), which enables the *measured* volatile-tail split. See
-    [Configuration](#configuration).
+    shown to help, so no shipped preset enables it — the presets carry [`cachesplit`](#cachesplit),
+    which enables the *measured* volatile-tail split instead. See [Configuration](#configuration_1).
 
-## How it works
+### How it works
 
 Placement is the solution to a cost minimisation, not a heuristic. With `R = 0.1` (cache
 read), `W = 1.25` (5m cache write) and `1.0` (plain input) as multipliers on the base input
@@ -53,7 +152,7 @@ On the IBM gateway that decision is currently moot for most models: measured liv
 is granted on `aws/claude-haiku-4-5` (36,251 of 36,574 written tokens) and silently downgraded
 to 5 minutes on `aws/claude-sonnet-5` (0 of 48,212). See `apply/headttl.go`.
 
-## What placement is actually worth
+### What placement is actually worth
 
 **Effectively unmeasured, and the one live reading is mildly negative — which is why it ships
 off.** One `cacheonly` vs `off` pair on SWE-bench Verified (`aws/claude-sonnet-5`, n=1 per arm,
@@ -78,7 +177,7 @@ every position this component would choose collides with an existing breakpoint.
 earns its keep on agents that do *not* mark their own tail, and when a prefix mutates
 mid-conversation.
 
-## Simulated comparison
+### Simulated comparison
 
 A simulation over a captured 91-request SWE-bench stream, calibrated to within 2.10 pp of a
 live 50-task run's cache-hit rate. It models the billing rule credibly; it is not a measurement
@@ -93,7 +192,7 @@ of the policy.
 Placing a single breakpoint *before* the newest turn shortens the cached prefix on every turn —
 a real cost increase, and the reason the policy marks the last block instead.
 
-## The 4-breakpoint budget is computed by the host
+### The 4-breakpoint budget is computed by the host
 
 The provider caps `cache_control` at **4 across `system` + `tools` + `messages` together**, and
 a component sees none of the first two. So `apply` counts them structurally from the raw body
@@ -109,7 +208,7 @@ carry exactly `system=2, tools=0, messages=1`), leaving this component one to pl
 original raw bytes after verifying the component's only change to that message was adding
 `cache_control` keys. Any wider change is discarded and counted in `discarded_changes`.
 
-## Lossiness
+### Lossiness
 
 None. It attaches cache directives only; model-visible content is unchanged, asserted by
 comparing model-visible text byte-for-byte across all 91 captured requests.
@@ -118,7 +217,7 @@ Messages whose content is a bare string cannot carry a block-level directive; th
 rather than restructured, and the breakpoint falls back to the nearest markable block below so
 the prefix is still written.
 
-## Configuration
+### Configuration
 
 ```yaml
 components:
@@ -130,50 +229,21 @@ components:
 
 `cacheinject` is in **no** preset: placement has never been shown to help, and shipping it on
 by default would enable an unmeasured policy on every request. The presets carry
-[`cachesplit`](cachesplit.md) instead, which enables the volatile-tail split — the measured
+[`cachesplit`](#cachesplit) instead, which enables the volatile-tail split — the measured
 part — without the placement. Add `cacheinject` by hand to run the placement study, or when
 your agent does not set its own `cache_control`.
 
-## When it's inert
+### When it's inert
 
 On OpenAI- and Gemini-shaped wires, where `cache_control` does not exist at all. Also when four
 breakpoints are already present anywhere in the request (including `system` and `tools`), and on
 string-content messages.
 
-## The volatile-tail split
+## What the split is worth
 
-Enabling **`cachesplit`** (or `cacheinject`) switches on a body-level repair in
-`apply/prefixsplit.go` that no breakpoint placement can achieve, because a cache entry hashes
-*everything before* its breakpoint and no position can exclude part of a single block. This is
-the mechanism the default presets keep, and it is the one with strong evidence.
-
-Claude Code appends a live environment snapshot to the **end** of its main system block:
-
-```
-Current branch: main
-...
-Recent commits:
-0898367954 SWE-bench
-```
-
-Across 50 SWE-bench tasks that block is ~7,017 tokens, of which the first **6,921 (98.4%)** are
-byte-identical across sessions — but it is one cacheable unit with its breakpoint at the end, so
-the hash covers the churning tail and the shared 98.4% is re-written every session.
-
-The tail is real content and cannot be dropped without lying to the model about the repo state.
-It can be **split**: `[stable][volatile]` as two text blocks with the same concatenated text,
-breakpoint on the first. Adjacent text blocks concatenate, so the model sees a byte-identical
-prompt while the provider gains a hash boundary that excludes the churn.
-
-**Explicit-breakpoint providers only** (the Anthropic family). Under an implicit longest-prefix
-cache (OpenAI, Gemini) the match already ends at the divergence, so a block boundary buys
-nothing.
-
-### What the split is worth
-
-**Is there a target?** Across 50 real Claude Code sessions the stable half of that block takes
-**1** distinct value while the volatile tail takes **50** — so without the split, the hash
-covers a value unique to each session and the 6,877-token stable half can never be read from
+**Is there a target?** Across 50 real Claude Code sessions the stable half of the volatile-tail
+block takes **1** distinct value while the volatile tail takes **50** — so without the split, the
+hash covers a value unique to each session and the 6,877-token stable half can never be read from
 another session's cache.
 
 **Does the provider actually cache it?** Two sessions differing only in the git snapshot, same
@@ -210,5 +280,4 @@ Treat 34.1% as one task measured three times, not a fleet average: a second Term
 was within noise, its numbers are not quoted, and all figures are Sonnet 5 rates on one
 benchmark. Placement contributes **$0** of it — every dollar above is the split.
 
-See also: [Components overview](../components.md) ·
-[Choose a preset](../how-to/choose-a-preset.md)
+See also: [Components overview](../components.md) · [Choose a preset](../reference/presets.md)
