@@ -77,28 +77,24 @@ flowchart TD
 Change what it does:
 
 ```
-/plugin configure   # context-guru → Preset → housellm          opt into context editing
-/plugin configure   # context-guru → Cache strategy → none      stop the keep-alive pings
-/context-guru:cache-strategy-picker   # names each strategy and what it costs
+/context-guru:preset-picker            # → house      opt into context editing
+/context-guru:cache-strategy-picker    # → none        stop the keep-alive pings
 /context-guru:status                  # what is running, and what it saved (reads /stats)
 /context-guru:uninstall               # undo the routing, restoring any base URL it replaced
 ```
 
-**`/context-guru:status` is the one command for this — it takes no parameters.** There is no
-separate `/stats` slash command: `/stats` is the proxy's own HTTP endpoint, and `/context-guru:status`
-is what curls it (on the plugin's port, `8787` by default) and reports it back to you in Claude
-Code. Hit the endpoint directly only if you want the raw JSON instead:
-
-```sh
-curl -s localhost:8787/stats | jq                 # same endpoint /context-guru:status reads
-```
+**`/context-guru:status` is the one command for this.** There is no separate `/stats` slash
+command: `/stats` is the proxy's own HTTP endpoint, and `/context-guru:status` is what curls it
+(on the plugin's port, `8787` by default) and reports it back to you in Claude Code, interpreted.
+Want the raw JSON instead of the reading of it? `/context-guru:status --stats` prints the same
+endpoint verbatim — no separate curl needed.
 
 A changed option takes effect on your **next session**: the session hook stops the running proxy and
 starts it with the new configuration.
 
 | Option | Default | What it does |
 |---|---|---|
-| `preset` | `off` | What happens to the request body. `off` leaves it untouched; `house`/`housellm` start trimming and summarizing it. |
+| `preset` | `off` | What happens to the request body. `off` leaves it untouched; `house`/`housellm` start trimming and summarizing it. `/context-guru:preset-picker` explains each one and switches between them. |
 | `cache_strategy` | `5-min-ping` | Keep-alive. On by default, it pings your idle session so the cache doesn't go cold — spending a little of your own quota to do it. `none` turns that off; `1-hour-head` asks the provider for a longer-lived cache instead. |
 | `port` | `8787` | Port the proxy listens on. |
 | `idle_exit` | `24h` | Exit after this long with no requests. |

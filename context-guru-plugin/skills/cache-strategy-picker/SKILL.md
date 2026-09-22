@@ -71,7 +71,7 @@ actually paid for themselves, not just that they fired.
 |---|---|---|
 | `none` | no keep-alive pings, nothing extra happens | free |
 | `5-min-ping` | pings the cache now and then so it doesn't go cold while you're away | spends a little of your own credential between turns |
-| `1-hour-head` | asks the provider for a longer-lived cache instead of pinging | free, but on today's models it usually buys nothing — see below |
+| `1-hour-head` | asks the provider for a longer-lived cache instead of pinging, only on prefixes >=50k tokens | free, but on today's models it usually buys nothing — see below |
 
 **Say the cost before switching TO `5-min-ping`, once, in one line.** It spends the caller's money
 (or usage-limit budget) while nobody is at the keyboard, and it applies to every session routed

@@ -35,11 +35,11 @@ for an answer.
 Add the rule before you start, via `/permissions`, or in a settings file directly:
 
 1. Run `/permissions` and select **add a new rule**.
-2. Paste the rule below **alone** — not as a JSON object — replacing `you` with your own username
+2. Paste the rule below **alone** — not as a JSON object — replacing `{you}` with your own username
    (or the absolute path `/context-guru:install` prints, if you are unsure):
 
    ```
-   Bash(/Users/you/.claude/plugins/cache/context-guru/**)
+   Bash(/Users/{you}/.claude/plugins/cache/context-guru/**)
    ```
 
 3. When asked **"Where should this rule be saved?"**, pick **Project settings (local)** —
@@ -133,12 +133,15 @@ and a user-scope plugin does not route anything until you ask it to.
 ### `/plugin configure` — five options, all with working defaults
 
 You can open it, press **Save configuration**, and change nothing. Only one of these usually needs
-setting, and only in one situation.
+setting, and only in one situation. The Preset and Cache strategy rows below have their own
+pickers — `/context-guru:preset-picker` and `/context-guru:cache-strategy-picker` — because the
+raw configure form is a blank options grid with no explanation of what each choice does; use
+those instead of `/plugin configure` for the two rows that need judgment.
 
 | Option | Default | Change it when |
 |---|---|---|
 | **Proxy port** | `8787` | something already holds 8787. Deliberately not 4000, which collides with litellm |
-| **Preset** | `off` | you want it to actually edit your context. `off` just forwards requests untouched; `house`/`codesmart` trim tool output; `housellm` also uses a cheap model to compact |
+| **Preset** | `off` | you want it to actually edit your context. `off` just forwards requests untouched; `house`/`codesmart` trim tool output; `housellm` also uses a cheap model to compact. `/context-guru:preset-picker` explains each one and switches between them |
 | **Cache strategy** | `5-min-ping` | you don't want keep-alive. By default it pings your session every few minutes so the cache never goes cold — using a little of your own quota to do it. `none` turns that off. `/context-guru:cache-strategy-picker` explains each option and whether it's paying for itself on `keepalive_net_usd` |
 | **Idle exit** | `24h` | rarely. The floor is `max(2 × store.ttl_seconds, 1h)`; below it the proxy refuses to start rather than silently discarding cache state |
 | **Upstream base URL** | *(empty)* | **something else is already the gateway** — see below |
