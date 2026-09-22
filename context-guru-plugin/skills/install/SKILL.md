@@ -35,10 +35,7 @@ a numbered paragraph somebody can read differently.
 If `cache_strategy=5-min-ping` (the default), one more clause: keep-alive is on, so it spends a little
 of their own quota on idle turns to hold the cache warm, and `/context-guru:cache-strategy-picker`
 names the alternatives and what each costs. Do not recommend one — they differ in what they spend, and
-that is the user's call.
-
-One more, always: a terminal status line showing savings goes on too, at user scope — it only reads,
-never pings, and renders nothing in an unrouted project. `--no-statusline` skips it; `/context-guru:statusline off` any time after does the same.
+that is the user's call. Always, one more: a read-only status line goes on too, at user scope (`--no-statusline` skips it, `/context-guru:statusline off` undoes it after).
 
 Fuller detail is in `docs/how-to/install-plugin.md`. Point at it; do not recite it.
 
@@ -160,9 +157,7 @@ not reword the command to look like less than it is, and never write routing whi
   they spend the user's quota.
 - `strategy_warning=` — the strategy could not be written even though the name was valid (usually a
   config at that path we did not write). The proxy is fine; mention it and move on.
-- `statusline=on` — the status line was also installed, at user scope, in the same run. `skipped`
-  means it wasn't (a conflict with something already at that key, or `--no-statusline` was passed)
-  — not a failure of the install itself; `statusline_reason=` says why if you need it.
+- `statusline=on` — also installed; mention it once. `skipped` is not an install failure.
 
 ## 4. Then tell them
 
@@ -175,8 +170,6 @@ not reword the command to look like less than it is, and never write routing whi
 - If `port` is not 8787, say so; a non-default port is the kind of thing people forget they set.
 - `/context-guru:status` for numbers, `/context-guru:cache-strategy-picker` to change the strategy,
   `/context-guru:uninstall` to undo.
-- If `statusline=on`, mention it once: a status line showing savings just started showing up (new
-  session to see it) — `/context-guru:statusline` explains it and turns it off if unwanted.
 - **`reset_hatch=` verbatim, on its own line, as your last line.** This is the only moment the user
   is certain to be able to read it: the failure it exists for is "every request through the proxy
   fails", and in that state no skill can run — including uninstall. It happened to a colleague.

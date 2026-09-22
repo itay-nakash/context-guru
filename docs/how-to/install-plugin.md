@@ -151,7 +151,7 @@ install this is required, since that's how the platform gateway keeps authentica
 
 ## Troubleshooting
 
-**Every request fails or hangs, and `/context-guru:uninstall` can't run.** Run the recovery script,
+**Every request fails or hangs, and `/context-guru:uninstall` cannot run.** Run the recovery script,
 which needs no working Claude session:
 
 ```bash
