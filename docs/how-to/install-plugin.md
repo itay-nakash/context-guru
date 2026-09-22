@@ -352,6 +352,7 @@ repo. That is correct behaviour, but it means "clone and go" is really "clone, a
 - `/context-guru:status` — is it routed, is it up, and what has it saved. Reads `/stats`, including
   its `savings.{current,live,all}` block (with `--dashboard` on) — the same reconciled
   `keepalive_net_usd`/`total_saved_usd` the dashboard shows, without opening it.
+  `/context-guru:status --stats` skips the narration and prints the raw `/stats` JSON verbatim.
 - Dashboard: `http://127.0.0.1:8787/dashboard/`. The four billed token tiers are where the cache
   effect shows: tokens moving out of the premium cache-**creation** tier into the discounted
   cache-**read** tier. Its database lives in `~/.local/state/context-guru/`, deliberately not in
