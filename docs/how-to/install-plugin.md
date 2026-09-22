@@ -492,6 +492,29 @@ from. It says so, prints the three files worth checking, greps each for the keys
 timestamped backups beside them — rather than reporting "nothing to do" to somebody whose sessions
 are down. Exit status is 3: finished, with something left for a human.
 
+## Upgrading
+
+There are two different things to upgrade, and they move independently.
+
+**The plugin** (skills, hooks, scripts) updates the way any Claude Code marketplace plugin does.
+Claude Code checks the marketplace in the background after a session starts and, if something
+changed, prompts you to run `/reload-plugins` — or check on demand:
+
+```
+/plugin marketplace update rossoctl/context-guru
+/reload-plugins
+```
+
+Update detection is driven entirely by the `version` field in the plugin's `plugin.json` — an
+unchanged version means Claude Code never notices there is anything new, regardless of how much
+code actually changed. To keep that from going stale, this repo's release workflow bumps the
+plugin's version to match every proxy release automatically (a PR, not a silent push), so a proxy
+release is always also something your installed plugin gets prompted to update to.
+
+**The proxy binary** is the other half, and it upgrades separately: `/context-guru:install`
+reports what is installed and does not replace it. To move to a newer release, run the installer
+with `CONTEXT_GURU_UPGRADE=1`, or pin one with `CONTEXT_GURU_VERSION=vX.Y.Z`.
+
 ## Troubleshooting
 
 **Every request fails or hangs, and `/context-guru:uninstall` cannot run.** Run this:
@@ -516,9 +539,7 @@ cannot, start the proxy by hand
 (`context-guru-proxy --listen 127.0.0.1:8787 --preset cache`) or remove
 `env.ANTHROPIC_BASE_URL` from `.claude/settings.local.json` to get working immediately.
 
-**Upgrading.** `/context-guru:install` reports what is installed and does not replace it. To move to
-a newer release, run the installer with `CONTEXT_GURU_UPGRADE=1`, or pin one with
-`CONTEXT_GURU_VERSION=vX.Y.Z`.
+**Upgrading the plugin or the proxy binary.** See [Upgrading](#upgrading) above.
 
 **Requests fail with a connection error.** The proxy is not running and this project is routed.
 `/context-guru:status` will say so; the log is `${TMPDIR:-/tmp}/context-guru-proxy-<port>.log`.
