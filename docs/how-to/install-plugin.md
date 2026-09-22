@@ -32,15 +32,25 @@ With the rule in place, the same session read the plan and presented the chain/r
 generated from it, naming the existing gateway and what happens to it, and wrote nothing while waiting
 for an answer.
 
-Add the rule before you start, via `/permissions` (paste the rule **alone**, not a JSON object) or in a
-settings file:
+Add the rule before you start, via `/permissions`, or in a settings file directly:
 
-```
-Bash(/absolute/path/to/.claude/plugins/cache/context-guru/**)
-```
+1. Run `/permissions` and select **add a new rule**.
+2. Paste the rule below **alone** — not as a JSON object — replacing `you` with your own username
+   (or the absolute path `/context-guru:install` prints, if you are unsure):
 
-Use the absolute path — `~` is not expanded in permission rules — and take the path from what
-`/context-guru:install` prints if you are unsure. One rule covers every command the plugin runs.
+   ```
+   Bash(/Users/you/.claude/plugins/cache/context-guru/**)
+   ```
+
+3. When asked **"Where should this rule be saved?"**, pick **Project settings (local)** —
+   `.claude/settings.local.json`, gitignored, this repo only:
+
+   ```
+   ❯ 1. Project settings (local)
+   ```
+
+Use the absolute path — `~` is not expanded in permission rules. One rule covers every command the
+plugin runs.
 
 **Why it is needed at all is worth understanding rather than pasting past.** Starting the proxy, and
 writing the routing key, are the two steps that put your model traffic — and the credential that travels
@@ -101,17 +111,19 @@ with the most specific file winning.
 | Install for all collaborators (project scope) | `<repo>/.claude/settings.json` | **everyone who clones the repo** — this file is committed |
 | Install for you, in this repo only (local scope) | `<repo>/.claude/settings.local.json` | you, this repo only — gitignored |
 
-**User scope** is what the rest of this page assumes: install once, then decide routing per repo.
-The trade is that both hooks and ~225 always-on tokens apply to every session you start anywhere.
-That is why the hooks self-gate on `ANTHROPIC_BASE_URL` naming their own port — in a project you
-never routed they exit immediately and print nothing.
+**Local scope is the recommended pick, especially the first time.** One repo, gitignored, nothing
+left in your user configuration afterwards, and no committed file for anyone else to inherit. If
+you decide you want it everywhere, move to user scope later — there is no migration step, `/plugin
+install` again with a different scope answer is the whole of it.
+
+**User scope** is what the rest of this page assumes once you are past evaluating: install once,
+then decide routing per repo. The trade is that both hooks and ~225 always-on tokens apply to every
+session you start anywhere. That is why the hooks self-gate on `ANTHROPIC_BASE_URL` naming their own
+port — in a project you never routed they exit immediately and print nothing.
 
 **Project scope commits a proxy plugin to a shared repository.** Everyone who clones then gets a
 `SessionStart` hook that launches a local proxy and a `UserPromptSubmit` hook that runs before every
 prompt. That is a team decision, not a personal one; do not pick it on someone else's behalf.
-
-**Local scope** is the cleanest way to evaluate: one repo, gitignored, nothing left in your user
-configuration afterwards.
 
 **This is not the same question as the routing scope**, which `/context-guru:install` asks separately
 and which decides *which sessions go through the proxy* ([table below](#which-file-the-routing-goes-in)).
@@ -340,6 +352,7 @@ repo. That is correct behaviour, but it means "clone and go" is really "clone, a
 - `/context-guru:status` — is it routed, is it up, and what has it saved. Reads `/stats`, including
   its `savings.{current,live,all}` block (with `--dashboard` on) — the same reconciled
   `keepalive_net_usd`/`total_saved_usd` the dashboard shows, without opening it.
+  `/context-guru:status --stats` skips the narration and prints the raw `/stats` JSON verbatim.
 - Dashboard: `http://127.0.0.1:8787/dashboard/`. The four billed token tiers are where the cache
   effect shows: tokens moving out of the premium cache-**creation** tier into the discounted
   cache-**read** tier. Its database lives in `~/.local/state/context-guru/`, deliberately not in

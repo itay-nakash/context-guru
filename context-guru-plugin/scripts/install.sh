@@ -304,10 +304,13 @@ route_consent_question() {
       q="$q, REPLACING $R_EXISTING (recorded, and /context-guru:uninstall puts it back)"
     fi
   fi
-  # Named whenever it is not the endpoint just described as kept, so the sentence always says where
-  # traffic actually goes next.
+  # Always says where traffic actually goes next, even when that is "nowhere configured" - an
+  # empty upstream is silent about the fact that it means api.anthropic.com, and that silence is
+  # exactly what read as "still uses $R_EXISTING for outbound" to a human comparing the two options.
   if [ -n "$up" ] && [ "$up" != "$R_EXISTING" ]; then
     q="$q, forwarding on to $up as the upstream so it handles auth"
+  elif [ -z "$up" ]; then
+    q="$q, forwarding straight to api.anthropic.com"
   fi
   if [ "$R_MODE" = attach ]; then
     q="$q (attach mode: nothing is started, the URL is assumed to be already serving)"
