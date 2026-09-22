@@ -1555,7 +1555,7 @@ function renderTiles(o) {
       costNote(o, num(o.prefix_change_requests_all) + ' turns re-billed · not netted'),
       o.prefix_change_cost_all_usd > 0 ? 'bad' : ''),
     tile('requests', 'Requests', num(o.requests), num(o.sessions) + ' sessions'),
-  ], 'headline'));
+  ], 'headline dense'));
 
   // Count up to the headline dollar/token figures instead of painting them already
   // settled — pure polish, skipped entirely for anyone who asked the OS not to animate.
@@ -2110,6 +2110,9 @@ async function loadOverview(opts = {}) {
       complete: 'exact (all four tiers)', partial: 'estimated', missing: 'unmeasured',
     }, 'Fills in from the first captured request: every row is counted as exact, estimated or unmeasured.');
     renderSeries(s.buckets || []);
+    // Kept for renderOverviewBrief's latency-trend sentence, computed once loadUserInsights
+    // (below) resolves — no separate fetch, this is the same series /api/series just returned.
+    state.overviewBuckets = s.buckets || [];
     paintFreshness();
     // Not awaited: its own request, on its own failure path, so a slow or failed
     // keep-alive ledger never delays or blanks the rest of Overview.
@@ -2232,19 +2235,130 @@ async function loadValueBreakdown() {
  */
 async function loadUserInsights() {
   try {
-    const [sessions, report] = await Promise.all([
+    const [sessions, report, kv] = await Promise.all([
       api('sessions', { limit: 500 }),
       api('tools'),
+      api('kvcache'),
     ]);
     renderLatencyPanel(sessions);
     renderSessionUsagePanel(sessions);
     renderInventoryPanel(report);
+    renderCachingInsights(kv);
+    renderOverviewBrief(sessions, report);
   } catch (e) {
     if (aborted(e)) return;
-    for (const id of ['#latency-panel', '#inventory-panel', '#session-usage-panel']) {
+    for (const id of ['#latency-panel', '#inventory-panel', '#session-usage-panel', '#caching-insights-panel', '#overview-brief']) {
       const p = $(id);
       if (p) p.hidden = true;
     }
+  }
+}
+
+/**
+ * renderOverviewBrief is the "here's what happened" lead: up to four sentences, each with a
+ * real number inline, synthesized from data this page has already fetched. No arithmetic
+ * happens on anything NOT already computed by the backend, and each sentence is independently
+ * gated — a claim with insufficient support (too little history, nothing recorded yet) is
+ * omitted rather than hedged, per the same rule the rest of Overview already follows
+ * (Denominator.available, KeepAliveCoverage.recorded_from).
+ */
+function renderOverviewBrief(sessions, report) {
+  const host = $('#overview-brief');
+  if (!host) return;
+  const o = state.overview;
+  const rows = (sessions && sessions.sessions) || [];
+  const items = report ? [...(report.tools || []), ...(report.skills && report.skills.skills || [])] : [];
+  const out = [];
+
+  // Keep-alive's share of total savings — only once the ledger has actually run
+  // (keepalive_pings mirrors KeepAliveCoverage.recorded_from on Overview itself) and there is
+  // a positive total to take a share of.
+  if (o && o.keepalive_pings > 0 && o.total_saved_usd > 0) {
+    const share = pct((100 * o.keepalive_net_usd) / o.total_saved_usd, 0);
+    out.push([o.keepalive_net_usd < 0 ? 'warn' : 'good', usd(o.keepalive_net_usd), 'from keep-alive',
+      o.keepalive_net_usd < 0
+        ? `Keep-alive cost you ${usd(-o.keepalive_net_usd)} net this window — its pings outspent what they avoided.`
+        : `Keep-alive drove ${usd(o.keepalive_net_usd)} of this window's ${usd(o.total_saved_usd)} in savings — ${share} of the total.`]);
+  }
+
+  // Unused MCP servers/skills — only once the inventory read is actually captured.
+  if (report && report.coverage && report.coverage.captured && items.length) {
+    const unused = items.filter((t) => t.sessions_used === 0);
+    if (unused.length) {
+      out.push(['warn', `${unused.length} of ${items.length}`, 'unused',
+        `${unused.length} of your ${items.length} tools & skills haven't been called in this window` +
+        (unused.length <= 3 ? ` — ${unused.map((t) => t.name).join(', ')}.` : '.')]);
+    }
+  }
+
+  // Latency trend — only with enough daily history to say anything about a trend at all
+  // (5, the same minimum this codebase already uses for kvSuggestMinRequests-style gates).
+  const buckets = (state.overviewBuckets || []).filter((b) => b.cg_latency_ms_avg > 0);
+  if (buckets.length >= 5) {
+    const half = Math.floor(buckets.length / 2);
+    const first = buckets.slice(0, half).reduce((a, b) => a + b.cg_latency_ms_avg, 0) / half;
+    const second = buckets.slice(half).reduce((a, b) => a + b.cg_latency_ms_avg, 0) / (buckets.length - half);
+    if (first > 0) {
+      const delta = pct((100 * (second - first)) / first, 0);
+      const dropped = second < first;
+      out.push([dropped ? 'good' : 'warn', (dropped ? '−' : '+') + Math.abs(parseFloat(delta)) + '%', 'latency',
+        `Average latency ${dropped ? 'dropped' : 'rose'} ${Math.abs(parseFloat(delta))}% ` +
+        `(${ms(first)} → ${ms(second)}) over this window.`]);
+    }
+  }
+
+  // Multi- vs single-turn share — only once there is at least one sampled session.
+  if (rows.length) {
+    const used = rows.filter((s) => s.turns > 1).length;
+    const share = pct((100 * used) / rows.length, 0);
+    out.push(['neutral', share, 'multi-turn',
+      `${share} of your sessions are multi-turn (a follow-up, not just one message) — ` +
+      `keep-alive and summarization earn their keep on exactly these.`]);
+  }
+
+  clear(host);
+  if (!out.length) { host.hidden = true; return; }
+  host.hidden = false;
+  for (const [tone, num_, , sentence] of out.slice(0, 4)) {
+    host.appendChild(el('div', { class: 'insight-row ' + tone },
+      el('div', { class: 'num' }, num_),
+      el('p', { text: sentence })));
+  }
+}
+
+/**
+ * renderCachingInsights keeps keep-alive's own $ apart from cache-reuse behaviour in general —
+ * a dollar saved by not letting the cache lapse is a different lever than the cache simply
+ * being hit — reusing GET /api/kvcache (KVCacheAnalysis, the same read the KV-cache tab itself
+ * analyses) and the keepalive_* fields already on /api/stats. No arithmetic beyond what those
+ * two reads already computed.
+ */
+function renderCachingInsights(kv) {
+  const panel = $('#caching-insights-panel');
+  if (!panel) return;
+  const o = state.overview;
+  const cards = kv && kv.cards;
+  const coverage = kv && kv.coverage;
+  if (!cards || !cards.requests) { panel.hidden = true; return; }
+  panel.hidden = false;
+  const host = clear($('#caching-insights-tiles'));
+  const stat = (k, v, s, cls) => el('div', { class: 'stat' },
+    el('div', { class: 'k' }, k), el('div', { class: 'v ' + (cls || '') }, v),
+    s ? el('div', { class: 's' }, s) : null);
+  host.appendChild(stat('Cache-reuse rate', pct(cards.hit_rate_pct, 0), num(cards.hits) + ' of ' + num(cards.requests) + ' requests', 'good'));
+  host.appendChild(stat('Reused within 1h', pct(cards.within_1h_pct, 0), num(cards.within_1h) + ' of ' + num(cards.with_next) + ' with a follow-up'));
+  if (coverage) {
+    host.appendChild(stat('TTL known from config', num(coverage.ttl_configured),
+      'vs. ' + num(coverage.ttl_observed) + ' observed, ' + num(coverage.ttl_unknown) + ' unknown'));
+    host.appendChild(stat('Single-shot conversations', num(coverage.single_request_conversations),
+      'of ' + num(cards.conversations) + ' — no reuse was possible'));
+  }
+  // Keep-alive's own $, deliberately separate from the cache-reuse figures above: this is
+  // the mechanism that PREVENTS a lapse, not the reuse that happens anyway inside a TTL.
+  if (o && o.keepalive_pings > 0) {
+    host.appendChild(stat('Keep-alive $ saved', usd(o.keepalive_net_usd),
+      num(o.keepalive_pings) + ' pings · ' + usd(o.keepalive_ping_usd) + ' spent — kept apart from the savings above',
+      o.keepalive_net_usd < 0 ? 'bad' : 'good'));
   }
 }
 
@@ -2264,7 +2378,7 @@ function renderLatencyPanel(sessions) {
   clear($('#latency-tiles')).appendChild(tileGroup(null, null, [
     tile('latency-latest', 'Latest session', ms(latest.cg_latency_ms_avg), 'most recent session’s own average'),
     tile('latency-window-avg', 'Average, this window', ms(o.cg_latency_ms_avg), num(o.requests) + ' requests'),
-  ], 'headline'));
+  ], 'headline dense'));
 }
 
 /**
@@ -2292,7 +2406,7 @@ function renderSessionUsagePanel(sessions) {
     tile('sessions-total', 'Sessions', num(total)),
     tile('sessions-used', 'Multi-turn (engaged)', num(used), pct(rows.length ? (100 * used) / rows.length : 0, 0) + ' of sampled', 'good'),
     tile('sessions-single', 'Single-turn only', num(rows.length - used), 'one message, no follow-up'),
-  ]));
+  ], 'dense'));
   const note = $('#session-usage-note');
   note.textContent = 'A session that never sent a message never reaches context-guru at all, so '
     + '“opened but never used” cannot be measured here — this compares single-turn '
@@ -2318,7 +2432,7 @@ function renderInventoryPanel(rep) {
     tile('inv-skills', 'Skills', num(rep.skills ? rep.skills.declared : 0)),
     tile('inv-unused-usd', 'Spent carrying unused ones', rep.totals && rep.totals.priced ? usd(rep.totals.unused_usd) : 'unknown',
       'this window', rep.totals && rep.totals.unused_usd > 0 ? 'bad' : ''),
-  ]));
+  ], 'dense'));
   const host = clear($('#recommendations'));
   if (!items.length) return;
   // Strongest removal case: never invoked, ranked by what it costs to keep carrying.
@@ -5443,10 +5557,10 @@ function go(view, push = true) {
   if (!Object.prototype.hasOwnProperty.call(loaders, view)) view = 'overview';
   // A view whose tab this account is not entitled to is not reachable by typing its
   // hash either: its loader would 401/403 and paint an error nobody can act on. That
-  // covers a LOCKED tab as well as a hidden one — the lock says "not with this sign-in",
-  // and a 403 is not a better way to say it.
+  // covers a LOCKED tab as well as a hidden one, and — for a manager-only view never
+  // revealed from its <template> (see revealManagerTemplates) — a MISSING one too.
   const tab = navTab(view);
-  if (tab && !reachable(tab)) view = 'overview';
+  if (!tab || !reachable(tab)) view = 'overview';
   state.view = view;
   state.group = GROUP_OF.get(view) || 'overview';
   syncNav();
@@ -6015,7 +6129,8 @@ function init() {
   // Only the components table. Sessions and Requests are LIMIT 25 / LIMIT 50 server-side, so
   // a client-side sort there would sort ONE PAGE under a header that looks global — see
   // sortRows and docs/dashboard.md. They stay unsorted until ?sort=/?dir= reach the SQL.
-  sortable('[data-testid=components-table]', COMPONENT_SORT);
+  // Components is manager-only and its markup is now a <template> until revealed, so this
+  // is wired from wireManagerView instead of here — see revealManagerTemplates.
   $('#f-dim').addEventListener('change', (ev) => { state.dim = ev.currentTarget.value; loadUsage(); });
   // Debounced, and Enter commits immediately rather than waiting out the delay. The
   // pending timer is dropped on submit so the same query is not sent twice.
@@ -6037,7 +6152,8 @@ function init() {
   });
   $('#sess-prev').addEventListener('click', () => { state.sessOffset = Math.max(0, state.sessOffset - 25); loadSessions(); });
   $('#sess-next').addEventListener('click', () => { state.sessOffset += 25; loadSessions(); });
-  $('#bench-refresh').addEventListener('click', rescanBenchmarks);
+  // Benchmarks is manager-only and its markup is now a <template> until revealed, so
+  // #bench-refresh is wired from wireManagerView instead of here — see revealManagerTemplates.
   $('#drawer-close').addEventListener('click', closeDrawer);
   // Forward wrap: reaching the sentinel means the last real stop is behind us.
   $('#drawer-end').addEventListener('focus', () => { $('#drawer-close').focus(); });
@@ -6491,8 +6607,19 @@ function showGate(show) {
   syncNav();
 }
 
-/** Reflect who is signed in, and which tabs that entitles them to. */
-function applyAccount() {
+/**
+ * Reflect who is signed in, and which tabs that entitles them to.
+ *
+ * async, and a caller that is about to navigate — probeAccount, on the very first load —
+ * awaits it. Without that, the old <script defer> tag guaranteed campaigns.js ran (and had
+ * mounted its own #tab-campaigns) before applyURL() ever could; this function now fetches
+ * that script itself, on demand, so it has to await that fetch BEFORE the [data-manager]
+ * hidden-toggle loop below — otherwise a manager who deep-links or refreshes on
+ * #/savings/campaigns would hit go('campaigns') while #tab-campaigns either does not exist
+ * yet or exists but was never unhidden (mountTab mounts it hidden on purpose; see its own
+ * comment), and get silently bounced to Overview.
+ */
+async function applyAccount() {
   const t = account.tenant;
   $('#whoami').hidden = !t;
   $('#signout').hidden = !t;
@@ -6501,6 +6628,15 @@ function applyAccount() {
     $('#whoami').title = t.role === 'manager' ? 'Manager' : 'User';
   }
   for (const el of $$('[data-account]')) el.hidden = !account.hosted || !t;
+  // Build the manager-only tab/panel DOM (and fetch campaigns.js) only once the role that
+  // entitles a viewer to them is actually known — see revealManagerTemplates and
+  // maybeLoadManagerScript. A plain hosted account must never have this markup exist at
+  // all, not just be CSS-hidden.
+  revealManagerTemplates();
+  // Awaited before the loop below runs: campaigns.js's own mountTab call (which creates
+  // #tab-campaigns, initially hidden) has to have already happened, or this loop would
+  // run over a tab that does not exist yet and never get a second pass to unhide it.
+  await maybeLoadManagerScript();
   // data-manager is "hosted managers only". data-local-ok marks the ones that are also
   // fine on a single-tenant proxy, where there is no principal and nothing to scope:
   // /api/benchmarks is manager-gated in hosted mode but open locally, and hiding the tab
@@ -6520,6 +6656,50 @@ function applyAccount() {
   loadTenantOptions();
 }
 function isManager() { return !!(account.tenant && account.tenant.role === 'manager'); }
+
+// Manager-only tab + panel pairs that ship in index.html as inert <template>s (never part
+// of the live DOM, so a plain hosted account's browser never builds them) rather than as
+// hidden elements. `localOk` mirrors data-local-ok: true for the views a single-tenant
+// proxy — which has no principal to protect — may use even signed out.
+const MANAGER_ONLY_VIEWS = [
+  ['config', true], ['benchmarks', true], ['components', true],
+  ['strategies', false], ['tenants', false],
+];
+/** Clone each manager-only template into the live DOM once its viewer is entitled to it. */
+function revealManagerTemplates() {
+  for (const [view, localOk] of MANAGER_ONLY_VIEWS) {
+    if (!(account.hosted ? isManager() : localOk)) continue;
+    const tabTpl = document.getElementById('tpl-tab-' + view);
+    const panelTpl = document.getElementById('tpl-view-' + view);
+    if (!tabTpl && !panelTpl) continue; // already revealed by an earlier call
+    if (tabTpl) tabTpl.replaceWith(tabTpl.content);
+    if (panelTpl) panelTpl.replaceWith(panelTpl.content);
+    wireManagerView(view);
+  }
+}
+// Each view's init()-time-only bindings (sort headers, one-off click/change listeners),
+// deferred here because their targets did not exist in the DOM until just now.
+function wireManagerView(view) {
+  if (view === 'components') sortable('[data-testid=components-table]', COMPONENT_SORT);
+  else if (view === 'benchmarks') $('#bench-refresh').addEventListener('click', rescanBenchmarks);
+  else if (view === 'tenants') $('#ab-range').addEventListener('change', loadVariants);
+}
+// campaigns.js is manager-only (see its own header) with no local-ok exemption, so it is
+// not even <script>-tagged in index.html — fetching it at all would let a plain account's
+// network tab see a manager-only feature's code. Load it the one time a hosted manager
+// signs in, and resolve only once it has actually run — see applyAccount's own comment on
+// why a caller that is about to navigate needs to await this.
+let campaignsScriptPromise = null;
+function maybeLoadManagerScript() {
+  if (!(account.hosted && isManager())) return Promise.resolve();
+  if (!campaignsScriptPromise) {
+    campaignsScriptPromise = new Promise((resolve) => {
+      const s = el('script', { src: 'campaigns.js', onload: resolve, onerror: resolve });
+      document.body.appendChild(s);
+    });
+  }
+  return campaignsScriptPromise;
+}
 
 /**
  * loadTenantOptions fills the manager's scope select from the roster. Once per session: the
@@ -6570,7 +6750,10 @@ async function probeAccount() {
     account.tenant = null;
     showGate(false);
   }
-  applyAccount();
+  // Awaited: init()'s caller navigates (applyURL -> go) right after this resolves, and a
+  // manager deep-linked or refreshed on a campaigns.js view needs loaders.campaigns to
+  // already be registered before that happens — see applyAccount's own comment.
+  await applyAccount();
   return account.hosted && !!account.tenant;
 }
 
@@ -8805,8 +8988,9 @@ function initAccounts() {
 
   initReset();
   // The A/B window is local to that card: the Tenants view hides the global filter bar
-  // (it is not a traffic view), so the comparison carries its own range.
-  $('#ab-range').addEventListener('change', loadVariants);
+  // (it is not a traffic view), so the comparison carries its own range. Tenants is
+  // manager-only and its markup is now a <template> until revealed, so #ab-range is wired
+  // from wireManagerView instead of here — see revealManagerTemplates.
 
   $('#mint-token').addEventListener('click', async () => {
     const label = prompt('Name this token (e.g. laptop, ci):', 'new-token');
