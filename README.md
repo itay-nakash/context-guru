@@ -33,8 +33,8 @@ Full docs: **[rossoctl.github.io/context-guru](https://rossoctl.github.io/contex
 /plugin marketplace add rossoctl/context-guru
 /plugin install context-guru@context-guru
 /reload-plugins     # REQUIRED — without it the next lines answer "Unknown command"
-/permissions        # allow  Bash(/Users/you/.claude/plugins/cache/context-guru/**)
-                    #   absolute path only; `~` is not expanded in permission rules
+/permissions        # add a new rule → paste Bash(/Users/you/.claude/plugins/cache/context-guru/**)
+                    #   (absolute path, your username, not `~`) → save to Project settings (local)
 /context-guru:install
 ```
 
