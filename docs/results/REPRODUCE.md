@@ -293,7 +293,9 @@ for f in glob.glob('/home/vpcuser/.cache/harbor/tasks/*/*/task.toml'):
 json.dump(meta, open('/tmp/tb-runs/task_meta.json','w'), indent=1)
 PY
 python3 deploy/harbor/gen_tb_docs.py /tmp/tb-runs/tb89/rows-off.json \
-  docs/results/terminal-bench-baseline.md --meta /tmp/tb-runs/task_meta.json
+  docs/results/terminal-bench-arms.md --meta /tmp/tb-runs/task_meta.json
+# (baseline is now one `##` section in terminal-bench-arms.md, not its own page —
+# append this arm's section there rather than overwriting the file)
 ```
 
 ### 7b. Terminal-Bench framework arms (context-guru / headroom / rtk)

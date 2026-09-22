@@ -117,6 +117,18 @@ too — see [docs/reference/presets.md](../reference/presets.md).
 - Dashboard: `http://127.0.0.1:8787/dashboard/`.
 - `/context-guru:uninstall` — removes the one settings key (with a backup) and stops the proxy.
 - `/context-guru:statusline` — puts this session's running savings in your terminal status line.
+  Two extra segments are off by default; turn either on with:
+  ```bash
+  "${CLAUDE_PLUGIN_ROOT}/scripts/settings.py" add --file ~/.claude/settings.json \
+    --statusline "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/statusline.py\" --cache"
+  ```
+  for a countdown to the prompt-cache going cold, or
+  ```bash
+  "${CLAUDE_PLUGIN_ROOT}/scripts/settings.py" add --file ~/.claude/settings.json \
+    --statusline "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/statusline.py\" --keepalive"
+  ```
+  for the net savings from idle keep-alive pings. Both flags can be passed together; drop the flag
+  and re-run to turn an extra back off.
 
 ## If the install is blocked
 
