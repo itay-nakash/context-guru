@@ -1,11 +1,23 @@
 ---
 name: status
-description: Report whether the local context-guru proxy is running, whether this project is routed through it, and what it has actually saved — reading /stats and explaining the numbers honestly. Use when the user asks about context-guru status, savings, cache hit rate, cost, tokens saved, or whether the proxy is working.
+description: Report whether the local context-guru proxy is running, whether this project is routed through it, and what it has actually saved — reading /stats and explaining the numbers honestly. Use when the user asks about context-guru status, savings, cache hit rate, cost, tokens saved, or whether the proxy is working. Accepts --stats to print the raw /stats JSON verbatim instead of the interpreted report.
+
 ---
 
 # context-guru status
 
-Answer two questions in order, because the second is meaningless if the first is "no":
+**If invoked with `--stats`**, skip everything below: resolve the port the same way step 1 does
+(`settings.py config`, falling back to the `plugin.json` default of 8787), run
+
+```bash
+curl -fsS "http://127.0.0.1:${PORT}/stats"
+```
+
+and print its output verbatim — no narration, no interpretation, not even the liveness check. This
+is for someone who wants the JSON itself, not a reading of it; a failed curl (proxy not up) should
+still be shown as-is rather than translated into prose.
+
+**Otherwise**, answer two questions in order, because the second is meaningless if the first is "no":
 
 1. **Is this project actually routed, and is the proxy up?**
 2. **What has it saved?**
