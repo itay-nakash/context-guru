@@ -67,32 +67,25 @@ actually paid for themselves, not just that they fired.
 "${CLAUDE_PLUGIN_ROOT}/scripts/settings.py" strategy set --name <name> --port <port> --preset <preset>
 ```
 
-| Name | What it does | Cost |
+| Name | ELI5 | Cost |
 |---|---|---|
-| `none` | no cache strategy: the preset runs and nothing else. Written as the ABSENCE of a config | free — no model calls |
-| `5-min-ping` | an idle ping at 280 s (just under the provider's 5-minute TTL), ≤2 per idle span, ≥20k-token prefix, ≤$0.25/ping | **spends the caller's own credential between turns** |
-| `1-hour-head` | the 1-hour tier on the `tools`/`system` breakpoints, **only on >=50k-token prefixes** | free, and often $0 of benefit — see below |
+| `none` | no keep-alive pings, nothing extra happens | free |
+| `5-min-ping` | pings the cache now and then so it doesn't go cold while you're away | spends a little of your own credential between turns |
+| `1-hour-head` | asks the provider for a longer-lived cache instead of pinging, only on prefixes >=50k tokens | free, but on today's models it usually buys nothing — see below |
 
 **Say the cost before switching TO `5-min-ping`, once, in one line.** It spends the caller's money
 (or usage-limit budget) while nobody is at the keyboard, and it applies to every session routed
 through this proxy, not just this one. It is the default because holding the cache warm across an
 idle gap is the thing most people install this for — not because it is free.
 
-**Be honest about `1-hour-head` rather than selling it.** `config/config.go` records it measured
-live: GRANTED on `claude-haiku-4-5` (36,251 of 36,574 tokens written at the 1h tier) and **silently
-downgraded on `claude-sonnet-5`** (0 of 48,212, with an otherwise normal 200). Zero 1h writes appear
-in 19,805 production requests. So on the Opus/Sonnet models most users run, the honest projection is
-**$0**, and `Usage.CacheWrite1h` is the only thing that says otherwise. Offer it as a measurement,
-not an upgrade.
+**Be honest about `1-hour-head` rather than selling it.** In practice the 1-hour tier gets granted
+on Haiku but silently downgraded on Sonnet, so on the models most people run, expect $0 benefit
+unless `Usage.CacheWrite1h` says otherwise. Offer it as a measurement, not an upgrade.
 
-**And say the gate out loud when you offer it.** This strategy ships `head_ttl_min_tokens: 50000`, so
-it does nothing whatever on a prefix under 50k tokens. That threshold is what makes it pay at all
-(+$48.81, against −$18.34 applied blanket), so it is not a flaw — but **both measurements above are
-below it**: 36,574 tokens on Haiku, 48,212 on Sonnet. A user who arms this on Haiku 4.5, the one model
-where the tier was granted, and then checks a request the size of the one that was measured, sees no 1h
-label — and would reasonably conclude the tier was refused when in fact the request was too small to
-ask. If they are watching `Usage.CacheWrite1h` for zero, tell them which of the two reasons they are
-looking at.
+**And say the gate out loud when you offer it.** This strategy only does anything on a large prefix
+(tens of thousands of tokens) — below that threshold it's a no-op, so a user watching
+`Usage.CacheWrite1h` stay at zero on a small request shouldn't conclude the tier was refused; the
+request may just be too small to qualify.
 
 **Never turn a strategy on from a display path.** The status line renders on every keystroke; if it
 could arm this, a display hook would double as an unbounded traffic generator. Arming is always

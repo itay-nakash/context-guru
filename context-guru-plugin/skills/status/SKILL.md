@@ -10,12 +10,13 @@ description: Report whether the local context-guru proxy is running, whether thi
 (`settings.py config`, falling back to the `plugin.json` default of 8787), run
 
 ```bash
-curl -fsS "http://127.0.0.1:${PORT}/stats"
+curl -fsS "http://127.0.0.1:${PORT}/stats" | jq .
 ```
 
 and print its output verbatim — no narration, no interpretation, not even the liveness check. This
 is for someone who wants the JSON itself, not a reading of it; a failed curl (proxy not up) should
-still be shown as-is rather than translated into prose.
+still be shown as-is rather than translated into prose. If `jq` is not installed, fall back to the
+bare `curl` and print the unformatted body rather than failing.
 
 **Otherwise**, answer two questions in order, because the second is meaningless if the first is "no":
 

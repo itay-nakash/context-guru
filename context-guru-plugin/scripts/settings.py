@@ -1105,6 +1105,20 @@ def cmd_remove(args: argparse.Namespace) -> int:
     return 0
 
 
+def _option_file_candidates(plugin: str) -> list[str]:
+    """The three files a plugin's configured options can live in, most specific first.
+
+    Shared by `config` (read-only) and `preset` (which also writes), so the two commands can
+    never disagree about where "the configured value" actually lives.
+    """
+    return [
+        os.path.join(".claude", "settings.local.json"),
+        os.path.join(".claude", "settings.json"),
+        os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or
+                     os.path.join(os.path.expanduser("~"), ".claude"), "settings.json"),
+    ]
+
+
 def cmd_config(args: argparse.Namespace) -> int:
     """Print the plugin's CONFIGURED option values, which the install cannot otherwise see.
 
@@ -1120,13 +1134,7 @@ def cmd_config(args: argparse.Namespace) -> int:
     `pluginConfigs["<plugin>@<marketplace>"].options` in a settings file. Checked in precedence order,
     most specific first, because a project-scope install writes them into the project's file.
     """
-    candidates = [
-        os.path.join(".claude", "settings.local.json"),
-        os.path.join(".claude", "settings.json"),
-        os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or
-                     os.path.join(os.path.expanduser("~"), ".claude"), "settings.json"),
-    ]
-    for path in candidates:
+    for path in _option_file_candidates(args.plugin):
         if not os.path.exists(path):
             continue
         try:
@@ -1577,6 +1585,101 @@ def cmd_strategy(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Preset — the plugin option, not a per-port file
+# ---------------------------------------------------------------------------
+#
+# `/plugin configure` can set this too, but it is a generic options form with no per-option
+# guidance: five fields, no validation, no "what does house actually do" a person can read before
+# picking. `preset set --name <name>` is the same write — pluginConfigs[<plugin>].options.preset —
+# made nameable and explainable, the same reason `strategy` exists for cache_strategy above.
+PRESETS: dict[str, str] = {
+    "off": "nothing runs; requests are forwarded exactly as they arrived",
+    "cache": "keeps the prompt cache warm by splitting off the volatile part of the system "
+             "prompt; drops nothing",
+    "house": "trims obvious waste from tool output (repeats, dead runs) — the safe first step "
+             "into carrying less",
+    "codesmart": "house's trimming plus a cheap model that keeps only what looks relevant",
+    "housellm": "the deepest cut: a compaction model periodically rewrites the whole "
+                "conversation — the only preset that spends on its own",
+}
+DEFAULT_PRESET = "off"
+
+
+def cmd_preset(args: argparse.Namespace) -> int:
+    if args.op == "list":
+        emit(result="ok", default=DEFAULT_PRESET, names=",".join(PRESETS))
+        for name, desc in PRESETS.items():
+            emit(**{f"preset_{name}": desc})
+        return 0
+
+    if args.op == "show":
+        for path in _option_file_candidates(args.plugin):
+            if not os.path.exists(path):
+                continue
+            data, _ = load(path)
+            opts = (((data.get("pluginConfigs") or {}).get(args.plugin) or {}).get("options") or {})
+            if isinstance(opts, dict) and "preset" in opts:
+                emit(result="ok", preset=opts["preset"], file=path)
+                return 0
+        emit(result="ok", preset=DEFAULT_PRESET, file="(none)",
+             note="no preset configured; the plugin default applies")
+        return 0
+
+    # op == "set"
+    name = args.name
+    if name not in PRESETS:
+        emit(result="error", reason="unknown_preset", requested=name,
+             known=",".join(PRESETS))
+        return 2
+
+    target = None
+    for path in _option_file_candidates(args.plugin):
+        if not os.path.exists(path):
+            continue
+        data, _ = load(path)
+        opts = (((data.get("pluginConfigs") or {}).get(args.plugin) or {}).get("options") or {})
+        if isinstance(opts, dict) and opts:
+            target = path
+            break
+
+    if target is None:
+        # Nobody has configured this plugin's options in any of the three files yet. Land in
+        # project-local scope by default — reversible, gitignored, affects only this repo — the
+        # same default the install skill recommends; --user-scope opts into the machine-wide file
+        # instead, for someone who wants every project to pick this preset up.
+        target = (os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or
+                                os.path.join(os.path.expanduser("~"), ".claude"), "settings.json")
+                   if args.user_scope else os.path.join(".claude", "settings.local.json"))
+
+    data, existed = load(target)
+    plugins = data.setdefault("pluginConfigs", {})
+    if not isinstance(plugins, dict):
+        emit(result="error", reason="pluginConfigs_not_an_object", file=target)
+        return 3
+    entry = plugins.setdefault(args.plugin, {})
+    if not isinstance(entry, dict):
+        emit(result="error", reason="plugin_entry_not_an_object", file=target)
+        return 3
+    options = entry.setdefault("options", {})
+    if not isinstance(options, dict):
+        emit(result="error", reason="options_not_an_object", file=target)
+        return 3
+
+    if options.get("preset") == name:
+        emit(result="unchanged", preset=name, file=target)
+        return 0
+
+    if existed:
+        backup(target)
+    options["preset"] = name
+    save(target, data)
+    emit(result="set", preset=name, file=target,
+         note="takes effect the next time the proxy starts, not this session — stop and restart "
+              "it, or start a new session, to pick it up")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1623,6 +1726,17 @@ def main() -> int:
                     help="the preset to state in the file. Required for `set` and `sync`, because "
                          "--config REPLACES --preset rather than layering over it.")
 
+    pr = sub.add_parser("preset")
+    pr.add_argument("op", choices=("list", "show", "set"))
+    pr.add_argument("--plugin", default="context-guru@context-guru")
+    pr.add_argument("--name", default="",
+                    help="preset name for `set`; one of " + ", ".join(PRESETS))
+    pr.add_argument("--user-scope", action="store_true",
+                    help="only used when no options file exists yet: write the machine-wide "
+                         "settings file (~/.claude/settings.json) instead of the project-local "
+                         "one. Ignored if the plugin's options already live somewhere — that "
+                         "file is updated in place regardless of this flag.")
+
     args = ap.parse_args()
     if args.cmd == "add" and not args.url and not args.statusline:
         ap.error("add needs --url, or --statusline on its own for a statusline-only call")
@@ -1632,8 +1746,10 @@ def main() -> int:
                      "port, so a defaulted one writes a file nothing ever reads")
         if args.op == "set" and not args.name:
             ap.error("strategy set needs --name; one of " + ", ".join(STRATEGIES))
+    if args.cmd == "preset" and args.op == "set" and not args.name:
+        ap.error("preset set needs --name; one of " + ", ".join(PRESETS))
     rc = {"add": cmd_add, "remove": cmd_remove, "show": cmd_show,
-          "config": cmd_config, "strategy": cmd_strategy,
+          "config": cmd_config, "strategy": cmd_strategy, "preset": cmd_preset,
           "check-url": cmd_check_url}[args.cmd](args)
 
     # The hatch facts are printed HERE rather than from inside save(), so the `result=` line the

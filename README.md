@@ -32,9 +32,9 @@ Full docs: **[rossoctl.github.io/context-guru](https://rossoctl.github.io/contex
 ```
 /plugin marketplace add rossoctl/context-guru
 /plugin install context-guru@context-guru
-/reload-plugins     # REQUIRED — without it the next lines answer "Unknown command"
-/permissions        # add a new rule → paste Bash(/Users/you/.claude/plugins/cache/context-guru/**)
-                    #   (absolute path, your username, not `~`) → save to Project settings (local)
+/reload-plugins     # REQUIRED — next lines else answer "Unknown command"
+/permissions        # add a new rule → paste the line below → Project settings (local)
+Bash(/Users/{you}/.claude/plugins/cache/context-guru/**)
 /context-guru:install
 ```
 
@@ -48,13 +48,14 @@ Check what it's saving:
 ```
 
 It reports the preset and cache strategy running, and the dollars saved so far — keep-alive
-savings, any content-trimming savings, and the net. Sample output and the raw `/stats` endpoint
-it reads: [docs/more.md](docs/more.md#claude-code-plugin-advanced-options).
+savings, any content-trimming savings, and the net. Want the raw numbers instead of the reading of
+them? `/context-guru:status --stats` prints the `/stats` endpoint verbatim. Sample output:
+[docs/more.md](docs/more.md#claude-code-plugin-advanced-options).
 
 If you want to also carry less, not just pay less, opt into content trimming:
 
 ```
-/plugin configure   # context-guru → Preset → housellm
+/context-guru:preset-picker   # → house, the safe first step into trimming
 ```
 
 Everything else — architecture, the full benchmark, every component, the proxy/gateway path,
