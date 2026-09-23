@@ -15,6 +15,13 @@ here="$(cd "$(dirname "$0")" && pwd)"
 L="${CG_SCEN_ROOT:-$PWD/.cg-scen}/run.log"
 mkdir -p "$(dirname "$L")"
 : > "$L"
+# PREFLIGHT FIRST, and the run aborts if it fails. An hour of gateway time is too expensive a way to
+# discover a syntax error inside a heredoc, which `bash -n` cannot see.
+if ! "$here/preflight.sh"; then
+  echo "aborted: preflight failed" | tee -a "$L"
+  exit 1
+fi
+
 echo "=== SCENARIO RUN START $(date -u) ===" >> "$L"
 echo "=== source: ${CG_SCEN_SRC:-$PWD} ===" >> "$L"
 for s in a-firing-rate b-cold-events c-warm-only d-maxtokens-rule; do

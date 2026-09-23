@@ -61,7 +61,7 @@ MODEL="$MODEL2"
 
 echo "=== SCENARIO D: does W - max_tokens predict the compaction point? (model=$MODEL2) ==="
 scen_build
-scen_start "$N" "$PORT" 0.9 pre_expiry_or_cold
+scen_start "$N" "$PORT" 0.9
 scen_home "$N" "$PORT"
 scen_work  "$N"
 

@@ -33,22 +33,24 @@ set -u
 
 N=cold3
 PORT=4212
-# THE GAP MUST EXCEED THE TTL PLUS THE CLOCK-SKEW MARGIN, not just the TTL.
+# THE GAP MUST EXCEED THE TTL WITH ROOM TO SPARE, and the reason changed while the number did not.
 #
-# 310s looked right — past a 5-minute entry — and the gate declined every time. The provider HAD
-# already dropped the entry (the turn billed a full 183,660-token rewrite with zero cache read), but
-# components.CertainlyColdByClock requires ColdMargin (60s) PAST nominal expiry before it will make
-# the positive claim that an entry is gone, mirroring apply.cacheIsCold over the same timestamps. At
-# 310s idle the arithmetic says "-10s remaining", which is inside the allowance, so the gate refuses.
+# It was 380 because the GATE demanded it: a strict cold test required a 60s clock-skew margin past
+# nominal expiry before it would claim an entry was gone, so at 310s idle the arithmetic read "-10s
+# remaining" — inside the allowance — and `pre_expiry_or_cold` declined even though the provider had
+# already dropped the entry (that turn billed a full 183,660-token rewrite with zero cache read).
 #
-# That is the intended conservatism — forgoing an opportunity beats rewriting a prefix that may still
-# be live — and it is worth knowing it costs real firing opportunities: a session that returns between
-# 300s and 360s of idle finds the entry gone AND the gate shut.
-GAP=380   # > TTL (300) + components.ColdMargin (60)
+# That gate no longer exists; the cold-gated states were withdrawn and the default is `any`, so
+# nothing here waits for the arithmetic's permission. 380 stays anyway, because what this arm needs is
+# a genuinely COLD turn from the PROVIDER, and the provider's entry can outlive its nominal lifetime:
+# a measured turn at 383s came back a PARTIAL hit (read=22,441 write=10,829). So a wait can only make
+# a cold turn likely, never certain — which is why the checks below read the verdict they actually got
+# instead of assuming one.
+GAP=380   # > TTL (300), with margin for a provider entry that outlives its nominal lifetime
 
 echo "=== SCENARIO B: three cold events inside one span ==="
 scen_build
-scen_start  "$N" "$PORT" 0.5 pre_expiry_or_cold
+scen_start  "$N" "$PORT" 0.5
 scen_home   "$N" "$PORT"
 scen_work   "$N"
 
@@ -93,7 +95,7 @@ done
 echo
 echo "=== SCENARIO B: all rows ==="
 scen_tail "$N" 60
-scen_panel "$N" "$PORT"
+scen_panel "$N" "$PORT" "" 0.5
 
 echo
 echo "=== SCENARIO B: hand-derived against the panel ==="

@@ -191,17 +191,55 @@ func newSummarize(raw []byte) (components.Component, error) {
 // extra turn spent on a compacted context — so there is no knee to sit in. 0.9 is the
 // conservative end of a defensible range.
 //
-// WHAT STOPS A SESSION THAT NEVER ENTERS THE WINDOW: nothing here, deliberately. A session whose
-// turns are seconds apart stays warm indefinitely and this trigger declines on every turn while
-// the transcript grows. The ceiling is the CLIENT's: Claude Code runs its own compaction as it
-// approaches its budget. A deployment whose client does not — anything driving a raw API — must
-// set `cache_state: any` to get the old size-only behaviour, and both shipped example configs do
-// exactly that. This is a documented requirement rather than a backstop in the code because a
-// backstop firing at 0.99 would be compacting on a live prefix, which is the cost the whole
-// design avoids.
+// # THE CACHE STATE IS `any`, AND THAT IS A RETRACTION
+//
+// This default was `pre_expiry_or_cold` for one release: fire only when the prompt cache is about
+// to expire or already has, so the cache write compaction costs was going to be paid anyway. The
+// argument was wrong, and three things in the paragraphs above and below say so.
+//
+//  1. THE DOWNSIDE IT AVOIDED IS −$0.84. That is the figure four paragraphs up, for every session
+//     in the corpus that crossed 90% and then simply ended — which is the entire population that a
+//     warm-cache fire can waste money on. It was cited as the reason the FILL threshold could be
+//     low, and it is equally the reason the cache gate buys nothing: it was insuring a rounding
+//     error against a $531 upside.
+//
+//  2. FIRING WARM PAYS BACK IN 2-3 TURNS. At 0.9 of 200k a 180k prefix compacts to roughly 40k.
+//     The turn that compacts pays 40k at the 1.25x write rate instead of reading 180k at 0.1x,
+//     so it costs about 32k base-equivalents more; every later turn then reads 40k instead of
+//     180k and saves about 14k. That is 2.3 turns to break even, and it is rate-independent
+//     because read, write and base all scale together — the same arithmetic on haiku and opus.
+//     Any session sitting at 0.9 has far more than three turns left in it.
+//
+//  3. A COLD GATE CANNOT PREVENT THE FIRST COLD REWRITE, which is the structural half and the
+//     part that is not a judgement call. Compaction here is two-turn: the turn that fires
+//     COMMISSIONS a summary and forwards the transcript untouched (EventSummaryStarted), and a
+//     later turn splices the checkpoint. So the turn that first observes a cold cache is carrying
+//     the full 180k prefix and pays that rewrite in full. Waiting for cold therefore pays the
+//     first of the median 7 rewrites and prevents the rest; compacting while warm prevents all 7,
+//     for the one-time ~32k above.
+//
+// WHAT THE CACHE-AWARE WORK WAS ACTUALLY WORTH is the other half of the same release, and it
+// stands: Fires resolves the fraction against Ctx.PrevBilledInput (the provider's ruler) rather
+// than schema.MessagesTokens, and against C (the client's own compaction point) rather than the
+// raw window. Those are what made "0.9" denote anything. The gate on top of them did not.
+//
+// `pre_expiry` IS STILL THE RIGHT ANSWER FOR A DIFFERENT QUESTION, which is why the value survives —
+// but NOTHING ASKS THAT QUESTION YET, and the docstring should not imply otherwise. A summarizer
+// whose model call reuses the conversation's own prefix needs that prefix LIVE, the opposite concern
+// to this one and genuinely phase-dependent. THIS component is not one: it flattens its prompt into a
+// single string and shares no prefix with anything, so `pre_expiry` here is honoured and buys nothing
+// but a lower firing rate. cache_aware_summarizer IS the prefix-reusing one and consults neither
+// CacheAllows nor CachePhase, so the key is silently inert there — the same defect as #247. Kept
+// because no surviving value can express "is there a live prefix to hit", not because it pays today.
+//
+// WHAT STOPS A SESSION THAT NEVER ENTERS THE WINDOW: nothing here, deliberately. The ceiling is
+// the CLIENT's — Claude Code runs its own compaction as it approaches C, and Fires now measures
+// against C for that reason. A deployment whose client does not cap its context must set
+// `min_request_frac` low enough, or an absolute `min_request_tokens`, to compact before the
+// provider rejects the request.
 const (
 	summarizeDefaultRequestFrac = 0.9
-	summarizeDefaultCacheState  = components.CacheStatePreExpiryOrCold
+	summarizeDefaultCacheState  = components.CacheStateAny
 )
 
 // The four names summarize files on Report.Events. Promoted to constants because a SECOND
@@ -333,6 +371,12 @@ func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 	// loss. A checkpointed session can only reach it by SHRINKING, in which case the covered
 	// hash cannot match either and the provider's prefix is new anyway.
 	if end <= start {
+		// NAMED, because it is a transcript SHAPE the component can never act on however large the
+		// request grows, and it left rep.Skipped with no gate — indistinguishable from "not big enough
+		// yet", which is the healthy steady state. Measured on the iteration 027 probe: requests of
+		// 81,580 tokens sat above the trigger for six consecutive turns and summarize acted on none of
+		// them, with nothing recorded to say which path in this function refused.
+		rep.Gate("summary_span_empty")
 		rep.Skipped = true
 		return nil, nil
 	}
@@ -435,6 +479,11 @@ func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 		if end <= start {
 			// Nothing summarizable is left once expanded content is protected. Declining is the
 			// outcome summarize already has for an empty span, and the safe direction.
+			//
+			// SEPARATE from summary_span_empty above: that one is the transcript's own shape, this one
+			// is the agent having expanded content we then must not re-summarize. Same outcome,
+			// opposite remedies — one is a keep_last question, the other is about expand traffic.
+			rep.Gate("summary_span_empty_after_expand_trim")
 			rep.Skipped = true
 			return nil, nil
 		}
@@ -442,6 +491,11 @@ func (s *Summarize) Offload(req *bschemas.BifrostChatRequest, rep *components.Re
 
 	span := msgs[start:end]
 	if schema.MessagesTokens(&bschemas.BifrostChatRequest{Input: span}) < s.minTokens {
+		// The span cleared the request-level trigger and is still too small to be worth a model call.
+		// Labelled because it is the decline that says "the request is large but its COMPACTABLE part
+		// is not" — the signature of mass concentrated in the protected tail, and unrecoverable from
+		// the request size alone.
+		rep.Gate("summary_span_below_min_tokens")
 		rep.Skipped = true
 		return nil, nil
 	}
@@ -661,14 +715,42 @@ func (s *Summarize) tryReuse(c *components.Ctx, rep *components.Report, msgs []b
 	headCount, start, end int) (out []bschemas.ChatMessage, keys []string, ok, stale bool) {
 	cp, ok := loadCheckpoint(c)
 	if !ok || cp.CoveredCount <= 0 {
+		// No standing checkpoint. The expected state on a session's first eligible turn, and it must be
+		// distinguishable from the ones below, which mean a checkpoint exists and could not be used.
+		rep.Gate("summary_no_checkpoint")
 		return nil, nil, false, false
 	}
 	boundary := start + cp.CoveredCount
 	if boundary > end { // covered prefix would overlap the kept tail — can't reuse
+		rep.Gate("summary_checkpoint_overlaps_tail")
 		return nil, nil, false, false
 	}
 	covered := msgs[start:boundary]
 	if spanHash(covered) != cp.CoveredHash {
+		// COUNTED SEPARATELY because this is the only decline an UPSTREAM COMPONENT can cause. The hash
+		// is over msgs as the rest of the pipeline left them, and `summarize` runs last, so any
+		// component mutating a message inside the checkpointed span lands here. extract_llm_sweep is the
+		// obvious one: it removes deep-history outputs and runs earlier.
+		//
+		// READ THIS AS CHURN, NOT AS COST. It was misread as a cost once and the reasoning is easy to
+		// repeat, so here is why it is not:
+		//
+		//  1. The mutated messages are INSIDE msgs[start:end], which the fresh path collapses into a
+		//     single summary. So the upstream component's marker does not reach the wire at all on this
+		//     turn — its removal and this summary are doing the same job to the same bytes, and the
+		//     summary wins. There is no removal being "paid for twice".
+		//  2. It is a ONE-OFF per upstream change, not a per-turn tax. The fresh path writes a NEW
+		//     checkpoint whose hash covers the mutated content, so once the upstream component is
+		//     replaying a frozen decision — which is what freezing is for — the span hashes identically
+		//     from the next turn on and reuse resumes.
+		//
+		// So ONE firing per upstream removal is expected and harmless. What this counter is actually for
+		// is the other case: firing REPEATEDLY on one session means the checkpoint is not
+		// re-stabilising, i.e. some component above is mutating the span DIFFERENTLY turn to turn rather
+		// than replaying a fixed decision. That is when real money appears — a model call plus a prefix
+		// rewrite on every eligible turn — and it is indistinguishable from healthy operation without
+		// this gate. Compare the count against the session's turns, never against zero.
+		rep.Gate("summary_covered_span_changed")
 		return nil, nil, false, false // prefix diverged (different session / edited) → fresh
 	}
 	// The un-summarized middle since the checkpoint (excludes the kept last-K).
@@ -686,6 +768,14 @@ func (s *Summarize) tryReuse(c *components.Ctx, rep *components.Report, msgs []b
 		// faithful summary of msgs[start:boundary] and re-emitting it produces the same bytes
 		// earlier turns sent. Rolling it forward is merely BETTER, so a fresh attempt that
 		// cannot complete may fall back to it instead of sending the transcript full.
+		//
+		// NAMED FOR THE OUTCOME, not for one of its two reasons. This branch now carries both "the tail
+		// grew past resummarize_tokens" and "resummarize_tokens is 0, so roll forward on every eligible
+		// turn", which `0c21ead` deliberately merged here so that a config carrying 0 still reports a
+		// valid checkpoint rather than replaying nothing. An earlier version of this branch gated those
+		// two separately; one of those gates named a path that no longer exists and was dropped rather
+		// than carried forward as a counter that can never fire.
+		rep.Gate("summary_checkpoint_stale")
 		return nil, nil, false, true
 	}
 	// Refresh the stashed original span so expand keeps resolving it (full-mode

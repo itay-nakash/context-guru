@@ -999,9 +999,11 @@ func (k *keeper) record1(j pingJob, u Usage, status int, ms float64, startedAt t
 	// clock. A ping's whole job is to READ the cached prefix, and a read resets that entry's TTL —
 	// so after this the entry is warm again. With only real requests writing the clock, a
 	// kept-alive session's idle time grew without bound while the provider held the entry alive,
-	// and summarize's gate concluded the cache was long dead: CertainlyColdByClock returned true,
-	// the shipped `pre_expiry_or_cold` permitted a rewrite, and the component compacted a LIVE
-	// prefix — on exactly the sessions someone is paying pings to protect.
+	// and summarize's gate concluded the cache was long dead: a strict clock test said "certainly
+	// cold", the then-shipped `pre_expiry_or_cold` permitted a rewrite, and the component compacted
+	// a LIVE prefix — on exactly the sessions someone is paying pings to protect. Those cold-gated
+	// states have since been withdrawn, so the reader that made this expensive is gone; what still
+	// reads the clock is `cache_state: pre_expiry`, whose question is whether the prefix is LIVE.
 	//
 	// TWO CLOCKS, TWO QUESTIONS, and that is why this is not a contradiction of the paragraph
 	// above. "Is the provider still holding this prefix?" counts pings; "how long was the USER
@@ -1254,4 +1256,21 @@ func (k *keeper) Stats() KeepAliveStats {
 	return KeepAliveStats{Live: live, Pings: k.pings.Load(), Skipped: k.skipped.Load(),
 		Failed: k.failed.Load(), Wrote: k.wrote.Load(),
 		SpentUSD: math.Float64frombits(k.spentUSD.Load())}
+}
+
+// LiveSessionKeys returns the session ids the keeper currently considers live — a copy,
+// so mutating the result never touches k.live. k.live is keyed by tenant:session, but
+// each entry carries its own raw session id (kaEntry.session), which is what
+// dash.Filter.Session expects.
+func (k *keeper) LiveSessionKeys() []string {
+	if k == nil {
+		return nil
+	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	keys := make([]string, 0, len(k.live))
+	for _, e := range k.live {
+		keys = append(keys, e.session)
+	}
+	return keys
 }

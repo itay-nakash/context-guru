@@ -85,7 +85,9 @@ STARTER="${CLAUDE_PLUGIN_ROOT:-}/scripts/start-proxy.sh"
 # otherwise decline and do nothing. The port and preset must be passed for the same reason — the
 # CLAUDE_PLUGIN_OPTION_* values this hook can see are invisible there, so a bare invocation would
 # start on 8787 with the default preset.
-PRESET="${CLAUDE_PLUGIN_OPTION_PRESET:-cache}"
+# `off` by default, matching DEFAULT_PRESET in settings.py. TestThePresetDefaultIsEncodedOnce keeps
+# every copy of this default agreeing; there were five.
+PRESET="${CLAUDE_PLUGIN_OPTION_PRESET:-off}"
 IDLE_EXIT="${CLAUDE_PLUGIN_OPTION_IDLE_EXIT:-24h}"
 UPSTREAM="${CLAUDE_PLUGIN_OPTION_UPSTREAM:-${ANTHROPIC_UPSTREAM:-}}"
 if [ -x "$STARTER" ]; then

@@ -56,6 +56,15 @@ func (s *Summarize) summarizeInline(c *components.Ctx, rep *components.Report,
 		return nil, err // fail-open: the pipeline reverts this component
 	}
 	if strings.TrimSpace(summary) == "" {
+		// PAID FOR AND WASTED, which is the one decline on this path that costs money. Unlabelled it was
+		// indistinguishable from never having called.
+		//
+		// INLINE ONLY. The async path has the same check (summarize_async.go), but it runs in a detached
+		// goroutine with no Report to write to — which is why its siblings there are atomic counters
+		// (summarizeTimeouts, summarizeErrors) rather than gates. Adding a rep.Gate there would be a
+		// data race on a Report the request goroutine owns, so that case stays uncounted and is recorded
+		// as such rather than papered over.
+		rep.Gate("summary_empty_reply")
 		rep.Skipped = true
 		return nil, nil
 	}

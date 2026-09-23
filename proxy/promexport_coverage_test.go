@@ -71,6 +71,22 @@ func TestEverySnapshotFieldIsExportedOrExempt(t *testing.T) {
 // the honest reason: an entry here is a claim that /metrics loses nothing by it, so "not
 // exported yet" is spelled out as such rather than dressed up as a decision.
 var notExportedWhy = map[string]string{
+	// Not a number. The COUNT is exported as cg_model_info_unresolved_total and is what an alert
+	// fires on; the message is for the human who then goes and reads /stats or the log. A label
+	// carrying an arbitrary error string would be unbounded cardinality, which is the one thing a
+	// Prometheus label must never be.
+	"ModelInfoLastError": "not a metric — free-text; the count is cg_model_info_unresolved_total",
+
+	// The CONFIGURED pipeline, not a measurement. Pipeline is a list of names, which is label data
+	// rather than a series; PipelineLen never changes for the life of the process, so a gauge would
+	// be a constant that only ever restates the command line. Both exist for one reason: to let a
+	// reader of /stats tell "no components are configured" from "components ran and did nothing",
+	// which Components alone cannot express because both are an empty map. That question is asked
+	// when reading one proxy's stats, not when alerting across a fleet - and `off` became the
+	// plugin's default preset, so the empty case is now the common one and has to be legible.
+	"Pipeline":    "configured component order, not a measurement; label data, not a series",
+	"PipelineLen": "static for the process lifetime; a gauge would restate the command line",
+
 	// Derived: PromQL computes these from series that ARE exported, and a second series
 	// would be a number that can disagree with its own inputs.
 	"AdjustedSaved":  "cg_saved_tokens_total - cg_wasted_tokens_total",
@@ -84,6 +100,7 @@ var notExportedWhy = map[string]string{
 	"ExpandUnresolvedMalformed": `cg_expand_unresolved_total{reason="malformed"}, from expand.Unresolved()`,
 	"ExpandUnresolvedMissing":   `cg_expand_unresolved_total{reason="missing"}, from expand.Unresolved()`,
 	"AdjudicateStray":           "cg_adjudicate_stray_total, from adjudicate.StrayAnswered()",
+	"ModelInfoUnresolved":       "cg_model_info_unresolved_total, from the resolver's Unresolved()",
 	"LLMCalls":                  "cg_llm_calls_total, from cheapmodel.Usage()",
 	"LLMInputTokens":            `cg_llm_tokens_total{direction="input"}, from cheapmodel.Usage()`,
 	"LLMOutputTokens":           `cg_llm_tokens_total{direction="output"}, from cheapmodel.Usage()`,
@@ -118,6 +135,7 @@ var notExportedWhy = map[string]string{
 	"TopPassthrough":   `component NAMES; the counts are cg_component_runs_total{outcome="mutated"}`,
 	"TopDiscarded":     `component NAMES; the count is cg_component_runs_total{outcome="discarded"}`,
 	"KeepAlive":        "typed `any`; the host fills it with a ledger this package cannot name",
+	"Savings":          "typed `any`; already cg_tenant_net_saved_usd et al. via promexport's own dash-backed rows",
 
 	// Configured budgets, not measurements: constant for the process's life, so a series
 	// would only ever restate a flag. Read them off /stats when a *_timeouts is non-zero.
@@ -153,9 +171,21 @@ var notExportedWhy = map[string]string{
 	// silent: this change deliberately adds ONE family (cg_expand_unresolved_total, the
 	// alertable one) instead of growing the exposition by fourteen series inside a
 	// dashboard PR. Moving any entry out of this map is a small, self-contained change.
-	"LLMTruncated":      "NOT EXPORTED YET — full price, zero result; a real alert candidate",
-	"SummarizeTimeouts": "NOT EXPORTED YET — summarize's fail-open path is invisible in Prometheus",
-	"SummarizeErrors":   "NOT EXPORTED YET — as above",
+	"LLMTruncated":                         "NOT EXPORTED YET — full price, zero result; a real alert candidate",
+	"CacheAwareSummarizerCallTimeoutMs":    "configured budget, not a measurement",
+	"CacheAwareSummarizerCalls":            "NOT EXPORTED YET — this method's cost is per compacted turn, so a delta read without it is unattributable",
+	"CacheAwareSummarizerTimeouts":         "NOT EXPORTED YET — its fail-open path is invisible in Prometheus, as summarize's is",
+	"CacheAwareSummarizerErrors":           "NOT EXPORTED YET — as above",
+	"CacheAwareSummarizerDeclined":         "NOT EXPORTED YET — and it is the one that most deserves a series: a declining arm compacts nothing and is byte-identical to `off` on every other field here, so this is the only signal that separates 'ran' from 'no-op'",
+	"CacheAwareSummarizerEmpty":            "NOT EXPORTED YET — a call was PAID FOR and returned nothing usable",
+	"CacheAwareSummarizerUnverifiedSystem": "NOT EXPORTED YET — declined because instruction_role was pinned to `system` for a model no registry profile verifies",
+	"CacheAwareSummarizerRefusedStash":     "NOT EXPORTED YET — a summary was abandoned because the store would not accept the span",
+	"CacheAwareSummarizerTooLarge":         "NOT EXPORTED YET — declined because the outbound request would exceed max_request_tokens",
+	"CacheAwareSummarizerProfileFallbacks": "NOT EXPORTED YET — the profiles_path override could not be read and the embedded registry was used instead, so the roles this arm resolved are not the ones the deployment pinned",
+	"CacheAwareSummarizerAsyncStarted":     "NOT EXPORTED YET — detached summaries commissioned",
+	"CacheAwareSummarizerAsyncCommitted":   "NOT EXPORTED YET — detached summaries that reached a checkpoint. The PAIR is the signal: started without committed is a summary paid for and lost",
+	"SummarizeTimeouts":                    "NOT EXPORTED YET — summarize's fail-open path is invisible in Prometheus",
+	"SummarizeErrors":                      "NOT EXPORTED YET — as above",
 	// The detached summarizer path's health. Listed here rather than exported, following this
 	// block's own rule: adding seven cg_* series inside a PR about the trigger is exactly the
 	// exposition growth it exists to prevent. They ARE on /stats, which is what the review round

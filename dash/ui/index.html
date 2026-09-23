@@ -61,12 +61,12 @@
   <div class="grouppanel" role="tabpanel" id="grp-savings-panel" data-group="savings" aria-labelledby="grp-savings" hidden>
     <div class="viewtabs" role="tablist" data-group="savings" aria-label="Savings views">
       <button role="tab" class="tab" id="tab-usage" data-view="usage" data-testid="tab-usage" aria-controls="view-usage" aria-selected="false" tabindex="-1">Usage</button>
-      <button role="tab" class="tab" id="tab-benchmarks" data-view="benchmarks" data-testid="tab-benchmarks" aria-controls="view-benchmarks" aria-selected="false" tabindex="-1" data-manager data-local-ok>Benchmarks</button>
+      <template id="tpl-tab-benchmarks"><button role="tab" class="tab" id="tab-benchmarks" data-view="benchmarks" data-testid="tab-benchmarks" aria-controls="view-benchmarks" aria-selected="false" tabindex="-1" data-manager data-local-ok>Benchmarks</button></template>
     </div>
   </div>
   <div class="grouppanel" role="tabpanel" id="grp-behaviour-panel" data-group="behaviour" aria-labelledby="grp-behaviour" hidden>
     <div class="viewtabs" role="tablist" data-group="behaviour" aria-label="Behaviour views">
-      <button role="tab" class="tab" id="tab-components" data-view="components" data-testid="tab-components" aria-controls="view-components" aria-selected="false" tabindex="-1" data-manager data-local-ok>Components</button>
+      <template id="tpl-tab-components"><button role="tab" class="tab" id="tab-components" data-view="components" data-testid="tab-components" aria-controls="view-components" aria-selected="false" tabindex="-1" data-manager data-local-ok>Components</button></template>
       <button role="tab" class="tab" id="tab-keepalive" data-view="keepalive" data-testid="tab-keepalive" aria-controls="view-keepalive" aria-selected="false" tabindex="-1">Keep-alive</button>
     </div>
   </div>
@@ -78,9 +78,9 @@
   </div>
   <div class="grouppanel" role="tabpanel" id="grp-admin-panel" data-group="admin" aria-labelledby="grp-admin" hidden>
     <div class="viewtabs" role="tablist" data-group="admin" aria-label="Admin views">
-      <button role="tab" class="tab" id="tab-config" data-view="config" data-testid="tab-config" aria-controls="view-config" aria-selected="false" tabindex="-1" data-manager data-local-ok>Config</button>
-      <button role="tab" class="tab" id="tab-strategies" data-view="strategies" data-testid="tab-strategies" aria-controls="view-strategies" aria-selected="false" tabindex="-1" data-manager hidden>Strategies</button>
-      <button role="tab" class="tab" id="tab-tenants" data-view="tenants" data-testid="tab-tenants" aria-controls="view-tenants" aria-selected="false" tabindex="-1" data-manager hidden>Tenants</button>
+      <template id="tpl-tab-config"><button role="tab" class="tab" id="tab-config" data-view="config" data-testid="tab-config" aria-controls="view-config" aria-selected="false" tabindex="-1" data-manager data-local-ok>Config</button></template>
+      <template id="tpl-tab-strategies"><button role="tab" class="tab" id="tab-strategies" data-view="strategies" data-testid="tab-strategies" aria-controls="view-strategies" aria-selected="false" tabindex="-1" data-manager>Strategies</button></template>
+      <template id="tpl-tab-tenants"><button role="tab" class="tab" id="tab-tenants" data-view="tenants" data-testid="tab-tenants" aria-controls="view-tenants" aria-selected="false" tabindex="-1" data-manager>Tenants</button></template>
       <button role="tab" class="tab" id="tab-setup" data-view="setup" data-testid="tab-setup" aria-controls="view-setup" aria-selected="false" tabindex="-1" data-account hidden>Setup</button>
       <button role="tab" class="tab" id="tab-settings" data-view="settings" data-testid="tab-settings" aria-controls="view-settings" aria-selected="false" tabindex="-1" data-account hidden>Settings</button>
       <button role="tab" class="tab" id="tab-archive" data-view="archive" data-testid="tab-archive" aria-controls="view-archive" aria-selected="false" tabindex="-1" data-account hidden>Archive</button>
@@ -301,10 +301,60 @@
     </label>
   </div>
 
+  <!-- renderOverviewBrief: up to four synthesized sentences with a real number inline, ahead
+       of the evidence below — see its own comment in app.js for how each is gated. Hidden
+       whenever none of them has enough support to say anything. -->
+  <div class="insight-brief" id="overview-brief" hidden></div>
+
   <!-- renderTiles() builds the grouped tile grids in here: a headline row of the three
        numbers that answer "is this working", then one labelled group per subject. Twenty
        tiles in one flat grid is twenty things of equal importance, i.e. no hierarchy. -->
   <div id="tiles"></div>
+
+  <!-- Your latest session's latency beside your average across this window — "is it fast
+       right now" and "is it fast overall" are different questions and a single averaged
+       tile answers neither. Fed from the same /api/sessions read the usage panel below
+       already needs, so this costs no extra request. -->
+  <div class="panel" id="latency-panel" hidden>
+    <h2>Latency</h2>
+    <div id="latency-tiles"></div>
+  </div>
+
+  <!-- What you actually added yourself — MCP servers and skills, never Claude Code's own
+       built-ins — and what to do about the ones not earning their place. Reuses the
+       Inventory tab's own GET /api/tools report; no new backend read. -->
+  <div class="panel" id="inventory-panel" hidden>
+    <h2>Your tools &amp; skills</h2>
+    <p class="note">What you added yourself. Claude Code's own built-in tools are left out —
+      see the Inventory tab for the full picture, including those.</p>
+    <div id="inventory-tiles"></div>
+    <div id="recommendations" data-testid="recommendations"></div>
+  </div>
+
+  <!-- Caching insights: keep-alive's own $ kept apart from cache-reuse behaviour in general.
+       Reuses GET /api/kvcache (the KV-cache tab's own read) plus the keepalive_* fields
+       already on /api/stats; no new backend field. -->
+  <div class="panel" id="caching-insights-panel" hidden>
+    <h2>Caching insights</h2>
+    <p class="note">Cache reuse (any request hitting a warm prefix) and keep-alive (the
+      mechanism that stops one from lapsing) are different levers — kept apart below rather
+      than blended into one savings figure.</p>
+    <div id="caching-insights-tiles" class="caching-statrow"></div>
+  </div>
+
+  <!-- How many of your sessions actually did something, not just how many exist. Reuses
+       GET /api/sessions; no new backend read. -->
+  <div class="panel" id="session-usage-panel" hidden>
+    <h2>Your sessions</h2>
+    <div id="session-usage-tiles"></div>
+    <p class="note" id="session-usage-note"></p>
+  </div>
+
+  <!-- Everything below is real and correct, and most viewers never need it: the operator-
+       level detail behind the numbers above, folded the same way Keep-alive's own gap-timing
+       diagnostics are. -->
+  <details class="setup-others" id="overview-diagnostics">
+    <summary>Detailed diagnostics</summary>
 
   <!-- A small callout, for every user — not just managers — reusing GET /api/keepalive's
        already-computed ledger. Hidden until the keep-alive has actually run on this
@@ -438,6 +488,7 @@
       </table>
     </div>
   </div>
+  </details>
 </section>
 
 <!-- ── Usage ─────────────────────────────────────────────────────────────────
@@ -497,6 +548,9 @@
 </section>
 
 <!-- ── Components ─────────────────────────────────────────────────────────── -->
+<!-- Manager-only: wrapped in a <template> (revealed by revealManagerTemplates in app.js) so
+     a plain hosted account's browser never builds this panel at all, not just hides it. -->
+<template id="tpl-view-components">
 <section class="view" id="view-components" role="tabpanel" aria-labelledby="tab-components" hidden>
   <div class="panel">
     <h2>Per-component economics</h2>
@@ -618,6 +672,7 @@
     <p class="hint" id="episodes-assumptions" data-testid="episodes-assumptions" hidden></p>
   </div>
 </section>
+</template>
 
 <!-- ── Sessions ───────────────────────────────────────────────────────────── -->
 <section class="view" id="view-sessions" role="tabpanel" aria-labelledby="tab-sessions" hidden>
@@ -823,6 +878,9 @@
 </section>
 
 <!-- ── Benchmarks ─────────────────────────────────────────────────────────── -->
+<!-- Manager-only: wrapped in a <template> (revealed by revealManagerTemplates in app.js) so
+     a plain hosted account's browser never builds this panel at all, not just hides it. -->
+<template id="tpl-view-benchmarks">
 <section class="view" id="view-benchmarks" role="tabpanel" aria-labelledby="tab-benchmarks" hidden>
   <div class="panel">
     <h2>Benchmark runs</h2>
@@ -835,6 +893,7 @@
     <div id="bench-list" data-testid="bench-list"></div>
   </div>
 </section>
+</template>
 
 <!-- ── Config ─────────────────────────────────────────────────────────────── -->
 <!-- Archive: what has moved to cold storage. The list comes from a LOCAL index, so it
@@ -961,6 +1020,9 @@
 </section>
 
 <!-- Tenants: the manager's roster. -->
+<!-- Manager-only: wrapped in a <template> (revealed by revealManagerTemplates in app.js) so
+     a plain hosted account's browser never builds this panel at all, not just hides it. -->
+<template id="tpl-view-tenants">
 <section class="view" id="view-tenants" role="tabpanel" aria-labelledby="tab-tenants" hidden>
   <div class="card">
     <div class="card-head"><h2>A/B variants</h2>
@@ -990,6 +1052,7 @@
     <div id="tenants-list" data-testid="tenants-list" tabindex="0"></div>
   </div>
 </section>
+</template>
 
 <!-- Strategies: manager-controlled keep-alive rules that run above every tenant's own
      account switch and below a per-session override. See
@@ -998,6 +1061,9 @@
      the Tenant editor are — an empty mount point here, so the fields, the window
      builder and the account picker cannot drift from the validation the control route
      itself enforces. -->
+<!-- Manager-only: wrapped in a <template> (revealed by revealManagerTemplates in app.js) so
+     a plain hosted account's browser never builds this panel at all, not just hides it. -->
+<template id="tpl-view-strategies">
 <section class="view" id="view-strategies" role="tabpanel" aria-labelledby="tab-strategies" hidden>
   <div class="panel">
     <h2 id="strategy-form-title">New strategy</h2>
@@ -1012,7 +1078,11 @@
     <div id="strategies-list" data-testid="strategies-list" tabindex="0"></div>
   </div>
 </section>
+</template>
 
+<!-- Manager-only: wrapped in a <template> (revealed by revealManagerTemplates in app.js) so
+     a plain hosted account's browser never builds this panel at all, not just hides it. -->
+<template id="tpl-view-config">
 <section class="view" id="view-config" role="tabpanel" aria-labelledby="tab-config" hidden>
   <!-- YOUR configuration first. The complaint this answers: a change saved on the Settings
        page never appeared here, because this tab only ever rendered the PROXY PROCESS's
@@ -1046,6 +1116,7 @@
     <div id="logs-help" data-testid="logs-help"></div>
   </div>
 </section>
+</template>
 
 </main>
 
@@ -1069,7 +1140,9 @@
 <script defer src="tools.js"></script>
 <!-- The KV-cache TTL view mounts itself the same way, from kvcache.js. -->
 <script defer src="kvcache.js"></script>
-<!-- Strategy campaigns mounts itself the same way, from campaigns.js. -->
-<script defer src="campaigns.js"></script>
+<!-- Strategy campaigns mounts itself the same way, from campaigns.js — but unlike
+     tools.js/kvcache.js it is manager-only with no local-ok exemption, so it is not
+     tagged here at all. app.js's maybeLoadManagerScript fetches it the one time a hosted
+     manager signs in, so a plain account's browser never requests this file. -->
 </body>
 </html>

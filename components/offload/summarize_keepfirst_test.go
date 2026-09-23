@@ -8,7 +8,6 @@ import (
 
 	bschemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/rossoctl/context-guru/components"
-	"github.com/rossoctl/context-guru/schema"
 	"github.com/rossoctl/context-guru/store"
 )
 
@@ -45,25 +44,6 @@ func summarizeWithKeepFirst(t *testing.T, keepFirst int) *Summarize {
 	s.modelClient = &fixedModel{out: "SUMMARY: explored the handler, 3 tests fail."}
 	s.mode = markerOff
 	return s
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var b []byte
-	for n > 0 {
-		b = append([]byte{byte('0' + n%10)}, b...)
-		n /= 10
-	}
-	if neg {
-		return "-" + string(b)
-	}
-	return string(b)
 }
 
 // openAIShaped is the layout the defect is about: index 0 is the system prompt and index 1 is the
@@ -106,15 +86,6 @@ func runSummarize(t *testing.T, s *Summarize, session string, msgs []bschemas.Ch
 			"the span, so the head assertions below would be vacuous", len(msgs), len(turn2.Input))
 	}
 	return turn2.Input
-}
-
-func holdsText(msgs []bschemas.ChatMessage, want string) bool {
-	for i := range msgs {
-		if strings.Contains(schema.MessageText(msgs[i]), want) {
-			return true
-		}
-	}
-	return false
 }
 
 // The default (1) reproduces the historical shape: only msgs[0] survives, so on OpenAI-shaped
@@ -185,12 +156,4 @@ func TestSummarizeKeepFirstZeroIsHonouredAndNegativeIsRefused(t *testing.T) {
 	if _, err := newSummarize([]byte("keep_first: -1\n")); err == nil {
 		t.Errorf("keep_first: -1 was accepted; a negative head must be refused, not read as 0")
 	}
-}
-
-func roles(msgs []bschemas.ChatMessage) []string {
-	out := make([]string, 0, len(msgs))
-	for i := range msgs {
-		out = append(out, string(msgs[i].Role))
-	}
-	return out
 }

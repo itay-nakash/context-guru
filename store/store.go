@@ -1,5 +1,4 @@
-// Package store holds context-guru's cross-call state behind one interface so
-// both hosts (bifrost proxy, AuthBridge plugin) share it. v1 ships an in-memory
+// both hosts (bifrost proxy, sidecar plugin) share it. v1 ships an in-memory
 // TTL+LRU backend; SQLite/Redis slot in behind the same interface when a
 // durable or multi-replica deployment is real (see the design doc, D5).
 //
@@ -157,7 +156,16 @@ type FrozenLoser interface {
 const (
 	FrozenPrefix = "cg:frz:" // mask / failed_run freeze decisions
 	ResultPrefix = "cg:res:" // extract_llm's replayed result (projection + summary, one key)
-	LenPrefix    = "cg:len:" // apply's prev-turn message count (the MaxCachedIdx boundary)
+	// SweepKeepPrefix records that extract_llm_sweep's adjudicator judged a specific output STILL
+	// NEEDED, and at what point in the conversation it said so.
+	//
+	// A SEPARATE NAMESPACE, not ResultPrefix, and the reason is a property of that one: a cg:res:
+	// record holds a PROJECTION, and getResult treats an empty projection as absent so that half a
+	// decision can never be spliced. A keep has no projection by definition — nothing is replaced —
+	// so storing keeps there would either be discarded on read or would weaken that guard for
+	// everyone. Different fact, different key.
+	SweepKeepPrefix = "cg:swk:" // extract_llm_sweep: "the adjudicator said keep, at turn N"
+	LenPrefix       = "cg:len:" // apply's prev-turn message count (the MaxCachedIdx boundary)
 	// XResultPrefix is extract_llm's CROSS-session result namespace. Pinned for the same
 	// reason ResultPrefix is: every entry is a model call already paid for, and the store's
 	// default cap is 1,000 entries shared with the unpinned expand stashes — which are the
